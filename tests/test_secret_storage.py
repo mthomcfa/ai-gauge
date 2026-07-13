@@ -40,6 +40,24 @@ def test_load_missing_returns_none():
     assert load_secret("never-set-this-key") is None
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="plaintext gate is non-Windows only")
+def test_plaintext_read_refused_without_opt_in(monkeypatch):
+    save_secret("gated", "value")
+    monkeypatch.delenv("AIGAUGE_ALLOW_PLAINTEXT_SECRETS", raising=False)
+    assert load_secret("gated") is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="plaintext gate is non-Windows only")
+def test_plaintext_file_is_owner_only(tmp_path):
+    import os
+
+    from aigauge.secret_storage import _secrets_path
+
+    save_secret("perm-check", "value")
+    mode = os.stat(_secrets_path()).st_mode & 0o777
+    assert mode == 0o600
+
+
 def test_multiple_secrets_independent():
     save_secret("a", "alpha")
     save_secret("b", "beta")

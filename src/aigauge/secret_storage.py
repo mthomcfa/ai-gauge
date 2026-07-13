@@ -103,6 +103,16 @@ def _load_all() -> dict[str, str]:
     path = _secrets_path()
     if not path.exists():
         return {}
+    if sys.platform != "win32" and os.environ.get(_ALLOW_PLAINTEXT_ENV) != "1":
+        # Mirror the write-side refusal: without the explicit opt-in, a
+        # plaintext secrets.dat on a non-Windows host is never trusted, so a
+        # file planted here cannot feed values into the app.
+        log.warning(
+            "secret_storage: ignoring existing secrets.dat on non-Windows host "
+            "(set %s=1 to opt in; development only).",
+            _ALLOW_PLAINTEXT_ENV,
+        )
+        return {}
     try:
         raw = path.read_bytes()
         if not raw:
@@ -130,7 +140,13 @@ def _save_all(data: dict[str, str]) -> None:
             "(AIGAUGE_ALLOW_PLAINTEXT_SECRETS=1). This is a development-only "
             "escape hatch; do not use it with real provider cookies."
         )
-        path.write_bytes(payload)
+        # Owner-only from the first byte: create/truncate with 0600 rather
+        # than writing with the default umask and chmodding afterwards.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
         return
     raise RuntimeError(
         "secret_storage: refusing to write secrets on non-Windows host. "
