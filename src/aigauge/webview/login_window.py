@@ -90,8 +90,15 @@ class _AllowlistedPage(QuietWebEnginePage):
     ) -> bool:
         if is_main_frame:
             scheme = url.scheme().lower()
-            if scheme in ("about", "data", "blob"):
+            if scheme in ("about", "blob"):
                 return True
+            if scheme == "data":
+                # A data: document has an opaque origin and no address bar in
+                # this chrome-less window, which makes it a phishing canvas if
+                # a provider page is ever compromised. No legitimate sign-in
+                # flow navigates the top frame to data:.
+                log.warning("login_window: blocking data: main-frame navigation")
+                return False
             if scheme not in ("http", "https"):
                 log.warning(
                     "login_window: blocking non-http navigation scheme=%s url=%s",
