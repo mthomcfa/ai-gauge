@@ -29,6 +29,9 @@ log = logging.getLogger("aigauge.secret_storage")
 
 _SECRETS_FILENAME = "secrets.dat"
 
+# Never pop a DPAPI UI prompt from a background tray app; fail instead.
+_CRYPTPROTECT_UI_FORBIDDEN = 0x1
+
 # Opt-in escape hatch for the cross-platform test suite. When unset (the
 # normal case) writes on non-Windows refuse loudly so a misconfigured macOS
 # or Linux box cannot silently produce an unencrypted secrets.dat next to a
@@ -77,7 +80,13 @@ def _protect(plaintext: bytes) -> bytes:
     in_blob = _to_blob(plaintext)
     out_blob = _DataBlob()
     ok = _CRYPT32.CryptProtectData(
-        ctypes.byref(in_blob), None, None, None, None, 0, ctypes.byref(out_blob)
+        ctypes.byref(in_blob),
+        None,
+        None,
+        None,
+        None,
+        _CRYPTPROTECT_UI_FORBIDDEN,
+        ctypes.byref(out_blob),
     )
     if not ok:
         raise OSError(ctypes.get_last_error(), "CryptProtectData failed")
@@ -88,7 +97,13 @@ def _unprotect(ciphertext: bytes) -> bytes:
     in_blob = _to_blob(ciphertext)
     out_blob = _DataBlob()
     ok = _CRYPT32.CryptUnprotectData(
-        ctypes.byref(in_blob), None, None, None, None, 0, ctypes.byref(out_blob)
+        ctypes.byref(in_blob),
+        None,
+        None,
+        None,
+        None,
+        _CRYPTPROTECT_UI_FORBIDDEN,
+        ctypes.byref(out_blob),
     )
     if not ok:
         raise OSError(ctypes.get_last_error(), "CryptUnprotectData failed")
@@ -124,6 +139,11 @@ def _load_all() -> dict[str, str]:
         loaded = json.loads(decrypted)
         return loaded if isinstance(loaded, dict) else {}
     except Exception:
+        # A failed decrypt/parse means the stored cookies are gone (rotated
+        # Windows credentials, another user's DPAPI blob, or tampering).
+        # Surface it in the log — silently returning {} both hides the cause
+        # and lets the next save_secret() overwrite the undecryptable blob.
+        log.exception("secret_storage: failed to load %s", path)
         return {}
 
 
