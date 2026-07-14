@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from typing import Any
@@ -41,15 +42,42 @@ QPushButton:default { background:#2563eb; border-color:#1d4ed8; }
 """
 
 
+# The scraped page text in snapshot.raw can carry the account holder's name,
+# email, or org as rendered on the provider page. Diagnostics are copied to the
+# clipboard for bug reports, so redact email-shaped strings and cap the raw page
+# text before it can leave the machine.
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+_BODY_TEXT_LIMIT = 500
+
+
+def _redact_emails(text: str) -> str:
+    return _EMAIL_RE.sub("[redacted-email]", text)
+
+
+def _sanitize_raw(raw: Any) -> Any:
+    if isinstance(raw, dict):
+        sanitized: dict[str, Any] = {}
+        for key, value in raw.items():
+            if key == "body_text" and isinstance(value, str) and len(value) > _BODY_TEXT_LIMIT:
+                value = value[:_BODY_TEXT_LIMIT] + "…[truncated]"
+            elif isinstance(value, (dict, list)):
+                value = _sanitize_raw(value)
+            sanitized[key] = value
+        return sanitized
+    if isinstance(raw, list):
+        return [_sanitize_raw(item) for item in raw]
+    return raw
+
+
 def _format_diagnostics(provider: str, snapshot: UsageSnapshot) -> str:
     payload: dict[str, Any] = {
         "provider": provider,
         "status": snapshot.status.value,
         "fetched_at": snapshot.fetched_at.isoformat(timespec="seconds"),
         "error": snapshot.error,
-        "raw": snapshot.raw,
+        "raw": _sanitize_raw(snapshot.raw),
     }
-    return json.dumps(payload, indent=2, default=str)
+    return _redact_emails(json.dumps(payload, indent=2, default=str))
 
 
 def reveal_path(path) -> None:
