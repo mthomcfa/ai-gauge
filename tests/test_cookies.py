@@ -72,13 +72,24 @@ def test_parse_codex_raw_value_uses_current_and_legacy_names():
 
 
 
-def test_parse_opencode_go_full_cookie_header_keeps_all_cookies():
-    pasted = "Cookie: opencode.sid=session; other=value"
+def test_parse_opencode_go_keeps_only_allowlisted_cookies():
+    pasted = "Cookie: opencode.sid=session; _ga=track; other=value"
 
     assert _parse_cookie_pairs("opencode_go", pasted) == [
         ("opencode.sid", "session"),
-        ("other", "value"),
     ]
+
+
+def test_build_cookie_is_always_httponly_and_secure():
+    from aigauge.webview.cookies import _build_cookie
+
+    opencode = _build_cookie("opencode_go", "opencode.sid", "session")
+    assert opencode.isHttpOnly()
+    assert opencode.isSecure()
+
+    claude = _build_cookie("claude", "sessionKey", "value")
+    assert claude.isHttpOnly()
+    assert claude.isSecure()
 
 
 def test_parse_opencode_go_rejects_bare_raw_value():

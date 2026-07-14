@@ -24,6 +24,18 @@ log = logging.getLogger("aigauge.webview.cookies")
 # WebEngine restart cycle.
 _COOKIE_TTL_DAYS = 60
 
+# OpenCode's auth cookie names are undocumented and have rotated over time, so
+# the paste flow can't rely on a fixed alias list. Instead of trusting an
+# arbitrary pasted Cookie header wholesale (which injected every foreign
+# analytics/tracking cookie into the profile), keep only cookies in OpenCode's
+# own namespace and drop everything else.
+_OPENCODE_COOKIE_PREFIXES = ("opencode", "__secure-opencode", "__host-opencode")
+
+
+def _opencode_cookie_allowed(name: str) -> bool:
+    lowered = name.strip().lower()
+    return any(lowered.startswith(prefix) for prefix in _OPENCODE_COOKIE_PREFIXES)
+
 
 def _unquote_cookie_value(value: str) -> str:
     if len(value) < 2 or value[0] != '"' or value[-1] != '"':
@@ -122,7 +134,9 @@ def _parse_cookie_pairs(provider: str, pasted: str) -> list[tuple[str, str]]:
         keep_all = ";" in cookie_text
         all_pairs = _parse_name_value_pairs(cookie_text)
         if provider == "opencode_go":
-            return all_pairs
+            return [
+                pair for pair in all_pairs if _opencode_cookie_allowed(pair[0])
+            ]
         if keep_all and _has_auth_cookie(provider, all_pairs):
             parsed = all_pairs
         else:
@@ -141,21 +155,31 @@ def _parse_cookie_pairs(provider: str, pasted: str) -> list[tuple[str, str]]:
     return [(name, value) for name in raw_names]
 
 
-def _set_cookie(kind: str, account_id: str, name: str, value: str) -> None:
-    domain = COOKIE_DOMAINS[kind]
-    profile = get_profile(account_id)
-    store = profile.cookieStore()
-
+def _build_cookie(kind: str, name: str, value: str) -> QNetworkCookie:
     cookie = QNetworkCookie(
         QByteArray(name.encode("utf-8")),
         QByteArray(value.strip().encode("utf-8")),
     )
     if kind != "opencode_go" and not name.startswith("__Host-"):
-        cookie.setDomain(domain)
+        cookie.setDomain(COOKIE_DOMAINS[kind])
     cookie.setPath("/")
     cookie.setSecure(True)
-    cookie.setHttpOnly(kind != "opencode_go")
+    # Always HttpOnly. Usage numbers are read from the rendered DOM text, never
+    # from JS cookie access, so no injected cookie needs to be script-readable.
+    # OpenCode was previously injected without HttpOnly, leaving its session
+    # token exposed to any script in the embedded page; force it on for every
+    # provider.
+    cookie.setHttpOnly(True)
     cookie.setExpirationDate(QDateTime.currentDateTime().addDays(_COOKIE_TTL_DAYS))
+    return cookie
+
+
+def _set_cookie(kind: str, account_id: str, name: str, value: str) -> None:
+    domain = COOKIE_DOMAINS[kind]
+    profile = get_profile(account_id)
+    store = profile.cookieStore()
+
+    cookie = _build_cookie(kind, name, value)
 
     # Origin URL must match the cookie domain (drop the leading dot).
     origin = QUrl(f"https://{domain.lstrip('.')}/")
