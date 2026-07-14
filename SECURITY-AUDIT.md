@@ -24,7 +24,7 @@ Severity, `file:line` (at the fixed state), the defect, the concrete bad outcome
 | AG-03 | **Medium** | `webview/login_window.py:acceptNavigationRequest` | Sign-in window allowlist waved through `data:` top-frame navigations → full-window credential phishing in a chrome-less window. | **Fixed** `2fdcb4d` |
 | AG-04 | **Medium** | `.github/workflows/*.yml` | Actions pinned by mutable tag (incl. third-party `action-gh-release`); `contents: write` on every release job → a compromised action could publish a trojaned binary with the project's own checksum. | **Fixed** `e152307` |
 | AG-11 | **Medium** | `settings_dialog.py:apply_to` (removal path) | Removing an account cleared only the stored cookie blob; its whole QtWebEngine profile — including Chromium's own persisted live session cookies and cache — stayed on disk under `profiles/<id>/`. | **Fixed** `67aa7bc` |
-| AG-12 | **Medium** | `webview/cookies.py:_set_cookie`, `_parse_cookie_pairs` | OpenCode cookies injected **non-HttpOnly** and the **entire pasted header** retained (any foreign analytics/tracking cookie injected; session token JS-readable). | **Fixed** `ef897ab` |
+| AG-12 | **Medium** | `webview/cookies.py:_set_cookie`, `_parse_cookie_pairs` | The **entire pasted header** was retained for OpenCode → any foreign analytics/tracking cookie the user copied was injected into the profile. (OpenCode is intentionally non-HttpOnly: its SPA reads the session cookie to hydrate — an upstream 0.6.3 decision left in place and commented; the injected-cookie allowlist is the real fix.) | **Fixed** `ef897ab`, `07e99f8` |
 | AG-13 | **Medium** | `config.py` / `providers/opencode_go.py` (`usage_url`) | OpenCode usage URL was an unvalidated string loaded into the signed-in browser → a poisoned config could point the authenticated session at `file:`/`data:`/an attacker host. | **Fixed** `b613f3c` |
 | AG-14 | **Medium** | `config.py:BrowserAccount.id` → `webview_profile_dir` | Account id flowed unvalidated into `profiles/<id>` → a poisoned config id (`../../evil`) redirected profile create/open/delete outside the app-data tree. | **Fixed** `a1b423b` |
 | AG-05 | **Low** | `config.py`, `providers/opencode_go.py:17`, `webview/verify.py:35` | Developer's personal OpenCode workspace URL hardcoded as the default → an unconfigured user's authenticated browser navigates to the dev's workspace path (fails; leaks the dev's workspace id — no user data leaves the machine). | Open (maintainer call; provider off by default) |
@@ -79,7 +79,7 @@ Per-user Task Scheduler entry `"AI Gauge"` (not a Run key / Startup folder), `Lo
 | `e152307` | AG-04 — SHA-pin actions, least-privilege `GITHUB_TOKEN` |
 | `a1b423b` | AG-14 — validate account/profile ids against traversal |
 | `67aa7bc` | AG-11 — delete the WebEngine profile on account removal + "Clear all browser data" |
-| `ef897ab` | AG-12 — allowlist OpenCode cookies, force HttpOnly on all injected cookies |
+| `ef897ab`, `07e99f8` | AG-12 — allowlist OpenCode cookies (OpenCode stays script-readable for SPA hydration) |
 | `b613f3c` | AG-13 — validate the OpenCode usage URL before load |
 | `fabe62b` | AG-02 — atomic writes, quarantine corrupt files, Windows DACL |
 | `59218b0` | AG-08 — redact emails / truncate page text in diagnostics |
