@@ -98,5 +98,19 @@ def purge_profile(account_id: str) -> None:
         )
         return
     if resolved.exists():
+        # deleteAllCookies()/clearHttpCache() above already purge the sensitive
+        # data through Chromium's own API. The rmtree reclaims the directory
+        # too, but on Windows a still-open profile (deleteLater is deferred) can
+        # hold locks on the SQLite Cookies/cache files; ignore_errors keeps that
+        # from crashing, and we log if anything survived so an incomplete delete
+        # is never silently reported as success.
         shutil.rmtree(resolved, ignore_errors=True)
-        log.info("purge_profile: deleted profile dir for account=%s", account_id)
+        if resolved.exists():
+            log.warning(
+                "purge_profile: profile dir for account=%s only partially "
+                "removed (files may be locked by an open profile): %s",
+                account_id,
+                resolved,
+            )
+        else:
+            log.info("purge_profile: deleted profile dir for account=%s", account_id)
