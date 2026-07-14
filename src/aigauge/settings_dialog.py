@@ -51,6 +51,7 @@ from .config import (
 )
 from .error_dialog import reveal_path
 from .logging_setup import log_path
+from .webview.profile import purge_profile
 from .providers.claude import CLAUDE_USAGE_URL
 from .providers.codex import CODEX_USAGE_URL
 from .providers.opencode_go import OPENCODE_GO_USAGE_URL, usage_url as opencode_go_usage_url
@@ -322,7 +323,10 @@ class _BrowserAccountRow(QWidget):
         remove = QPushButton("Remove")
         remove.setFixedWidth(72)
         remove.setVisible(removable)
-        remove.setToolTip("Remove this account and clear its saved cookie.")
+        remove.setToolTip(
+            "Remove this account and delete its saved cookie plus its browser "
+            "profile (cached pages and any live session cookies)."
+        )
         remove.clicked.connect(lambda: self.remove_clicked.emit(self.account_id))
 
         layout = QHBoxLayout(self)
@@ -455,6 +459,17 @@ class SettingsDialog(QDialog):
         scale_row.addStretch(1)
         general_grid.addWidget(QLabel("UI scale:"), 4, 0)
         general_grid.addLayout(scale_row, 4, 1, 1, 3)
+
+        self.clear_browser_data_btn = QPushButton("Clear all browser data")
+        self.clear_browser_data_btn.setObjectName("clear_browser_data_btn")
+        self.clear_browser_data_btn.setToolTip(
+            "Delete every account's saved cookie and embedded-browser profile "
+            "(cached pages and live session cookies). You'll need to sign in again."
+        )
+        self.clear_browser_data_btn.clicked.connect(self._clear_all_browser_data)
+        general_grid.addWidget(
+            self.clear_browser_data_btn, 5, 0, 1, 2, Qt.AlignmentFlag.AlignLeft
+        )
 
         # ----- Providers -----
         providers = QGroupBox("Providers")
@@ -835,6 +850,44 @@ class SettingsDialog(QDialog):
         layout.addWidget(tabs, 1)
         layout.addLayout(button_row)
 
+    def _profile_ids_on_disk(self) -> list[str]:
+        try:
+            profiles_root = app_data_dir() / "profiles"
+            if not profiles_root.is_dir():
+                return []
+            return [child.name for child in profiles_root.iterdir() if child.is_dir()]
+        except OSError:
+            return []
+
+    def _clear_all_browser_data(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            "Clear all browser data",
+            "Delete every account's saved cookie and embedded-browser profile?\n\n"
+            "You will need to sign in again for each provider. This cannot be "
+            "undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        account_ids = {account.id for account in self._current_browser_accounts()}
+        account_ids |= {account.id for account in self._config.browser_accounts}
+        account_ids |= {"claude", "codex", "opencode_go"}
+        account_ids |= set(self._profile_ids_on_disk())
+        for account_id in sorted(account_ids):
+            try:
+                set_provider_cookie(account_id, None)
+                purge_profile(account_id)
+            except Exception:  # noqa: BLE001 - clear as much as possible
+                log.exception("failed to clear browser data for %s", account_id)
+        QMessageBox.information(
+            self,
+            "Browser data cleared",
+            "Saved cookies and browser profiles were deleted. Sign in again to "
+            "resume monitoring.",
+        )
+
     def _new_account_id(self, kind: str) -> str:
         existing = {account.id for account in self._browser_accounts}
         while True:
@@ -1078,6 +1131,10 @@ class SettingsDialog(QDialog):
         config.providers.opencode_go = self.opencode_go_cb.isChecked()
         for account_id in self._removed_browser_account_ids:
             set_provider_cookie(account_id, None)
+            try:
+                purge_profile(account_id)
+            except Exception:  # noqa: BLE001 - never let cleanup crash the save
+                log.exception("failed to purge profile for %s", account_id)
         username = self.gh_username.text().strip()
         config.copilot.username = username or None
         billing_org = self.gh_billing_org.text().strip()

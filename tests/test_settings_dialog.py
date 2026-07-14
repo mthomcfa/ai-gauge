@@ -141,6 +141,28 @@ def test_remove_secondary_account_clears_cookie(qtbot, monkeypatch):
 
     assert removed == [(account_id, None)]
 
+def test_remove_account_purges_profile_dir(qtbot, monkeypatch):
+    monkeypatch.setattr(settings_dialog, "set_start_at_login", lambda enabled: None)
+    monkeypatch.setattr(settings_dialog, "set_provider_cookie", lambda key, value: None)
+    config = Config()
+    dialog = SettingsDialog(config)
+    qtbot.addWidget(dialog)
+
+    dialog._add_browser_account("claude")  # noqa: SLF001
+    account_id = dialog._browser_accounts[-1].id  # noqa: SLF001
+
+    from aigauge.config import webview_profile_dir
+
+    profile_dir = webview_profile_dir(account_id)
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    (profile_dir / "Cookies").write_bytes(b"SQLite format 3\x00")
+
+    dialog._remove_browser_account(account_id)  # noqa: SLF001
+    dialog.apply_to(config)
+
+    assert not profile_dir.exists()
+
+
 def test_fade_when_inactive_setting_applies(qtbot, monkeypatch):
     monkeypatch.setattr(settings_dialog, "set_start_at_login", lambda enabled: None)
     config = Config()
