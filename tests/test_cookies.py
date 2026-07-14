@@ -80,16 +80,19 @@ def test_parse_opencode_go_keeps_only_allowlisted_cookies():
     ]
 
 
-def test_build_cookie_is_always_httponly_and_secure():
+def test_build_cookie_httponly_policy_and_secure():
     from aigauge.webview.cookies import _build_cookie
 
-    opencode = _build_cookie("opencode_go", "opencode.sid", "session")
-    assert opencode.isHttpOnly()
-    assert opencode.isSecure()
-
+    # Claude/Codex tokens are never read by page JS → HttpOnly.
     claude = _build_cookie("claude", "sessionKey", "value")
     assert claude.isHttpOnly()
     assert claude.isSecure()
+
+    # OpenCode's SPA reads its session cookie to hydrate, so it must stay
+    # script-readable; it is the isolated non-HttpOnly exception.
+    opencode = _build_cookie("opencode_go", "opencode.sid", "session")
+    assert not opencode.isHttpOnly()
+    assert opencode.isSecure()
 
 
 def test_parse_opencode_go_rejects_bare_raw_value():

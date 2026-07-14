@@ -164,12 +164,13 @@ def _build_cookie(kind: str, name: str, value: str) -> QNetworkCookie:
         cookie.setDomain(COOKIE_DOMAINS[kind])
     cookie.setPath("/")
     cookie.setSecure(True)
-    # Always HttpOnly. Usage numbers are read from the rendered DOM text, never
-    # from JS cookie access, so no injected cookie needs to be script-readable.
-    # OpenCode was previously injected without HttpOnly, leaving its session
-    # token exposed to any script in the embedded page; force it on for every
-    # provider.
-    cookie.setHttpOnly(True)
+    # HttpOnly for Claude/Codex, whose session tokens are never read by page
+    # JS. OpenCode is the isolated exception: its SPA reads the session cookie
+    # from document.cookie to hydrate, so forcing HttpOnly there breaks sign-in
+    # (a regression fixed upstream in 0.6.3). Keep it script-readable — the
+    # allowlist above still bounds *which* cookies are injected, which is the
+    # part that was actually unsafe.
+    cookie.setHttpOnly(kind != "opencode_go")
     cookie.setExpirationDate(QDateTime.currentDateTime().addDays(_COOKIE_TTL_DAYS))
     return cookie
 
