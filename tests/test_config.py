@@ -1,3 +1,6 @@
+import pytest
+from pydantic import ValidationError
+
 from aigauge.config import (
     BrowserAccount,
     Config,
@@ -9,6 +12,36 @@ from aigauge.config import (
     qt_scale_factor_env,
     webview_profile_dir,
 )
+
+
+@pytest.mark.parametrize("bad_id", ["../evil", "a/b", "..", "x/../../y", "with space", ""])
+def test_browser_account_rejects_unsafe_ids(bad_id):
+    with pytest.raises(ValidationError):
+        BrowserAccount(id=bad_id, kind="claude")
+
+
+@pytest.mark.parametrize("good_id", ["claude", "codex", "opencode_go", "claude-ab12cd34"])
+def test_browser_account_accepts_generated_ids(good_id):
+    assert BrowserAccount(id=good_id, kind="claude").id == good_id
+
+
+@pytest.mark.parametrize("bad_id", ["../../evil", "a/b", "..", "foo/bar"])
+def test_webview_profile_dir_rejects_traversal(bad_id):
+    with pytest.raises(ValueError):
+        webview_profile_dir(bad_id)
+
+
+def test_load_rejects_config_with_unsafe_account_id():
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        '{"browser_accounts": [{"id": "../../evil", "kind": "claude"}]}',
+        encoding="utf-8",
+    )
+    # A poisoned id must not survive into a live profile path; load falls back
+    # to defaults rather than adopting the traversal id.
+    c = Config.load()
+    assert all(webview_profile_dir(a.id) for a in c.browser_accounts)
+    assert [a.id for a in c.browser_accounts] == ["claude", "codex"]
 
 
 def test_defaults():

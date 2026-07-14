@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import keyring
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .platforms import APP_NAME, get_platform
 
@@ -59,8 +59,33 @@ def app_data_dir() -> Path:
     return get_platform().app_data_dir()
 
 
+# Account / profile ids become a filesystem path component under profiles/.
+# Restrict them to the shape our own generators produce (slugs, hex suffixes,
+# and the fixed provider ids like ``opencode_go``) so a poisoned config.json
+# can never turn an id into a path-traversal payload.
+_PROFILE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def _is_safe_profile_id(provider: str) -> bool:
+    return bool(provider) and _PROFILE_ID_RE.fullmatch(provider) is not None
+
+
 def webview_profile_dir(provider: str) -> Path:
-    return app_data_dir() / "profiles" / provider
+    """Path to a provider/account's QtWebEngine profile.
+
+    Validates ``provider`` and confirms the resulting path stays inside the
+    ``profiles/`` root before returning it — every profile create/open/delete
+    routes through here, so this is the single traversal chokepoint.
+    """
+    if not _is_safe_profile_id(provider):
+        raise ValueError(f"unsafe profile id: {provider!r}")
+    profiles_root = app_data_dir() / "profiles"
+    target = profiles_root / provider
+    resolved = target.resolve()
+    root_resolved = profiles_root.resolve()
+    if resolved != root_resolved and not resolved.is_relative_to(root_resolved):
+        raise ValueError(f"profile path escapes root: {provider!r}")
+    return target
 
 
 def config_path() -> Path:
@@ -96,6 +121,16 @@ class BrowserAccount(BaseModel):
     kind: str
     name: str | None = None
     enabled: bool = True
+
+    @field_validator("id")
+    @classmethod
+    def _validate_id(cls, value: str) -> str:
+        # The id is used verbatim as a profiles/ path component and as a
+        # keyring/secret name; keep it to the generated slug-<hex> / fixed-id
+        # shape so it can never carry a path-traversal or separator payload.
+        if not _is_safe_profile_id(value):
+            raise ValueError(f"unsafe browser account id: {value!r}")
+        return value
 
 
 class CopilotConfig(BaseModel):
