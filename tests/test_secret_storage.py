@@ -58,6 +58,32 @@ def test_plaintext_file_is_owner_only(tmp_path):
     assert mode == 0o600
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="plaintext gate is non-Windows only")
+def test_corrupt_file_is_quarantined_not_destroyed():
+    from aigauge.secret_storage import _secrets_path
+
+    path = _secrets_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"{ this is not valid json")
+
+    assert load_secret("anything") is None
+
+    corrupt = path.with_name(path.name + ".corrupt")
+    assert corrupt.exists()
+    assert corrupt.read_bytes() == b"{ this is not valid json"
+    assert not path.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="plaintext gate is non-Windows only")
+def test_write_leaves_no_temp_files():
+    from aigauge.secret_storage import _secrets_path
+
+    save_secret("atomic", "value")
+    leftovers = list(_secrets_path().parent.glob(".secrets-*.tmp"))
+    assert leftovers == []
+    assert load_secret("atomic") == "value"
+
+
 def test_multiple_secrets_independent():
     save_secret("a", "alpha")
     save_secret("b", "beta")

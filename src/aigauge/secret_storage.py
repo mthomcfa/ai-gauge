@@ -20,7 +20,9 @@ import ctypes.wintypes as wt
 import json
 import logging
 import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from .config import app_data_dir
@@ -114,6 +116,25 @@ def _secrets_path() -> Path:
     return app_data_dir() / _SECRETS_FILENAME
 
 
+def _quarantine(path: Path) -> None:
+    """Move an undecryptable/corrupt secrets file aside instead of destroying it.
+
+    Renaming (rather than letting the next save overwrite it) preserves the
+    original bytes for recovery/forensics — e.g. a DPAPI blob that failed to
+    decrypt because Windows credentials rotated might still be recoverable.
+    """
+    try:
+        dest = path.with_name(path.name + ".corrupt")
+        index = 1
+        while dest.exists():
+            dest = path.with_name(f"{path.name}.corrupt{index}")
+            index += 1
+        os.replace(path, dest)
+        log.warning("secret_storage: quarantined undecryptable secrets to %s", dest)
+    except OSError:
+        log.exception("secret_storage: failed to quarantine %s", path)
+
+
 def _load_all() -> dict[str, str]:
     path = _secrets_path()
     if not path.exists():
@@ -139,12 +160,86 @@ def _load_all() -> dict[str, str]:
         loaded = json.loads(decrypted)
         return loaded if isinstance(loaded, dict) else {}
     except Exception:
-        # A failed decrypt/parse means the stored cookies are gone (rotated
-        # Windows credentials, another user's DPAPI blob, or tampering).
-        # Surface it in the log — silently returning {} both hides the cause
-        # and lets the next save_secret() overwrite the undecryptable blob.
+        # A failed decrypt/parse means the stored cookies are unreadable
+        # (rotated Windows credentials, another user's DPAPI blob, or
+        # tampering). Log it, and quarantine the original file instead of
+        # leaving the next save_secret() to silently overwrite it — the old
+        # code destroyed the only copy of a possibly-recoverable blob.
         log.exception("secret_storage: failed to load %s", path)
+        _quarantine(path)
         return {}
+
+
+def _atomic_write(path: Path, payload: bytes, *, mode: int | None = None) -> None:
+    """Write ``payload`` to ``path`` atomically via a same-dir temp + os.replace.
+
+    A crash or concurrent read can never observe a half-written secrets file:
+    readers see either the old file or the complete new one. When ``mode`` is
+    given the temp file is created with it before any bytes are written, so the
+    payload is never briefly world-readable.
+    """
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".secrets-", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        if mode is not None:
+            os.chmod(tmp, mode)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _lock_down_windows_acl(path: Path) -> None:
+    """Best-effort: restrict secrets.dat to the current user via an explicit DACL.
+
+    DPAPI already binds the ciphertext to the user, but an explicit owner-only
+    DACL keeps other local accounts from even reading the blob. Uses icacls
+    (always present on Windows); logged and non-fatal on failure.
+    """
+    if sys.platform != "win32":
+        return
+    user = (os.environ.get("USERNAME") or "").strip()
+    if not user:
+        return
+    try:
+        result = subprocess.run(
+            ["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
+            check=False,
+            capture_output=True,
+            text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if result.returncode != 0:
+            log.warning(
+                "secret_storage: icacls lockdown failed rc=%s detail=%s",
+                result.returncode,
+                (result.stderr or result.stdout or "").strip(),
+            )
+            return
+        # Verify the DACL took: re-read it and confirm inheritance is gone and
+        # only the current user is granted.
+        verify = subprocess.run(
+            ["icacls", str(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        acl_text = verify.stdout or ""
+        if user.lower() not in acl_text.lower():
+            log.warning(
+                "secret_storage: DACL verify did not show current user; acl=%s",
+                acl_text.strip(),
+            )
+    except OSError:
+        log.exception("secret_storage: could not apply Windows DACL to %s", path)
 
 
 def _save_all(data: dict[str, str]) -> None:
@@ -152,7 +247,8 @@ def _save_all(data: dict[str, str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(data).encode("utf-8")
     if sys.platform == "win32":
-        path.write_bytes(_protect(payload))
+        _atomic_write(path, _protect(payload))
+        _lock_down_windows_acl(path)
         return
     if os.environ.get(_ALLOW_PLAINTEXT_ENV) == "1":
         log.warning(
@@ -160,13 +256,8 @@ def _save_all(data: dict[str, str]) -> None:
             "(AIGAUGE_ALLOW_PLAINTEXT_SECRETS=1). This is a development-only "
             "escape hatch; do not use it with real provider cookies."
         )
-        # Owner-only from the first byte: create/truncate with 0600 rather
-        # than writing with the default umask and chmodding afterwards.
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            os.write(fd, payload)
-        finally:
-            os.close(fd)
+        # Owner-only from the first byte, written atomically.
+        _atomic_write(path, payload, mode=0o600)
         return
     raise RuntimeError(
         "secret_storage: refusing to write secrets on non-Windows host. "
