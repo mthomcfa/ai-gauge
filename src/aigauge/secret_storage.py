@@ -181,9 +181,12 @@ def _atomic_write(path: Path, payload: bytes, *, mode: int | None = None) -> Non
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".secrets-", suffix=".tmp")
     tmp = Path(tmp_name)
     try:
-        if mode is not None:
-            os.chmod(tmp, mode)
+        # Own the fd through the with-block so it is closed exactly once on every
+        # path. fchmod on the open descriptor (rather than chmod on the name
+        # before fdopen) avoids leaking the fd if setting the mode fails.
         with os.fdopen(fd, "wb") as handle:
+            if mode is not None:
+                os.fchmod(handle.fileno(), mode)
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
