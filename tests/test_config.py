@@ -31,6 +31,45 @@ def test_webview_profile_dir_rejects_traversal(bad_id):
         webview_profile_dir(bad_id)
 
 
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "http://opencode.ai/workspace/x/go",
+        "file:///etc/passwd",
+        "data:text/html,<h1>hi",
+        "https://user:pass@opencode.ai/workspace/x/go",
+        "https://opencode.ai:8443/workspace/x/go",
+        "https://evil.com/workspace/x/go",
+        "https://opencode.ai.evil.com/workspace/x/go",
+        "https://127.0.0.1/workspace/x/go",
+        "https://opencode.ai",
+        "https://opencode.ai/",
+    ],
+)
+def test_validate_opencode_usage_url_rejects_unsafe(bad_url):
+    from aigauge.config import validate_opencode_usage_url
+
+    with pytest.raises(ValueError):
+        validate_opencode_usage_url(bad_url)
+
+
+def test_validate_opencode_usage_url_accepts_workspace_url():
+    from aigauge.config import validate_opencode_usage_url
+
+    url = "https://opencode.ai/workspace/wrk_abc/go"
+    assert validate_opencode_usage_url(url) == url
+
+
+def test_load_rejects_config_with_unsafe_opencode_url():
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        '{"opencode_go": {"usage_url": "https://evil.com/workspace/x/go"}}',
+        encoding="utf-8",
+    )
+    c = Config.load()
+    assert c.opencode_go.usage_url.startswith("https://opencode.ai/workspace/")
+
+
 def test_load_rejects_config_with_unsafe_account_id():
     config_path().parent.mkdir(parents=True, exist_ok=True)
     config_path().write_text(

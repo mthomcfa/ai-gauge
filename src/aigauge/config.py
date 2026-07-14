@@ -143,10 +143,44 @@ class OpenRouterConfig(BaseModel):
     daily_budget: float | None = Field(default=None, ge=0)
 
 
+def validate_opencode_usage_url(value: str) -> str:
+    """Return ``value`` if it is a safe OpenCode usage URL, else raise ValueError.
+
+    The URL is loaded into the embedded, authenticated browser, so it must be
+    a plain ``https`` page on ``opencode.ai`` with no way to redirect the signed
+    -in session elsewhere. Rejects non-https schemes (``file:``/``data:``/…),
+    embedded credentials, an explicit port, IP-literal or look-alike hosts, and
+    a bare/rootless path.
+    """
+    from urllib.parse import urlparse
+
+    text = (value or "").strip()
+    parsed = urlparse(text)
+    if parsed.scheme != "https":
+        raise ValueError("OpenCode usage URL must use https")
+    if parsed.username or parsed.password:
+        raise ValueError("OpenCode usage URL must not contain embedded credentials")
+    if parsed.port is not None:
+        raise ValueError("OpenCode usage URL must not specify a port")
+    host = (parsed.hostname or "").lower()
+    # An exact host / real subdomain match also rejects IP literals and
+    # look-alike hosts such as opencode.ai.evil.com.
+    if host != "opencode.ai" and not host.endswith(".opencode.ai"):
+        raise ValueError("OpenCode usage URL host must be opencode.ai")
+    if not parsed.path or parsed.path == "/":
+        raise ValueError("OpenCode usage URL must include a workspace path")
+    return text
+
+
 class OpenCodeGoConfig(BaseModel):
     usage_url: str = (
         "https://opencode.ai/workspace/wrk_01KX3HT8MFWCMHR2289KGPZ1RD/go"
     )
+
+    @field_validator("usage_url")
+    @classmethod
+    def _validate_usage_url(cls, value: str) -> str:
+        return validate_opencode_usage_url(value)
 
 
 class Config(BaseModel):

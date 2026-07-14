@@ -1,7 +1,27 @@
 from datetime import datetime, timedelta
 
+from aigauge.config import Config
 from aigauge.models import SnapshotStatus
-from aigauge.providers.opencode_go import _build_snapshot, _parse_reset_text
+from aigauge.providers.opencode_go import (
+    OPENCODE_GO_USAGE_URL,
+    _build_snapshot,
+    _parse_reset_text,
+    usage_url,
+)
+
+
+def test_usage_url_falls_back_when_config_holds_unsafe_url():
+    config = Config()
+    # Bypass the field validator to simulate a value that reached runtime
+    # through some other path; usage_url() must still refuse to load it.
+    object.__setattr__(config.opencode_go, "usage_url", "https://evil.com/x/go")
+    assert usage_url(config) == OPENCODE_GO_USAGE_URL
+
+
+def test_usage_url_returns_configured_safe_url():
+    config = Config()
+    config.opencode_go.usage_url = "https://opencode.ai/workspace/custom/go"
+    assert usage_url(config) == "https://opencode.ai/workspace/custom/go"
 
 
 def test_parse_reset_text_handles_days_hours_minutes():
