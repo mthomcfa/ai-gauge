@@ -2,10 +2,27 @@ from PyQt6.QtCore import QUrl
 
 from aigauge.webview.login_window import (
     VERIFY_TARGETS,
+    _blocked_main_frame_scheme,
     _host_allowed,
     _is_google_host,
     _safe_url_for_log,
 )
+
+
+def test_opaque_and_foreign_schemes_are_blocked_in_sign_in_top_frame():
+    # data: and blob: are opaque-origin phishing canvases in a chrome-less
+    # window; other non-web schemes are blocked too.
+    assert _blocked_main_frame_scheme("data") is True
+    assert _blocked_main_frame_scheme("blob") is True
+    assert _blocked_main_frame_scheme("javascript") is True
+    assert _blocked_main_frame_scheme("file") is True
+    assert _blocked_main_frame_scheme("ftp") is True
+
+
+def test_web_and_about_schemes_are_allowed_in_sign_in_top_frame():
+    assert _blocked_main_frame_scheme("http") is False
+    assert _blocked_main_frame_scheme("https") is False
+    assert _blocked_main_frame_scheme("about") is False
 
 
 def test_google_hosts_are_detected_and_allowlisted():
