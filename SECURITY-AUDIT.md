@@ -21,7 +21,7 @@ Severity, `file:line` (at the fixed state), the defect, the concrete bad outcome
 |----|----------|----------|---------------------------|-----------------|
 | AG-01 | **Medium** | `secret_storage.py:_load_all` | `AIGAUGE_ALLOW_PLAINTEXT_SECRETS` gated only writes; a planted plaintext `secrets.dat` on macOS/Linux was read and trusted → attacker-chosen session cookies adopted (session fixation). | **Fixed** `929018c` |
 | AG-02 | **Medium** | `secret_storage.py:_load_all`, `_protect`/`_unprotect` | Decrypt/parse failures swallowed silently; DPAPI called with `dwFlags=0` → user silently signed out, evidence overwritten, and a DPAPI UI prompt could hang the tray app. | **Fixed** `1a086ac` (+ quarantine in `fabe62b`) |
-| AG-03 | **Medium** | `webview/login_window.py:acceptNavigationRequest` | Sign-in window allowlist waved through `data:` top-frame navigations → full-window credential phishing in a chrome-less window. | **Fixed** `2fdcb4d` |
+| AG-03 | **Medium** | `webview/login_window.py:acceptNavigationRequest` | Sign-in window allowlist waved through `data:` (and, until the follow-up, `blob:`) top-frame navigations → full-window credential phishing in a chrome-less window. | **Fixed** `2fdcb4d`, `249ad5e` |
 | AG-04 | **Medium** | `.github/workflows/*.yml` | Actions pinned by mutable tag (incl. third-party `action-gh-release`); `contents: write` on every release job → a compromised action could publish a trojaned binary with the project's own checksum. | **Fixed** `e152307` |
 | AG-11 | **Medium** | `settings_dialog.py:apply_to` (removal path) | Removing an account cleared only the stored cookie blob; its whole QtWebEngine profile — including Chromium's own persisted live session cookies and cache — stayed on disk under `profiles/<id>/`. | **Fixed** `67aa7bc` |
 | AG-12 | **Medium** | `webview/cookies.py:_set_cookie`, `_parse_cookie_pairs` | The **entire pasted header** was retained for OpenCode → any foreign analytics/tracking cookie the user copied was injected into the profile. (OpenCode is intentionally non-HttpOnly: its SPA reads the session cookie to hydrate — an upstream 0.6.3 decision left in place and commented; the injected-cookie allowlist is the real fix.) | **Fixed** `ef897ab`, `07e99f8` |
@@ -85,5 +85,13 @@ Per-user Task Scheduler entry `"AI Gauge"` (not a Run key / Startup folder), `Lo
 | `59218b0` | AG-08 — redact emails / truncate page text in diagnostics |
 | `e83041b` | AG-06/AG-07 — build provenance, pin PyInstaller, fork+audit metadata |
 | `ae59a82` | AG-09 — resolve `icacls` to System32 |
+| `249ad5e` | AG-03 follow-up — block `blob:` main-frame navigation |
+| `e6ea6fd` | review follow-up — close temp fd on all paths in `_atomic_write` |
+| `8ed065f` | AG-11 follow-up — warn when a profile dir only partially deletes (Windows locks) |
+| `daf0a06` | AG-13 follow-up — reject control chars/backslashes in the OpenCode URL |
 
-Post-fix verification: **303 tests pass** (from a 265 baseline; +38 regression tests), `bandit` 0 High, `pip-audit` clean.
+## Self-review
+
+A two-agent adversarial pass ran over the full branch diff after implementation: one verifying each fix actually closes its finding (attempting bypasses), one hunting functional regressions/import cycles/logic bugs. All twelve fixes were confirmed closed with no functional regression. The review surfaced four hardening follow-ups, all now applied (the four rows above): the most material was the **`blob:` main-frame gap** — the `data:` block had left `blob:` (same opaque-origin phishing surface) open. Residual notes accepted as non-issues: Windows reserved device names pass the id regex (app-generated ids only), and the `opencode-*` cookie prefix is intentionally broad (foreign trackers still dropped; everything stays confined to the opencode.ai origin).
+
+Post-fix verification: **308 tests pass** (from a 265 baseline; +43 regression tests), `bandit` 0 High, `pip-audit` no vulnerable declared dependencies.
