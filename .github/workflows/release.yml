@@ -40,6 +40,12 @@ jobs:
 
   build:
     needs: resolve-version
+    permissions:
+      contents: read
+      # Required by actions/attest-build-provenance to mint the signed
+      # provenance attestation for the built artifact.
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -154,6 +160,13 @@ jobs:
           shasum -a 256 "$archive" | awk '{print $1 " *" $2}' > "$sha"
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
           echo "sha=$sha"         >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          # Only this OS's archive exists in the workspace; the matrix ext glob
+          # matches exactly that one file.
+          subject-path: ai-gauge-*.${{ matrix.archive_ext }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
