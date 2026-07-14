@@ -196,21 +196,29 @@ def _atomic_write(path: Path, payload: bytes, *, mode: int | None = None) -> Non
         raise
 
 
+def _icacls_path() -> str:
+    windir = os.environ.get("WINDIR") or os.environ.get("SystemRoot") or r"C:\Windows"
+    candidate = Path(windir) / "System32" / "icacls.exe"
+    return str(candidate) if candidate.exists() else "icacls.exe"
+
+
 def _lock_down_windows_acl(path: Path) -> None:
     """Best-effort: restrict secrets.dat to the current user via an explicit DACL.
 
     DPAPI already binds the ciphertext to the user, but an explicit owner-only
     DACL keeps other local accounts from even reading the blob. Uses icacls
-    (always present on Windows); logged and non-fatal on failure.
+    (always present on Windows), resolved to its System32 path so a hijacked
+    PATH can't substitute it; logged and non-fatal on failure.
     """
     if sys.platform != "win32":
         return
     user = (os.environ.get("USERNAME") or "").strip()
     if not user:
         return
+    icacls = _icacls_path()
     try:
         result = subprocess.run(
-            ["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
+            [icacls, str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
             check=False,
             capture_output=True,
             text=True,
@@ -226,7 +234,7 @@ def _lock_down_windows_acl(path: Path) -> None:
         # Verify the DACL took: re-read it and confirm inheritance is gone and
         # only the current user is granted.
         verify = subprocess.run(
-            ["icacls", str(path)],
+            [icacls, str(path)],
             check=False,
             capture_output=True,
             text=True,
