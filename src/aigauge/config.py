@@ -155,6 +155,12 @@ def validate_opencode_usage_url(value: str) -> str:
     from urllib.parse import urlparse
 
     text = (value or "").strip()
+    # Reject control characters and backslashes up front. Python's urlparse and
+    # Qt's QUrl disagree on how to handle these (a backslash-injection host like
+    # ``evil.com\.opencode.ai`` parses "safe" here but becomes a different/empty
+    # host in QUrl); refusing them keeps the two parsers from ever diverging.
+    if any(ord(ch) < 0x20 or ch in "\\ " for ch in text):
+        raise ValueError("OpenCode usage URL contains illegal characters")
     parsed = urlparse(text)
     if parsed.scheme != "https":
         raise ValueError("OpenCode usage URL must use https")

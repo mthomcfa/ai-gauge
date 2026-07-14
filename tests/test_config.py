@@ -44,6 +44,9 @@ def test_webview_profile_dir_rejects_traversal(bad_id):
         "https://127.0.0.1/workspace/x/go",
         "https://opencode.ai",
         "https://opencode.ai/",
+        "https://evil.com\\.opencode.ai/workspace/x/go",
+        "https://opencode.ai/work\tspace/go",
+        "https://opencode.ai/work space/go",
     ],
 )
 def test_validate_opencode_usage_url_rejects_unsafe(bad_url):
