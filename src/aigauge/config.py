@@ -72,9 +72,21 @@ def app_data_dir() -> Path:
 # can never turn an id into a path-traversal payload.
 _PROFILE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
+# Windows treats these as device names regardless of any extension, so a
+# profiles/<id> path built from one would target the device, not a directory.
+# App-generated ids never collide with these; reject them for the poisoned
+# -config threat model.
+_WIN_RESERVED_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{i}" for i in range(1, 10)}
+    | {f"lpt{i}" for i in range(1, 10)}
+)
+
 
 def _is_safe_profile_id(provider: str) -> bool:
-    return bool(provider) and _PROFILE_ID_RE.fullmatch(provider) is not None
+    if not provider or _PROFILE_ID_RE.fullmatch(provider) is None:
+        return False
+    return provider.split(".", 1)[0].lower() not in _WIN_RESERVED_NAMES
 
 
 def webview_profile_dir(provider: str) -> Path:

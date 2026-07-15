@@ -75,6 +75,20 @@ def test_corrupt_file_is_quarantined_not_destroyed():
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="plaintext gate is non-Windows only")
+def test_repeated_corruption_stays_bounded_to_one_quarantine_file():
+    from aigauge.secret_storage import _secrets_path
+
+    path = _secrets_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Two successive corrupt files must not accumulate .corrupt1/.corrupt2…
+    for _ in range(3):
+        path.write_bytes(b"not json")
+        assert load_secret("x") is None
+    corrupts = sorted(p.name for p in path.parent.glob(path.name + ".corrupt*"))
+    assert corrupts == [path.name + ".corrupt"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="plaintext gate is non-Windows only")
 def test_write_leaves_no_temp_files():
     from aigauge.secret_storage import _secrets_path
 

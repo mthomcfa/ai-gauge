@@ -17,7 +17,10 @@ from aigauge.config import (
 )
 
 
-@pytest.mark.parametrize("bad_id", ["../evil", "a/b", "..", "x/../../y", "with space", ""])
+@pytest.mark.parametrize(
+    "bad_id",
+    ["../evil", "a/b", "..", "x/../../y", "with space", "", "con", "NUL", "com1", "lpt9.dat"],
+)
 def test_browser_account_rejects_unsafe_ids(bad_id):
     with pytest.raises(ValidationError):
         BrowserAccount(id=bad_id, kind="claude")

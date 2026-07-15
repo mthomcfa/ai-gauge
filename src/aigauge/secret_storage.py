@@ -124,11 +124,13 @@ def _quarantine(path: Path) -> None:
     decrypt because Windows credentials rotated might still be recoverable.
     """
     try:
+        # A single fixed name, overwritten atomically. Using incrementing
+        # .corrupt/.corrupt1/... names would sprawl without bound on a
+        # roaming/OneDrive-synced %APPDATA%, where a machine-foreign DPAPI blob
+        # fails to decrypt and gets quarantined on every launch — each an
+        # encrypted copy of the session cookies. Overwriting a prior quarantine
+        # (already unreadable) is safe and keeps this bounded to one file.
         dest = path.with_name(path.name + ".corrupt")
-        index = 1
-        while dest.exists():
-            dest = path.with_name(f"{path.name}.corrupt{index}")
-            index += 1
         os.replace(path, dest)
         log.warning("secret_storage: quarantined undecryptable secrets to %s", dest)
     except OSError:
