@@ -10,7 +10,7 @@ automatically. No secrets/tokens are included.
 A full source audit of 0.6.3 found the codebase clean (no covert egress,
 telemetry, code-execution, or credential-exfiltration paths). This change set
 addresses the hardening findings it surfaced. Each fix is a focused commit with
-a regression test; the suite goes from 265 to 308 passing, `bandit` reports 0
+a regression test; the suite goes from 265 to 316 passing, `bandit` reports 0
 High, and `pip-audit` is clean.
 
 ## What changed
@@ -42,7 +42,7 @@ High, and `pip-audit` is clean.
 
 ## Testing
 
-- `pytest` — 308 passing (was 265; +43 regression tests).
+- `pytest` — 316 passing (was 265; +51 regression tests).
 - `bandit -r src/ tools/` — 0 High (Low/Medium are pre-existing fixed-argv
   subprocess and an f-string-template false positive).
 - `pip-audit` — no vulnerable dependencies.

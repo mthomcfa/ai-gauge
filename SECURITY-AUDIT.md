@@ -89,9 +89,20 @@ Per-user Task Scheduler entry `"AI Gauge"` (not a Run key / Startup folder), `Lo
 | `e6ea6fd` | review follow-up — close temp fd on all paths in `_atomic_write` |
 | `8ed065f` | AG-11 follow-up — warn when a profile dir only partially deletes (Windows locks) |
 | `daf0a06` | AG-13 follow-up — reject control chars/backslashes in the OpenCode URL |
+| `f8d1206` | 3-way gate — a rejected config field no longer wipes the whole config |
+| `f398181` | 3-way gate — bound quarantine files; reject Windows device-name ids |
+| `cef527e` | 3-way gate — validate OpenCode URL before "Open usage in browser" |
 
-## Self-review
+## Self-review — three-way adversarial gate
 
-A two-agent adversarial pass ran over the full branch diff after implementation: one verifying each fix actually closes its finding (attempting bypasses), one hunting functional regressions/import cycles/logic bugs. All twelve fixes were confirmed closed with no functional regression. The review surfaced four hardening follow-ups, all now applied (the four rows above): the most material was the **`blob:` main-frame gap** — the `data:` block had left `blob:` (same opaque-origin phishing surface) open. Residual notes accepted as non-issues: Windows reserved device names pass the id regex (app-generated ids only), and the `opencode-*` cookie prefix is intentionally broad (foreign trackers still dropped; everything stays confined to the opencode.ai origin).
+Three independent adversarial passes ran over the full branch diff:
 
-Post-fix verification: **308 tests pass** (from a 265 baseline; +43 regression tests), `bandit` 0 High, `pip-audit` no vulnerable declared dependencies.
+1. **Claude Opus, verify-each-fix** — attempted a bypass of every control.
+2. **Claude Opus, regression hunt** — import cycles, use-after-free, fd leaks, logic bugs.
+3. **Fable, fresh skeptic** — brute-forced the OpenCode URL validator across the codepoint range (IDN/homograph/fullwidth-dot/zero-width/percent-encoding/userinfo/port), symlink+traversal on `purge_profile`, host-suffix spoofing, and cookie-name tricks.
+
+(A GitHub Copilot review — OpenAI/GPT-family — was also requested on the PR as a fourth, non-Claude engine.)
+
+**No security control was defeated by any pass.** The three follow-ups from passes 1–2 (`blob:` main-frame gap — the most material, since the `data:` block had left the same opaque-origin phishing surface open — plus the `_atomic_write` fd-leak and the Windows partial-delete warning) were applied. Pass 3 then found one **functional regression the first two missed and this document originally overstated away**: a single config field rejected by the new strict validators bubbled out of `Config.load()`'s blanket `except` and reset the *entire* config, so an upgrading user with a custom OpenCode URL would silently lose all other settings. Fixed by coercing/dropping the bad field per-field instead (commit `f8d1206`), with tests asserting sibling settings survive. Pass 3's two LOW items (unbounded quarantine files on roaming `%APPDATA%`; Windows reserved device-name ids) and one NOTE (unvalidated URL in "Open usage in browser") were also fixed (`f398181`, `cef527e`) — so the reserved-device-name residual is now closed rather than accepted.
+
+Post-fix verification: **316 tests pass** (from a 265 baseline; +51 regression tests), `bandit` 0 High, `pip-audit` no vulnerable declared dependencies.
