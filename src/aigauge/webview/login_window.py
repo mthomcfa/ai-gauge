@@ -67,6 +67,20 @@ def _safe_url_for_log(url: QUrl) -> str:
     return f"{url.scheme()}:{url.path()}"
 
 
+def _blocked_main_frame_scheme(scheme: str) -> bool:
+    """True if ``scheme`` must never drive the sign-in window's top frame.
+
+    Blocks the opaque-origin canvases (``data:``, ``blob:``) — both render with
+    no address bar here and are trivially minted from page JS, so either is a
+    full-window phishing surface — and anything that isn't ``about:`` (Chromium
+    internal, e.g. about:blank) or ``http(s)``.
+    """
+    scheme = scheme.lower()
+    if scheme == "about":
+        return False
+    return scheme in ("data", "blob") or scheme not in ("http", "https")
+
+
 class _AllowlistedPage(QuietWebEnginePage):
     """QuietWebEnginePage that blocks main-frame navigation off the auth allowlist."""
 
@@ -90,11 +104,11 @@ class _AllowlistedPage(QuietWebEnginePage):
     ) -> bool:
         if is_main_frame:
             scheme = url.scheme().lower()
-            if scheme in ("about", "data", "blob"):
+            if scheme == "about":
                 return True
-            if scheme not in ("http", "https"):
+            if _blocked_main_frame_scheme(scheme):
                 log.warning(
-                    "login_window: blocking non-http navigation scheme=%s url=%s",
+                    "login_window: blocking %s main-frame navigation url=%s",
                     scheme,
                     _safe_url_for_log(url),
                 )

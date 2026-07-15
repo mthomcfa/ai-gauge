@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import uuid
 from pathlib import Path
 from typing import Any
 
 import keyring
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .platforms import APP_NAME, get_platform
+
+log = logging.getLogger("aigauge.config")
+
+DEFAULT_OPENCODE_USAGE_URL = (
+    "https://opencode.ai/workspace/wrk_01KX3HT8MFWCMHR2289KGPZ1RD/go"
+)
 
 KEYRING_SERVICE = "ai-gauge"
 KEYRING_GITHUB_PAT = "github-pat"
@@ -59,8 +66,45 @@ def app_data_dir() -> Path:
     return get_platform().app_data_dir()
 
 
+# Account / profile ids become a filesystem path component under profiles/.
+# Restrict them to the shape our own generators produce (slugs, hex suffixes,
+# and the fixed provider ids like ``opencode_go``) so a poisoned config.json
+# can never turn an id into a path-traversal payload.
+_PROFILE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+# Windows treats these as device names regardless of any extension, so a
+# profiles/<id> path built from one would target the device, not a directory.
+# App-generated ids never collide with these; reject them for the poisoned
+# -config threat model.
+_WIN_RESERVED_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{i}" for i in range(1, 10)}
+    | {f"lpt{i}" for i in range(1, 10)}
+)
+
+
+def _is_safe_profile_id(provider: str) -> bool:
+    if not provider or _PROFILE_ID_RE.fullmatch(provider) is None:
+        return False
+    return provider.split(".", 1)[0].lower() not in _WIN_RESERVED_NAMES
+
+
 def webview_profile_dir(provider: str) -> Path:
-    return app_data_dir() / "profiles" / provider
+    """Path to a provider/account's QtWebEngine profile.
+
+    Validates ``provider`` and confirms the resulting path stays inside the
+    ``profiles/`` root before returning it — every profile create/open/delete
+    routes through here, so this is the single traversal chokepoint.
+    """
+    if not _is_safe_profile_id(provider):
+        raise ValueError(f"unsafe profile id: {provider!r}")
+    profiles_root = app_data_dir() / "profiles"
+    target = profiles_root / provider
+    resolved = target.resolve()
+    root_resolved = profiles_root.resolve()
+    if resolved != root_resolved and not resolved.is_relative_to(root_resolved):
+        raise ValueError(f"profile path escapes root: {provider!r}")
+    return target
 
 
 def config_path() -> Path:
@@ -97,6 +141,16 @@ class BrowserAccount(BaseModel):
     name: str | None = None
     enabled: bool = True
 
+    @field_validator("id")
+    @classmethod
+    def _validate_id(cls, value: str) -> str:
+        # The id is used verbatim as a profiles/ path component and as a
+        # keyring/secret name; keep it to the generated slug-<hex> / fixed-id
+        # shape so it can never carry a path-traversal or separator payload.
+        if not _is_safe_profile_id(value):
+            raise ValueError(f"unsafe browser account id: {value!r}")
+        return value
+
 
 class CopilotConfig(BaseModel):
     username: str | None = None
@@ -108,10 +162,61 @@ class OpenRouterConfig(BaseModel):
     daily_budget: float | None = Field(default=None, ge=0)
 
 
+def validate_opencode_usage_url(value: str) -> str:
+    """Return ``value`` if it is a safe OpenCode usage URL, else raise ValueError.
+
+    The URL is loaded into the embedded, authenticated browser, so it must be
+    a plain ``https`` page on ``opencode.ai`` with no way to redirect the signed
+    -in session elsewhere. Rejects non-https schemes (``file:``/``data:``/…),
+    embedded credentials, an explicit port, IP-literal or look-alike hosts, and
+    a bare/rootless path.
+    """
+    from urllib.parse import urlparse
+
+    text = (value or "").strip()
+    # Reject control characters and backslashes up front. Python's urlparse and
+    # Qt's QUrl disagree on how to handle these (a backslash-injection host like
+    # ``evil.com\.opencode.ai`` parses "safe" here but becomes a different/empty
+    # host in QUrl); refusing them keeps the two parsers from ever diverging.
+    if any(ord(ch) < 0x20 or ch in "\\ " for ch in text):
+        raise ValueError("OpenCode usage URL contains illegal characters")
+    parsed = urlparse(text)
+    if parsed.scheme != "https":
+        raise ValueError("OpenCode usage URL must use https")
+    if parsed.username or parsed.password:
+        raise ValueError("OpenCode usage URL must not contain embedded credentials")
+    if parsed.port is not None:
+        raise ValueError("OpenCode usage URL must not specify a port")
+    host = (parsed.hostname or "").lower()
+    # An exact host / real subdomain match also rejects IP literals and
+    # look-alike hosts such as opencode.ai.evil.com.
+    if host != "opencode.ai" and not host.endswith(".opencode.ai"):
+        raise ValueError("OpenCode usage URL host must be opencode.ai")
+    if not parsed.path or parsed.path == "/":
+        raise ValueError("OpenCode usage URL must include a workspace path")
+    return text
+
+
 class OpenCodeGoConfig(BaseModel):
-    usage_url: str = (
-        "https://opencode.ai/workspace/wrk_01KX3HT8MFWCMHR2289KGPZ1RD/go"
-    )
+    usage_url: str = DEFAULT_OPENCODE_USAGE_URL
+
+    @field_validator("usage_url")
+    @classmethod
+    def _validate_usage_url(cls, value: str) -> str:
+        # Coerce an unsafe/invalid URL to the safe default rather than raising:
+        # a raise would bubble out of Config.load()'s blanket except and reset
+        # the WHOLE config (losing PAT username, budgets, named accounts, window
+        # prefs). The security property still holds — the unsafe URL is never
+        # loaded — and the rest of the user's settings survive. The standalone
+        # validate_opencode_usage_url() still raises for the Settings dialog and
+        # the runtime load guard.
+        try:
+            return validate_opencode_usage_url(value)
+        except ValueError:
+            log.warning(
+                "config: rejecting unsafe OpenCode usage_url; using default"
+            )
+            return DEFAULT_OPENCODE_USAGE_URL
 
 
 class Config(BaseModel):
@@ -178,6 +283,15 @@ class Config(BaseModel):
         elif isinstance(data.get("browser_accounts"), list):
             accounts = [
                 item for item in data["browser_accounts"] if isinstance(item, dict)
+            ]
+            # Drop entries whose id can't be a safe profiles/ path component
+            # before validation runs. Otherwise one poisoned id would raise out
+            # of Config.load()'s blanket except and discard the entire config;
+            # dropping just the bad account preserves everything else.
+            accounts = [
+                item
+                for item in accounts
+                if _is_safe_profile_id(str(item.get("id") or ""))
             ]
             ids = {str(item.get("id") or "") for item in accounts}
             if "claude" not in ids:

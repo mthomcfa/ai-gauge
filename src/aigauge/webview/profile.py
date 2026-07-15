@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 
 from PyQt6.QtCore import QT_VERSION_STR
 from PyQt6.QtWebEngineCore import (
@@ -10,7 +11,7 @@ from PyQt6.QtWebEngineCore import (
     qWebEngineVersion,
 )
 
-from ..config import webview_profile_dir
+from ..config import app_data_dir, webview_profile_dir
 
 log = logging.getLogger("aigauge.webview.profile")
 
@@ -58,3 +59,58 @@ def get_profile(provider: str) -> QWebEngineProfile:
 
     _profiles[provider] = profile
     return profile
+
+
+def purge_profile(account_id: str) -> None:
+    """Tear down and delete an account's QtWebEngine profile.
+
+    Releases the cached ``QWebEngineProfile`` (clearing its cookie store and
+    HTTP cache first), then recursively removes the on-disk profile directory
+    so a removed account leaves no live session, cache, or persisted cookies
+    behind. The directory delete is guarded: it only proceeds for a path that
+    resolves strictly inside the ``profiles/`` root.
+    """
+    profile = _profiles.pop(account_id, None)
+    if profile is not None:
+        try:
+            store = profile.cookieStore()
+            if store is not None:
+                store.deleteAllCookies()
+            profile.clearHttpCache()
+        except RuntimeError:
+            # The underlying C++ object may already be gone; the directory
+            # delete below is what actually reclaims the data.
+            pass
+        profile.deleteLater()
+
+    try:
+        target = webview_profile_dir(account_id)
+    except ValueError:
+        log.warning("purge_profile: refusing unsafe account id %r", account_id)
+        return
+    profiles_root = (app_data_dir() / "profiles").resolve()
+    resolved = target.resolve()
+    if resolved == profiles_root or not resolved.is_relative_to(profiles_root):
+        log.warning(
+            "purge_profile: refusing to delete %s (outside %s)",
+            resolved,
+            profiles_root,
+        )
+        return
+    if resolved.exists():
+        # deleteAllCookies()/clearHttpCache() above already purge the sensitive
+        # data through Chromium's own API. The rmtree reclaims the directory
+        # too, but on Windows a still-open profile (deleteLater is deferred) can
+        # hold locks on the SQLite Cookies/cache files; ignore_errors keeps that
+        # from crashing, and we log if anything survived so an incomplete delete
+        # is never silently reported as success.
+        shutil.rmtree(resolved, ignore_errors=True)
+        if resolved.exists():
+            log.warning(
+                "purge_profile: profile dir for account=%s only partially "
+                "removed (files may be locked by an open profile): %s",
+                account_id,
+                resolved,
+            )
+        else:
+            log.info("purge_profile: deleted profile dir for account=%s", account_id)

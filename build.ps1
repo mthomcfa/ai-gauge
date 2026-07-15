@@ -17,7 +17,9 @@ if (-not (Test-Path $venvPython)) {
     Write-Error "Virtualenv not found at .venv. Run: py -m venv .venv; .venv\Scripts\pip install -e .[dev]"
 }
 
-& $venvPython -m pip install --quiet pyinstaller
+# Pin the build tool to an exact version so a compromised or yanked future
+# PyInstaller release can't silently enter the shipped binary.
+& $venvPython -m pip install --quiet "pyinstaller==6.21.0"
 
 $versionInfo = Join-Path $PSScriptRoot "build\pyinstaller-version-info.txt"
 & $venvPython (Join-Path $PSScriptRoot "tools\write_pyinstaller_version_info.py") $versionInfo

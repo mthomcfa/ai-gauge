@@ -48,9 +48,11 @@ from .config import (
     set_openrouter_key,
     set_openrouter_mgmt_key,
     set_provider_cookie,
+    validate_opencode_usage_url,
 )
 from .error_dialog import reveal_path
 from .logging_setup import log_path
+from .webview.profile import purge_profile
 from .providers.claude import CLAUDE_USAGE_URL
 from .providers.codex import CODEX_USAGE_URL
 from .providers.opencode_go import OPENCODE_GO_USAGE_URL, usage_url as opencode_go_usage_url
@@ -322,7 +324,10 @@ class _BrowserAccountRow(QWidget):
         remove = QPushButton("Remove")
         remove.setFixedWidth(72)
         remove.setVisible(removable)
-        remove.setToolTip("Remove this account and clear its saved cookie.")
+        remove.setToolTip(
+            "Remove this account and delete its saved cookie plus its browser "
+            "profile (cached pages and any live session cookies)."
+        )
         remove.clicked.connect(lambda: self.remove_clicked.emit(self.account_id))
 
         layout = QHBoxLayout(self)
@@ -455,6 +460,17 @@ class SettingsDialog(QDialog):
         scale_row.addStretch(1)
         general_grid.addWidget(QLabel("UI scale:"), 4, 0)
         general_grid.addLayout(scale_row, 4, 1, 1, 3)
+
+        self.clear_browser_data_btn = QPushButton("Clear all browser data")
+        self.clear_browser_data_btn.setObjectName("clear_browser_data_btn")
+        self.clear_browser_data_btn.setToolTip(
+            "Delete every account's saved cookie and embedded-browser profile "
+            "(cached pages and live session cookies). You'll need to sign in again."
+        )
+        self.clear_browser_data_btn.clicked.connect(self._clear_all_browser_data)
+        general_grid.addWidget(
+            self.clear_browser_data_btn, 5, 0, 1, 2, Qt.AlignmentFlag.AlignLeft
+        )
 
         # ----- Providers -----
         providers = QGroupBox("Providers")
@@ -745,9 +761,7 @@ class SettingsDialog(QDialog):
         opencode_go_usage_btn.setObjectName("opencode_go_open_usage_btn")
         opencode_go_usage_btn.setToolTip("Open the OpenCode usage page in your default browser.")
         opencode_go_usage_btn.clicked.connect(
-            lambda _checked=False: _open_in_browser(
-                self.opencode_go_url.text().strip() or OPENCODE_GO_USAGE_URL
-            )
+            lambda _checked=False: self._open_opencode_usage()
         )
         opencode_go_form.addRow("", opencode_go_usage_btn)
 
@@ -834,6 +848,54 @@ class SettingsDialog(QDialog):
         layout.setSpacing(10)
         layout.addWidget(tabs, 1)
         layout.addLayout(button_row)
+
+    def _open_opencode_usage(self) -> None:
+        raw = self.opencode_go_url.text().strip() or OPENCODE_GO_USAGE_URL
+        try:
+            url = validate_opencode_usage_url(raw)
+        except ValueError:
+            # Consistent with the load path: never hand an unvalidated,
+            # arbitrary-scheme URL to the OS default handler.
+            url = OPENCODE_GO_USAGE_URL
+        _open_in_browser(url)
+
+    def _profile_ids_on_disk(self) -> list[str]:
+        try:
+            profiles_root = app_data_dir() / "profiles"
+            if not profiles_root.is_dir():
+                return []
+            return [child.name for child in profiles_root.iterdir() if child.is_dir()]
+        except OSError:
+            return []
+
+    def _clear_all_browser_data(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            "Clear all browser data",
+            "Delete every account's saved cookie and embedded-browser profile?\n\n"
+            "You will need to sign in again for each provider. This cannot be "
+            "undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        account_ids = {account.id for account in self._current_browser_accounts()}
+        account_ids |= {account.id for account in self._config.browser_accounts}
+        account_ids |= {"claude", "codex", "opencode_go"}
+        account_ids |= set(self._profile_ids_on_disk())
+        for account_id in sorted(account_ids):
+            try:
+                set_provider_cookie(account_id, None)
+                purge_profile(account_id)
+            except Exception:  # noqa: BLE001 - clear as much as possible
+                log.exception("failed to clear browser data for %s", account_id)
+        QMessageBox.information(
+            self,
+            "Browser data cleared",
+            "Saved cookies and browser profiles were deleted. Sign in again to "
+            "resume monitoring.",
+        )
 
     def _new_account_id(self, kind: str) -> str:
         existing = {account.id for account in self._browser_accounts}
@@ -1078,6 +1140,10 @@ class SettingsDialog(QDialog):
         config.providers.opencode_go = self.opencode_go_cb.isChecked()
         for account_id in self._removed_browser_account_ids:
             set_provider_cookie(account_id, None)
+            try:
+                purge_profile(account_id)
+            except Exception:  # noqa: BLE001 - never let cleanup crash the save
+                log.exception("failed to purge profile for %s", account_id)
         username = self.gh_username.text().strip()
         config.copilot.username = username or None
         billing_org = self.gh_billing_org.text().strip()
@@ -1088,9 +1154,18 @@ class SettingsDialog(QDialog):
         )
         budget = self.or_daily_budget.value()
         config.openrouter.daily_budget = budget if budget > 0 else None
-        config.opencode_go.usage_url = (
-            self.opencode_go_url.text().strip() or OPENCODE_GO_USAGE_URL
-        )
+        raw_opencode_url = self.opencode_go_url.text().strip() or OPENCODE_GO_USAGE_URL
+        try:
+            config.opencode_go.usage_url = validate_opencode_usage_url(raw_opencode_url)
+        except ValueError:
+            QMessageBox.warning(
+                self,
+                "Invalid OpenCode URL",
+                "The OpenCode usage URL must be an https opencode.ai workspace "
+                "page (no other host, port, or credentials). Keeping the "
+                "previous value.",
+            )
+            self.opencode_go_url.setText(config.opencode_go.usage_url)
         # Persist all settings first: wiring up OS autostart can fail (e.g. a
         # rejected Task Scheduler entry), and that must neither lose the user's
         # other changes nor crash the app via an exception escaping this slot.

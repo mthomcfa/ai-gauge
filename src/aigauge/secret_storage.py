@@ -20,7 +20,9 @@ import ctypes.wintypes as wt
 import json
 import logging
 import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from .config import app_data_dir
@@ -28,6 +30,9 @@ from .config import app_data_dir
 log = logging.getLogger("aigauge.secret_storage")
 
 _SECRETS_FILENAME = "secrets.dat"
+
+# Never pop a DPAPI UI prompt from a background tray app; fail instead.
+_CRYPTPROTECT_UI_FORBIDDEN = 0x1
 
 # Opt-in escape hatch for the cross-platform test suite. When unset (the
 # normal case) writes on non-Windows refuse loudly so a misconfigured macOS
@@ -77,7 +82,13 @@ def _protect(plaintext: bytes) -> bytes:
     in_blob = _to_blob(plaintext)
     out_blob = _DataBlob()
     ok = _CRYPT32.CryptProtectData(
-        ctypes.byref(in_blob), None, None, None, None, 0, ctypes.byref(out_blob)
+        ctypes.byref(in_blob),
+        None,
+        None,
+        None,
+        None,
+        _CRYPTPROTECT_UI_FORBIDDEN,
+        ctypes.byref(out_blob),
     )
     if not ok:
         raise OSError(ctypes.get_last_error(), "CryptProtectData failed")
@@ -88,7 +99,13 @@ def _unprotect(ciphertext: bytes) -> bytes:
     in_blob = _to_blob(ciphertext)
     out_blob = _DataBlob()
     ok = _CRYPT32.CryptUnprotectData(
-        ctypes.byref(in_blob), None, None, None, None, 0, ctypes.byref(out_blob)
+        ctypes.byref(in_blob),
+        None,
+        None,
+        None,
+        None,
+        _CRYPTPROTECT_UI_FORBIDDEN,
+        ctypes.byref(out_blob),
     )
     if not ok:
         raise OSError(ctypes.get_last_error(), "CryptUnprotectData failed")
@@ -99,9 +116,40 @@ def _secrets_path() -> Path:
     return app_data_dir() / _SECRETS_FILENAME
 
 
+def _quarantine(path: Path) -> None:
+    """Move an undecryptable/corrupt secrets file aside instead of destroying it.
+
+    Renaming (rather than letting the next save overwrite it) preserves the
+    original bytes for recovery/forensics — e.g. a DPAPI blob that failed to
+    decrypt because Windows credentials rotated might still be recoverable.
+    """
+    try:
+        # A single fixed name, overwritten atomically. Using incrementing
+        # .corrupt/.corrupt1/... names would sprawl without bound on a
+        # roaming/OneDrive-synced %APPDATA%, where a machine-foreign DPAPI blob
+        # fails to decrypt and gets quarantined on every launch — each an
+        # encrypted copy of the session cookies. Overwriting a prior quarantine
+        # (already unreadable) is safe and keeps this bounded to one file.
+        dest = path.with_name(path.name + ".corrupt")
+        os.replace(path, dest)
+        log.warning("secret_storage: quarantined undecryptable secrets to %s", dest)
+    except OSError:
+        log.exception("secret_storage: failed to quarantine %s", path)
+
+
 def _load_all() -> dict[str, str]:
     path = _secrets_path()
     if not path.exists():
+        return {}
+    if sys.platform != "win32" and os.environ.get(_ALLOW_PLAINTEXT_ENV) != "1":
+        # Mirror the write-side refusal: without the explicit opt-in, a
+        # plaintext secrets.dat on a non-Windows host is never trusted, so a
+        # file planted here cannot feed values into the app.
+        log.warning(
+            "secret_storage: ignoring existing secrets.dat on non-Windows host "
+            "(set %s=1 to opt in; development only).",
+            _ALLOW_PLAINTEXT_ENV,
+        )
         return {}
     try:
         raw = path.read_bytes()
@@ -114,7 +162,97 @@ def _load_all() -> dict[str, str]:
         loaded = json.loads(decrypted)
         return loaded if isinstance(loaded, dict) else {}
     except Exception:
+        # A failed decrypt/parse means the stored cookies are unreadable
+        # (rotated Windows credentials, another user's DPAPI blob, or
+        # tampering). Log it, and quarantine the original file instead of
+        # leaving the next save_secret() to silently overwrite it — the old
+        # code destroyed the only copy of a possibly-recoverable blob.
+        log.exception("secret_storage: failed to load %s", path)
+        _quarantine(path)
         return {}
+
+
+def _atomic_write(path: Path, payload: bytes, *, mode: int | None = None) -> None:
+    """Write ``payload`` to ``path`` atomically via a same-dir temp + os.replace.
+
+    A crash or concurrent read can never observe a half-written secrets file:
+    readers see either the old file or the complete new one. When ``mode`` is
+    given the temp file is created with it before any bytes are written, so the
+    payload is never briefly world-readable.
+    """
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".secrets-", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        # Own the fd through the with-block so it is closed exactly once on every
+        # path. fchmod on the open descriptor (rather than chmod on the name
+        # before fdopen) avoids leaking the fd if setting the mode fails.
+        with os.fdopen(fd, "wb") as handle:
+            if mode is not None:
+                os.fchmod(handle.fileno(), mode)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _icacls_path() -> str:
+    windir = os.environ.get("WINDIR") or os.environ.get("SystemRoot") or r"C:\Windows"
+    candidate = Path(windir) / "System32" / "icacls.exe"
+    return str(candidate) if candidate.exists() else "icacls.exe"
+
+
+def _lock_down_windows_acl(path: Path) -> None:
+    """Best-effort: restrict secrets.dat to the current user via an explicit DACL.
+
+    DPAPI already binds the ciphertext to the user, but an explicit owner-only
+    DACL keeps other local accounts from even reading the blob. Uses icacls
+    (always present on Windows), resolved to its System32 path so a hijacked
+    PATH can't substitute it; logged and non-fatal on failure.
+    """
+    if sys.platform != "win32":
+        return
+    user = (os.environ.get("USERNAME") or "").strip()
+    if not user:
+        return
+    icacls = _icacls_path()
+    try:
+        result = subprocess.run(
+            [icacls, str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
+            check=False,
+            capture_output=True,
+            text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if result.returncode != 0:
+            log.warning(
+                "secret_storage: icacls lockdown failed rc=%s detail=%s",
+                result.returncode,
+                (result.stderr or result.stdout or "").strip(),
+            )
+            return
+        # Verify the DACL took: re-read it and confirm inheritance is gone and
+        # only the current user is granted.
+        verify = subprocess.run(
+            [icacls, str(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        acl_text = verify.stdout or ""
+        if user.lower() not in acl_text.lower():
+            log.warning(
+                "secret_storage: DACL verify did not show current user; acl=%s",
+                acl_text.strip(),
+            )
+    except OSError:
+        log.exception("secret_storage: could not apply Windows DACL to %s", path)
 
 
 def _save_all(data: dict[str, str]) -> None:
@@ -122,7 +260,8 @@ def _save_all(data: dict[str, str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(data).encode("utf-8")
     if sys.platform == "win32":
-        path.write_bytes(_protect(payload))
+        _atomic_write(path, _protect(payload))
+        _lock_down_windows_acl(path)
         return
     if os.environ.get(_ALLOW_PLAINTEXT_ENV) == "1":
         log.warning(
@@ -130,7 +269,8 @@ def _save_all(data: dict[str, str]) -> None:
             "(AIGAUGE_ALLOW_PLAINTEXT_SECRETS=1). This is a development-only "
             "escape hatch; do not use it with real provider cookies."
         )
-        path.write_bytes(payload)
+        # Owner-only from the first byte, written atomically.
+        _atomic_write(path, payload, mode=0o600)
         return
     raise RuntimeError(
         "secret_storage: refusing to write secrets on non-Windows host. "

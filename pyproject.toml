@@ -34,6 +34,15 @@ Homepage = "https://github.com/jpajak/ai-gauge"
 Repository = "https://github.com/jpajak/ai-gauge"
 Issues = "https://github.com/jpajak/ai-gauge/issues"
 Security = "https://github.com/jpajak/ai-gauge/security"
+Fork = "https://github.com/mthomcfa/ai-gauge"
+
+# This tree is a security-hardening fork. It was audited and patched starting
+# from the upstream commit recorded below; downstream builds should be produced
+# from this fork, not the upstream unsigned releases.
+[tool.ai-gauge-audit]
+upstream_repo = "https://github.com/jpajak/ai-gauge"
+fork_repo = "https://github.com/mthomcfa/ai-gauge"
+audited_upstream_commit = "1df4536"
 
 [project.optional-dependencies]
 dev = [

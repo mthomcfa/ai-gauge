@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 from PyQt6.QtCore import QObject
 
-from ..config import Config
+from ..config import Config, validate_opencode_usage_url
 from ..models import SnapshotStatus, UsageMetric, UsageSnapshot
 from ._common import is_security_verification_page
 from ._scrape_runner import ScrapeRunner
@@ -62,10 +62,23 @@ EXTRACTOR_JS = r"""
 
 
 def usage_url(config: Config | None = None) -> str:
+    """The configured OpenCode usage URL, validated, or the safe default.
+
+    Every webview load of the OpenCode page (scrape, verify, and the embedded
+    sign-in window) resolves its URL through here, so revalidating at this
+    chokepoint enforces the check immediately before any load — even if an
+    unsafe value somehow reached the config at runtime.
+    """
     value = ""
     if config is not None:
         value = str(getattr(getattr(config, "opencode_go", None), "usage_url", "") or "").strip()
-    return value or OPENCODE_GO_USAGE_URL
+    if not value:
+        return OPENCODE_GO_USAGE_URL
+    try:
+        return validate_opencode_usage_url(value)
+    except ValueError:
+        log.warning("opencode_go: ignoring unsafe usage_url; falling back to default")
+        return OPENCODE_GO_USAGE_URL
 
 
 def _parse_reset_text(text: str | None) -> datetime | None:

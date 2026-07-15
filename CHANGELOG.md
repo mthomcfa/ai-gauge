@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased — security hardening
+
+Security-hardening branch following a full two-engine source audit (see
+`SECURITY-AUDIT.md`). The audit found the source clean; these are hardening
+fixes, each with regression tests.
+
+### Security
+
+- Secret storage: require an explicit opt-in to read a non-Windows plaintext `secrets.dat`, write it `0600`, write atomically (temp + `os.replace`), quarantine (not overwrite) an undecryptable file, log DPAPI failures, pass `CRYPTPROTECT_UI_FORBIDDEN`, and apply an explicit owner-only Windows DACL.
+- Embedded sign-in browser: block `data:` top-frame navigation (anti-phishing).
+- Account removal now deletes the account's whole embedded-browser profile (live cookies + cache), not just the stored cookie blob; added a **Clear all browser data** button.
+- OpenCode: inject only allowlisted cookies from a pasted header (drop foreign/tracking cookies); validate the workspace usage URL (`https` on `opencode.ai` only — no `file:`/`data:`/other host/port/credentials) before any load. OpenCode's session cookie stays script-readable so the page still hydrates.
+- Account/profile ids are validated against path traversal (and Windows reserved device names) before use as filesystem paths. A single invalid field in a saved config now falls back per-field on load instead of resetting the whole config.
+- "Copy diagnostics" now redacts email addresses and truncates scraped page text.
+- CI: pin all GitHub Actions to commit SHAs, drop `GITHUB_TOKEN` to least privilege, add build-provenance attestation, and pin the build-time PyInstaller version.
+
 ## 0.6.3 - 2026-07-10
 
 ### Added

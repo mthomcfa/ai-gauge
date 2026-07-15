@@ -1,4 +1,10 @@
+import json
+
+import pytest
+from pydantic import ValidationError
+
 from aigauge.config import (
+    DEFAULT_OPENCODE_USAGE_URL,
     BrowserAccount,
     Config,
     account_display_name,
@@ -9,6 +15,128 @@ from aigauge.config import (
     qt_scale_factor_env,
     webview_profile_dir,
 )
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    ["../evil", "a/b", "..", "x/../../y", "with space", "", "con", "NUL", "com1", "lpt9.dat"],
+)
+def test_browser_account_rejects_unsafe_ids(bad_id):
+    with pytest.raises(ValidationError):
+        BrowserAccount(id=bad_id, kind="claude")
+
+
+@pytest.mark.parametrize("good_id", ["claude", "codex", "opencode_go", "claude-ab12cd34"])
+def test_browser_account_accepts_generated_ids(good_id):
+    assert BrowserAccount(id=good_id, kind="claude").id == good_id
+
+
+@pytest.mark.parametrize("bad_id", ["../../evil", "a/b", "..", "foo/bar"])
+def test_webview_profile_dir_rejects_traversal(bad_id):
+    with pytest.raises(ValueError):
+        webview_profile_dir(bad_id)
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "http://opencode.ai/workspace/x/go",
+        "file:///etc/passwd",
+        "data:text/html,<h1>hi",
+        "https://user:pass@opencode.ai/workspace/x/go",
+        "https://opencode.ai:8443/workspace/x/go",
+        "https://evil.com/workspace/x/go",
+        "https://opencode.ai.evil.com/workspace/x/go",
+        "https://127.0.0.1/workspace/x/go",
+        "https://opencode.ai",
+        "https://opencode.ai/",
+        "https://evil.com\\.opencode.ai/workspace/x/go",
+        "https://opencode.ai/work\tspace/go",
+        "https://opencode.ai/work space/go",
+    ],
+)
+def test_validate_opencode_usage_url_rejects_unsafe(bad_url):
+    from aigauge.config import validate_opencode_usage_url
+
+    with pytest.raises(ValueError):
+        validate_opencode_usage_url(bad_url)
+
+
+def test_validate_opencode_usage_url_accepts_workspace_url():
+    from aigauge.config import validate_opencode_usage_url
+
+    url = "https://opencode.ai/workspace/wrk_abc/go"
+    assert validate_opencode_usage_url(url) == url
+
+
+def test_load_rejects_config_with_unsafe_opencode_url():
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        '{"opencode_go": {"usage_url": "https://evil.com/workspace/x/go"}}',
+        encoding="utf-8",
+    )
+    c = Config.load()
+    assert c.opencode_go.usage_url.startswith("https://opencode.ai/workspace/")
+
+
+def test_load_rejects_config_with_unsafe_account_id():
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        '{"browser_accounts": [{"id": "../../evil", "kind": "claude"}]}',
+        encoding="utf-8",
+    )
+    # A poisoned id must not survive into a live profile path; load falls back
+    # to defaults rather than adopting the traversal id.
+    c = Config.load()
+    assert all(webview_profile_dir(a.id) for a in c.browser_accounts)
+    assert [a.id for a in c.browser_accounts] == ["claude", "codex"]
+
+
+def test_unsafe_opencode_url_does_not_wipe_sibling_settings():
+    # An existing config with a now-invalid usage_url plus lots of other
+    # customization must keep everything else and just coerce the URL to the
+    # safe default — not reset the whole config.
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        json.dumps(
+            {
+                "active_refresh_interval_minutes": 3,
+                "copilot": {"username": "octocat", "monthly_quota": 7000},
+                "openrouter": {"daily_budget": 25.0},
+                "window": {"x": 111, "y": 222},
+                "opencode_go": {"usage_url": "http://opencode.ai/workspace/x/go"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    c = Config.load()
+    assert c.opencode_go.usage_url == DEFAULT_OPENCODE_USAGE_URL
+    # Siblings preserved:
+    assert c.active_refresh_interval_minutes == 3
+    assert c.copilot.username == "octocat"
+    assert c.copilot.monthly_quota == 7000
+    assert c.openrouter.daily_budget == 25.0
+    assert c.window.x == 111 and c.window.y == 222
+
+
+def test_unsafe_account_id_drops_only_that_account():
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        json.dumps(
+            {
+                "active_refresh_interval_minutes": 4,
+                "browser_accounts": [
+                    {"id": "claude", "kind": "claude"},
+                    {"id": "../../evil", "kind": "claude"},
+                    {"id": "codex", "kind": "codex"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    c = Config.load()
+    assert [a.id for a in c.browser_accounts] == ["claude", "codex"]
+    assert c.active_refresh_interval_minutes == 4
 
 
 def test_defaults():

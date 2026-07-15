@@ -40,6 +40,64 @@ def test_load_missing_returns_none():
     assert load_secret("never-set-this-key") is None
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="plaintext gate is non-Windows only")
+def test_plaintext_read_refused_without_opt_in(monkeypatch):
+    save_secret("gated", "value")
+    monkeypatch.delenv("AIGAUGE_ALLOW_PLAINTEXT_SECRETS", raising=False)
+    assert load_secret("gated") is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="plaintext gate is non-Windows only")
+def test_plaintext_file_is_owner_only(tmp_path):
+    import os
+
+    from aigauge.secret_storage import _secrets_path
+
+    save_secret("perm-check", "value")
+    mode = os.stat(_secrets_path()).st_mode & 0o777
+    assert mode == 0o600
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="plaintext gate is non-Windows only")
+def test_corrupt_file_is_quarantined_not_destroyed():
+    from aigauge.secret_storage import _secrets_path
+
+    path = _secrets_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"{ this is not valid json")
+
+    assert load_secret("anything") is None
+
+    corrupt = path.with_name(path.name + ".corrupt")
+    assert corrupt.exists()
+    assert corrupt.read_bytes() == b"{ this is not valid json"
+    assert not path.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="plaintext gate is non-Windows only")
+def test_repeated_corruption_stays_bounded_to_one_quarantine_file():
+    from aigauge.secret_storage import _secrets_path
+
+    path = _secrets_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Two successive corrupt files must not accumulate .corrupt1/.corrupt2…
+    for _ in range(3):
+        path.write_bytes(b"not json")
+        assert load_secret("x") is None
+    corrupts = sorted(p.name for p in path.parent.glob(path.name + ".corrupt*"))
+    assert corrupts == [path.name + ".corrupt"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="plaintext gate is non-Windows only")
+def test_write_leaves_no_temp_files():
+    from aigauge.secret_storage import _secrets_path
+
+    save_secret("atomic", "value")
+    leftovers = list(_secrets_path().parent.glob(".secrets-*.tmp"))
+    assert leftovers == []
+    assert load_secret("atomic") == "value"
+
+
 def test_multiple_secrets_independent():
     save_secret("a", "alpha")
     save_secret("b", "beta")
