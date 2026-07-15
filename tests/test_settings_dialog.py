@@ -94,6 +94,19 @@ def test_opencode_go_open_usage_button_launches_configured_url(qtbot, monkeypatc
     assert opened == ["https://opencode.ai/workspace/test/go"]
 
 
+def test_opencode_go_open_usage_button_falls_back_for_unsafe_url(qtbot, monkeypatch):
+    opened = []
+    monkeypatch.setattr(
+        settings_dialog, "_open_in_browser", lambda url: opened.append(url)
+    )
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    dialog.opencode_go_url.setText("file:///etc/passwd")
+    _button(dialog, "opencode_go_open_usage_btn").click()
+
+    assert opened == [settings_dialog.OPENCODE_GO_USAGE_URL]
+
+
 def test_opencode_go_settings_apply(qtbot, monkeypatch):
     monkeypatch.setattr(settings_dialog, "set_start_at_login", lambda enabled: None)
     config = Config()

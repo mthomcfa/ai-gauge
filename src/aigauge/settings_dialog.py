@@ -761,9 +761,7 @@ class SettingsDialog(QDialog):
         opencode_go_usage_btn.setObjectName("opencode_go_open_usage_btn")
         opencode_go_usage_btn.setToolTip("Open the OpenCode usage page in your default browser.")
         opencode_go_usage_btn.clicked.connect(
-            lambda _checked=False: _open_in_browser(
-                self.opencode_go_url.text().strip() or OPENCODE_GO_USAGE_URL
-            )
+            lambda _checked=False: self._open_opencode_usage()
         )
         opencode_go_form.addRow("", opencode_go_usage_btn)
 
@@ -850,6 +848,16 @@ class SettingsDialog(QDialog):
         layout.setSpacing(10)
         layout.addWidget(tabs, 1)
         layout.addLayout(button_row)
+
+    def _open_opencode_usage(self) -> None:
+        raw = self.opencode_go_url.text().strip() or OPENCODE_GO_USAGE_URL
+        try:
+            url = validate_opencode_usage_url(raw)
+        except ValueError:
+            # Consistent with the load path: never hand an unvalidated,
+            # arbitrary-scheme URL to the OS default handler.
+            url = OPENCODE_GO_USAGE_URL
+        _open_in_browser(url)
 
     def _profile_ids_on_disk(self) -> list[str]:
         try:
