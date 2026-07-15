@@ -1,7 +1,10 @@
+import json
+
 import pytest
 from pydantic import ValidationError
 
 from aigauge.config import (
+    DEFAULT_OPENCODE_USAGE_URL,
     BrowserAccount,
     Config,
     account_display_name,
@@ -84,6 +87,53 @@ def test_load_rejects_config_with_unsafe_account_id():
     c = Config.load()
     assert all(webview_profile_dir(a.id) for a in c.browser_accounts)
     assert [a.id for a in c.browser_accounts] == ["claude", "codex"]
+
+
+def test_unsafe_opencode_url_does_not_wipe_sibling_settings():
+    # An existing config with a now-invalid usage_url plus lots of other
+    # customization must keep everything else and just coerce the URL to the
+    # safe default — not reset the whole config.
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        json.dumps(
+            {
+                "active_refresh_interval_minutes": 3,
+                "copilot": {"username": "octocat", "monthly_quota": 7000},
+                "openrouter": {"daily_budget": 25.0},
+                "window": {"x": 111, "y": 222},
+                "opencode_go": {"usage_url": "http://opencode.ai/workspace/x/go"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    c = Config.load()
+    assert c.opencode_go.usage_url == DEFAULT_OPENCODE_USAGE_URL
+    # Siblings preserved:
+    assert c.active_refresh_interval_minutes == 3
+    assert c.copilot.username == "octocat"
+    assert c.copilot.monthly_quota == 7000
+    assert c.openrouter.daily_budget == 25.0
+    assert c.window.x == 111 and c.window.y == 222
+
+
+def test_unsafe_account_id_drops_only_that_account():
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        json.dumps(
+            {
+                "active_refresh_interval_minutes": 4,
+                "browser_accounts": [
+                    {"id": "claude", "kind": "claude"},
+                    {"id": "../../evil", "kind": "claude"},
+                    {"id": "codex", "kind": "codex"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    c = Config.load()
+    assert [a.id for a in c.browser_accounts] == ["claude", "codex"]
+    assert c.active_refresh_interval_minutes == 4
 
 
 def test_defaults():

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import uuid
 from pathlib import Path
@@ -10,6 +11,12 @@ import keyring
 from pydantic import BaseModel, Field, field_validator
 
 from .platforms import APP_NAME, get_platform
+
+log = logging.getLogger("aigauge.config")
+
+DEFAULT_OPENCODE_USAGE_URL = (
+    "https://opencode.ai/workspace/wrk_01KX3HT8MFWCMHR2289KGPZ1RD/go"
+)
 
 KEYRING_SERVICE = "ai-gauge"
 KEYRING_GITHUB_PAT = "github-pat"
@@ -179,14 +186,25 @@ def validate_opencode_usage_url(value: str) -> str:
 
 
 class OpenCodeGoConfig(BaseModel):
-    usage_url: str = (
-        "https://opencode.ai/workspace/wrk_01KX3HT8MFWCMHR2289KGPZ1RD/go"
-    )
+    usage_url: str = DEFAULT_OPENCODE_USAGE_URL
 
     @field_validator("usage_url")
     @classmethod
     def _validate_usage_url(cls, value: str) -> str:
-        return validate_opencode_usage_url(value)
+        # Coerce an unsafe/invalid URL to the safe default rather than raising:
+        # a raise would bubble out of Config.load()'s blanket except and reset
+        # the WHOLE config (losing PAT username, budgets, named accounts, window
+        # prefs). The security property still holds — the unsafe URL is never
+        # loaded — and the rest of the user's settings survive. The standalone
+        # validate_opencode_usage_url() still raises for the Settings dialog and
+        # the runtime load guard.
+        try:
+            return validate_opencode_usage_url(value)
+        except ValueError:
+            log.warning(
+                "config: rejecting unsafe OpenCode usage_url; using default"
+            )
+            return DEFAULT_OPENCODE_USAGE_URL
 
 
 class Config(BaseModel):
@@ -253,6 +271,15 @@ class Config(BaseModel):
         elif isinstance(data.get("browser_accounts"), list):
             accounts = [
                 item for item in data["browser_accounts"] if isinstance(item, dict)
+            ]
+            # Drop entries whose id can't be a safe profiles/ path component
+            # before validation runs. Otherwise one poisoned id would raise out
+            # of Config.load()'s blanket except and discard the entire config;
+            # dropping just the bad account preserves everything else.
+            accounts = [
+                item
+                for item in accounts
+                if _is_safe_profile_id(str(item.get("id") or ""))
             ]
             ids = {str(item.get("id") or "") for item in accounts}
             if "claude" not in ids:
