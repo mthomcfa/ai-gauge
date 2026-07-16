@@ -54,10 +54,6 @@ jobs:
             label: windows
             archive_ext: zip
             build_cmd: ./build.ps1
-          - os: macos-latest
-            label: macos
-            archive_ext: tar.gz
-            build_cmd: ./build.sh
           - os: ubuntu-22.04
             label: linux
             archive_ext: tar.gz
@@ -79,7 +75,7 @@ jobs:
           .\.venv\Scripts\python.exe -m pip install --upgrade pip
           .\.venv\Scripts\pip.exe install -e .[dev]
 
-      - name: Bootstrap virtualenv (macOS / Linux)
+      - name: Bootstrap virtualenv (Linux)
         if: matrix.os != 'windows-latest'
         shell: bash
         run: |
@@ -108,7 +104,7 @@ jobs:
           .\.venv\Scripts\python.exe tools\check_versions.py
           .\.venv\Scripts\python.exe -m pytest -q
 
-      - name: Run tests (macOS / Linux)
+      - name: Run tests (Linux)
         if: matrix.os != 'windows-latest'
         shell: bash
         env:
@@ -122,7 +118,7 @@ jobs:
         shell: pwsh
         run: ${{ matrix.build_cmd }}
 
-      - name: Build (macOS / Linux)
+      - name: Build (Linux)
         if: matrix.os != 'windows-latest'
         shell: bash
         run: |
@@ -143,7 +139,7 @@ jobs:
           "archive=$zipName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "sha=$shaName"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-      - name: Package (macOS / Linux tar.gz + sha256)
+      - name: Package (Linux tar.gz + sha256)
         id: pack_unix
         if: matrix.os != 'windows-latest'
         shell: bash
@@ -151,12 +147,7 @@ jobs:
           version="${{ needs.resolve-version.outputs.version }}"
           archive="ai-gauge-${version}-${{ matrix.label }}.tar.gz"
           sha="${archive}.sha256"
-          # On mac, archive the .app bundle. On Linux, archive the dist folder.
-          if [ "${{ matrix.os }}" = "macos-latest" ]; then
-              tar -C dist -czf "$archive" ai-gauge.app
-          else
-              tar -C dist -czf "$archive" ai-gauge
-          fi
+          tar -C dist -czf "$archive" ai-gauge
           shasum -a 256 "$archive" | awk '{print $1 " *" $2}' > "$sha"
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
           echo "sha=$sha"         >> "$GITHUB_OUTPUT"
@@ -213,10 +204,12 @@ jobs:
 
             **Downloads** (pick the artifact for your OS, extract, and run):
             - Windows: `ai-gauge-${{ needs.resolve-version.outputs.version }}-windows.zip`, run `ai-gauge.exe`
-            - macOS:   `ai-gauge-${{ needs.resolve-version.outputs.version }}-macos.tar.gz`, drag `ai-gauge.app` to Applications
             - Linux:   `ai-gauge-${{ needs.resolve-version.outputs.version }}-linux.tar.gz`, run `./ai-gauge/ai-gauge`
 
-            **Verify:** SHA256 sums live next to each archive.
+            **Verify:** SHA256 sums live next to each archive. Each build also
+            carries a signed provenance attestation — verify it with:
+            `gh attestation verify <archive> --repo ${{ github.repository }}`
 
-            Builds are unsigned. Windows SmartScreen and macOS Gatekeeper may warn on first launch; see the README for the per-OS first-launch steps.
+            Windows builds are not Authenticode-signed, so SmartScreen may warn
+            on first launch; see the README for the first-launch steps.
           files: release/*
