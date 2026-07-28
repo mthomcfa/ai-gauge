@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.4 - 2026-07-16 — security hardening
+## 0.6.4 - 2026-07-28 — security hardening
 
 Security-hardening release following a full source audit (see
 `SECURITY-AUDIT.md`). The audit found the source clean; these are hardening
