@@ -1,10 +1,11 @@
 # Changelog
 
-## Unreleased — security hardening
+## 0.6.4 - 2026-07-28 — security hardening
 
-Security-hardening branch following a full two-engine source audit (see
+Security-hardening release following a full source audit (see
 `SECURITY-AUDIT.md`). The audit found the source clean; these are hardening
-fixes, each with regression tests.
+fixes, each with regression tests. Release builds are Windows + Linux only and
+carry a signed provenance attestation (verify with `gh attestation verify`).
 
 ### Security
 
