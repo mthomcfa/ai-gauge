@@ -21,10 +21,16 @@ VERIFY_TARGETS = {
         r"""(() => {
           const visibleText = el => ((el && (el.innerText || el.textContent)) || '').replace(/\s+/g, ' ').trim();
           const text = visibleText(document.body);
-          if (/5 hour usage limit/i.test(text) && /Weekly usage limit/i.test(text) && /\d+(?:\.\d+)?\s*%/.test(text)) {
+          // Only the Weekly card is required. Codex may temporarily expose just
+          // the shared weekly agentic limit with no 5-hour Session card; demanding
+          // both made verification fail for genuinely signed-in accounts.
+          if (/Weekly usage limit/i.test(text) && /\d+(?:\.\d+)?\s*%/.test(text)) {
             return true;
           }
-          const labels = Array.from(document.querySelectorAll('button,a,[role="tab"],[role="button"],div,span,p'));
+          // Only interactive elements are real tabs. "Personal usage" is now a
+          // plain heading div; including div/span/p clicked that wrapper forever
+          // and exhausted the verification budget.
+          const labels = Array.from(document.querySelectorAll('button,a,[role="tab"],[role="button"]'));
           const label = labels.find(el => visibleText(el).toLowerCase() === 'personal usage');
           const target = label && (label.closest('button,a,[role="tab"],[role="button"]') || label);
           if (target) target.click();

@@ -23,8 +23,10 @@ CODEX_USAGE_URL = f"{CODEX_ANALYTICS_URL}#personal-usage"
 _EXPECTED_ROWS = ("session", "weekly")
 log = logging.getLogger("aigauge.providers.codex")
 
-# Walks the rendered analytics page, finds the two "Balance" cards by their
-# headings, and reads the percentage + reset text out of each. Returns raw text
+# Walks the rendered analytics page, finds the available "Balance" cards by
+# their headings, and reads the percentage + reset text out of each. The weekly
+# card is always required; the five-hour card is optional because Codex may
+# temporarily expose only the shared weekly agentic limit. Returns raw text
 # fragments so Python can do the unit-aware normalization.
 EXTRACTOR_JS = r"""
 (() => {
@@ -46,11 +48,14 @@ EXTRACTOR_JS = r"""
   }
 
   function maybeSelectPersonalUsageTab(bodyText) {
-    if (/5 hour usage limit/i.test(bodyText) && /Weekly usage limit/i.test(bodyText)) {
+    if (/Weekly usage limit/i.test(bodyText) && /\d+(?:\.\d+)?\s*%/.test(bodyText)) {
       return null;
     }
 
-    const labels = Array.from(document.querySelectorAll('button,a,[role="tab"],[role="button"],div,span,p'));
+    // Only interactive elements are tabs. The current analytics page uses
+    // "Personal usage" as a heading inside a plain div; clicking that wrapper
+    // forever would exhaust the extractor's retry budget.
+    const labels = Array.from(document.querySelectorAll('button,a,[role="tab"],[role="button"]'));
     const label = labels.find(el => visibleText(el).toLowerCase() === 'personal usage');
     if (!label) return null;
 
@@ -292,6 +297,21 @@ def _looks_like_empty_signed_in_usage(payload: dict[str, Any]) -> bool:
     return any(marker in body_text for marker in ("codex", "chatgpt", "tasks", "cloud"))
 
 
+def _is_weekly_only_usage_layout(body_text: str) -> bool:
+    """Return whether Codex rendered the newer shared weekly-limit layout."""
+    text = re.sub(r"\s+", " ", body_text or "").lower()
+    if "weekly usage limit" not in text:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "shared agentic usage limit",
+            "credits remaining",
+            "usage breakdown",
+        )
+    )
+
+
 def _is_logged_out_payload(payload: dict[str, Any]) -> bool:
     url = str(payload.get("url") or "").lower()
     if "/auth/login" in url or "/login" in url or "/logout" in url:
@@ -371,7 +391,13 @@ def _build_snapshot(
         )
 
     labels = {metric.label.lower(): metric for metric in metrics}
-    if metrics and set(labels) != {"session", "weekly"}:
+    # Accept a lone Weekly card only when the surrounding page identifies the
+    # new shared-agentic layout. This preserves transient-error retries for a
+    # genuinely partial render of the older Session + Weekly layout.
+    weekly_only_layout = (
+        set(labels) == {"weekly"} and _is_weekly_only_usage_layout(body_text)
+    )
+    if metrics and set(labels) != {"session", "weekly"} and not weekly_only_layout:
         log_page_diagnosis(
             log,
             provider=account_id,

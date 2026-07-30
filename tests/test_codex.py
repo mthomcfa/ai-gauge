@@ -299,3 +299,59 @@ def test_codex_body_text_fallback_reads_new_visible_cards():
     assert snapshot.status == SnapshotStatus.OK
     assert [metric.percent_used for metric in snapshot.metrics] == [1.0, 6.0]
     assert all(metric.resets_at is not None for metric in snapshot.metrics)
+
+
+def test_codex_accepts_weekly_only_shared_agentic_layout():
+    # Codex can temporarily expose only the shared weekly agentic limit with no
+    # 5-hour Session card. That must produce a usable snapshot instead of an
+    # 'error - stale' partial-render retry loop.
+    snapshot = _build_snapshot(
+        {
+            "logged_out": False,
+            "session": None,
+            "weekly": None,
+            "title": "Codex",
+            "url": CODEX_USAGE_URL,
+            "body_text": (
+                "Personal usage Shared agentic usage limit "
+                "Weekly usage limit 40% used Resets May 19, 2026 at 9:36 AM"
+            ),
+            "has_usage_text": True,
+            "has_percent_text": True,
+        }
+    )
+
+    assert snapshot.status == SnapshotStatus.OK
+    assert [metric.label for metric in snapshot.metrics] == ["Weekly"]
+    assert snapshot.metrics[0].percent_used == 40.0
+
+
+def test_codex_weekly_only_without_shared_layout_markers_still_retries():
+    # A genuinely partial render of the OLD Session+Weekly layout must keep
+    # retrying rather than silently reporting a weekly-only snapshot.
+    snapshot = _build_snapshot(
+        {
+            "logged_out": False,
+            "session": None,
+            "weekly": None,
+            "title": "Codex",
+            "url": CODEX_USAGE_URL,
+            "body_text": "Personal usage Weekly usage limit 40% used",
+            "has_usage_text": True,
+            "has_percent_text": True,
+        }
+    )
+
+    assert snapshot.status == SnapshotStatus.ERROR
+
+
+def test_codex_verify_js_accepts_weekly_only_and_targets_interactive_tabs():
+    from aigauge.webview.verify import VERIFY_TARGETS
+
+    _url, check_js = VERIFY_TARGETS["codex"]
+    # Must not require the 5-hour Session card (OpenAI may not render it).
+    assert "5 hour usage limit" not in check_js
+    assert "Weekly usage limit" in check_js
+    # Must only treat interactive elements as tabs; clicking a plain heading
+    # div forever exhausted the verification budget.
+    assert 'div,span,p' not in check_js
