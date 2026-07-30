@@ -40,10 +40,15 @@ def test_logged_blocked_url_drops_query_and_fragment():
 
     assert _safe_url_for_log(url) == "https://accounts.google.com/o/oauth2/v2/auth"
 
-def test_opencode_go_has_verify_target():
+def test_opencode_go_verify_target_checks_authenticated_shell():
     url, check_js = VERIFY_TARGETS["opencode_go"]
 
     assert url.startswith("https://opencode.ai/workspace/")
-    assert "Rolling Usage" in check_js
-    assert "Weekly Usage" in check_js
-    assert "Monthly Usage" in check_js
+    # Verifies the signed-in workspace shell, not rendered usage meters: an
+    # account with no usage rows yet was wrongly reported as signed out.
+    assert "Rolling Usage" not in check_js
+    for marker in ("api keys", "members", "billing", "settings"):
+        assert marker in check_js
+    # Host + workspace path are still pinned so a redirect can't satisfy it.
+    assert "opencode.ai" in check_js
+    assert "workspace" in check_js

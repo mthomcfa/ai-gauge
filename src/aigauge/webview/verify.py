@@ -41,8 +41,15 @@ VERIFY_TARGETS = {
         "https://opencode.ai/workspace/wrk_01KX3HT8MFWCMHR2289KGPZ1RD/go",
         r"""(() => {
           const visibleText = el => ((el && (el.innerText || el.textContent)) || '').replace(/\s+/g, ' ').trim();
-          const text = visibleText(document.body);
-          return /Rolling Usage/i.test(text) && /Weekly Usage/i.test(text) && /Monthly Usage/i.test(text) && /\d+(?:\.\d+)?\s*%/.test(text);
+          const text = visibleText(document.body).toLowerCase();
+          // Verify the authenticated workspace shell rather than rendered usage
+          // meters: a valid account with no usage rows yet was being reported as
+          // signed out. Host and workspace path are still checked so a redirect
+          // to another page (or another host) cannot satisfy the check.
+          const workspacePath = /^\/workspace\/[^/]+(?:\/|$)/.test(location.pathname);
+          const shellMarkers = ['usage', 'api keys', 'members', 'billing', 'settings'];
+          return location.hostname === 'opencode.ai' && workspacePath &&
+            shellMarkers.every(marker => text.includes(marker));
         })()""",
     ),
 }
