@@ -59,7 +59,9 @@ EXTRACTOR_JS = r"""
     const label = labels.find(el => visibleText(el).toLowerCase() === 'personal usage');
     if (!label) return null;
 
-    const target = label.closest('button,a,[role="tab"],[role="button"]') || label;
+    // `labels` is already filtered to interactive elements, so the element is
+    // its own click target (a .closest() hop here would be a no-op).
+    const target = label;
     const selected =
       target.getAttribute('aria-selected') === 'true' ||
       target.getAttribute('data-state') === 'active' ||
@@ -150,6 +152,14 @@ EXTRACTOR_JS = r"""
     title: document.title,
     has_percent_text: /%/.test(bodyText),
     has_usage_text: /usage limit/i.test(bodyText),
+    // Computed over the FULL body text. body_text below is truncated to 2000
+    // chars, and the Codex page's task rail can push the analytics panel past
+    // that cut — so deciding the weekly-only layout from the truncated copy
+    // produced false rejects (a permanent 'error - stale' tile).
+    has_shared_agentic_text:
+      /shared agentic usage limit/i.test(bodyText),
+    has_usage_summary_text:
+      /credits remaining|usage breakdown/i.test(bodyText),
     body_text: bodyText.slice(0, 2000),
   };
 })();
@@ -297,19 +307,30 @@ def _looks_like_empty_signed_in_usage(payload: dict[str, Any]) -> bool:
     return any(marker in body_text for marker in ("codex", "chatgpt", "tasks", "cloud"))
 
 
-def _is_weekly_only_usage_layout(body_text: str) -> bool:
-    """Return whether Codex rendered the newer shared weekly-limit layout."""
-    text = re.sub(r"\s+", " ", body_text or "").lower()
-    if "weekly usage limit" not in text:
-        return False
-    return any(
-        marker in text
-        for marker in (
-            "shared agentic usage limit",
-            "credits remaining",
-            "usage breakdown",
-        )
-    )
+def _is_weekly_only_usage_layout(payload: dict[str, Any]) -> bool:
+    """Return whether Codex rendered the newer shared weekly-limit layout.
+
+    Prefers the booleans the extractor computes over the *full* page text.
+    ``body_text`` is truncated to 2000 characters and the analytics panel can
+    sit past that cut (the page carries a task rail first), so deciding this
+    from the truncated copy produced false rejects — a permanently stale tile.
+    The truncated text is still consulted as a fallback for payloads that
+    predate those booleans (e.g. cached snapshots or hand-built test payloads).
+    """
+    text = re.sub(r"\s+", " ", str(payload.get("body_text") or "")).lower()
+
+    # Unambiguous marker for the shared-agentic layout.
+    if payload.get("has_shared_agentic_text") or "shared agentic usage limit" in text:
+        return True
+
+    # "credits remaining" / "usage breakdown" are generic settings-page
+    # vocabulary that also appears beside a partially-rendered old two-card
+    # layout, so they are weaker evidence. They are still accepted, but the
+    # caller additionally refuses a 0%/idle lone weekly card, which is what a
+    # mid-hydration render looks like.
+    if payload.get("has_usage_summary_text"):
+        return True
+    return any(marker in text for marker in ("credits remaining", "usage breakdown"))
 
 
 def _is_logged_out_payload(payload: dict[str, Any]) -> bool:
@@ -395,8 +416,17 @@ def _build_snapshot(
     # new shared-agentic layout. This preserves transient-error retries for a
     # genuinely partial render of the older Session + Weekly layout.
     weekly_only_layout = (
-        set(labels) == {"weekly"} and _is_weekly_only_usage_layout(body_text)
+        set(labels) == {"weekly"} and _is_weekly_only_usage_layout(payload)
     )
+    if weekly_only_layout:
+        weekly_metric = labels["weekly"]
+        # A lone Weekly card reading 0% with an idle countdown is
+        # indistinguishable from a mid-hydration render, and the
+        # mixed_session_weekly_idle guard below cannot fire without a Session
+        # metric. Accepting it would tell the user their weekly quota is
+        # untouched; keep retrying instead.
+        if (weekly_metric.percent_used or 0) <= 0 and weekly_metric.reset_label == "idle":
+            weekly_only_layout = False
     if metrics and set(labels) != {"session", "weekly"} and not weekly_only_layout:
         log_page_diagnosis(
             log,

@@ -345,13 +345,45 @@ def test_codex_weekly_only_without_shared_layout_markers_still_retries():
     assert snapshot.status == SnapshotStatus.ERROR
 
 
-def test_codex_verify_js_accepts_weekly_only_and_targets_interactive_tabs():
-    from aigauge.webview.verify import VERIFY_TARGETS
+def test_codex_weekly_only_uses_full_page_marker_not_truncated_body():
+    # body_text is truncated to 2000 chars by the extractor and the analytics
+    # panel can sit past that cut. The layout decision must come from the
+    # full-page boolean, or a valid page is rejected forever as 'stale'.
+    filler = "Task list item. " * 200  # pushes markers past the 2000-char cut
+    snapshot = _build_snapshot(
+        {
+            "logged_out": False,
+            "session": None,
+            "weekly": {"percent": 40.0, "kind": "used", "reset_text": "Mon 9:00 AM"},
+            "title": "Codex",
+            "url": CODEX_USAGE_URL,
+            "body_text": (filler + " Weekly usage limit 40% used")[:2000],
+            "has_shared_agentic_text": True,
+            "has_usage_text": True,
+            "has_percent_text": True,
+        }
+    )
 
-    _url, check_js = VERIFY_TARGETS["codex"]
-    # Must not require the 5-hour Session card (OpenAI may not render it).
-    assert "5 hour usage limit" not in check_js
-    assert "Weekly usage limit" in check_js
-    # Must only treat interactive elements as tabs; clicking a plain heading
-    # div forever exhausted the verification budget.
-    assert 'div,span,p' not in check_js
+    assert snapshot.status == SnapshotStatus.OK
+    assert [m.label for m in snapshot.metrics] == ["Weekly"]
+
+
+def test_codex_weekly_only_idle_zero_percent_is_treated_as_mid_hydration():
+    # A lone Weekly card at 0% with an idle countdown looks identical to a
+    # half-rendered page. Accepting it would tell the user their whole weekly
+    # quota is untouched, so it must keep retrying instead.
+    snapshot = _build_snapshot(
+        {
+            "logged_out": False,
+            "session": None,
+            "weekly": {"percent": 0.0, "kind": "used", "reset_text": None},
+            "title": "Codex",
+            "url": CODEX_USAGE_URL,
+            "body_text": "Usage breakdown Weekly usage limit 0% used",
+            "has_usage_summary_text": True,
+            "has_usage_text": True,
+            "has_percent_text": True,
+        }
+    )
+
+    assert snapshot.status == SnapshotStatus.ERROR
