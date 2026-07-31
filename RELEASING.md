@@ -23,11 +23,30 @@ For AI Gauge, the release page should include:
 ## Release Checklist (automated path)
 
 The recommended path uses [.github/workflows/release.yml](.github/workflows/release.yml):
-pushing a `v*` tag fans out a 3-OS build matrix (Windows, macOS, Ubuntu).
-Each runner runs the test suite, builds its OS's standalone bundle, packages
-it, computes a SHA256, and uploads both files as job artifacts. A final job
-collects all artifacts and attaches them to a **draft** release on GitHub.
-You publish the draft from the web UI.
+pushing a `v*` tag fans out a **2-OS** build matrix (Windows, Ubuntu). Each
+runner runs the test suite, builds its OS's standalone bundle, packages it,
+computes a SHA256, mints a **signed build-provenance attestation**, and uploads
+the files as job artifacts. A final job collects them and attaches them to a
+**draft** release on GitHub. You publish the draft from the web UI.
+
+> **macOS is not built by CI.** PyInstaller cannot cross-compile and this fork
+> builds Windows and Linux only. macOS users run from source. If you want a
+> macOS artifact, build it locally per the manual fallback below.
+
+### Version numbering
+
+Fork releases use a PEP 440 local segment: `<release>+cfa.<n>`, e.g.
+`0.6.5+cfa.1`. The number before `+` is **this fork's own counter**, not a claim
+about which upstream release the tree matches — upstream ships its own releases
+with overlapping numbers and different code. `tools/check_versions.py` rejects a
+bare number, so CI fails if the segment is missing.
+
+- Tag the full version, including the `+`: `git tag v0.6.5+cfa.1`. Both git and
+  PEP 440 accept it.
+- **Archive filenames substitute `-` for `+`** (`ai-gauge-0.6.5-cfa.1-windows.zip`),
+  because GitHub normalises some characters in release asset names. The
+  workflow derives this automatically via the `file_version` output — do not
+  hand-write archive names.
 
 1. Confirm `pyproject.toml`, `src/aigauge/__init__.py`, `README.md`, and
    `CHANGELOG.md` all show the new version. The release workflow runs
@@ -61,12 +80,19 @@ You publish the draft from the web UI.
    ```
 
 4. Watch the **release** workflow under the Actions tab. On success it
-   creates a draft release on the [Releases page](https://github.com/jpajak/ai-gauge/releases)
-   with three artifact pairs attached:
-   - `ai-gauge-<version>-windows.zip` (+ `.sha256`)
-   - `ai-gauge-<version>-macos.tar.gz` (+ `.sha256`)
-   - `ai-gauge-<version>-linux.tar.gz` (+ `.sha256`)
-5. Open the draft release, paste the relevant changelog notes into the body
+   creates a draft release on the [Releases page](https://github.com/mthomcfa/ai-gauge/releases)
+   with two artifact pairs attached (`<file-version>` is the version with `+`
+   replaced by `-`):
+   - `ai-gauge-<file-version>-windows.zip` (+ `.sha256`)
+   - `ai-gauge-<file-version>-linux.tar.gz` (+ `.sha256`)
+5. Verify the provenance attestation before publishing — this is the step that
+   proves the artifact came from this repo's CI at this commit:
+
+   ```bash
+   gh attestation verify ai-gauge-<file-version>-windows.zip --repo mthomcfa/ai-gauge
+   ```
+
+6. Open the draft release, paste the relevant changelog notes into the body
    (the workflow auto-generates a commit list, but the changelog reads
    better), and click **Publish release**. Mark as prerelease if you want a
    soft launch.

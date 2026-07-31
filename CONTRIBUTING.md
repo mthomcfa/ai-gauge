@@ -19,7 +19,7 @@ testing is still useful on each OS because tray/menu-bar behavior and native
 credential storage are platform-specific.
 
 ```powershell
-git clone https://github.com/jpajak/ai-gauge.git
+git clone https://github.com/mthomcfa/ai-gauge.git
 cd ai-gauge
 
 py -m venv .venv
