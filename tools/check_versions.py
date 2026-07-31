@@ -16,7 +16,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # <release>+cfa.<n> - see _check_fork_scheme().
-_FORK_VERSION_RE = re.compile(r"\d+\.\d+\.\d+\+cfa\.\d+")
+# re.ASCII: bare \d matches Unicode digits, so "٠.٦.٥+cfa.١" would pass here
+# while the release workflow's [0-9] rejected the matching tag.
+_FORK_VERSION_RE = re.compile(r"\d+\.\d+\.\d+\+cfa\.\d+", re.ASCII)
 
 
 def _read_pyproject_version() -> str:

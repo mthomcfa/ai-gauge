@@ -37,7 +37,10 @@ jobs:
           # Reject anything that is not exactly a fork release tag BEFORE the
           # value reaches any other step. Fork versions carry a PEP 440 local
           # segment (v0.6.5+cfa.1); see "Versioning" in README.md.
-          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+\+cfa\.[0-9]+$'; then
+          # [[ =~ ]] anchors to the whole string. grep -E anchors per LINE, so
+          # an embedded newline would pass validation and then inject extra
+          # lines into $GITHUB_OUTPUT.
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+\+cfa\.[0-9]+$ ]]; then
               echo "refusing to build from tag '$TAG': expected vX.Y.Z+cfa.N" >&2
               exit 1
           fi
@@ -85,8 +88,10 @@ jobs:
             archive_ext: tar.gz
             build_cmd: ./build.sh
           # PyInstaller cannot cross-compile, so a macOS artifact needs a macOS
-          # runner. The .app is NOT signed or notarized - see the Gatekeeper
-          # caveat in README.md and the release notes below.
+          # runner. macos-latest is Apple Silicon, and PyInstaller builds for
+          # the host arch, so this artifact is arm64-only - Intel Macs must run
+          # from source. The .app is ad-hoc signed, NOT notarized; see the
+          # Gatekeeper caveat in README.md and the release notes below.
           - os: macos-latest
             label: macos
             archive_ext: tar.gz
@@ -182,14 +187,17 @@ jobs:
         env:
           FILE_VERSION: ${{ needs.resolve-version.outputs.file_version }}
           LABEL: ${{ matrix.label }}
-          RUNNER_OS_NAME: ${{ matrix.os }}
         run: |
           set -euo pipefail
           version="$FILE_VERSION"
           archive="ai-gauge-${version}-${LABEL}.tar.gz"
           sha="${archive}.sha256"
           # build.sh emits an .app bundle on macOS and a plain folder on Linux.
-          if [ "$RUNNER_OS_NAME" = "macos-latest" ]; then
+          # Key on RUNNER_OS (set by the runner itself) rather than the matrix
+          # label: PyInstaller also leaves a plain dist/ai-gauge on macOS, so a
+          # renamed runner label would silently ship the wrong payload under a
+          # perfectly valid attestation.
+          if [ "$RUNNER_OS" = "macOS" ]; then
               payload="ai-gauge.app"
           else
               payload="ai-gauge"
@@ -198,6 +206,12 @@ jobs:
               echo "expected dist/$payload to exist after the build" >&2
               ls -la dist >&2
               exit 1
+          fi
+          if [ "$RUNNER_OS" = "macOS" ]; then
+              # build.sh re-signs after its post-build edits; confirm the seal
+              # actually holds. An invalidly-signed bundle is refused at exec
+              # on Apple Silicon, and no amount of clearing quarantine helps.
+              codesign --verify --deep --strict "dist/$payload"
           fi
           # -C dist keeps the archive rooted at the bundle/folder, not at dist/.
           tar -C dist -czf "$archive" "$payload"
@@ -237,8 +251,18 @@ jobs:
       - name: Flatten artifact tree
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p release
-          find artifacts -mindepth 2 -type f -exec mv -t release {} +
+          before=$(find artifacts -mindepth 2 -type f | wc -l)
+          # -n so a name collision leaves the file behind instead of silently
+          # overwriting a different platform's artifact.
+          find artifacts -mindepth 2 -type f -exec mv -n -t release {} +
+          after=$(find release -type f | wc -l)
+          if [ "$before" -ne "$after" ]; then
+              echo "artifact name collision: $before collected, $after published" >&2
+              find artifacts -mindepth 2 -type f >&2
+              exit 1
+          fi
           ls -la release
 
       - name: Create draft GitHub Release
@@ -257,7 +281,8 @@ jobs:
 
             **Downloads** (pick the artifact for your OS, extract, and run):
             - Windows: `ai-gauge-${{ needs.resolve-version.outputs.file_version }}-windows.zip`, run `ai-gauge.exe`
-            - macOS:   `ai-gauge-${{ needs.resolve-version.outputs.file_version }}-macos.tar.gz`, drag `ai-gauge.app` to Applications
+            - macOS (Apple Silicon): `ai-gauge-${{ needs.resolve-version.outputs.file_version }}-macos.tar.gz`, drag `ai-gauge.app` to Applications.
+              **Intel Macs are not covered by this build** - run from source instead.
             - Linux:   `ai-gauge-${{ needs.resolve-version.outputs.file_version }}-linux.tar.gz`, run `./ai-gauge/ai-gauge`
 
             **Verify:** SHA256 sums live next to each archive. Each build also
@@ -269,7 +294,8 @@ jobs:
             - macOS: Gatekeeper quarantines downloaded unsigned apps, and on
               current macOS the dialog says the app "is damaged and can't be
               opened" — which is misleading, it means unsigned, not corrupt.
-              Clear the quarantine flag after verifying the SHA256 and the
-              attestation above:
-              `xattr -dr com.apple.quarantine /Applications/ai-gauge.app`
+              After verifying the SHA256 and the attestation above, and after
+              moving the app where you want it, clear the quarantine flag on
+              that path:
+              `xattr -dr com.apple.quarantine /path/to/ai-gauge.app`
           files: release/*

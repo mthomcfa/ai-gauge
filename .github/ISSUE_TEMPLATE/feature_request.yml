@@ -9,6 +9,13 @@ body:
         providers or anything that changes the panel layout. AI Gauge tries to
         stay small and unobtrusive on all supported desktops, so not every idea
         will fit.
+
+        **This is a security-hardened fork of
+        [jpajak/ai-gauge](https://github.com/jpajak/ai-gauge).** General feature
+        ideas are usually better raised upstream, where they benefit everyone;
+        this fork prioritises hardening and takes upstream features
+        selectively. Ideas specific to the fork's security posture are welcome
+        here.
   - type: textarea
     id: problem
     attributes:

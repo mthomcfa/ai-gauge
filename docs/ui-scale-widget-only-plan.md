@@ -1,6 +1,8 @@
 # Plan: confine "UI scale" to the widget only
 
-**Status:** proposed (not started)
+**Status:** proposed (not started) — re-checked at 0.6.5+cfa.1 and still
+accurate: UI scale is still applied process-wide via `QT_SCALE_FACTOR`
+(`app.py:1071`) and a change still requires the relaunch at `app.py:822`.
 **Author:** design note for a future change
 **Related:** the off-screen-at-high-DPI fix in `UsageWidget._clamp_to_visible_screen`
 (separate, already shipped)
