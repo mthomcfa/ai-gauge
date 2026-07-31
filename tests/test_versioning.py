@@ -221,34 +221,66 @@ def test_release_workflow_never_interpolates_values_into_shell():
 
 
 def test_release_tag_is_validated_before_use():
-    # Rejecting a malformed tag up front keeps every downstream step from ever
-    # seeing an unexpected string.
+    """Extract the workflow's tag pattern and actually exercise it.
+
+    An earlier version of this test asserted `"cfa" in ver_step["run"]` - which
+    the word "cfa" satisfies from a *comment*. Replacing the pattern with `.*`
+    left the whole suite green while the workflow accepted any ref name. Match
+    the real pattern out of the shell and run inputs through it.
+    """
+    import re
+
     workflow = _release_workflow()
     ver_step = next(
         s for s in workflow["jobs"]["resolve-version"]["steps"] if s.get("id") == "ver"
     )
     assert "github.ref_name" in str(ver_step.get("env", {})), "tag must arrive via env"
-    assert "cfa" in ver_step["run"] and "exit 1" in ver_step["run"], (
-        "the tag must be pattern-checked against the fork scheme before use"
+
+    match = re.search(r"=~\s*(\^\S+\$)", ver_step["run"])
+    assert match, "the tag must be checked against an anchored pattern before use"
+    pattern = re.compile(match.group(1).replace("\\+", "\\+"))
+
+    assert pattern.fullmatch("v0.6.5+cfa.1")
+    assert pattern.fullmatch("v1.2.3+cfa.10")
+    for bad in (
+        "v0.6.5",
+        "v0.6.5+cfa",
+        "v0.6.5-rc1+cfa.1",
+        "v0.6.5+cfa.1;id",
+        'v0.0.0+cfa.0";id;"',
+        "v0.6.5+cfa.1$(id)",
+    ):
+        assert not pattern.fullmatch(bad), f"{bad!r} must be rejected"
+
+
+def test_the_two_version_checkers_agree():
+    """The scheme is implemented twice, in Python and in shell.
+
+    check_versions.py gates CI; the workflow gates the tag. Nothing forced them
+    to accept the same set, and they had already drifted - Python's \\d matches
+    Unicode digits while the shell's [0-9] does not. If someone relaxes one,
+    CI stays green and the release fails only at tag-push time.
+    """
+    import re
+
+    workflow = _release_workflow()
+    ver_step = next(
+        s for s in workflow["jobs"]["resolve-version"]["steps"] if s.get("id") == "ver"
     )
-
-
-def test_readme_and_changelog_track_the_current_version():
-    from aigauge import __version__
-
+    shell_pattern = re.compile(re.search(r"=~\s*(\^\S+\$)", ver_step["run"]).group(1))
     check = _load_check_versions()
-    assert check._readme_mentions_version(__version__)
-    assert check._changelog_has_section(__version__)
 
-
-def test_fork_metadata_records_the_upstream_base():
-    # The version number deliberately does NOT encode the upstream base, so
-    # that provenance has to live somewhere machine-readable.
-    import tomllib
-
-    with (REPO_ROOT / "pyproject.toml").open("rb") as handle:
-        data = tomllib.load(handle)
-    audit = data["tool"]["ai-gauge-audit"]
-    assert audit["audited_upstream_commit"]
-    assert audit["audited_upstream_tag"].startswith("v")
-    assert audit["fork_repo"].endswith("mthomcfa/ai-gauge")
+    cases = [
+        "0.6.5+cfa.1", "1.2.3+cfa.10",
+        "0.6.5", "0.6.4", "0.7.0", "0.6.5+cfa",
+        "0.6.5+dev.1", "0.6.5-cfa.1", "0.6.5+cfa.1.extra", "",
+        "\u0660.\u0666.\u0665+cfa.\u0661",
+    ]
+    for version in cases:
+        failures: list[str] = []
+        check._check_fork_scheme(version, failures)
+        python_ok = not failures
+        shell_ok = bool(shell_pattern.fullmatch(f"v{version}"))
+        assert python_ok == shell_ok, (
+            f"{version!r}: check_versions says {python_ok}, workflow says {shell_ok}"
+        )

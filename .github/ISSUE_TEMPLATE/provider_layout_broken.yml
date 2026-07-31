@@ -5,10 +5,14 @@ body:
   - type: markdown
     attributes:
       value: |
-        AI Gauge scrapes Claude.ai and ChatGPT Codex usage pages. When those
-        pages change shape upstream, the page-extractor JS in
-        `src/aigauge/providers/{claude,codex}.py` needs adjusting. These
-        reports are very welcome.
+        AI Gauge scrapes the Claude.ai, ChatGPT Codex, and OpenCode usage
+        pages. When those pages change shape, the page-extractor JS in
+        `src/aigauge/providers/{claude,codex,opencode_go}.py` needs adjusting.
+        These reports are very welcome.
+
+        This is a fork of [jpajak/ai-gauge](https://github.com/jpajak/ai-gauge)
+        and its extractors have diverged from upstream's, so a layout fix here
+        may not match one made there.
 
         **Do not paste your `Cookie:` header.** Paste only the diagnostic
         details below.
@@ -19,14 +23,19 @@ body:
       options:
         - Claude.ai
         - ChatGPT Codex
-        - Both
+        - OpenCode
+        - More than one
     validations:
       required: true
   - type: input
     id: version
     attributes:
       label: AI Gauge version
-      placeholder: "e.g. 0.5.0"
+      description: |
+        The **full** string, including the `+cfa.N` suffix — a bare number is
+        ambiguous between this fork and upstream. Find it in the panel header,
+        the tray tooltip, or the `app_version` field of **Copy diagnostics**.
+      placeholder: "e.g. 0.6.5+cfa.1"
     validations:
       required: true
   - type: textarea
@@ -60,5 +69,6 @@ body:
       label: Relevant log lines
       description: |
         From `ai-gauge.log` in the per-OS app-data directory. Look for
-        `provider=claude` or `provider=codex` lines around the failed refresh.
+        `provider=claude`, `provider=codex` or `provider=opencode_go` lines
+        around the failed refresh.
       render: text

@@ -1,11 +1,19 @@
 # Contributing to AI Gauge
 
+> **This is [mthomcfa/ai-gauge](https://github.com/mthomcfa/ai-gauge), a
+> security-hardening fork of
+> [jpajak/ai-gauge](https://github.com/jpajak/ai-gauge).** It has its own
+> version numbers and its own hardening that upstream does not carry — see
+> [Relationship to upstream](README.md#relationship-to-upstream). General
+> feature work is usually better contributed upstream; this fork prioritises
+> security fixes and takes upstream features selectively.
+
 Thanks for your interest. AI Gauge is a small cross-platform desktop utility,
 so most contributions fall into one of three buckets:
 
-- **Provider layout fixes** — when Claude or Codex change their usage page and
-  a tile starts showing `error · layout changed`. These are the most common
-  and most welcome PRs.
+- **Provider layout fixes** — when Claude, Codex, or OpenCode change their
+  usage page and a tile starts showing `error · layout changed`. These are the
+  most common and most welcome PRs.
 - **Bug reports and small bug fixes** — anything around tray, widget,
   cookie storage, settings, or refresh logic.
 - **New providers or new features** — please open an issue first so we can
@@ -52,6 +60,11 @@ The version-sync check that gates CI:
   both run in CI on push and pull request.
 - If you bump the version, update `pyproject.toml`, `src/aigauge/__init__.py`,
   `README.md`, and add a `CHANGELOG.md` section. CI will fail otherwise.
+- **Fork versions must carry the `+cfa.N` local segment** (e.g. `0.6.5+cfa.1`).
+  `tools/check_versions.py` rejects a bare number, because it would collide
+  with a real upstream release of the same value but different code. The number
+  before `+` is this fork's own counter, not a claim about the upstream base —
+  see [Versioning](README.md#versioning).
 - Avoid logging cookies, PATs, or full provider response bodies. The logger
   is rotated under the per-OS app-data directory, and users may attach those
   logs to issues.
@@ -61,7 +74,7 @@ The version-sync check that gates CI:
 Use the issue templates under [.github/ISSUE_TEMPLATE/](.github/ISSUE_TEMPLATE/):
 
 - **Bug report** — generic crashes, UI issues, settings glitches.
-- **Provider layout broken** — Claude or Codex tile started failing.
+- **Provider layout broken** — a Claude, Codex, or OpenCode tile started failing.
 - **Feature request** — new ideas worth discussing before code.
 
 For anything that exposes session cookies or tokens, please follow
@@ -73,6 +86,11 @@ For anything that exposes session cookies or tokens, please follow
   no formatter is enforced but please keep diffs minimal.
 - Tests: use `pytest` and `pytest-qt`. Avoid mocking the database or the
   filesystem when an in-memory or `tmp_path` alternative works.
+- **Write tests that fail when the behaviour they cover is removed.** Several
+  tests in this repo have shipped green while asserting nothing — matching a
+  word that also appeared in a comment, or inspecting the wrong lines of a
+  workflow. Before trusting a new test, revert the code it covers and confirm
+  it actually fails.
 - Comments should explain *why*, not *what*. The repo's existing style favors
   short, sparse comments over docstring boilerplate.
 

@@ -20,3 +20,6 @@ dist/
 .claude/
 RELEASE_TODO.local.md
 .DS_Store
+
+# PyInstaller regenerates a spec next to the build; it is not authoritative.
+*.spec

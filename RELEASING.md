@@ -97,8 +97,13 @@ bare number, so CI fails if the segment is missing.
    proves the artifact came from this repo's CI at this commit:
 
    ```bash
-   gh attestation verify ai-gauge-<file-version>-windows.zip --repo mthomcfa/ai-gauge
+   gh attestation verify ai-gauge-<file-version>-windows.zip --repo mthomcfa/ai-gauge \
+     --signer-workflow mthomcfa/ai-gauge/.github/workflows/release.yml
    ```
+
+   `--signer-workflow` pins which workflow is allowed to have minted the
+   attestation. Without it, one signed by any other workflow in the repo
+   holding `attestations: write` would also pass. Repeat for each archive.
 
 6. Open the draft release, paste the relevant changelog notes into the body
    (the workflow auto-generates a commit list, but the changelog reads
@@ -146,13 +151,23 @@ Native UI per OS: floating widget on Windows / Linux, menu-bar item on macOS.
 ### Download
 
 - Windows: `ai-gauge-<file-version>-windows.zip` → extract, run `ai-gauge.exe`.
-- macOS: `ai-gauge-<file-version>-macos.tar.gz` → drag `ai-gauge.app` to Applications.
-  First launch needs `xattr -dr com.apple.quarantine ai-gauge.app` or right-click → Open.
+- macOS (Apple Silicon only): `ai-gauge-<file-version>-macos.tar.gz` → drag `ai-gauge.app` to Applications.
+  These builds are ad-hoc signed but not notarized, so macOS reports the bundle as
+  "damaged and can't be opened" — that means unsigned, not corrupt. After verifying
+  the SHA256 and the attestation, clear the quarantine flag on wherever you put it:
+  `xattr -dr com.apple.quarantine /path/to/ai-gauge.app`. Control-click → Open does
+  **not** work for this dialog. Intel Macs must run from source.
 - Linux: `ai-gauge-<file-version>-linux.tar.gz` → extract, run `./ai-gauge/ai-gauge`.
 
 ### Verification
 
-SHA256: see the `.sha256` next to each archive.
+SHA256: see the `.sha256` next to each archive. Every build also carries a
+signed provenance attestation:
+
+`gh attestation verify <archive> --repo mthomcfa/ai-gauge`
+
+These builds are not OS-code-signed. Windows SmartScreen warns; macOS reports
+an unsigned bundle as "damaged", which means unsigned, not corrupt.
 ```
 
 ## Windows Defender / Reputation Notes
