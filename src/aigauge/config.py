@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import keyring
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .platforms import APP_NAME, get_platform
 
@@ -135,11 +135,79 @@ class ProviderToggles(BaseModel):
     opencode_go: bool = False
 
 
+_HEX_COLOR_RE = re.compile(r"#[0-9A-Fa-f]{6}")
+
+_DEFAULT_BAND_COLORS = {
+    "green_color": "#22c55e",
+    "yellow_color": "#f59e0b",
+    "orange_color": "#f97316",
+    "red_color": "#ef4444",
+}
+
+
+class ColorThresholds(BaseModel):
+    """Per-account gauge severity bands.
+
+    Defaults reproduce the original fixed behaviour exactly: green below 60%,
+    yellow 60-79%, orange 80-94%, red 95%+.
+
+    Every value here is attacker-reachable through a hand-edited ``config.json``
+    and the colours are interpolated into Qt stylesheets, so both the cutoffs
+    and the colour strings are validated. Invalid values are *coerced* to the
+    default rather than raising: a raise would escape ``Config.load()``'s
+    blanket except and reset the user's entire configuration.
+    """
+
+    green_max: int = Field(default=59, ge=0, le=100)
+    yellow_max: int = Field(default=79, ge=0, le=100)
+    orange_max: int = Field(default=94, ge=0, le=100)
+    green_color: str = _DEFAULT_BAND_COLORS["green_color"]
+    yellow_color: str = _DEFAULT_BAND_COLORS["yellow_color"]
+    orange_color: str = _DEFAULT_BAND_COLORS["orange_color"]
+    red_color: str = _DEFAULT_BAND_COLORS["red_color"]
+
+    @field_validator("green_color", "yellow_color", "orange_color", "red_color")
+    @classmethod
+    def _validate_color(cls, value: str, info) -> str:
+        # These strings are interpolated into Qt stylesheets
+        # (``background:{color}``). Anything other than a plain #RRGGBB literal
+        # could close the declaration and inject arbitrary QSS - including
+        # url() fetches - so refuse it and fall back to the band default.
+        text = str(value or "").strip()
+        if _HEX_COLOR_RE.fullmatch(text):
+            return text
+        default = _DEFAULT_BAND_COLORS[info.field_name]
+        log.warning(
+            "config: rejecting invalid %s %r; using %s",
+            info.field_name,
+            value,
+            default,
+        )
+        return default
+
+    @model_validator(mode="after")
+    def _validate_band_order(self) -> ColorThresholds:
+        # Bands must be non-decreasing or band_for_percent() produces
+        # unreachable ranges. Repair in place instead of rejecting the config.
+        if not (self.green_max <= self.yellow_max <= self.orange_max):
+            log.warning(
+                "config: gauge cutoffs out of order (%s/%s/%s); using defaults",
+                self.green_max,
+                self.yellow_max,
+                self.orange_max,
+            )
+            self.green_max = 59
+            self.yellow_max = 79
+            self.orange_max = 94
+        return self
+
+
 class BrowserAccount(BaseModel):
     id: str
     kind: str
     name: str | None = None
     enabled: bool = True
+    colors: ColorThresholds = Field(default_factory=ColorThresholds)
 
     @field_validator("id")
     @classmethod
@@ -153,12 +221,14 @@ class BrowserAccount(BaseModel):
 
 
 class CopilotConfig(BaseModel):
+    colors: ColorThresholds = Field(default_factory=ColorThresholds)
     username: str | None = None
     billing_org: str | None = None
     monthly_quota: int = Field(default=1500, ge=1)  # AI credits; Pro=1500
 
 
 class OpenRouterConfig(BaseModel):
+    colors: ColorThresholds = Field(default_factory=ColorThresholds)
     daily_budget: float | None = Field(default=None, ge=0)
 
 
@@ -198,6 +268,7 @@ def validate_opencode_usage_url(value: str) -> str:
 
 
 class OpenCodeGoConfig(BaseModel):
+    colors: ColorThresholds = Field(default_factory=ColorThresholds)
     usage_url: str = DEFAULT_OPENCODE_USAGE_URL
 
     @field_validator("usage_url")

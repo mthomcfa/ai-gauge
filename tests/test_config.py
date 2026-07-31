@@ -312,3 +312,68 @@ def test_load_clamps_saved_window_size():
 
     assert c.window.width == 340
     assert c.window.height == 80
+
+
+def test_color_thresholds_reject_stylesheet_injection():
+    from aigauge.config import ColorThresholds
+
+    # Colours are interpolated into Qt stylesheets, so a non-hex value could
+    # close the declaration and inject arbitrary QSS (including url() fetches).
+    bad = ColorThresholds(
+        green_color="red; } QWidget { image: url(http://evil/x.png)",
+        yellow_color="",
+        orange_color="#ggg",
+        red_color="javascript:alert(1)",
+    )
+    assert bad.green_color == "#22c55e"
+    assert bad.yellow_color == "#f59e0b"
+    assert bad.orange_color == "#f97316"
+    assert bad.red_color == "#ef4444"
+    # A legitimate custom colour is preserved.
+    assert ColorThresholds(green_color="#0A1B2C").green_color == "#0A1B2C"
+
+
+def test_color_thresholds_repair_out_of_order_cutoffs():
+    from aigauge.config import ColorThresholds
+
+    repaired = ColorThresholds(green_max=90, yellow_max=10, orange_max=50)
+    assert (repaired.green_max, repaired.yellow_max, repaired.orange_max) == (59, 79, 94)
+
+
+def test_existing_config_without_colors_still_loads_with_defaults():
+    # Adding per-account colours must not disturb a config written by an
+    # earlier version: every other setting survives and colours default.
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        json.dumps(
+            {
+                "active_refresh_interval_minutes": 3,
+                "copilot": {"username": "octocat", "monthly_quota": 7000},
+                "browser_accounts": [{"id": "claude", "kind": "claude"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    c = Config.load()
+    assert c.active_refresh_interval_minutes == 3
+    assert c.copilot.username == "octocat"
+    assert c.copilot.monthly_quota == 7000
+    assert c.browser_accounts[0].colors.green_max == 59
+    assert c.copilot.colors.red_color == "#ef4444"
+
+
+def test_bad_colors_in_config_do_not_wipe_the_whole_config():
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        json.dumps(
+            {
+                "active_refresh_interval_minutes": 4,
+                "copilot": {"username": "octocat", "colors": {"green_color": "nope"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    c = Config.load()
+    assert c.active_refresh_interval_minutes == 4
+    assert c.copilot.username == "octocat"
+    assert c.copilot.colors.green_color == "#22c55e"
