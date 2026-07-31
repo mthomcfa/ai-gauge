@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
+from . import __version__
 from .logging_setup import log_path
 from .models import UsageSnapshot
 
@@ -71,6 +72,9 @@ def _sanitize_raw(raw: Any) -> Any:
 
 def _format_diagnostics(provider: str, snapshot: UsageSnapshot) -> str:
     payload: dict[str, Any] = {
+        # Fork and upstream ship overlapping release numbers, so a diagnostics
+        # paste is ambiguous without the full version string (0.6.5+cfa.1).
+        "app_version": __version__,
         "provider": provider,
         "status": snapshot.status.value,
         "fetched_at": snapshot.fetched_at.isoformat(timespec="seconds"),

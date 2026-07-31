@@ -1,6 +1,6 @@
 [project]
 name = "ai-gauge"
-version = "0.6.4"
+version = "0.6.5+cfa.1"
 description = "Compact always-on-top monitor for Claude.ai, ChatGPT Codex, and GitHub Copilot usage limits."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -30,19 +30,27 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/jpajak/ai-gauge"
-Repository = "https://github.com/jpajak/ai-gauge"
-Issues = "https://github.com/jpajak/ai-gauge/issues"
-Security = "https://github.com/jpajak/ai-gauge/security"
-Fork = "https://github.com/mthomcfa/ai-gauge"
+Homepage = "https://github.com/mthomcfa/ai-gauge"
+Repository = "https://github.com/mthomcfa/ai-gauge"
+Issues = "https://github.com/mthomcfa/ai-gauge/issues"
+Security = "https://github.com/mthomcfa/ai-gauge/security"
+Changelog = "https://github.com/mthomcfa/ai-gauge/blob/main/CHANGELOG.md"
+Upstream = "https://github.com/jpajak/ai-gauge"
 
 # This tree is a security-hardening fork. It was audited and patched starting
 # from the upstream commit recorded below; downstream builds should be produced
 # from this fork, not the upstream unsigned releases.
+#
+# Versioning: the release number before "+" is this fork's own counter, not a
+# claim about which upstream release this matches. Upstream numbers of the same
+# value exist and are different code. The "+cfa.N" local segment (PEP 440) is
+# what makes a fork build unambiguous. See "Versioning" in README.md.
 [tool.ai-gauge-audit]
 upstream_repo = "https://github.com/jpajak/ai-gauge"
 fork_repo = "https://github.com/mthomcfa/ai-gauge"
 audited_upstream_commit = "1df4536"
+audited_upstream_tag = "v0.6.3"
+fork_local_segment = "cfa"
 
 [project.optional-dependencies]
 dev = [

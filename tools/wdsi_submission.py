@@ -33,7 +33,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_EXE = REPO_ROOT / "dist" / "ai-gauge" / "ai-gauge.exe"
 PORTAL_URL = "https://www.microsoft.com/en-us/wdsi/filesubmission"
-REPO_URL = "https://github.com/jpajak/ai-gauge"
+REPO_URL = "https://github.com/mthomcfa/ai-gauge"
 PLACEHOLDER = "<read off the Defender alert>"
 
 

@@ -85,6 +85,40 @@ if [ "$(uname -s)" = "Darwin" ] && [ "$ONEFILE" -eq 0 ] \
         dist/ai-gauge.app/Contents/Info.plist 2>/dev/null \
         || /usr/libexec/PlistBuddy -c "Set :LSUIElement true" \
             dist/ai-gauge.app/Contents/Info.plist
+
+    # PyInstaller's generated BUNDLE passes no version=, so Finder -> Get Info
+    # would report 0.0.0 - which undercuts the point of an unambiguous version
+    # string on the one platform where the bundle is the artifact. CFBundle
+    # versions must be dotted numerics, so the '+cfa.N' local segment is
+    # carried in the display string only.
+    APP_VERSION=$("$VENV_PY" -c \
+        "import re,pathlib;print(re.search(r'\"([^\"]+)\"',pathlib.Path('src/aigauge/__init__.py').read_text()).group(1))")
+    APP_VERSION_NUMERIC=$(printf '%s' "$APP_VERSION" | sed -E 's/[^0-9.].*$//; s/\.$//')
+    for KEY in CFBundleShortVersionString CFBundleVersion; do
+        /usr/libexec/PlistBuddy -c "Add :$KEY string $APP_VERSION_NUMERIC" \
+            dist/ai-gauge.app/Contents/Info.plist 2>/dev/null \
+            || /usr/libexec/PlistBuddy -c "Set :$KEY $APP_VERSION_NUMERIC" \
+                dist/ai-gauge.app/Contents/Info.plist
+    done
+    /usr/libexec/PlistBuddy -c "Add :AIGaugeFullVersion string $APP_VERSION" \
+        dist/ai-gauge.app/Contents/Info.plist 2>/dev/null \
+        || /usr/libexec/PlistBuddy -c "Set :AIGaugeFullVersion $APP_VERSION" \
+            dist/ai-gauge.app/Contents/Info.plist
+fi
+
+# Re-sign after the edits above. PyInstaller ad-hoc-signs the bundle as the
+# LAST step of BUNDLE.assemble, so relocating the QtWebEngineCore framework
+# and editing Info.plist both invalidate that seal: the framework moves break
+# CodeResources and the plist edit breaks the executable's Info.plist special
+# slot. On Apple Silicon a Mach-O with an invalid signature is refused at exec
+# by AMFI, and clearing the quarantine flag does not help - the user just gets
+# "can't be opened" or Killed: 9. Verify too, so a broken bundle fails the
+# build rather than shipping.
+if [ "$(uname -s)" = "Darwin" ] && [ "$ONEFILE" -eq 0 ] \
+        && [ -d "dist/ai-gauge.app" ]; then
+    echo "Re-signing bundle (ad-hoc) after post-build edits..."
+    codesign --force --deep --sign - dist/ai-gauge.app
+    codesign --verify --deep --strict dist/ai-gauge.app
 fi
 
 echo

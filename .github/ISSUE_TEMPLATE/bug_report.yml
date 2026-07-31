@@ -6,13 +6,26 @@ body:
     attributes:
       value: |
         Please do not paste real cookies, GitHub PATs, or account-identifying
-        log lines. Redact them as `<redacted>` if needed.
+        log lines. Redact them as `<redacted>` if needed. **Copy diagnostics**
+        already redacts email addresses and truncates scraped page text.
+  - type: markdown
+    attributes:
+      value: |
+        **This is [mthomcfa/ai-gauge](https://github.com/mthomcfa/ai-gauge), a
+        security-hardened fork of
+        [jpajak/ai-gauge](https://github.com/jpajak/ai-gauge).** The two share
+        release numbers but not code. Please report bugs in *this* fork here;
+        if you can reproduce the same bug on a clean upstream checkout, it is
+        worth reporting there too.
   - type: input
     id: version
     attributes:
       label: AI Gauge version
-      description: Find this in the widget header.
-      placeholder: "e.g. 0.5.0"
+      description: |
+        The **full** string, including the `+cfa.N` suffix — a bare number is
+        ambiguous between this fork and upstream. Find it in the panel header,
+        the tray tooltip, or the `app_version` field of **Copy diagnostics**.
+      placeholder: "e.g. 0.6.5+cfa.1"
     validations:
       required: true
   - type: input

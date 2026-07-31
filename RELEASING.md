@@ -23,11 +23,37 @@ For AI Gauge, the release page should include:
 ## Release Checklist (automated path)
 
 The recommended path uses [.github/workflows/release.yml](.github/workflows/release.yml):
-pushing a `v*` tag fans out a 3-OS build matrix (Windows, macOS, Ubuntu).
-Each runner runs the test suite, builds its OS's standalone bundle, packages
-it, computes a SHA256, and uploads both files as job artifacts. A final job
-collects all artifacts and attaches them to a **draft** release on GitHub.
-You publish the draft from the web UI.
+pushing a `v*` tag fans out a **3-OS** build matrix (Windows, macOS, Ubuntu).
+Each runner runs the test suite, builds its OS's standalone bundle, packages it,
+computes a SHA256, mints a **signed build-provenance attestation**, and uploads
+the files as job artifacts. A final job collects them and attaches them to a
+**draft** release on GitHub. You publish the draft from the web UI.
+
+PyInstaller cannot cross-compile, which is why each artifact is built on its own
+runner rather than fanned out from one.
+
+> **None of the artifacts are OS-code-signed.** The provenance attestation is
+> the integrity guarantee, not a code-signing certificate. macOS in particular
+> will report an unsigned downloaded bundle as *"damaged and can't be opened"* —
+> that means unsigned, not corrupt. Signing properly needs an Apple Developer ID
+> plus notarization (macOS) and an Authenticode certificate (Windows); see
+> [Signing Notes](#signing-notes). Keep the first-launch caveats in the release
+> body accurate whenever this changes.
+
+### Version numbering
+
+Fork releases use a PEP 440 local segment: `<release>+cfa.<n>`, e.g.
+`0.6.5+cfa.1`. The number before `+` is **this fork's own counter**, not a claim
+about which upstream release the tree matches — upstream ships its own releases
+with overlapping numbers and different code. `tools/check_versions.py` rejects a
+bare number, so CI fails if the segment is missing.
+
+- Tag the full version, including the `+`: `git tag v0.6.5+cfa.1`. Both git and
+  PEP 440 accept it.
+- **Archive filenames substitute `-` for `+`** (`ai-gauge-0.6.5-cfa.1-windows.zip`),
+  because GitHub normalises some characters in release asset names. The
+  workflow derives this automatically via the `file_version` output — do not
+  hand-write archive names.
 
 1. Confirm `pyproject.toml`, `src/aigauge/__init__.py`, `README.md`, and
    `CHANGELOG.md` all show the new version. The release workflow runs
@@ -61,12 +87,25 @@ You publish the draft from the web UI.
    ```
 
 4. Watch the **release** workflow under the Actions tab. On success it
-   creates a draft release on the [Releases page](https://github.com/jpajak/ai-gauge/releases)
-   with three artifact pairs attached:
-   - `ai-gauge-<version>-windows.zip` (+ `.sha256`)
-   - `ai-gauge-<version>-macos.tar.gz` (+ `.sha256`)
-   - `ai-gauge-<version>-linux.tar.gz` (+ `.sha256`)
-5. Open the draft release, paste the relevant changelog notes into the body
+   creates a draft release on the [Releases page](https://github.com/mthomcfa/ai-gauge/releases)
+   with three artifact pairs attached (`<file-version>` is the version with `+`
+   replaced by `-`):
+   - `ai-gauge-<file-version>-windows.zip` (+ `.sha256`)
+   - `ai-gauge-<file-version>-macos.tar.gz` (+ `.sha256`)
+   - `ai-gauge-<file-version>-linux.tar.gz` (+ `.sha256`)
+5. Verify the provenance attestation before publishing — this is the step that
+   proves the artifact came from this repo's CI at this commit:
+
+   ```bash
+   gh attestation verify ai-gauge-<file-version>-windows.zip --repo mthomcfa/ai-gauge \
+     --signer-workflow mthomcfa/ai-gauge/.github/workflows/release.yml
+   ```
+
+   `--signer-workflow` pins which workflow is allowed to have minted the
+   attestation. Without it, one signed by any other workflow in the repo
+   holding `attestations: write` would also pass. Repeat for each archive.
+
+6. Open the draft release, paste the relevant changelog notes into the body
    (the workflow auto-generates a commit list, but the changelog reads
    better), and click **Publish release**. Mark as prerelease if you want a
    soft launch.
@@ -81,16 +120,16 @@ PyInstaller cross-compilation isn't supported.
 1. Run the same local pre-flight in step 1 above on each target OS.
 2. Package the build:
    - Windows: zip the full `dist\ai-gauge\` folder.
-   - macOS: `tar -C dist -czf ai-gauge-<ver>-macos.tar.gz ai-gauge.app`
-   - Linux: `tar -C dist -czf ai-gauge-<ver>-linux.tar.gz ai-gauge`
+   - macOS: `tar -C dist -czf ai-gauge-<file-version>-macos.tar.gz ai-gauge.app`
+   - Linux: `tar -C dist -czf ai-gauge-<file-version>-linux.tar.gz ai-gauge`
 3. Create a checksum:
 
    ```powershell
-   Get-FileHash .\ai-gauge-<ver>-windows.zip -Algorithm SHA256
+   Get-FileHash .\ai-gauge-<file-version>-windows.zip -Algorithm SHA256
    ```
 
    ```bash
-   shasum -a 256 ai-gauge-<ver>-macos.tar.gz
+   shasum -a 256 ai-gauge-<file-version>-macos.tar.gz
    ```
 
 4. Push the version tag, then in GitHub go to **Releases** → **Draft a new
@@ -111,14 +150,24 @@ Native UI per OS: floating widget on Windows / Linux, menu-bar item on macOS.
 
 ### Download
 
-- Windows: `ai-gauge-<ver>-windows.zip` → extract, run `ai-gauge.exe`.
-- macOS: `ai-gauge-<ver>-macos.tar.gz` → drag `ai-gauge.app` to Applications.
-  First launch needs `xattr -dr com.apple.quarantine ai-gauge.app` or right-click → Open.
-- Linux: `ai-gauge-<ver>-linux.tar.gz` → extract, run `./ai-gauge/ai-gauge`.
+- Windows: `ai-gauge-<file-version>-windows.zip` → extract, run `ai-gauge.exe`.
+- macOS (Apple Silicon only): `ai-gauge-<file-version>-macos.tar.gz` → drag `ai-gauge.app` to Applications.
+  These builds are ad-hoc signed but not notarized, so macOS reports the bundle as
+  "damaged and can't be opened" — that means unsigned, not corrupt. After verifying
+  the SHA256 and the attestation, clear the quarantine flag on wherever you put it:
+  `xattr -dr com.apple.quarantine /path/to/ai-gauge.app`. Control-click → Open does
+  **not** work for this dialog. Intel Macs must run from source.
+- Linux: `ai-gauge-<file-version>-linux.tar.gz` → extract, run `./ai-gauge/ai-gauge`.
 
 ### Verification
 
-SHA256: see the `.sha256` next to each archive.
+SHA256: see the `.sha256` next to each archive. Every build also carries a
+signed provenance attestation:
+
+`gh attestation verify <archive> --repo mthomcfa/ai-gauge`
+
+These builds are not OS-code-signed. Windows SmartScreen warns; macOS reports
+an unsigned bundle as "damaged", which means unsigned, not corrupt.
 ```
 
 ## Windows Defender / Reputation Notes

@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Security vulnerability
-    url: https://github.com/jpajak/ai-gauge/security/advisories/new
+    url: https://github.com/mthomcfa/ai-gauge/security/advisories/new
     about: Please report security issues privately, not as a public issue. See SECURITY.md.
+  - name: Upstream project (jpajak/ai-gauge)
+    url: https://github.com/jpajak/ai-gauge
+    about: This repo is a security-hardening fork with its own version numbers. If your issue reproduces on a clean upstream checkout, it belongs upstream.

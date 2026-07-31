@@ -4,7 +4,18 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    # Filters on the PR's BASE branch. Stacked PRs target the branch below
+    # them rather than main, so without the second pattern they would get no
+    # CI at all until they are retargeted - which is exactly when you want it
+    # least.
+    branches: [main, "claude/**"]
+
+# Stacked PRs now get CI and the matrix is 3 OS x 2 Python versions, so a
+# rapid series of pushes would otherwise leave six superseded macOS/Windows
+# jobs running per push.
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
