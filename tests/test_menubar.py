@@ -186,3 +186,24 @@ def test_native_mac_status_item_forwards_config_to_status_items(monkeypatch):
     item.update({}, ("claude",), config)
 
     assert captured["config"] is config
+
+
+def test_status_items_actually_applies_configured_colors():
+    """Guards the mutation where status_items accepts config and ignores it.
+
+    The existing forwarding test stubs status_items, so it cannot catch that.
+    """
+    from aigauge.config import ColorThresholds, Config
+    from aigauge.menubar import status_items
+
+    config = Config()
+    config.browser_accounts[0].colors = ColorThresholds(
+        green_max=1, yellow_max=2, orange_max=3, red_color="#654321"
+    )
+    items = status_items({"claude": _ok_snap("claude", 50.0)}, ("claude",), config)
+    assert items == [("Cl", "50%", "#654321")]
+
+    # Without config the same snapshot uses the defaults.
+    assert status_items({"claude": _ok_snap("claude", 50.0)}, ("claude",))[0][2] == (
+        ColorThresholds().green_color
+    )

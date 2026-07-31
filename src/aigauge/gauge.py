@@ -97,12 +97,20 @@ def thresholds_for_provider(
 
 
 def provider_max_percent(snapshot: UsageSnapshot | None) -> float | None:
+    """Worst usage percentage in a snapshot, ignoring tagged breakdown rows.
+
+    Tagged metrics are supplementary detail rather than usage against a limit -
+    OpenRouter's model-breakdown rows carry each model's *share of spend*, so a
+    single model at 96% of spend would otherwise drive the tray indicator red
+    as though the account were at 96% of a quota. Every other metric consumer
+    in the app filters on ``tag``; this is the shared one, so it must too.
+    """
     if snapshot is None or snapshot.status != SnapshotStatus.OK:
         return None
     values = [
         metric.percent_used
         for metric in snapshot.metrics
-        if metric.percent_used is not None
+        if metric.percent_used is not None and metric.tag is None
     ]
     return max(values) if values else None
 

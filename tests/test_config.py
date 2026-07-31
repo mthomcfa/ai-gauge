@@ -383,6 +383,15 @@ def test_existing_config_without_colors_still_loads_with_defaults():
         {"green_color": "#fff"},
         {"green_color": "red; } * { background: url(http://evil/x) } a {"},
         {"green_max": 90, "yellow_max": 10, "orange_max": 50},
+        # Non-finite floats. json.dumps writes these as the bare tokens
+        # Infinity / -Infinity / NaN and json.loads accepts them by default,
+        # so they reach the validator as real floats. int(inf) raises
+        # OverflowError - a different exception class than int("abc").
+        {"green_max": float("inf")},
+        {"green_max": float("-inf")},
+        {"green_max": float("nan")},
+        {"yellow_max": float("inf")},
+        {"orange_max": float("-inf")},
         # A colors block that isn't a mapping at all.
         "nope",
         None,
@@ -417,6 +426,23 @@ def test_malformed_colors_never_wipe_the_config(colors):
     # And the bands are always usable.
     assert 0 <= c.copilot.colors.green_max <= 100
     assert c.copilot.colors.green_color.startswith("#")
+
+
+@pytest.mark.parametrize("literal", ["1e400", "-1e400", "Infinity", "-Infinity", "NaN"])
+def test_overflowing_numeric_literals_never_wipe_the_config(literal):
+    # These are lexically valid to json.loads (which accepts the non-finite
+    # tokens by default) but overflow int(), so they must be handled as
+    # malformed rather than escaping Config.load() as an exception.
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        '{"active_refresh_interval_minutes": 3, "copilot": {"username": "octocat",'
+        ' "colors": {"green_max": ' + literal + "}}}",
+        encoding="utf-8",
+    )
+    c = Config.load()
+    assert c.active_refresh_interval_minutes == 3
+    assert c.copilot.username == "octocat"
+    assert 0 <= c.copilot.colors.green_max <= 100
 
 
 def test_malformed_account_colors_do_not_wipe_the_config():

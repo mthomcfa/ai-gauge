@@ -429,9 +429,10 @@ class GaugeColorsDialog(QDialog):
                 "border:1px solid #4b5563; border-radius:4px; padding:4px 8px; }"
             )
             swatch.setText(color)
-            text = ranges[band]
-            # An empty band (cutoffs collapsed together) would never render.
-            self._range_labels[band].setText(text)
+            # Collapsed cutoffs can produce an inverted label such as
+            # "101-100%"; that is an accurate description of a band that can
+            # never match, and the ordering repair keeps it from being stored.
+            self._range_labels[band].setText(ranges[band])
 
     def colors(self) -> ColorThresholds:
         return self._colors.model_copy(deep=True)
@@ -1340,9 +1341,14 @@ class SettingsDialog(QDialog):
                 purge_profile(account_id)
             except Exception:  # noqa: BLE001 - never let cleanup crash the save
                 log.exception("failed to purge profile for %s", account_id)
-        config.copilot.colors = self._provider_colors["copilot"]
-        config.openrouter.colors = self._provider_colors["openrouter"]
-        config.opencode_go.colors = self._provider_colors["opencode_go"]
+        # Copy so the saved config never aliases this dialog's working state.
+        config.copilot.colors = self._provider_colors["copilot"].model_copy(deep=True)
+        config.openrouter.colors = self._provider_colors["openrouter"].model_copy(
+            deep=True
+        )
+        config.opencode_go.colors = self._provider_colors["opencode_go"].model_copy(
+            deep=True
+        )
         username = self.gh_username.text().strip()
         config.copilot.username = username or None
         billing_org = self.gh_billing_org.text().strip()

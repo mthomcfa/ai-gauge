@@ -188,7 +188,11 @@ class ColorThresholds(BaseModel):
             return default
         try:
             number = int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError matters: json.loads accepts the non-standard
+            # literals Infinity / -Infinity / 1e400, and int(float("inf"))
+            # raises it. Anything escaping here reaches Config.load()'s blanket
+            # except and discards the user's whole configuration.
             log.warning(
                 "config: unusable %s %r; using %s", info.field_name, value, default
             )
@@ -241,6 +245,7 @@ def _coerce_colors_payload(value: object) -> object:
     """
     if isinstance(value, (ColorThresholds, dict)):
         return value
+    log.warning("config: ignoring non-mapping colors block %r; using defaults", value)
     return {}
 
 

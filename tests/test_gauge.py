@@ -101,3 +101,40 @@ def test_highest_indicator_prefers_band_then_percent():
 def test_highest_indicator_returns_none_without_usable_snapshots():
     config = Config()
     assert highest_indicator(config, {}, ("claude", "codex")) is None
+
+
+def test_provider_max_percent_ignores_tagged_breakdown_metrics():
+    # OpenRouter's model-breakdown rows carry each model's SHARE OF SPEND as
+    # percent_used. Counting them would drive the tray red because one model
+    # dominates spend, with no usage limit anywhere near its cap.
+    snapshot = UsageSnapshot(
+        provider="openrouter",
+        status=SnapshotStatus.OK,
+        metrics=[
+            UsageMetric(label="Balance ($10.00 left)", percent_used=None),
+            UsageMetric(label="Models", percent_used=None, tag="model_breakdown"),
+            UsageMetric(label="claude-opus", percent_used=96.0, tag="model_breakdown"),
+            UsageMetric(label="gpt", percent_used=4.0, tag="model_breakdown"),
+        ],
+    )
+    from aigauge.gauge import provider_max_percent
+
+    assert provider_max_percent(snapshot) is None
+
+    config = Config()
+    assert provider_indicator(config, "openrouter", snapshot) is None
+    assert highest_indicator(config, {"openrouter": snapshot}, ("openrouter",)) is None
+
+
+def test_provider_max_percent_still_uses_untagged_metrics():
+    snapshot = UsageSnapshot(
+        provider="openrouter",
+        status=SnapshotStatus.OK,
+        metrics=[
+            UsageMetric(label="Today ($9/$10)", percent_used=90.0),
+            UsageMetric(label="claude-opus", percent_used=96.0, tag="model_breakdown"),
+        ],
+    )
+    from aigauge.gauge import provider_max_percent
+
+    assert provider_max_percent(snapshot) == 90.0

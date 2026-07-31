@@ -893,6 +893,8 @@ class App(QObject):
             dlg.apply_to(self._config)
             self._build_providers()
             self._widget.apply_gauge_colors()
+            # Colour-only changes must not wait for the next network refresh.
+            self._update_tray()
             self._widget.apply_window_settings()
             self._widget.show()
             # Copilot's metric label bakes the quota into the displayed string.
