@@ -23,15 +23,22 @@ For AI Gauge, the release page should include:
 ## Release Checklist (automated path)
 
 The recommended path uses [.github/workflows/release.yml](.github/workflows/release.yml):
-pushing a `v*` tag fans out a **2-OS** build matrix (Windows, Ubuntu). Each
-runner runs the test suite, builds its OS's standalone bundle, packages it,
+pushing a `v*` tag fans out a **3-OS** build matrix (Windows, macOS, Ubuntu).
+Each runner runs the test suite, builds its OS's standalone bundle, packages it,
 computes a SHA256, mints a **signed build-provenance attestation**, and uploads
 the files as job artifacts. A final job collects them and attaches them to a
 **draft** release on GitHub. You publish the draft from the web UI.
 
-> **macOS is not built by CI.** PyInstaller cannot cross-compile and this fork
-> builds Windows and Linux only. macOS users run from source. If you want a
-> macOS artifact, build it locally per the manual fallback below.
+PyInstaller cannot cross-compile, which is why each artifact is built on its own
+runner rather than fanned out from one.
+
+> **None of the artifacts are OS-code-signed.** The provenance attestation is
+> the integrity guarantee, not a code-signing certificate. macOS in particular
+> will report an unsigned downloaded bundle as *"damaged and can't be opened"* —
+> that means unsigned, not corrupt. Signing properly needs an Apple Developer ID
+> plus notarization (macOS) and an Authenticode certificate (Windows); see
+> [Signing Notes](#signing-notes). Keep the first-launch caveats in the release
+> body accurate whenever this changes.
 
 ### Version numbering
 
@@ -81,9 +88,10 @@ bare number, so CI fails if the segment is missing.
 
 4. Watch the **release** workflow under the Actions tab. On success it
    creates a draft release on the [Releases page](https://github.com/mthomcfa/ai-gauge/releases)
-   with two artifact pairs attached (`<file-version>` is the version with `+`
+   with three artifact pairs attached (`<file-version>` is the version with `+`
    replaced by `-`):
    - `ai-gauge-<file-version>-windows.zip` (+ `.sha256`)
+   - `ai-gauge-<file-version>-macos.tar.gz` (+ `.sha256`)
    - `ai-gauge-<file-version>-linux.tar.gz` (+ `.sha256`)
 5. Verify the provenance attestation before publishing — this is the step that
    proves the artifact came from this repo's CI at this commit:

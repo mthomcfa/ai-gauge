@@ -59,22 +59,37 @@ notice.
 
 Binaries are published on **[this fork's Releases page](https://github.com/mthomcfa/ai-gauge/releases)**. Do not download from upstream's releases — those are built from different code and do not contain the fixes in [SECURITY-AUDIT.md](SECURITY-AUDIT.md).
 
-| OS      | Archive                                | Run                                |
-| ------- | -------------------------------------- | ---------------------------------- |
-| Windows | `ai-gauge-<version>-windows.zip`       | extract, run `ai-gauge.exe`        |
-| Linux   | `ai-gauge-<version>-linux.tar.gz`      | extract, run `./ai-gauge/ai-gauge` |
+| OS      | Archive                                | Run                                          |
+| ------- | -------------------------------------- | -------------------------------------------- |
+| Windows | `ai-gauge-<file-version>-windows.zip`       | extract, run `ai-gauge.exe`                  |
+| macOS   | `ai-gauge-<file-version>-macos.tar.gz`      | extract, drag `ai-gauge.app` to Applications |
+| Linux   | `ai-gauge-<file-version>-linux.tar.gz`      | extract, run `./ai-gauge/ai-gauge`           |
 
-**macOS is source-only in this fork.** PyInstaller cannot cross-compile and this fork's CI builds Windows and Linux only, so there is no `.app` archive. macOS users run [from source](#run-from-source); the menu-bar UI works normally.
+`<file-version>` is the version with `+` replaced by `-`, so `0.6.5+cfa.1` ships as `ai-gauge-0.6.5-cfa.1-windows.zip`. Print it with `python tools/check_versions.py`.
 
-Archive filenames substitute `-` for the `+` in the version, so `0.6.5+cfa.1` ships as `ai-gauge-0.6.5-cfa.1-windows.zip`.
+### Verify before you run it
 
 SHA256 sums are published alongside each archive, and every release carries a **signed build-provenance attestation** proving it was built by this repository's CI from a specific commit:
 
 ```bash
-gh attestation verify ai-gauge-<version>-windows.zip --repo mthomcfa/ai-gauge
+gh attestation verify ai-gauge-<file-version>-windows.zip --repo mthomcfa/ai-gauge
 ```
 
-Verify that before trusting a download. The binaries are not code-signed with an OS-trusted certificate, so SmartScreen still warns on first launch — see [first-launch warnings](#build-a-standalone-binary).
+Do that before trusting a download. It is the strongest guarantee these builds offer, because **none of them are signed with an OS-trusted code-signing certificate** — see the per-OS first-launch notes below.
+
+### First launch
+
+- **Windows** — SmartScreen shows "Windows protected your PC" for an unsigned binary. Click **More info → Run anyway**.
+- **macOS** — Gatekeeper quarantines unsigned apps downloaded from the internet. On current macOS the dialog reads **"ai-gauge.app is damaged and can't be opened"**, which is misleading: it means *unsigned*, not corrupt. After verifying the SHA256 and the attestation above, clear the quarantine flag:
+
+  ```bash
+  xattr -dr com.apple.quarantine /Applications/ai-gauge.app
+  ```
+
+  If you would rather not do that, [run from source](#run-from-source) instead — the menu-bar UI works identically.
+- **Linux** — no equivalent gate; make sure the binary is executable (`chmod +x ai-gauge/ai-gauge`).
+
+Signing the macOS bundle properly requires an Apple Developer ID plus notarization in CI, and Windows requires an Authenticode certificate. Neither is set up for this fork, so the attestation is deliberately the thing to check.
 
 ## Run from source
 
