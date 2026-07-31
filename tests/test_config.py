@@ -6,6 +6,7 @@ from pydantic import ValidationError
 from aigauge.config import (
     DEFAULT_OPENCODE_USAGE_URL,
     BrowserAccount,
+    ColorThresholds,
     Config,
     account_display_name,
     app_data_dir,
@@ -312,3 +313,264 @@ def test_load_clamps_saved_window_size():
 
     assert c.window.width == 340
     assert c.window.height == 80
+
+
+def test_color_thresholds_reject_stylesheet_injection():
+    from aigauge.config import ColorThresholds
+
+    # Colours are interpolated into Qt stylesheets, so a non-hex value could
+    # close the declaration and inject arbitrary QSS (including url() fetches).
+    bad = ColorThresholds(
+        green_color="red; } QWidget { image: url(http://evil/x.png)",
+        yellow_color="",
+        orange_color="#ggg",
+        red_color="javascript:alert(1)",
+    )
+    assert bad.green_color == "#22c55e"
+    assert bad.yellow_color == "#f59e0b"
+    assert bad.orange_color == "#f97316"
+    assert bad.red_color == "#ef4444"
+    # A legitimate custom colour is preserved.
+    assert ColorThresholds(green_color="#0A1B2C").green_color == "#0A1B2C"
+
+
+def test_color_thresholds_repair_out_of_order_cutoffs():
+    from aigauge.config import ColorThresholds
+
+    repaired = ColorThresholds(green_max=90, yellow_max=10, orange_max=50)
+    assert (repaired.green_max, repaired.yellow_max, repaired.orange_max) == (59, 79, 94)
+
+
+def test_existing_config_without_colors_still_loads_with_defaults():
+    # Adding per-account colours must not disturb a config written by an
+    # earlier version: every other setting survives and colours default.
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        json.dumps(
+            {
+                "active_refresh_interval_minutes": 3,
+                "copilot": {"username": "octocat", "monthly_quota": 7000},
+                "browser_accounts": [{"id": "claude", "kind": "claude"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    c = Config.load()
+    assert c.active_refresh_interval_minutes == 3
+    assert c.copilot.username == "octocat"
+    assert c.copilot.monthly_quota == 7000
+    assert c.browser_accounts[0].colors.green_max == 59
+    assert c.copilot.colors.red_color == "#ef4444"
+
+
+@pytest.mark.parametrize(
+    "colors",
+    [
+        # Non-str / non-int payloads: these hit pydantic's own type coercion,
+        # which raises - and a raise inside Config.load() discards the whole
+        # file. Every one of these previously wiped the user's config.
+        {"green_max": 500},
+        {"green_max": -1},
+        {"green_max": 10**20},
+        {"green_max": "abc"},
+        {"green_max": 59.7},
+        {"green_max": None},
+        {"green_max": True},
+        {"green_color": 123},
+        {"green_color": True},
+        {"green_color": ["#fff"]},
+        {"green_color": None},
+        {"green_color": ""},
+        {"green_color": "#fff"},
+        {"green_color": "red; } * { background: url(http://evil/x) } a {"},
+        {"green_max": 90, "yellow_max": 10, "orange_max": 50},
+        # Non-finite floats. json.dumps writes these as the bare tokens
+        # Infinity / -Infinity / NaN and json.loads accepts them by default,
+        # so they reach the validator as real floats. int(inf) raises
+        # OverflowError - a different exception class than int("abc").
+        {"green_max": float("inf")},
+        {"green_max": float("-inf")},
+        {"green_max": float("nan")},
+        {"yellow_max": float("inf")},
+        {"orange_max": float("-inf")},
+        # A colors block that isn't a mapping at all.
+        "nope",
+        None,
+        [],
+        7,
+    ],
+)
+def test_malformed_colors_never_wipe_the_config(colors):
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        json.dumps(
+            {
+                "active_refresh_interval_minutes": 3,
+                "copilot": {
+                    "username": "octocat",
+                    "monthly_quota": 7000,
+                    "colors": colors,
+                },
+                "openrouter": {"daily_budget": 25.0},
+                "window": {"x": 111, "y": 222},
+            }
+        ),
+        encoding="utf-8",
+    )
+    c = Config.load()
+    # Every unrelated setting must survive a bad colours block.
+    assert c.active_refresh_interval_minutes == 3
+    assert c.copilot.username == "octocat"
+    assert c.copilot.monthly_quota == 7000
+    assert c.openrouter.daily_budget == 25.0
+    assert c.window.x == 111 and c.window.y == 222
+    # And the bands are always usable.
+    assert 0 <= c.copilot.colors.green_max <= 100
+    assert c.copilot.colors.green_color.startswith("#")
+
+
+@pytest.mark.parametrize("literal", ["1e400", "-1e400", "Infinity", "-Infinity", "NaN"])
+def test_overflowing_numeric_literals_never_wipe_the_config(literal):
+    # These are lexically valid to json.loads (which accepts the non-finite
+    # tokens by default) but overflow int(), so they must be handled as
+    # malformed rather than escaping Config.load() as an exception.
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        '{"active_refresh_interval_minutes": 3, "copilot": {"username": "octocat",'
+        ' "colors": {"green_max": ' + literal + "}}}",
+        encoding="utf-8",
+    )
+    c = Config.load()
+    assert c.active_refresh_interval_minutes == 3
+    assert c.copilot.username == "octocat"
+    assert 0 <= c.copilot.colors.green_max <= 100
+
+
+class _ReprBomb:
+    """A value whose repr() raises, like a >4300-digit int or deep nesting."""
+
+    def __init__(self, exc: type[BaseException]) -> None:
+        self._exc = exc
+
+    def __repr__(self) -> str:
+        raise self._exc("boom")
+
+
+@pytest.mark.parametrize("exc", [ValueError, RecursionError, MemoryError, TypeError])
+@pytest.mark.parametrize("field", ["green_max", "green_color"])
+def test_validators_never_render_untrusted_values_with_repr(exc, field):
+    # repr() is not total. logging swallows a ValueError raised during
+    # formatting but lets RecursionError through, so a bare %r in a validator
+    # that promises never to raise is a live hazard.
+    colors = ColorThresholds.model_validate({field: _ReprBomb(exc)})
+    assert 0 <= colors.green_max <= 100
+    assert colors.green_color == "#22c55e"
+
+
+def test_unparseable_config_is_preserved_not_silently_destroyed():
+    # A file that is not JSON has no recoverable structure, so defaults are the
+    # only option - but Config.save() overwrites it on the next window move, so
+    # the user's settings must be recoverable from somewhere.
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    raw = '{"copilot": {"username": "octocat"}, "window": {'  # truncated
+    config_path().write_text(raw, encoding="utf-8")
+    c = Config.load()
+    assert c.copilot.username is None
+    backup = config_path().with_suffix(config_path().suffix + ".corrupt")
+    assert backup.exists()
+    assert backup.read_text(encoding="utf-8") == raw
+
+
+def test_repeated_failed_loads_do_not_accumulate_backups():
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    for _ in range(5):
+        config_path().write_text("{not json", encoding="utf-8")
+        Config.load()
+    backups = list(config_path().parent.glob("*.corrupt*"))
+    assert len(backups) == 1
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"window": {"height": "abc"}},
+        {"window": {"opacity": 5.0}},
+        {"expanded_tiles": 5},
+        {"browser_accounts": "x"},
+        {"refresh_interval_minutes": 9999},
+        {"providers": []},
+        {"openrouter": "nope"},
+        {"opencode_go": 7},
+    ],
+)
+def test_one_bad_setting_does_not_discard_the_others(bad):
+    # Before salvage, a single bogus value anywhere in the file cost the user
+    # every unrelated setting - accounts, quotas, budgets, window geometry -
+    # and the next save made that permanent.
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "active_refresh_interval_minutes": 3,
+        "copilot": {"username": "octocat", "monthly_quota": 7000},
+        "openrouter": {"daily_budget": 25.0},
+        "browser_accounts": [{"id": "work", "kind": "claude"}],
+        "window": {"x": 111, "y": 222},
+    }
+    payload.update(bad)
+    config_path().write_text(json.dumps(payload), encoding="utf-8")
+    c = Config.load()
+    assert c.active_refresh_interval_minutes == 3
+    assert c.copilot.username == "octocat"
+    assert c.copilot.monthly_quota == 7000
+    # Only the key that is actually broken is dropped. _migrate always
+    # re-seeds the built-in claude/codex accounts, so assert on membership.
+    if "browser_accounts" not in bad:
+        assert "work" in [a.id for a in c.browser_accounts]
+    if "openrouter" not in bad:
+        assert c.openrouter.daily_budget == 25.0
+    if "window" not in bad:
+        assert c.window.x == 111 and c.window.y == 222
+
+
+def test_malformed_account_colors_do_not_wipe_the_config():
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        json.dumps(
+            {
+                "active_refresh_interval_minutes": 3,
+                "copilot": {"username": "octocat"},
+                "browser_accounts": [
+                    {"id": "claude", "kind": "claude", "colors": {"green_max": 500}},
+                    {"id": "codex", "kind": "codex", "colors": 7},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    c = Config.load()
+    assert c.copilot.username == "octocat"
+    assert c.active_refresh_interval_minutes == 3
+    assert [a.id for a in c.browser_accounts] == ["claude", "codex"]
+
+
+def test_color_thresholds_clamp_rather_than_reject_numeric_cutoffs():
+    from aigauge.config import ColorThresholds
+
+    # In range after clamping and still ordered -> the clamped value is kept.
+    assert ColorThresholds(green_max=-5).green_max == 0
+    # Clamping to 100 would put green above yellow, so the band set is
+    # repaired to defaults rather than left with an unreachable range.
+    repaired = ColorThresholds(green_max=500)
+    assert repaired.green_max <= repaired.yellow_max <= repaired.orange_max
+    assert (repaired.green_max, repaired.yellow_max) == (59, 79)
+    # A clamped value that stays ordered survives.
+    assert ColorThresholds(green_max=500, yellow_max=100, orange_max=100).green_max == 100
+
+
+def test_color_thresholds_reject_assignment_of_non_hex_color():
+    from aigauge.config import ColorThresholds
+
+    # validate_assignment keeps a runtime mutation from smuggling a payload
+    # into the Qt stylesheet sinks.
+    ct = ColorThresholds()
+    ct.green_color = "red; } * { background: url(http://evil/x) }"
+    assert ct.green_color == "#22c55e"

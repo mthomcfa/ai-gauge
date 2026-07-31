@@ -32,6 +32,7 @@ from .cookie_dialog import CookieDialog
 from .error_dialog import ErrorDetailsDialog
 from .history import HistoryStore
 from .logging_setup import setup_logging
+from .gauge import highest_indicator
 from .menubar import render_menubar_pixmap
 from .models import SnapshotStatus, UsageSnapshot
 from .platforms import autostart_command, get_platform
@@ -61,19 +62,18 @@ _HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000
 _LOG_VALUE_LIMIT = 300
 
 
-def _make_dot_tray_icon(percent: float | None = None) -> QIcon:
+def _make_dot_tray_icon(color: str | None = None) -> QIcon:
+    """Tray dot in the given band colour (grey when there is nothing to show).
+
+    The colour is resolved by the shared gauge bands, so the tray agrees with
+    the expanded bars and compact chips. This unified the cutoffs: the dot used
+    to have its own fixed 75/90 thresholds.
+    """
     pix = QPixmap(32, 32)
     pix.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pix)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    if percent is None:
-        painter.setBrush(QColor("#6b7280"))
-    elif percent >= 90:
-        painter.setBrush(QColor("#ef4444"))
-    elif percent >= 75:
-        painter.setBrush(QColor("#f59e0b"))
-    else:
-        painter.setBrush(QColor("#22c55e"))
+    painter.setBrush(QColor(color or "#6b7280"))
     painter.setPen(Qt.PenStyle.NoPen)
     painter.drawEllipse(4, 4, 24, 24)
     painter.end()
@@ -283,6 +283,7 @@ class App(QObject):
                 self._native_status.update(
                     self._snapshots,
                     _enabled_providers(self._config),
+                    self._config,
                 )
                 self._native_status.set_tooltip(f"AI Gauge {__version__}")
                 self._tray = None
@@ -685,6 +686,7 @@ class App(QObject):
             self._native_status.update(
                 self._snapshots,
                 _enabled_providers(self._config),
+                self._config,
             )
             self._native_status.set_tooltip(tooltip)
             return
@@ -708,18 +710,14 @@ class App(QObject):
     def _render_tray_icon(self) -> QIcon:
         if self._ui_mode == "menubar":
             providers = _enabled_providers(self._config)
-            pixmap = render_menubar_pixmap(self._snapshots, providers)
+            pixmap = render_menubar_pixmap(
+                self._snapshots, providers, config=self._config
+            )
             return QIcon(pixmap)
-        max_pct: float | None = None
-        for snap in self._snapshots.values():
-            if snap.status != SnapshotStatus.OK:
-                continue
-            for m in snap.metrics:
-                if m.percent_used is None:
-                    continue
-                if max_pct is None or m.percent_used > max_pct:
-                    max_pct = m.percent_used
-        return _make_dot_tray_icon(max_pct)
+        indicator = highest_indicator(
+            self._config, self._snapshots, _enabled_providers(self._config)
+        )
+        return _make_dot_tray_icon(indicator.color if indicator else None)
 
     # ----- Login / cookie paste -----
 
@@ -894,6 +892,9 @@ class App(QObject):
         if accepted:
             dlg.apply_to(self._config)
             self._build_providers()
+            self._widget.apply_gauge_colors()
+            # Colour-only changes must not wait for the next network refresh.
+            self._update_tray()
             self._widget.apply_window_settings()
             self._widget.show()
             # Copilot's metric label bakes the quota into the displayed string.

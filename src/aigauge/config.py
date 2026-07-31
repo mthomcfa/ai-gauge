@@ -5,10 +5,17 @@ import logging
 import re
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 import keyring
-from pydantic import BaseModel, Field, field_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from .platforms import APP_NAME, get_platform
 
@@ -135,11 +142,152 @@ class ProviderToggles(BaseModel):
     opencode_go: bool = False
 
 
+_HEX_COLOR_RE = re.compile(r"#[0-9A-Fa-f]{6}")
+
+_DEFAULT_BAND_COLORS = {
+    "green_color": "#22c55e",
+    "yellow_color": "#f59e0b",
+    "orange_color": "#f97316",
+    "red_color": "#ef4444",
+}
+_DEFAULT_CUTOFFS = {"green_max": 59, "yellow_max": 79, "orange_max": 94}
+
+
+def _safe_repr(value: object, limit: int = 120) -> str:
+    """Describe an untrusted value for a log line without ever raising.
+
+    ``repr()`` is not total. A deeply nested structure raises ``RecursionError``
+    and an integer of more than 4300 digits raises ``ValueError`` (CPython's
+    int/str conversion limit). ``logging`` swallows a ``ValueError`` raised
+    while formatting, but ``RecursionError`` propagates - the stack is still
+    exhausted when the error handler runs - so a bare ``%r`` in a validator can
+    take down the caller. These validators promise never to raise, so they
+    cannot use ``%r`` on attacker-controlled input.
+    """
+    try:
+        text = repr(value)
+    except Exception:  # noqa: BLE001 - describing a value must never fail
+        return type(value).__name__
+    if len(text) > limit:
+        return f"{type(value).__name__}, {text[:limit]}..."
+    return text
+
+
+class ColorThresholds(BaseModel):
+    """Per-account gauge severity bands.
+
+    Defaults reproduce the original fixed behaviour exactly: green below 60%,
+    yellow 60-79%, orange 80-94%, red 95%+.
+
+    Every value here is attacker-reachable through a hand-edited ``config.json``
+    and the colours are interpolated into Qt stylesheets, so all of it is
+    validated. Validation *never raises*: every check runs ``mode="before"`` and
+    coerces to the band default. That matters because ``Config.load()`` catches
+    any exception and returns a blank config, so one bad value in here would
+    otherwise silently destroy every unrelated setting the user has.
+    """
+
+    model_config = ConfigDict(validate_assignment=True)
+
+    green_max: int = _DEFAULT_CUTOFFS["green_max"]
+    yellow_max: int = _DEFAULT_CUTOFFS["yellow_max"]
+    orange_max: int = _DEFAULT_CUTOFFS["orange_max"]
+    green_color: str = _DEFAULT_BAND_COLORS["green_color"]
+    yellow_color: str = _DEFAULT_BAND_COLORS["yellow_color"]
+    orange_color: str = _DEFAULT_BAND_COLORS["orange_color"]
+    red_color: str = _DEFAULT_BAND_COLORS["red_color"]
+
+    @field_validator("green_max", "yellow_max", "orange_max", mode="before")
+    @classmethod
+    def _coerce_cutoff(cls, value: object, info) -> int:
+        # Runs before pydantic's int parsing and range checks, both of which
+        # raise. Anything unusable becomes the default; anything numeric is
+        # clamped into 0-100 rather than rejected.
+        default = _DEFAULT_CUTOFFS[info.field_name]
+        if isinstance(value, bool) or value is None:
+            return default
+        try:
+            number = int(value)
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError matters: json.loads accepts the non-standard
+            # literals Infinity / -Infinity / 1e400, and int(float("inf"))
+            # raises it. Anything escaping here reaches Config.load() and costs
+            # the user settings they did not touch.
+            log.warning(
+                "config: unusable %s (%s); using %s",
+                info.field_name,
+                _safe_repr(value),
+                default,
+            )
+            return default
+        return max(0, min(100, number))
+
+    @field_validator("green_color", "yellow_color", "orange_color", "red_color",
+                     mode="before")
+    @classmethod
+    def _coerce_color(cls, value: object, info) -> str:
+        # These strings are interpolated into Qt stylesheets
+        # (``background:{color}``). Anything other than a plain #RRGGBB literal
+        # could close the declaration and inject arbitrary QSS - including
+        # url() fetches - so refuse it and fall back to the band default.
+        # Non-string input is rejected here too, before pydantic's str check
+        # can raise.
+        default = _DEFAULT_BAND_COLORS[info.field_name]
+        text = value.strip() if isinstance(value, str) else ""
+        if _HEX_COLOR_RE.fullmatch(text):
+            return text
+        log.warning(
+            "config: rejecting invalid %s (%s); using %s",
+            info.field_name,
+            _safe_repr(value),
+            default,
+        )
+        return default
+
+    @model_validator(mode="after")
+    def _validate_band_order(self) -> ColorThresholds:
+        # Bands must be non-decreasing or band_for_percent() produces
+        # unreachable ranges. Repair in place instead of rejecting the config.
+        if not (self.green_max <= self.yellow_max <= self.orange_max):
+            log.warning(
+                "config: gauge cutoffs out of order (%s/%s/%s); using defaults",
+                self.green_max,
+                self.yellow_max,
+                self.orange_max,
+            )
+            # object.__setattr__ avoids re-entering validation under
+            # validate_assignment=True.
+            object.__setattr__(self, "green_max", _DEFAULT_CUTOFFS["green_max"])
+            object.__setattr__(self, "yellow_max", _DEFAULT_CUTOFFS["yellow_max"])
+            object.__setattr__(self, "orange_max", _DEFAULT_CUTOFFS["orange_max"])
+        return self
+
+
+def _coerce_colors_payload(value: object) -> object:
+    """Accept only a mapping (or an existing model) for a ``colors`` block.
+
+    A scalar or list in that slot would raise during validation and take the
+    whole config down with it; an empty mapping yields the defaults instead.
+    """
+    if isinstance(value, (ColorThresholds, dict)):
+        return value
+    log.warning(
+        "config: ignoring non-mapping colors block (%s); using defaults",
+        _safe_repr(value),
+    )
+    return {}
+
+
+# Every ``colors`` field uses this so malformed payloads degrade to defaults.
+GaugeColors = Annotated[ColorThresholds, BeforeValidator(_coerce_colors_payload)]
+
+
 class BrowserAccount(BaseModel):
     id: str
     kind: str
     name: str | None = None
     enabled: bool = True
+    colors: GaugeColors = Field(default_factory=ColorThresholds)
 
     @field_validator("id")
     @classmethod
@@ -153,12 +301,14 @@ class BrowserAccount(BaseModel):
 
 
 class CopilotConfig(BaseModel):
+    colors: GaugeColors = Field(default_factory=ColorThresholds)
     username: str | None = None
     billing_org: str | None = None
     monthly_quota: int = Field(default=1500, ge=1)  # AI credits; Pro=1500
 
 
 class OpenRouterConfig(BaseModel):
+    colors: GaugeColors = Field(default_factory=ColorThresholds)
     daily_budget: float | None = Field(default=None, ge=0)
 
 
@@ -198,6 +348,7 @@ def validate_opencode_usage_url(value: str) -> str:
 
 
 class OpenCodeGoConfig(BaseModel):
+    colors: GaugeColors = Field(default_factory=ColorThresholds)
     usage_url: str = DEFAULT_OPENCODE_USAGE_URL
 
     @field_validator("usage_url")
@@ -217,6 +368,22 @@ class OpenCodeGoConfig(BaseModel):
                 "config: rejecting unsafe OpenCode usage_url; using default"
             )
             return DEFAULT_OPENCODE_USAGE_URL
+
+
+def _quarantine_config(path: Path, raw: str) -> None:
+    """Keep a copy of a config file we are about to stop honouring.
+
+    ``Config.save()`` overwrites the file on the next settings change or window
+    move, so anything we discard here is gone for good otherwise. A single
+    fixed suffix keeps a repeatedly-failing load from filling the directory.
+    """
+    backup = path.with_suffix(path.suffix + ".corrupt")
+    try:
+        backup.write_text(raw, encoding="utf-8")
+    except OSError:
+        log.exception("config: could not preserve %s", path)
+        return
+    log.warning("config: previous contents preserved at %s", backup)
 
 
 class Config(BaseModel):
@@ -243,11 +410,61 @@ class Config(BaseModel):
         if not path.exists():
             return cls()
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                cls._migrate(data)
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
+            log.exception("config: cannot read %s; using defaults", path)
+            return cls()
+
+        try:
+            data = json.loads(raw)
+        except Exception:  # noqa: BLE001 - json raises several unrelated types
+            # Not just JSONDecodeError: a >4300-digit number literal raises
+            # ValueError and deep nesting raises RecursionError.
+            log.exception("config: %s is not readable JSON", path)
+            _quarantine_config(path, raw)
+            return cls()
+
+        if not isinstance(data, dict):
+            log.warning("config: %s is not a JSON object; using defaults", path)
+            _quarantine_config(path, raw)
+            return cls()
+
+        try:
+            cls._migrate(data)
+        except Exception:  # noqa: BLE001 - a failed migration must not be fatal
+            log.exception("config: migration failed; loading the file as-is")
+
+        try:
             return cls.model_validate(data)
-        except Exception:
+        except Exception:  # noqa: BLE001 - fall through to per-key salvage
+            log.warning("config: %s failed validation; salvaging valid settings", path)
+        _quarantine_config(path, raw)
+        return cls._salvage(data)
+
+    @classmethod
+    def _salvage(cls, data: dict[str, Any]) -> Config:
+        """Build a Config from the subset of ``data`` that validates.
+
+        Previously any single bad value discarded the entire file: one bogus
+        ``window.height`` cost the user their named accounts, Copilot quota,
+        OpenRouter budget and window geometry, and the next save made that
+        permanent. Settings the user never touched must survive a bad
+        neighbour, so re-validate one top-level key at a time and drop only the
+        keys that are actually broken.
+        """
+        good: dict[str, Any] = {}
+        for key, value in data.items():
+            candidate = {**good, key: value}
+            try:
+                cls.model_validate(candidate)
+            except Exception:  # noqa: BLE001 - any failure means drop this key
+                log.warning("config: dropping unusable setting %s", _safe_repr(key))
+                continue
+            good = candidate
+        try:
+            return cls.model_validate(good)
+        except Exception:  # noqa: BLE001 - should be unreachable; never crash
+            log.exception("config: salvage failed; using defaults")
             return cls()
 
     @staticmethod

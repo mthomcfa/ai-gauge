@@ -5,6 +5,7 @@ from collections.abc import Callable
 
 from PyQt6.QtCore import QPoint
 
+from .config import Config
 from .menubar import status_items
 from .models import UsageSnapshot
 
@@ -42,11 +43,27 @@ def unavailable_reason() -> str | None:
     return None if _IMPORT_ERROR is None else str(_IMPORT_ERROR)
 
 
+_NEUTRAL_NS_COLOR = "#6b7280"
+
+
 def _ns_color(hex_color: str):
-    value = hex_color.lstrip("#")
-    red = int(value[0:2], 16) / 255
-    green = int(value[2:4], 16) / 255
-    blue = int(value[4:6], 16) / 255
+    """Parse a #RRGGBB string into an NSColor.
+
+    Since gauge colours became user-configurable this receives values that
+    originate in config.json rather than only module constants, so a malformed
+    string must not raise on every menu-bar repaint. config.ColorThresholds
+    already guarantees #RRGGBB; this is the same belt-and-braces laundering the
+    Qt stylesheet sinks apply.
+    """
+    value = str(hex_color or "").strip().lstrip("#")
+    try:
+        if len(value) != 6:
+            raise ValueError(value)
+        channels = [int(value[i : i + 2], 16) / 255 for i in (0, 2, 4)]
+    except ValueError:
+        neutral = _NEUTRAL_NS_COLOR.lstrip("#")
+        channels = [int(neutral[i : i + 2], 16) / 255 for i in (0, 2, 4)]
+    red, green, blue = channels
     return NSColor.colorWithCalibratedRed_green_blue_alpha_(red, green, blue, 1.0)
 
 
@@ -135,8 +152,9 @@ class NativeMacStatusItem:
         self,
         snapshots: dict[str, UsageSnapshot],
         enabled_providers: tuple[str, ...],
+        config: Config | None = None,
     ) -> None:
-        items = status_items(snapshots, enabled_providers)
+        items = status_items(snapshots, enabled_providers, config)
         button = self._status_item.button()
         button.setAttributedTitle_(_attributed_title(items))
 

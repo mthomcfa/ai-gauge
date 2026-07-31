@@ -208,3 +208,53 @@ def test_clear_saved_pat_checkbox_removes_existing_pat(qtbot, monkeypatch):
     dialog._accept()  # noqa: SLF001
 
     assert calls == [None]
+
+
+def test_gauge_colors_dialog_keeps_cutoffs_non_decreasing(qtbot):
+    from aigauge.config import ColorThresholds
+    from aigauge.settings_dialog import GaugeColorsDialog
+
+    dialog = GaugeColorsDialog("Claude", ColorThresholds())
+    qtbot.addWidget(dialog)
+
+    # Dragging green above yellow must push the later bands along, never leave
+    # an unreachable range behind.
+    dialog._spins["green"].setValue(90)  # noqa: SLF001
+
+    colors = dialog.colors()
+    assert colors.green_max == 90
+    assert colors.yellow_max >= 90
+    assert colors.orange_max >= colors.yellow_max
+
+
+def test_gauge_colors_dialog_reset_restores_defaults(qtbot):
+    from aigauge.config import ColorThresholds
+    from aigauge.settings_dialog import GaugeColorsDialog
+
+    dialog = GaugeColorsDialog("Claude", ColorThresholds(green_max=5, green_color="#010203"))
+    qtbot.addWidget(dialog)
+    dialog._reset_defaults()  # noqa: SLF001
+
+    colors = dialog.colors()
+    assert (colors.green_max, colors.yellow_max, colors.orange_max) == (59, 79, 94)
+    assert colors.green_color == "#22c55e"
+
+
+def test_account_and_provider_colors_persist_through_apply(qtbot, monkeypatch):
+    from aigauge.config import ColorThresholds
+
+    monkeypatch.setattr(settings_dialog, "set_start_at_login", lambda enabled: None)
+    config = Config()
+    dialog = SettingsDialog(config)
+    qtbot.addWidget(dialog)
+
+    dialog._browser_account_rows[0].colors = ColorThresholds(  # noqa: SLF001
+        green_color="#111111"
+    )
+    dialog._provider_colors["copilot"] = ColorThresholds(  # noqa: SLF001
+        red_color="#222222"
+    )
+    dialog.apply_to(config)
+
+    assert config.browser_accounts[0].colors.green_color == "#111111"
+    assert config.copilot.colors.red_color == "#222222"
