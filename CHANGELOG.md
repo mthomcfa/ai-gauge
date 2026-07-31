@@ -6,6 +6,10 @@
 > earlier `0.6.4` entry predates that convention and **is not** upstream's
 > `v0.6.4`, which is different code.
 
+## 0.0.1+cfa.1 - 2026-07-31
+
+RELEASE PIPELINE DRY RUN - not a real release.
+
 ## 0.6.5+cfa.1 - 2026-07-31
 
 First release under the fork's explicit versioning scheme, plus a substantial
