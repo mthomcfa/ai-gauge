@@ -42,6 +42,7 @@ from PyQt6.QtWidgets import (
 
 from . import __version__
 from .config import (
+    ColorThresholds,
     Config,
     WINDOW_COLLAPSED_HEIGHT,
     WINDOW_MAX_HEIGHT,
@@ -50,6 +51,7 @@ from .config import (
     browser_account,
     display_name_for_account,
 )
+from .gauge import color_for_percent, thresholds_for_provider
 from .models import SnapshotStatus, UsageSnapshot
 from .ratio import (
     MIN_SAMPLES,
@@ -178,32 +180,21 @@ def _pace_tooltip_line(
 
 
 # Severity bands are shared between the expanded row bars and the compact
-# chips. Each band pairs a bright tone (used in row bars, where the percent
-# label sits next to the bar) with a darker tone of the same hue family
-# (used in chips, where text sits on top of the fill). Same band → same
-# color name in both views.
-def _color_for_percent(p: float | None) -> str:
-    if p is None:
-        return "#6b7280"
-    if p >= 95:
-        return "#ef4444"  # red-500
-    if p >= 80:
-        return "#f97316"  # orange-500
-    if p >= 60:
-        return "#f59e0b"  # amber-500
-    return "#22c55e"  # green-500
+# chips, and are configurable per account (see config.ColorThresholds). Each
+# band pairs a bright tone (used in row bars, where the percent label sits
+# beside the bar) with a darker tone of the same hue (used in chips, where the
+# text sits on top of the fill). Deriving the chip tone by darkening keeps the
+# pairing intact for user-chosen colours instead of only the built-in palette.
+def _color_for_percent(p: float | None, colors: ColorThresholds | None = None) -> str:
+    return color_for_percent(p, colors)
 
 
-def _chip_fill_for_percent(p: float | None) -> str:
+def _chip_fill_for_percent(
+    p: float | None, colors: ColorThresholds | None = None
+) -> str:
     if p is None:
         return "#374151"
-    if p >= 95:
-        return "#b91c1c"  # red-700
-    if p >= 80:
-        return "#c2410c"  # orange-700
-    if p >= 60:
-        return "#b45309"  # amber-700
-    return "#15803d"  # green-700
+    return QColor(color_for_percent(p, colors)).darker(135).name()
 
 
 def _format_summary_percent(p: float | None) -> str:
@@ -412,13 +403,14 @@ class _SummaryChip(QWidget):
         percent: float | None,
         kind: str,
         pace: float | None = None,
+        colors: ColorThresholds | None = None,
     ) -> None:
         """kind ∈ {"ok", "loading", "auth", "error"}."""
         self._text = text
         self._pace_pct = max(0.0, min(100.0, pace)) if pace is not None else None
         if kind == "ok":
             self._percent = percent
-            self._fill_color = QColor(_chip_fill_for_percent(percent))
+            self._fill_color = QColor(_chip_fill_for_percent(percent, colors))
         elif kind == "auth":
             self._percent = 100.0
             self._fill_color = self._AUTH_FILL
@@ -572,6 +564,7 @@ class _MetricRow(QWidget):
         self.label.setMinimumWidth(70)
         self._resets_at: datetime | None = None
         self._window: timedelta | None = None
+        self._colors: ColorThresholds | None = None
 
         self.bar = _PaceProgressBar()
         self.bar.setRange(0, 100)
@@ -649,7 +642,7 @@ class _MetricRow(QWidget):
             self.pct.setText(f"{percent:.0f}%")
             self.pct.setVisible(True)
             self.bar.setVisible(True)
-        color = _color_for_percent(percent)
+        color = _color_for_percent(percent, self._colors)
         self.bar.setStyleSheet(
             f"QProgressBar {{ background:#374151; border:none; border-radius:3px; }}"
             f"QProgressBar::chunk {{ background:{color}; border-radius:3px; }}"
@@ -721,6 +714,7 @@ class _CompactMetric(QWidget):
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
+        self._colors: ColorThresholds | None = None
         self.code = QLabel("")
         self.code.setStyleSheet("color:#d1d5db; font-size:10px; font-weight:700;")
         self.code.setFixedWidth(10)
@@ -759,7 +753,7 @@ class _CompactMetric(QWidget):
         self.bar.setValue(
             0 if percent is None else int(round(max(0.0, min(percent, 100.0))))
         )
-        color = _color_for_percent(percent)
+        color = _color_for_percent(percent, self._colors)
         self.bar.setStyleSheet(
             f"QProgressBar {{ background:#374151; border:none; border-radius:3px; }}"
             f"QProgressBar::chunk {{ background:{color}; border-radius:3px; }}"
@@ -857,6 +851,7 @@ class _ProviderTile(QFrame):
         header_row.addWidget(self.status)
 
         self._rows: list[_MetricRow] = []
+        self._colors: ColorThresholds | None = None
         self._expanded = self._supports_compact_collapse()
         self._latest_snapshot: UsageSnapshot | None = None
         self._ratio_estimate: RatioEstimate | None = None
@@ -910,12 +905,21 @@ class _ProviderTile(QFrame):
             item.setParent(None)
             item.deleteLater()
         for item, metric in zip(self._compact_metrics, metrics):
+            item._colors = self._colors  # noqa: SLF001 - same-module collaborator
             item.set_metric(metric, show_reset=show_reset)
             item.show()
         self._compact_summary.setVisible(bool(metrics))
 
     def _hide_compact_metrics(self) -> None:
         self._compact_summary.setVisible(False)
+
+    def set_colors(self, colors: ColorThresholds | None) -> None:
+        """Apply this account's gauge bands and re-render the current snapshot."""
+        if self._colors == colors:
+            return
+        self._colors = colors
+        if self._latest_snapshot is not None:
+            self.set_snapshot(self._latest_snapshot)
 
     def set_refreshing(self, refreshing: bool) -> None:
         if self._refreshing == refreshing:
@@ -1153,6 +1157,7 @@ class _ProviderTile(QFrame):
             self._rows,
             rows,
         ):
+            row._colors = self._colors  # noqa: SLF001 - same-module collaborator
             row.set_metric(label, pct, reset, reset_label, note, window)
             if tag and pct is not None:
                 grouped.setdefault(tag, []).append(row.label)
@@ -1402,6 +1407,9 @@ class UsageWidget(QWidget):
             self._refit_height()
         else:
             self._tiles[provider].header.setText(display_name)
+        self._tiles[provider].set_colors(
+            thresholds_for_provider(self._config, provider)
+        )
         return self._tiles[provider]
 
     def _tile_sort_key(self, provider: str) -> tuple[int, int, str]:
@@ -1700,7 +1708,9 @@ class UsageWidget(QWidget):
             kind = "ok"
 
         chip = _SummaryChip()
-        chip.set_state(text, percent, kind, pace)
+        chip.set_state(
+            text, percent, kind, pace, thresholds_for_provider(self._config, provider)
+        )
         chip.setToolTip(tooltip)
         return chip
 
@@ -1775,6 +1785,12 @@ class UsageWidget(QWidget):
 
     def _apply_window_opacity(self) -> None:
         self.setWindowOpacity(self._target_window_opacity())
+
+    def apply_gauge_colors(self) -> None:
+        """Re-read per-account gauge bands from config and repaint."""
+        for provider, tile in self._tiles.items():
+            tile.set_colors(thresholds_for_provider(self._config, provider))
+        self._refresh_collapsed_summary()
 
     def apply_window_settings(self) -> None:
         """Re-read window-related fields from config and apply."""

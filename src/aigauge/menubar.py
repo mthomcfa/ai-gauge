@@ -15,6 +15,8 @@ from typing import Iterable
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QPainter, QPixmap
 
+from .config import ColorThresholds, Config
+from .gauge import color_for_percent, thresholds_for_provider
 from .models import SnapshotStatus, UsageSnapshot
 
 # Layout constants in logical (pre-DPR) pixels.
@@ -41,14 +43,18 @@ SETUP_COLOR = "#38bdf8"
 ERROR_COLOR = OK_COLORS["high"]
 
 
-def _color_for_percent(percent: float | None) -> str:
+def _color_for_percent(
+    percent: float | None, colors: ColorThresholds | None = None
+) -> str:
+    """Band colour for the menu-bar dot.
+
+    Delegates to the shared gauge bands so the dot, the expanded bars and the
+    compact chips always agree. Note this also unified the thresholds: the dot
+    previously used its own fixed 75/90 cutoffs while the bars used 60/80/95.
+    """
     if percent is None:
         return NEUTRAL_COLOR
-    if percent >= 90:
-        return OK_COLORS["high"]
-    if percent >= 75:
-        return OK_COLORS["med"]
-    return OK_COLORS["low"]
+    return color_for_percent(percent, colors, neutral_color=NEUTRAL_COLOR)
 
 
 def _provider_max_percent(snapshot: UsageSnapshot | None) -> float | None:
@@ -66,7 +72,9 @@ def _provider_max_percent(snapshot: UsageSnapshot | None) -> float | None:
     return best
 
 
-def _provider_color(snapshot: UsageSnapshot | None) -> str:
+def _provider_color(
+    snapshot: UsageSnapshot | None, colors: ColorThresholds | None = None
+) -> str:
     if snapshot is None:
         return NEUTRAL_COLOR
     if snapshot.status == SnapshotStatus.AUTH_REQUIRED:
@@ -74,7 +82,7 @@ def _provider_color(snapshot: UsageSnapshot | None) -> str:
     if snapshot.status == SnapshotStatus.ERROR:
         return ERROR_COLOR
     percent = _provider_max_percent(snapshot)
-    return _color_for_percent(percent)
+    return _color_for_percent(percent, colors)
 
 
 def _provider_value(snapshot: UsageSnapshot | None) -> str:
@@ -89,13 +97,16 @@ def _provider_value(snapshot: UsageSnapshot | None) -> str:
 def status_items(
     snapshots: dict[str, UsageSnapshot],
     enabled_providers: Iterable[str],
+    config: Config | None = None,
 ) -> list[tuple[str, str, str]]:
     """Return ``(provider_label, value, color)`` items for native menu bars."""
     return [
         (
             PROVIDER_LABELS.get(provider, provider[:2].title()),
             _provider_value(snapshots.get(provider)),
-            _provider_color(snapshots.get(provider)),
+            _provider_color(
+                snapshots.get(provider), thresholds_for_provider(config, provider)
+            ),
         )
         for provider in enabled_providers
     ]
@@ -125,6 +136,7 @@ def render_menubar_pixmap(
     *,
     device_pixel_ratio: float = 2.0,
     is_dark: bool = True,
+    config: Config | None = None,
 ) -> QPixmap:
     """Render a compact per-provider status icon for the macOS menu bar.
 
@@ -147,7 +159,12 @@ def render_menubar_pixmap(
     dot_count = len(providers) if providers else 1
     dot_top = height / 2 - DOT_DIAMETER / 2
     colors = (
-        [_provider_color(snapshots.get(provider)) for provider in providers]
+        [
+            _provider_color(
+                snapshots.get(provider), thresholds_for_provider(config, provider)
+            )
+            for provider in providers
+        ]
         if providers
         else [NEUTRAL_COLOR]
     )

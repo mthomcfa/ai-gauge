@@ -838,3 +838,52 @@ def test_metric_row_bar_clamps_overage_but_label_keeps_real_value(qtbot):
 
     assert row.bar._bar.value() == 100
     assert row.pct.text() == "110%"
+
+
+def test_tile_bar_uses_configured_account_colors(qtbot):
+    from aigauge.config import ColorThresholds, Config
+    from aigauge.models import SnapshotStatus, UsageMetric, UsageSnapshot
+    from aigauge.widget import UsageWidget
+
+    config = Config()
+    config.browser_accounts[0].colors = ColorThresholds(
+        green_max=5, yellow_max=6, orange_max=7, red_color="#123456"
+    )
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+
+    snapshot = UsageSnapshot(
+        provider="claude",
+        status=SnapshotStatus.OK,
+        metrics=[UsageMetric(label="Session", percent_used=50.0)],
+    )
+    widget.update_snapshot(snapshot, "Claude")
+
+    tile = widget._tiles["claude"]  # noqa: SLF001
+    # 50% is green under the defaults but red under these cutoffs.
+    assert "#123456" in tile._rows[0].bar._bar.styleSheet()  # noqa: SLF001
+
+
+def test_apply_gauge_colors_repaints_existing_tiles(qtbot):
+    from aigauge.config import ColorThresholds, Config
+    from aigauge.models import SnapshotStatus, UsageMetric, UsageSnapshot
+    from aigauge.widget import UsageWidget
+
+    config = Config()
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+    widget.update_snapshot(
+        UsageSnapshot(
+            provider="claude",
+            status=SnapshotStatus.OK,
+            metrics=[UsageMetric(label="Session", percent_used=50.0)],
+        ),
+        "Claude",
+    )
+    tile = widget._tiles["claude"]  # noqa: SLF001
+    assert "#22c55e" in tile._rows[0].bar._bar.styleSheet()  # noqa: SLF001
+
+    config.browser_accounts[0].colors = ColorThresholds(green_color="#abcdef")
+    widget.apply_gauge_colors()
+
+    assert "#abcdef" in tile._rows[0].bar._bar.styleSheet()  # noqa: SLF001

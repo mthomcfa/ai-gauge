@@ -53,10 +53,18 @@ def test_empty_renders_a_neutral_dot(qtbot):  # qtbot ensures QApplication exist
 
 
 def test_provider_dot_color_matches_threshold_band(qtbot):
+    # The dot now shares the configurable gauge bands with the expanded bars
+    # and compact chips. This also unified the cutoffs: the dot previously had
+    # its own fixed 75/90 thresholds, so 80% was amber and 90% was red; it now
+    # follows 60/80/95 like everything else.
+    from aigauge.config import ColorThresholds
+
+    defaults = ColorThresholds()
     cases = [
-        (10.0, OK_COLORS["low"]),
-        (80.0, OK_COLORS["med"]),
-        (95.0, OK_COLORS["high"]),
+        (10.0, defaults.green_color),
+        (65.0, defaults.yellow_color),
+        (80.0, defaults.orange_color),
+        (95.0, defaults.red_color),
     ]
     for percent, expected in cases:
         pix = render_menubar_pixmap({"claude": _ok_snap("claude", percent)}, ("claude",))
@@ -64,6 +72,20 @@ def test_provider_dot_color_matches_threshold_band(qtbot):
         assert color.name().lower() == expected.lower(), (
             f"percent={percent} expected {expected} got {color.name()}"
         )
+
+
+def test_provider_dot_honors_configured_colors(qtbot):
+    from aigauge.config import ColorThresholds, Config
+
+    config = Config()
+    config.browser_accounts[0].colors = ColorThresholds(
+        green_max=5, green_color="#010203"
+    )
+    pix = render_menubar_pixmap(
+        {"claude": _ok_snap("claude", 1.0)}, ("claude",), config=config
+    )
+    color = _color_at(pix, SIDE_PADDING + DOT_DIAMETER // 2, PIXMAP_HEIGHT // 2)
+    assert color.name().lower() == "#010203"
 
 
 def test_unknown_provider_renders_neutral(qtbot):
