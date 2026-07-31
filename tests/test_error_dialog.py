@@ -27,3 +27,17 @@ def test_format_diagnostics_truncates_long_body_text():
     assert "person@example.com" not in out
     # The huge page dump must not be copied wholesale into the clipboard.
     assert out.count("x") < 1000
+
+
+def test_format_diagnostics_includes_the_app_version():
+    # Fork and upstream ship overlapping release numbers, so a pasted
+    # diagnostics blob is ambiguous without the full version string. The
+    # README and the version-scheme docs both promise this field is here.
+    import json
+
+    from aigauge import __version__
+
+    snapshot = UsageSnapshot(provider="claude", status=SnapshotStatus.ERROR, error="boom")
+    payload = json.loads(_format_diagnostics("claude", snapshot))
+    assert payload["app_version"] == __version__
+    assert "+cfa." in payload["app_version"]

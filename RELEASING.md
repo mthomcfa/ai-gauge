@@ -115,16 +115,16 @@ PyInstaller cross-compilation isn't supported.
 1. Run the same local pre-flight in step 1 above on each target OS.
 2. Package the build:
    - Windows: zip the full `dist\ai-gauge\` folder.
-   - macOS: `tar -C dist -czf ai-gauge-<ver>-macos.tar.gz ai-gauge.app`
-   - Linux: `tar -C dist -czf ai-gauge-<ver>-linux.tar.gz ai-gauge`
+   - macOS: `tar -C dist -czf ai-gauge-<file-version>-macos.tar.gz ai-gauge.app`
+   - Linux: `tar -C dist -czf ai-gauge-<file-version>-linux.tar.gz ai-gauge`
 3. Create a checksum:
 
    ```powershell
-   Get-FileHash .\ai-gauge-<ver>-windows.zip -Algorithm SHA256
+   Get-FileHash .\ai-gauge-<file-version>-windows.zip -Algorithm SHA256
    ```
 
    ```bash
-   shasum -a 256 ai-gauge-<ver>-macos.tar.gz
+   shasum -a 256 ai-gauge-<file-version>-macos.tar.gz
    ```
 
 4. Push the version tag, then in GitHub go to **Releases** → **Draft a new
@@ -145,10 +145,10 @@ Native UI per OS: floating widget on Windows / Linux, menu-bar item on macOS.
 
 ### Download
 
-- Windows: `ai-gauge-<ver>-windows.zip` → extract, run `ai-gauge.exe`.
-- macOS: `ai-gauge-<ver>-macos.tar.gz` → drag `ai-gauge.app` to Applications.
+- Windows: `ai-gauge-<file-version>-windows.zip` → extract, run `ai-gauge.exe`.
+- macOS: `ai-gauge-<file-version>-macos.tar.gz` → drag `ai-gauge.app` to Applications.
   First launch needs `xattr -dr com.apple.quarantine ai-gauge.app` or right-click → Open.
-- Linux: `ai-gauge-<ver>-linux.tar.gz` → extract, run `./ai-gauge/ai-gauge`.
+- Linux: `ai-gauge-<file-version>-linux.tar.gz` → extract, run `./ai-gauge/ai-gauge`.
 
 ### Verification
 

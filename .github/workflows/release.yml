@@ -5,6 +5,12 @@ on:
     tags:
       - "v*"
 
+# Serialise releases per tag, but never cancel one midway: a half-run release
+# can publish some platforms' artifacts and not others.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 # Read-only by default; only the release job (which creates the draft
 # GitHub Release) gets contents: write.
 permissions:
@@ -247,7 +253,7 @@ jobs:
 
             _Replace this section with 3-5 user-facing highlights for this release before publishing the draft._
 
-            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ needs.resolve-version.outputs.tag }}/CHANGELOG.md) for full notes.
+            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/CHANGELOG.md) for full notes.
 
             **Downloads** (pick the artifact for your OS, extract, and run):
             - Windows: `ai-gauge-${{ needs.resolve-version.outputs.file_version }}-windows.zip`, run `ai-gauge.exe`

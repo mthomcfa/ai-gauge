@@ -199,7 +199,7 @@ Tests cover: config round-trip, Copilot and OpenRouter REST helpers (with mocked
 
 ## Relationship to upstream
 
-This fork was created from upstream [`1df4536`](https://github.com/jpajak/ai-gauge/commit/1df4536) (upstream **v0.6.3**) and audited line by line. The audit found **no covert egress, telemetry, code execution, or credential exfiltration** — the upstream source was clean. It did find 14 hardening defects, recorded with attack scenarios and fixes in [SECURITY-AUDIT.md](SECURITY-AUDIT.md).
+This fork was created from upstream [`1df4536`](https://github.com/jpajak/ai-gauge/commit/1df4536) (upstream **v0.6.3**) and audited line by line. The audit found **no covert egress, telemetry, code execution, or credential exfiltration** — the upstream source was clean. It did find 13 hardening defects — 11 fixed, 2 partially fixed, 1 left open as a maintainer call — plus one informational finding, all recorded with attack scenarios in [SECURITY-AUDIT.md](SECURITY-AUDIT.md).
 
 **What this fork has that upstream does not:**
 
@@ -230,7 +230,7 @@ Fork releases use a [PEP 440](https://peps.python.org/pep-0440/) local version s
   └──────── this fork's own release counter, NOT an upstream release number
 ```
 
-**The number before `+` does not mean "equivalent to upstream X."** This fork's `0.6.4` was built from upstream v0.6.3, while upstream separately shipped its own, unrelated `v0.6.4`; upstream also has a `v0.6.5`. The `+cfa.N` segment is what makes a fork build unambiguous, so always quote the full string in a bug report. The exact upstream commit this tree descends from is recorded in `pyproject.toml` under `[tool.ai-gauge-audit]`, and the app shows the full version in its title bar, tray tooltip, and diagnostics dump.
+**The number before `+` does not mean "equivalent to upstream X."** This fork's `0.6.4` was built from upstream v0.6.3, while upstream separately shipped its own, unrelated `v0.6.4`; upstream also has a `v0.6.5`. The `+cfa.N` segment is what makes a fork build unambiguous, so always quote the full string in a bug report. The exact upstream commit this tree descends from is recorded in `pyproject.toml` under `[tool.ai-gauge-audit]`, and the app shows the full version in its panel header, its tray tooltip, and the `app_version` field of **Copy diagnostics**.
 
 `tools/check_versions.py` enforces the scheme in CI — a bare, upstream-style number fails the build. Archive filenames substitute `-` for `+`, since GitHub normalises some characters in release asset names.
 
