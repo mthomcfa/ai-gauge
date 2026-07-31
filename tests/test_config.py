@@ -6,6 +6,7 @@ from pydantic import ValidationError
 from aigauge.config import (
     DEFAULT_OPENCODE_USAGE_URL,
     BrowserAccount,
+    ColorThresholds,
     Config,
     account_display_name,
     app_data_dir,
@@ -443,6 +444,91 @@ def test_overflowing_numeric_literals_never_wipe_the_config(literal):
     assert c.active_refresh_interval_minutes == 3
     assert c.copilot.username == "octocat"
     assert 0 <= c.copilot.colors.green_max <= 100
+
+
+class _ReprBomb:
+    """A value whose repr() raises, like a >4300-digit int or deep nesting."""
+
+    def __init__(self, exc: type[BaseException]) -> None:
+        self._exc = exc
+
+    def __repr__(self) -> str:
+        raise self._exc("boom")
+
+
+@pytest.mark.parametrize("exc", [ValueError, RecursionError, MemoryError, TypeError])
+@pytest.mark.parametrize("field", ["green_max", "green_color"])
+def test_validators_never_render_untrusted_values_with_repr(exc, field):
+    # repr() is not total. logging swallows a ValueError raised during
+    # formatting but lets RecursionError through, so a bare %r in a validator
+    # that promises never to raise is a live hazard.
+    colors = ColorThresholds.model_validate({field: _ReprBomb(exc)})
+    assert 0 <= colors.green_max <= 100
+    assert colors.green_color == "#22c55e"
+
+
+def test_unparseable_config_is_preserved_not_silently_destroyed():
+    # A file that is not JSON has no recoverable structure, so defaults are the
+    # only option - but Config.save() overwrites it on the next window move, so
+    # the user's settings must be recoverable from somewhere.
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    raw = '{"copilot": {"username": "octocat"}, "window": {'  # truncated
+    config_path().write_text(raw, encoding="utf-8")
+    c = Config.load()
+    assert c.copilot.username is None
+    backup = config_path().with_suffix(config_path().suffix + ".corrupt")
+    assert backup.exists()
+    assert backup.read_text(encoding="utf-8") == raw
+
+
+def test_repeated_failed_loads_do_not_accumulate_backups():
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    for _ in range(5):
+        config_path().write_text("{not json", encoding="utf-8")
+        Config.load()
+    backups = list(config_path().parent.glob("*.corrupt*"))
+    assert len(backups) == 1
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"window": {"height": "abc"}},
+        {"window": {"opacity": 5.0}},
+        {"expanded_tiles": 5},
+        {"browser_accounts": "x"},
+        {"refresh_interval_minutes": 9999},
+        {"providers": []},
+        {"openrouter": "nope"},
+        {"opencode_go": 7},
+    ],
+)
+def test_one_bad_setting_does_not_discard_the_others(bad):
+    # Before salvage, a single bogus value anywhere in the file cost the user
+    # every unrelated setting - accounts, quotas, budgets, window geometry -
+    # and the next save made that permanent.
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "active_refresh_interval_minutes": 3,
+        "copilot": {"username": "octocat", "monthly_quota": 7000},
+        "openrouter": {"daily_budget": 25.0},
+        "browser_accounts": [{"id": "work", "kind": "claude"}],
+        "window": {"x": 111, "y": 222},
+    }
+    payload.update(bad)
+    config_path().write_text(json.dumps(payload), encoding="utf-8")
+    c = Config.load()
+    assert c.active_refresh_interval_minutes == 3
+    assert c.copilot.username == "octocat"
+    assert c.copilot.monthly_quota == 7000
+    # Only the key that is actually broken is dropped. _migrate always
+    # re-seeds the built-in claude/codex accounts, so assert on membership.
+    if "browser_accounts" not in bad:
+        assert "work" in [a.id for a in c.browser_accounts]
+    if "openrouter" not in bad:
+        assert c.openrouter.daily_budget == 25.0
+    if "window" not in bad:
+        assert c.window.x == 111 and c.window.y == 222
 
 
 def test_malformed_account_colors_do_not_wipe_the_config():

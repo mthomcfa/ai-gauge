@@ -153,6 +153,26 @@ _DEFAULT_BAND_COLORS = {
 _DEFAULT_CUTOFFS = {"green_max": 59, "yellow_max": 79, "orange_max": 94}
 
 
+def _safe_repr(value: object, limit: int = 120) -> str:
+    """Describe an untrusted value for a log line without ever raising.
+
+    ``repr()`` is not total. A deeply nested structure raises ``RecursionError``
+    and an integer of more than 4300 digits raises ``ValueError`` (CPython's
+    int/str conversion limit). ``logging`` swallows a ``ValueError`` raised
+    while formatting, but ``RecursionError`` propagates - the stack is still
+    exhausted when the error handler runs - so a bare ``%r`` in a validator can
+    take down the caller. These validators promise never to raise, so they
+    cannot use ``%r`` on attacker-controlled input.
+    """
+    try:
+        text = repr(value)
+    except Exception:  # noqa: BLE001 - describing a value must never fail
+        return type(value).__name__
+    if len(text) > limit:
+        return f"{type(value).__name__}, {text[:limit]}..."
+    return text
+
+
 class ColorThresholds(BaseModel):
     """Per-account gauge severity bands.
 
@@ -191,10 +211,13 @@ class ColorThresholds(BaseModel):
         except (TypeError, ValueError, OverflowError):
             # OverflowError matters: json.loads accepts the non-standard
             # literals Infinity / -Infinity / 1e400, and int(float("inf"))
-            # raises it. Anything escaping here reaches Config.load()'s blanket
-            # except and discards the user's whole configuration.
+            # raises it. Anything escaping here reaches Config.load() and costs
+            # the user settings they did not touch.
             log.warning(
-                "config: unusable %s %r; using %s", info.field_name, value, default
+                "config: unusable %s (%s); using %s",
+                info.field_name,
+                _safe_repr(value),
+                default,
             )
             return default
         return max(0, min(100, number))
@@ -214,7 +237,10 @@ class ColorThresholds(BaseModel):
         if _HEX_COLOR_RE.fullmatch(text):
             return text
         log.warning(
-            "config: rejecting invalid %s %r; using %s", info.field_name, value, default
+            "config: rejecting invalid %s (%s); using %s",
+            info.field_name,
+            _safe_repr(value),
+            default,
         )
         return default
 
@@ -245,7 +271,10 @@ def _coerce_colors_payload(value: object) -> object:
     """
     if isinstance(value, (ColorThresholds, dict)):
         return value
-    log.warning("config: ignoring non-mapping colors block %r; using defaults", value)
+    log.warning(
+        "config: ignoring non-mapping colors block (%s); using defaults",
+        _safe_repr(value),
+    )
     return {}
 
 
@@ -341,6 +370,22 @@ class OpenCodeGoConfig(BaseModel):
             return DEFAULT_OPENCODE_USAGE_URL
 
 
+def _quarantine_config(path: Path, raw: str) -> None:
+    """Keep a copy of a config file we are about to stop honouring.
+
+    ``Config.save()`` overwrites the file on the next settings change or window
+    move, so anything we discard here is gone for good otherwise. A single
+    fixed suffix keeps a repeatedly-failing load from filling the directory.
+    """
+    backup = path.with_suffix(path.suffix + ".corrupt")
+    try:
+        backup.write_text(raw, encoding="utf-8")
+    except OSError:
+        log.exception("config: could not preserve %s", path)
+        return
+    log.warning("config: previous contents preserved at %s", backup)
+
+
 class Config(BaseModel):
     active_refresh_interval_minutes: int = Field(default=5, ge=1, le=180)
     refresh_interval_minutes: int = Field(default=60, ge=1, le=180)
@@ -365,11 +410,61 @@ class Config(BaseModel):
         if not path.exists():
             return cls()
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                cls._migrate(data)
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
+            log.exception("config: cannot read %s; using defaults", path)
+            return cls()
+
+        try:
+            data = json.loads(raw)
+        except Exception:  # noqa: BLE001 - json raises several unrelated types
+            # Not just JSONDecodeError: a >4300-digit number literal raises
+            # ValueError and deep nesting raises RecursionError.
+            log.exception("config: %s is not readable JSON", path)
+            _quarantine_config(path, raw)
+            return cls()
+
+        if not isinstance(data, dict):
+            log.warning("config: %s is not a JSON object; using defaults", path)
+            _quarantine_config(path, raw)
+            return cls()
+
+        try:
+            cls._migrate(data)
+        except Exception:  # noqa: BLE001 - a failed migration must not be fatal
+            log.exception("config: migration failed; loading the file as-is")
+
+        try:
             return cls.model_validate(data)
-        except Exception:
+        except Exception:  # noqa: BLE001 - fall through to per-key salvage
+            log.warning("config: %s failed validation; salvaging valid settings", path)
+        _quarantine_config(path, raw)
+        return cls._salvage(data)
+
+    @classmethod
+    def _salvage(cls, data: dict[str, Any]) -> Config:
+        """Build a Config from the subset of ``data`` that validates.
+
+        Previously any single bad value discarded the entire file: one bogus
+        ``window.height`` cost the user their named accounts, Copilot quota,
+        OpenRouter budget and window geometry, and the next save made that
+        permanent. Settings the user never touched must survive a bad
+        neighbour, so re-validate one top-level key at a time and drop only the
+        keys that are actually broken.
+        """
+        good: dict[str, Any] = {}
+        for key, value in data.items():
+            candidate = {**good, key: value}
+            try:
+                cls.model_validate(candidate)
+            except Exception:  # noqa: BLE001 - any failure means drop this key
+                log.warning("config: dropping unusable setting %s", _safe_repr(key))
+                continue
+            good = candidate
+        try:
+            return cls.model_validate(good)
+        except Exception:  # noqa: BLE001 - should be unreachable; never crash
+            log.exception("config: salvage failed; using defaults")
             return cls()
 
     @staticmethod
