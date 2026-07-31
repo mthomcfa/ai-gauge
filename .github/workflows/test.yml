@@ -10,6 +10,13 @@ on:
     # least.
     branches: [main, "claude/**"]
 
+# Stacked PRs now get CI and the matrix is 3 OS x 2 Python versions, so a
+# rapid series of pushes would otherwise leave six superseded macOS/Windows
+# jobs running per push.
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 

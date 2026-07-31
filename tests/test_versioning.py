@@ -4,7 +4,7 @@ A bare, upstream-style number is ambiguous: this fork's 0.6.4 was built from
 upstream v0.6.3 while upstream shipped its own unrelated v0.6.4, and upstream
 also has a v0.6.5. The +cfa.N local segment is the only thing that makes a
 build identifiable in a bug report, in the diagnostics dump, and in the app's
-own title bar. CI enforces it via tools/check_versions.py; these tests make
+panel header. CI enforces it via tools/check_versions.py; these tests make
 sure that enforcement actually works and cannot rot.
 """
 
@@ -109,18 +109,80 @@ def test_release_workflow_exposes_a_sanitized_file_version():
     assert "${version//+/-}" in body
 
 
-@pytest.mark.parametrize("step_name", ["Package (Windows zip + sha256)",
-                                       "Package (macOS / Linux tar.gz + sha256)"])
-def test_packaging_steps_never_use_the_raw_version(step_name):
-    # A '+' reaching an asset filename is exactly the failure this guards, and
-    # the packaging steps are where the name is actually built.
+def test_no_workflow_step_builds_a_filename_from_the_raw_version():
+    """A '+' reaching an asset filename is the failure this guards.
+
+    Deliberately sweeps EVERY step of every job rather than naming the
+    packaging steps: an earlier version of this test named them, and a
+    cosmetic rename was enough to make it error out. Worse, when it did match,
+    it inspected only two steps - the release-notes body could regress to the
+    raw version with the whole suite still green.
+    """
+    import re
+
+    # Only filenames matter. The release *title* legitimately shows the real
+    # version, '+' and all, so a blanket "no outputs.version anywhere" rule
+    # would be wrong rather than merely strict.
+    interpolated = re.compile(r"ai-gauge-\$\{\{([^}]+)\}\}")
+    shell_var = re.compile(r"ai-gauge-[\$\{]+([A-Za-z_][A-Za-z0-9_]*)")
+
     workflow = _release_workflow()
-    steps = {s.get("name"): s for s in workflow["jobs"]["build"]["steps"]}
-    assert step_name in steps, f"{step_name!r} not found; did the workflow change?"
-    wired = "\n".join(str(v) for v in steps[step_name].get("env", {}).values())
-    assert "outputs.file_version" in wired
-    # Substring check would match file_version too, so strip it before looking.
-    assert "outputs.version" not in wired.replace("outputs.file_version", "")
+    offenders: list[str] = []
+    checked = 0
+    for job_name, job in workflow["jobs"].items():
+        for step in job["steps"]:
+            label = f"{job_name}/{step.get('name', '<unnamed>')}"
+            env = step.get("env", {})
+            blob = step.get("run", "") + "\n" + str(step.get("with", ""))
+            for expr in interpolated.findall(blob):
+                # matrix.label alone carries no version; only flag a name that
+                # actually interpolates one.
+                if "version" not in expr:
+                    continue
+                checked += 1
+                if "file_version" not in expr:
+                    offenders.append(f"{label}: ai-gauge-${{{{{expr}}}}}")
+            if shell_var.search(blob):
+                # The shell-local name ("$version") rarely matches the env key
+                # ("FILE_VERSION"), so resolving by name misses the regression.
+                # Instead require that a step which builds an archive name is
+                # not handed the raw version at all.
+                for key, value in env.items():
+                    if "version" not in str(value):
+                        continue
+                    checked += 1
+                    if "file_version" not in str(value):
+                        offenders.append(f"{label}: env {key}={value}")
+    assert checked, "no archive-name construction found; did the workflow change?"
+    assert not offenders, (
+        "these build a filename from the raw version, which contains '+': "
+        + "; ".join(offenders)
+    )
+
+
+def test_main_rejects_a_bare_version(monkeypatch):
+    """The scheme check must be wired into main(), not merely defined.
+
+    Testing the helper in isolation proves nothing: deleting the single call
+    in main() leaves the helper, its docstring and every parametrised case
+    passing, while `python tools/check_versions.py` starts accepting a bare
+    0.6.6 - the exact ambiguity this whole scheme exists to prevent.
+    """
+    check = _load_check_versions()
+    monkeypatch.setattr(check, "_read_pyproject_version", lambda: "0.6.6")
+    monkeypatch.setattr(check, "_read_init_version", lambda: "0.6.6")
+    monkeypatch.setattr(check, "_readme_mentions_version", lambda v: True)
+    monkeypatch.setattr(check, "_changelog_has_section", lambda v: True)
+    assert check.main() == 1
+
+
+def test_main_accepts_a_well_formed_fork_version(monkeypatch):
+    check = _load_check_versions()
+    monkeypatch.setattr(check, "_read_pyproject_version", lambda: "9.9.9+cfa.3")
+    monkeypatch.setattr(check, "_read_init_version", lambda: "9.9.9+cfa.3")
+    monkeypatch.setattr(check, "_readme_mentions_version", lambda v: True)
+    monkeypatch.setattr(check, "_changelog_has_section", lambda v: True)
+    assert check.main() == 0
 
 
 def _run_blocks(job: dict) -> list[tuple[str, str]]:

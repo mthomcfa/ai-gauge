@@ -52,7 +52,7 @@ def _check_fork_scheme(version: str, failures: list[str]) -> None:
     real upstream release of the same value but entirely different code: this
     fork's 0.6.4 was built from upstream v0.6.3 while upstream shipped its own,
     unrelated v0.6.4. A bare number is therefore ambiguous in bug reports, in
-    the diagnostics dump, and in the app's own title bar, so CI rejects one.
+    the diagnostics dump, and in the app's panel header, so CI rejects one.
     """
     if not _FORK_VERSION_RE.fullmatch(version):
         failures.append(
