@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+> **Version numbers in this file are this fork's own.** They are not upstream
+> release numbers and do not line up with them. See "Versioning" in
+> `README.md`. Fork releases from 0.6.5 onward carry a `+cfa.N` suffix; the
+> earlier `0.6.4` entry predates that convention and **is not** upstream's
+> `v0.6.4`, which is different code.
+
+## 0.6.5+cfa.1 - 2026-07-31
+
+First release under the fork's explicit versioning scheme, plus a substantial
+documentation pass making the fork's identity and divergence from upstream
+explicit.
 
 ### Added
 
@@ -10,8 +20,18 @@
 
 - **The tray and menu-bar indicator now use the same severity cutoffs as the gauges.** They previously had their own fixed 75%/90% thresholds while the bars used 60%/80%/95%, so the indicator turned amber at 75% and red at 90%. It now follows the shared (and configurable) bands, meaning **red starts at 95% instead of 90%** by default. Lower the red cutoff for an account if you want the earlier warning back.
 - Compact summary chips derive their fill by darkening the band color instead of using fixed tones, so custom colors keep the bright-bar / dark-chip pairing. The default chip tones shift very slightly.
+- The tray indicator no longer counts OpenRouter's model-breakdown rows. Those carry each model's *share of spend*, so one model at 96% of spend drove the indicator red with no usage limit anywhere near its cap.
+- **Versioning:** fork releases now carry a PEP 440 local segment (`0.6.5+cfa.1`). The number before `+` is this fork's own counter, not a claim about which upstream release the tree matches. `tools/check_versions.py` now rejects a bare number in CI. Release archives substitute `-` for `+` in the filename, because GitHub normalises some characters in release asset names.
+- **Documentation** now describes the fork rather than upstream: the README's CI badge and download links pointed at upstream, so the front page was directing people to the *unhardened* upstream binaries. Security reports, issue-template links, contributing instructions, release process and project URLs are all routed to this fork; a new "Relationship to upstream" section records what diverges and why.
+
+### Fixed
+
+- `Config.load()` no longer discards the entire configuration when any single setting fails to parse or validate. A bad `window.height`, an out-of-range `opacity`, a wrong-typed `expanded_tiles`, or a file truncated by an interrupted write each used to cost named accounts, Copilot username/quota/billing org, OpenRouter budget, OpenCode workspace URL, window geometry, autostart and provider toggles — made permanent by the next save. Valid settings are now salvaged key by key, and a file that can no longer be honoured is preserved as `config.json.corrupt` instead of being silently destroyed.
 
 ## 0.6.4 - 2026-07-28 — security hardening
+
+> Fork release. **Not** upstream's `v0.6.4`, which is unrelated code; this was
+> built from upstream `v0.6.3` (`1df4536`).
 
 Security-hardening release following a full source audit (see
 `SECURITY-AUDIT.md`). The audit found the source clean; these are hardening

@@ -1,9 +1,16 @@
-# AI Gauge
+# AI Gauge (security-hardened fork)
 
-[![test](https://github.com/jpajak/ai-gauge/actions/workflows/test.yml/badge.svg)](https://github.com/jpajak/ai-gauge/actions/workflows/test.yml)
+[![test](https://github.com/mthomcfa/ai-gauge/actions/workflows/test.yml/badge.svg)](https://github.com/mthomcfa/ai-gauge/actions/workflows/test.yml)
 ![Windows / macOS / Linux](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-0078d4)
 ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776ab)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
+
+> **This is a fork of [jpajak/ai-gauge](https://github.com/jpajak/ai-gauge), not the upstream project.**
+> It carries a full source audit plus security fixes that upstream does not have, and its
+> version numbers are its own — they do **not** correspond to upstream releases of the same
+> number. Read [Relationship to upstream](#relationship-to-upstream) before using or reporting
+> a bug against it. Issues and security reports belong [here](https://github.com/mthomcfa/ai-gauge/issues),
+> not upstream, unless you have confirmed the problem also reproduces on upstream.
 
 If you pay for multiple AI subscriptions and frequently check your usage, AI Gauge might help. It shows session and weekly usage, reset times, account balances, and spend in a compact always-visible view, so you can get the most out of what you're paying for.
 
@@ -14,7 +21,7 @@ Compact monitor for **Claude.ai**, **ChatGPT Codex**, **GitHub Copilot**, and **
 
 > **Requires Python 3.11+.** Secrets live in the OS-native credential store (Windows Credential Manager / DPAPI, macOS Keychain, Linux Secret Service). Auto-start uses the platform's standard mechanism (Windows Task Scheduler / LaunchAgent / `~/.config/autostart`).
 
-Current version: **0.6.4**. See [CHANGELOG.md](CHANGELOG.md) for release notes.
+Current version: **0.6.5+cfa.1** — a fork version, see [Versioning](#versioning). Release notes in [CHANGELOG.md](CHANGELOG.md).
 
 AI Gauge is an independent open-source project and unofficial local desktop
 utility. It is not affiliated with Anthropic, OpenAI, GitHub, Microsoft,
@@ -50,15 +57,24 @@ notice.
 
 ## Download
 
-Pre-built binaries for each release are published on the [Releases page](https://github.com/jpajak/ai-gauge/releases). Pick the archive for your OS, extract, and run:
+Binaries are published on **[this fork's Releases page](https://github.com/mthomcfa/ai-gauge/releases)**. Do not download from upstream's releases — those are built from different code and do not contain the fixes in [SECURITY-AUDIT.md](SECURITY-AUDIT.md).
 
-| OS      | Archive                              | Run                                |
-| ------- | ------------------------------------ | ---------------------------------- |
-| Windows | `ai-gauge-<version>-windows.zip`     | extract, run `ai-gauge.exe`        |
-| macOS   | `ai-gauge-<version>-macos.tar.gz`    | extract, drag `ai-gauge.app` to Applications |
-| Linux   | `ai-gauge-<version>-linux.tar.gz`    | extract, run `./ai-gauge/ai-gauge` |
+| OS      | Archive                                | Run                                |
+| ------- | -------------------------------------- | ---------------------------------- |
+| Windows | `ai-gauge-<version>-windows.zip`       | extract, run `ai-gauge.exe`        |
+| Linux   | `ai-gauge-<version>-linux.tar.gz`      | extract, run `./ai-gauge/ai-gauge` |
 
-SHA256 sums are published alongside each archive. Builds are unsigned - see the [first-launch warnings](#build-a-standalone-binary) section below for SmartScreen / Gatekeeper handling.
+**macOS is source-only in this fork.** PyInstaller cannot cross-compile and this fork's CI builds Windows and Linux only, so there is no `.app` archive. macOS users run [from source](#run-from-source); the menu-bar UI works normally.
+
+Archive filenames substitute `-` for the `+` in the version, so `0.6.5+cfa.1` ships as `ai-gauge-0.6.5-cfa.1-windows.zip`.
+
+SHA256 sums are published alongside each archive, and every release carries a **signed build-provenance attestation** proving it was built by this repository's CI from a specific commit:
+
+```bash
+gh attestation verify ai-gauge-<version>-windows.zip --repo mthomcfa/ai-gauge
+```
+
+Verify that before trusting a download. The binaries are not code-signed with an OS-trusted certificate, so SmartScreen still warns on first launch — see [first-launch warnings](#build-a-standalone-binary).
 
 ## Run from source
 
@@ -165,6 +181,43 @@ See [RELEASING.md](RELEASING.md) for maintainer release steps.
 ```
 
 Tests cover: config round-trip, Copilot and OpenRouter REST helpers (with mocked HTTP), widget behavior, and snapshot models. Provider scrapers (Claude/Codex) require a live browser session and are validated manually.
+
+## Relationship to upstream
+
+This fork was created from upstream [`1df4536`](https://github.com/jpajak/ai-gauge/commit/1df4536) (upstream **v0.6.3**) and audited line by line. The audit found **no covert egress, telemetry, code execution, or credential exfiltration** — the upstream source was clean. It did find 14 hardening defects, recorded with attack scenarios and fixes in [SECURITY-AUDIT.md](SECURITY-AUDIT.md).
+
+**What this fork has that upstream does not:**
+
+| Area | Hardening |
+| --- | --- |
+| Secret storage | Plaintext `secrets.dat` rejected unless explicitly opted in; atomic `0600` writes; undecryptable files quarantined rather than overwritten; `CRYPTPROTECT_UI_FORBIDDEN` so DPAPI cannot hang the tray; explicit owner-only Windows DACL |
+| Embedded browser | `data:`/`blob:` top-frame navigation blocked (anti-phishing); host allowlist rejects look-alikes such as `claude.ai.evil.com` |
+| Account removal | Deletes the whole QtWebEngine profile — live Chromium cookies and cache — not just the stored blob; plus a **Clear all browser data** button |
+| OpenCode | Only allowlisted cookies injected from a pasted header; workspace URL pinned to `https` on `opencode.ai` (no `file:`, `data:`, other host, port, or embedded credentials) |
+| Path safety | Account ids validated against traversal and Windows reserved device names before use as filesystem paths |
+| Config durability | One bad setting no longer discards the whole config; unreadable files are preserved as `config.json.corrupt` |
+| Diagnostics | Email addresses redacted, scraped page text truncated |
+| Supply chain | All GitHub Actions pinned to commit SHAs, `GITHUB_TOKEN` at least privilege, PyInstaller version pinned, signed build-provenance attestation on every release |
+| Gauge colors | Validated as `#RRGGBB` and laundered through `QColor(...).name()` at every stylesheet sink |
+
+**Deliberate divergence.** Later upstream releases were reviewed and selectively cherry-picked rather than merged, because upstream v0.7.0 **regresses four of the fixes above**. Most relevant to gauge colors: upstream declares `green_color: str` with no validation and interpolates it straight into `setStyleSheet`, which is a genuine QSS injection from a hand-edited config; and it uses `Field(ge=0, le=100)` on the cutoffs, which raises and destroys the whole config file. This fork takes upstream's *features* and keeps its own hardening.
+
+That also means **upstream cannot support this build**, and bugs here may not exist upstream. File issues [here](https://github.com/mthomcfa/ai-gauge/issues). If you have confirmed a bug also reproduces on a clean upstream checkout, filing it upstream too is welcome and useful.
+
+## Versioning
+
+Fork releases use a [PEP 440](https://peps.python.org/pep-0440/) local version segment:
+
+```
+0.6.5+cfa.1
+└─┬─┘ └─┬─┘
+  │     └── fork build counter — identifies this as a fork build
+  └──────── this fork's own release counter, NOT an upstream release number
+```
+
+**The number before `+` does not mean "equivalent to upstream X."** This fork's `0.6.4` was built from upstream v0.6.3, while upstream separately shipped its own, unrelated `v0.6.4`; upstream also has a `v0.6.5`. The `+cfa.N` segment is what makes a fork build unambiguous, so always quote the full string in a bug report. The exact upstream commit this tree descends from is recorded in `pyproject.toml` under `[tool.ai-gauge-audit]`, and the app shows the full version in its title bar, tray tooltip, and diagnostics dump.
+
+`tools/check_versions.py` enforces the scheme in CI — a bare, upstream-style number fails the build. Archive filenames substitute `-` for `+`, since GitHub normalises some characters in release asset names.
 
 ## Contributing
 

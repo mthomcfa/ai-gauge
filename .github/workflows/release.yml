@@ -16,6 +16,7 @@ jobs:
     outputs:
       tag: ${{ steps.ver.outputs.tag }}
       version: ${{ steps.ver.outputs.version }}
+      file_version: ${{ steps.ver.outputs.file_version }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - id: ver
@@ -23,8 +24,13 @@ jobs:
         run: |
           tag="${GITHUB_REF_NAME}"
           version="${tag#v}"
-          echo "tag=$tag"         >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # Fork versions carry a PEP 440 local segment (0.6.5+cfa.1). '+' is
+          # legal in a version and in a git tag, but GitHub normalises some
+          # characters in release *asset* names, so archives use '-' instead.
+          file_version="${version//+/-}"
+          echo "tag=$tag"                   >> "$GITHUB_OUTPUT"
+          echo "version=$version"           >> "$GITHUB_OUTPUT"
+          echo "file_version=$file_version" >> "$GITHUB_OUTPUT"
       - name: Confirm tag matches pyproject version
         shell: bash
         run: |
@@ -130,7 +136,7 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          $version = "${{ needs.resolve-version.outputs.version }}"
+          $version = "${{ needs.resolve-version.outputs.file_version }}"
           $zipName = "ai-gauge-$version-windows.zip"
           $shaName = "$zipName.sha256"
           Compress-Archive -Path dist\ai-gauge -DestinationPath $zipName -Force
@@ -144,7 +150,7 @@ jobs:
         if: matrix.os != 'windows-latest'
         shell: bash
         run: |
-          version="${{ needs.resolve-version.outputs.version }}"
+          version="${{ needs.resolve-version.outputs.file_version }}"
           archive="ai-gauge-${version}-${{ matrix.label }}.tar.gz"
           sha="${archive}.sha256"
           tar -C dist -czf "$archive" ai-gauge
@@ -203,8 +209,8 @@ jobs:
             See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ needs.resolve-version.outputs.tag }}/CHANGELOG.md) for full notes.
 
             **Downloads** (pick the artifact for your OS, extract, and run):
-            - Windows: `ai-gauge-${{ needs.resolve-version.outputs.version }}-windows.zip`, run `ai-gauge.exe`
-            - Linux:   `ai-gauge-${{ needs.resolve-version.outputs.version }}-linux.tar.gz`, run `./ai-gauge/ai-gauge`
+            - Windows: `ai-gauge-${{ needs.resolve-version.outputs.file_version }}-windows.zip`, run `ai-gauge.exe`
+            - Linux:   `ai-gauge-${{ needs.resolve-version.outputs.file_version }}-linux.tar.gz`, run `./ai-gauge/ai-gauge`
 
             **Verify:** SHA256 sums live next to each archive. Each build also
             carries a signed provenance attestation — verify it with:

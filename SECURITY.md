@@ -10,7 +10,15 @@ Please do not open a public issue for a vulnerability that exposes session
 cookies, GitHub tokens, OpenRouter keys, or other secrets.
 
 Preferred channel: open a private security advisory at
-<https://github.com/jpajak/ai-gauge/security/advisories/new>.
+<https://github.com/mthomcfa/ai-gauge/security/advisories/new>.
+
+This is a security-hardening fork of
+[jpajak/ai-gauge](https://github.com/jpajak/ai-gauge). Report issues in **this
+fork's** code here. If you determine the issue also affects upstream — much of
+the code is shared — please report it upstream as well, at
+<https://github.com/jpajak/ai-gauge/security/advisories/new>, so users of the
+original project are covered. Include the full version string (e.g.
+`0.6.5+cfa.1`); a bare number is ambiguous between this fork and upstream.
 
 If that is not available, contact the maintainer directly through their
 GitHub profile and include:
