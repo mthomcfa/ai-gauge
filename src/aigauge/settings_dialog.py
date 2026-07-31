@@ -14,6 +14,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -36,6 +37,7 @@ from PyQt6.QtWidgets import (
 
 from .config import (
     BrowserAccount,
+    ColorThresholds,
     Config,
     account_display_name,
     app_data_dir,
@@ -286,6 +288,144 @@ def _open_in_browser(url: str) -> None:
     QDesktopServices.openUrl(QUrl(url))
 
 
+class GaugeColorsDialog(QDialog):
+    """Edit one account's gauge cutoffs and band colours.
+
+    Cutoffs are inclusive upper bounds, so the live labels read as the ranges
+    the user actually sees (e.g. "60-79%"). Values are kept non-decreasing as
+    the spin boxes move, which mirrors config.ColorThresholds' own repair.
+    """
+
+    _BANDS = (
+        ("green", "Green"),
+        ("yellow", "Yellow"),
+        ("orange", "Orange"),
+        ("red", "Red"),
+    )
+
+    def __init__(self, title: str, colors: ColorThresholds, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"{title} — gauge colors")
+        self.setStyleSheet(_build_stylesheet())
+        self._colors = colors.model_copy(deep=True)
+
+        form = QGridLayout()
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(8)
+
+        self._spins: dict[str, QSpinBox] = {}
+        for row, band in enumerate(("green", "yellow", "orange")):
+            spin = QSpinBox()
+            spin.setRange(0, 100)
+            spin.setSuffix("%")
+            spin.setValue(getattr(self._colors, f"{band}_max"))
+            spin.setObjectName(f"{band}_max_spin")
+            spin.valueChanged.connect(self._on_cutoff_changed)
+            self._spins[band] = spin
+            form.addWidget(QLabel(f"{band.title()} up to:"), row, 0)
+            form.addWidget(spin, row, 1)
+
+        self._swatches: dict[str, QPushButton] = {}
+        self._range_labels: dict[str, QLabel] = {}
+        for row, (band, label) in enumerate(self._BANDS, start=len(self._spins)):
+            swatch = QPushButton("Choose…")
+            swatch.setObjectName(f"{band}_color_btn")
+            swatch.setFixedWidth(96)
+            swatch.clicked.connect(lambda _c=False, b=band: self._pick_color(b))
+            self._swatches[band] = swatch
+            range_label = QLabel("")
+            range_label.setProperty("hint", True)
+            self._range_labels[band] = range_label
+            form.addWidget(QLabel(f"{label}:"), row, 0)
+            form.addWidget(swatch, row, 1)
+            form.addWidget(range_label, row, 2)
+        form.setColumnStretch(2, 1)
+
+        reset_btn = QPushButton("Reset defaults")
+        reset_btn.setObjectName("reset_colors_btn")
+        reset_btn.clicked.connect(self._reset_defaults)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        button_row = QHBoxLayout()
+        button_row.addWidget(reset_btn)
+        button_row.addStretch(1)
+        button_row.addWidget(buttons)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 10)
+        layout.setSpacing(10)
+        layout.addWidget(
+            _hint_label(
+                "Colors apply to this account's bars, compact chips and the "
+                "tray indicator."
+            )
+        )
+        layout.addLayout(form)
+        layout.addLayout(button_row)
+        self._refresh()
+
+    # ----- internals -----
+
+    def _on_cutoff_changed(self) -> None:
+        # Keep the cutoffs non-decreasing so no band becomes unreachable.
+        green = self._spins["green"].value()
+        yellow = max(green, self._spins["yellow"].value())
+        orange = max(yellow, self._spins["orange"].value())
+        for band, value in (("yellow", yellow), ("orange", orange)):
+            spin = self._spins[band]
+            if spin.value() != value:
+                spin.blockSignals(True)
+                spin.setValue(value)
+                spin.blockSignals(False)
+        self._colors.green_max = green
+        self._colors.yellow_max = yellow
+        self._colors.orange_max = orange
+        self._refresh()
+
+    def _pick_color(self, band: str) -> None:
+        current = QColor(getattr(self._colors, f"{band}_color"))
+        chosen = QColorDialog.getColor(current, self, f"{band.title()} color")
+        if chosen.isValid():
+            # name() always yields #rrggbb, which config's validator requires.
+            setattr(self._colors, f"{band}_color", chosen.name())
+            self._refresh()
+
+    def _reset_defaults(self) -> None:
+        self._colors = ColorThresholds()
+        for band, spin in self._spins.items():
+            spin.blockSignals(True)
+            spin.setValue(getattr(self._colors, f"{band}_max"))
+            spin.blockSignals(False)
+        self._refresh()
+
+    def _refresh(self) -> None:
+        ranges = {
+            "green": f"0-{self._colors.green_max}%",
+            "yellow": f"{self._colors.green_max + 1}-{self._colors.yellow_max}%",
+            "orange": f"{self._colors.yellow_max + 1}-{self._colors.orange_max}%",
+            "red": f"{self._colors.orange_max + 1}%+",
+        }
+        for band, _label in self._BANDS:
+            color = getattr(self._colors, f"{band}_color")
+            swatch = self._swatches[band]
+            swatch.setStyleSheet(
+                f"QPushButton {{ background:{color}; color:#111827; "
+                "border:1px solid #4b5563; border-radius:4px; padding:4px 8px; }}"
+            )
+            swatch.setText(color)
+            text = ranges[band]
+            # An empty band (cutoffs collapsed together) would never render.
+            self._range_labels[band].setText(text)
+
+    def colors(self) -> ColorThresholds:
+        return self._colors.model_copy(deep=True)
+
+
 class _BrowserAccountRow(QWidget):
     sign_in_clicked = pyqtSignal(str)
     paste_cookie_clicked = pyqtSignal(str)
@@ -301,6 +441,7 @@ class _BrowserAccountRow(QWidget):
         super().__init__(parent)
         self.account_id = account.id
         self.kind = account.kind
+        self.colors = account.colors.model_copy(deep=True)
 
         self.name_edit = QLineEdit()
         self.name_edit.setText(account.name or "")
@@ -321,6 +462,12 @@ class _BrowserAccountRow(QWidget):
         paste.setToolTip("Paste a session cookie for this account.")
         paste.clicked.connect(lambda: self.paste_cookie_clicked.emit(self.account_id))
 
+        colors_btn = QPushButton("Colors")
+        colors_btn.setObjectName(f"{account.id}_colors_btn")
+        colors_btn.setFixedWidth(64)
+        colors_btn.setToolTip("Set this account's gauge cutoffs and colors.")
+        colors_btn.clicked.connect(self._edit_colors)
+
         remove = QPushButton("Remove")
         remove.setFixedWidth(72)
         remove.setVisible(removable)
@@ -336,7 +483,14 @@ class _BrowserAccountRow(QWidget):
         layout.addWidget(self.name_edit, 1)
         layout.addWidget(sign_in)
         layout.addWidget(paste)
+        layout.addWidget(colors_btn)
         layout.addWidget(remove)
+
+    def _edit_colors(self) -> None:
+        label = self.name_edit.text().strip() or provider_base_name(self.kind)
+        dialog = GaugeColorsDialog(label, self.colors, parent=self)
+        if dialog.exec():
+            self.colors = dialog.colors()
 
     def to_account(self) -> BrowserAccount:
         name = self.name_edit.text().strip() or None
@@ -345,6 +499,7 @@ class _BrowserAccountRow(QWidget):
             kind=self.kind,
             name=name,
             enabled=True,
+            colors=self.colors,
         )
 
 
@@ -370,6 +525,12 @@ class SettingsDialog(QDialog):
         self._browser_accounts = [
             account.model_copy(deep=True) for account in browser_accounts(config)
         ]
+        # Working copies so Cancel discards colour edits like every other field.
+        self._provider_colors = {
+            "copilot": config.copilot.colors.model_copy(deep=True),
+            "openrouter": config.openrouter.colors.model_copy(deep=True),
+            "opencode_go": config.opencode_go.colors.model_copy(deep=True),
+        }
 
         # ----- General -----
         general = QGroupBox("General")
@@ -631,6 +792,8 @@ class SettingsDialog(QDialog):
         copilot_form.addRow(self.gh_quota_label, self.gh_quota)
         self._set_quota_selection(config.copilot.monthly_quota)
 
+        copilot_form.addRow("", self._gauge_colors_button("copilot", "Copilot"))
+
         quota_hint = _hint_label(
             "GitHub reports usage, not a reliable personal-plan allowance through "
             "the API; choose your plan here or Custom for a different monthly "
@@ -716,6 +879,10 @@ class SettingsDialog(QDialog):
         self.or_daily_budget.setValue(float(config.openrouter.daily_budget or 0.0))
         openrouter_form.addRow("Daily budget:", self.or_daily_budget)
 
+        openrouter_form.addRow(
+            "", self._gauge_colors_button("openrouter", "OpenRouter")
+        )
+
         budget_hint = _hint_label(
             "Optional. If set, the Daily row shows a colored gauge against this "
             "budget. Leave at $0.00 to show only the dollar amount."
@@ -764,6 +931,10 @@ class SettingsDialog(QDialog):
             lambda _checked=False: self._open_opencode_usage()
         )
         opencode_go_form.addRow("", opencode_go_usage_btn)
+
+        opencode_go_form.addRow(
+            "", self._gauge_colors_button("opencode_go", "OpenCode")
+        )
 
         opencode_go_help = _hint_label(
             "Paste the workspace <b>Go</b> usage page URL. The tile reads Rolling, "
@@ -848,6 +1019,20 @@ class SettingsDialog(QDialog):
         layout.setSpacing(10)
         layout.addWidget(tabs, 1)
         layout.addLayout(button_row)
+
+    def _edit_provider_colors(self, provider: str, label: str) -> None:
+        dialog = GaugeColorsDialog(label, self._provider_colors[provider], parent=self)
+        if dialog.exec():
+            self._provider_colors[provider] = dialog.colors()
+
+    def _gauge_colors_button(self, provider: str, label: str) -> QPushButton:
+        button = QPushButton("Gauge colors…")
+        button.setObjectName(f"{provider}_colors_btn")
+        button.setToolTip("Set this provider's gauge cutoffs and colors.")
+        button.clicked.connect(
+            lambda _checked=False: self._edit_provider_colors(provider, label)
+        )
+        return button
 
     def _open_opencode_usage(self) -> None:
         raw = self.opencode_go_url.text().strip() or OPENCODE_GO_USAGE_URL
@@ -1144,6 +1329,9 @@ class SettingsDialog(QDialog):
                 purge_profile(account_id)
             except Exception:  # noqa: BLE001 - never let cleanup crash the save
                 log.exception("failed to purge profile for %s", account_id)
+        config.copilot.colors = self._provider_colors["copilot"]
+        config.openrouter.colors = self._provider_colors["openrouter"]
+        config.opencode_go.colors = self._provider_colors["opencode_go"]
         username = self.gh_username.text().strip()
         config.copilot.username = username or None
         billing_org = self.gh_billing_org.text().strip()

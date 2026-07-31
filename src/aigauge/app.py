@@ -890,6 +890,7 @@ class App(QObject):
         if accepted:
             dlg.apply_to(self._config)
             self._build_providers()
+            self._widget.apply_gauge_colors()
             self._widget.apply_window_settings()
             self._widget.show()
             # Copilot's metric label bakes the quota into the displayed string.
