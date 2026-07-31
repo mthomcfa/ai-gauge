@@ -4,7 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    # Filters on the PR's BASE branch. Stacked PRs target the branch below
+    # them rather than main, so without the second pattern they would get no
+    # CI at all until they are retargeted - which is exactly when you want it
+    # least.
+    branches: [main, "claude/**"]
 
 permissions:
   contents: read
