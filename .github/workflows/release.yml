@@ -21,25 +21,39 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - id: ver
         shell: bash
+        env:
+          # Via env, never ${{ }} inside run: a tag is attacker-supplied text
+          # to this workflow, and git ref names permit ";", "$", "&" and "`".
+          # Textual interpolation would execute them.
+          TAG: ${{ github.ref_name }}
         run: |
-          tag="${GITHUB_REF_NAME}"
-          version="${tag#v}"
-          # Fork versions carry a PEP 440 local segment (0.6.5+cfa.1). '+' is
-          # legal in a version and in a git tag, but GitHub normalises some
-          # characters in release *asset* names, so archives use '-' instead.
+          set -euo pipefail
+          # Reject anything that is not exactly a fork release tag BEFORE the
+          # value reaches any other step. Fork versions carry a PEP 440 local
+          # segment (v0.6.5+cfa.1); see "Versioning" in README.md.
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+\+cfa\.[0-9]+$'; then
+              echo "refusing to build from tag '$TAG': expected vX.Y.Z+cfa.N" >&2
+              exit 1
+          fi
+          version="${TAG#v}"
+          # '+' is legal in a version and in a git tag, but GitHub normalises
+          # some characters in release *asset* names, so archives use '-'.
           file_version="${version//+/-}"
-          echo "tag=$tag"                   >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"                   >> "$GITHUB_OUTPUT"
           echo "version=$version"           >> "$GITHUB_OUTPUT"
           echo "file_version=$file_version" >> "$GITHUB_OUTPUT"
       - name: Confirm tag matches pyproject version
         shell: bash
+        env:
+          TAG_VERSION: ${{ steps.ver.outputs.version }}
         run: |
+          set -euo pipefail
           proj_version=$(grep -E '^version\s*=' pyproject.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
           if [ -z "$proj_version" ]; then
               echo "could not find version in pyproject.toml" >&2; exit 1
           fi
-          if [ "$proj_version" != "${{ steps.ver.outputs.version }}" ]; then
-              echo "tag version ${{ steps.ver.outputs.version }} != pyproject.toml version $proj_version" >&2
+          if [ "$proj_version" != "$TAG_VERSION" ]; then
+              echo "tag version $TAG_VERSION != pyproject.toml version $proj_version" >&2
               exit 1
           fi
           echo "Tag and pyproject agree on $proj_version"
@@ -64,6 +78,13 @@ jobs:
             label: linux
             archive_ext: tar.gz
             build_cmd: ./build.sh
+          # PyInstaller cannot cross-compile, so a macOS artifact needs a macOS
+          # runner. The .app is NOT signed or notarized - see the Gatekeeper
+          # caveat in README.md and the release notes below.
+          - os: macos-latest
+            label: macos
+            archive_ext: tar.gz
+            build_cmd: ./build.sh
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -81,7 +102,7 @@ jobs:
           .\.venv\Scripts\python.exe -m pip install --upgrade pip
           .\.venv\Scripts\pip.exe install -e .[dev]
 
-      - name: Bootstrap virtualenv (Linux)
+      - name: Bootstrap virtualenv (macOS / Linux)
         if: matrix.os != 'windows-latest'
         shell: bash
         run: |
@@ -110,7 +131,7 @@ jobs:
           .\.venv\Scripts\python.exe tools\check_versions.py
           .\.venv\Scripts\python.exe -m pytest -q
 
-      - name: Run tests (Linux)
+      - name: Run tests (macOS / Linux)
         if: matrix.os != 'windows-latest'
         shell: bash
         env:
@@ -124,7 +145,7 @@ jobs:
         shell: pwsh
         run: ${{ matrix.build_cmd }}
 
-      - name: Build (Linux)
+      - name: Build (macOS / Linux)
         if: matrix.os != 'windows-latest'
         shell: bash
         run: |
@@ -135,8 +156,11 @@ jobs:
         id: pack_win
         if: matrix.os == 'windows-latest'
         shell: pwsh
+        env:
+          FILE_VERSION: ${{ needs.resolve-version.outputs.file_version }}
         run: |
-          $version = "${{ needs.resolve-version.outputs.file_version }}"
+          $ErrorActionPreference = "Stop"
+          $version = $env:FILE_VERSION
           $zipName = "ai-gauge-$version-windows.zip"
           $shaName = "$zipName.sha256"
           Compress-Archive -Path dist\ai-gauge -DestinationPath $zipName -Force
@@ -145,15 +169,32 @@ jobs:
           "archive=$zipName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "sha=$shaName"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-      - name: Package (Linux tar.gz + sha256)
+      - name: Package (macOS / Linux tar.gz + sha256)
         id: pack_unix
         if: matrix.os != 'windows-latest'
         shell: bash
+        env:
+          FILE_VERSION: ${{ needs.resolve-version.outputs.file_version }}
+          LABEL: ${{ matrix.label }}
+          RUNNER_OS_NAME: ${{ matrix.os }}
         run: |
-          version="${{ needs.resolve-version.outputs.file_version }}"
-          archive="ai-gauge-${version}-${{ matrix.label }}.tar.gz"
+          set -euo pipefail
+          version="$FILE_VERSION"
+          archive="ai-gauge-${version}-${LABEL}.tar.gz"
           sha="${archive}.sha256"
-          tar -C dist -czf "$archive" ai-gauge
+          # build.sh emits an .app bundle on macOS and a plain folder on Linux.
+          if [ "$RUNNER_OS_NAME" = "macos-latest" ]; then
+              payload="ai-gauge.app"
+          else
+              payload="ai-gauge"
+          fi
+          if [ ! -e "dist/$payload" ]; then
+              echo "expected dist/$payload to exist after the build" >&2
+              ls -la dist >&2
+              exit 1
+          fi
+          # -C dist keeps the archive rooted at the bundle/folder, not at dist/.
+          tar -C dist -czf "$archive" "$payload"
           shasum -a 256 "$archive" | awk '{print $1 " *" $2}' > "$sha"
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
           echo "sha=$sha"         >> "$GITHUB_OUTPUT"
@@ -210,12 +251,19 @@ jobs:
 
             **Downloads** (pick the artifact for your OS, extract, and run):
             - Windows: `ai-gauge-${{ needs.resolve-version.outputs.file_version }}-windows.zip`, run `ai-gauge.exe`
+            - macOS:   `ai-gauge-${{ needs.resolve-version.outputs.file_version }}-macos.tar.gz`, drag `ai-gauge.app` to Applications
             - Linux:   `ai-gauge-${{ needs.resolve-version.outputs.file_version }}-linux.tar.gz`, run `./ai-gauge/ai-gauge`
 
             **Verify:** SHA256 sums live next to each archive. Each build also
             carries a signed provenance attestation — verify it with:
             `gh attestation verify <archive> --repo ${{ github.repository }}`
 
-            Windows builds are not Authenticode-signed, so SmartScreen may warn
-            on first launch; see the README for the first-launch steps.
+            **First launch — these builds are not OS-code-signed.**
+            - Windows: SmartScreen may warn; see the README for the steps.
+            - macOS: Gatekeeper quarantines downloaded unsigned apps, and on
+              current macOS the dialog says the app "is damaged and can't be
+              opened" — which is misleading, it means unsigned, not corrupt.
+              Clear the quarantine flag after verifying the SHA256 and the
+              attestation above:
+              `xattr -dr com.apple.quarantine /Applications/ai-gauge.app`
           files: release/*

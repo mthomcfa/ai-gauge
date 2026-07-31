@@ -99,6 +99,9 @@ def main() -> int:
         return 1
 
     print(f"Version check OK: {pyproject}")
+    # The release checklist and the README both need the filename form, and
+    # deriving it by hand is how a '+' ends up in an asset name.
+    print(f"  archive file-version: {archive_version(pyproject)}")
     return 0
 
 
