@@ -5,10 +5,17 @@ import logging
 import re
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 import keyring
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from .platforms import APP_NAME, get_platform
 
@@ -143,6 +150,7 @@ _DEFAULT_BAND_COLORS = {
     "orange_color": "#f97316",
     "red_color": "#ef4444",
 }
+_DEFAULT_CUTOFFS = {"green_max": 59, "yellow_max": 79, "orange_max": 94}
 
 
 class ColorThresholds(BaseModel):
@@ -152,36 +160,57 @@ class ColorThresholds(BaseModel):
     yellow 60-79%, orange 80-94%, red 95%+.
 
     Every value here is attacker-reachable through a hand-edited ``config.json``
-    and the colours are interpolated into Qt stylesheets, so both the cutoffs
-    and the colour strings are validated. Invalid values are *coerced* to the
-    default rather than raising: a raise would escape ``Config.load()``'s
-    blanket except and reset the user's entire configuration.
+    and the colours are interpolated into Qt stylesheets, so all of it is
+    validated. Validation *never raises*: every check runs ``mode="before"`` and
+    coerces to the band default. That matters because ``Config.load()`` catches
+    any exception and returns a blank config, so one bad value in here would
+    otherwise silently destroy every unrelated setting the user has.
     """
 
-    green_max: int = Field(default=59, ge=0, le=100)
-    yellow_max: int = Field(default=79, ge=0, le=100)
-    orange_max: int = Field(default=94, ge=0, le=100)
+    model_config = ConfigDict(validate_assignment=True)
+
+    green_max: int = _DEFAULT_CUTOFFS["green_max"]
+    yellow_max: int = _DEFAULT_CUTOFFS["yellow_max"]
+    orange_max: int = _DEFAULT_CUTOFFS["orange_max"]
     green_color: str = _DEFAULT_BAND_COLORS["green_color"]
     yellow_color: str = _DEFAULT_BAND_COLORS["yellow_color"]
     orange_color: str = _DEFAULT_BAND_COLORS["orange_color"]
     red_color: str = _DEFAULT_BAND_COLORS["red_color"]
 
-    @field_validator("green_color", "yellow_color", "orange_color", "red_color")
+    @field_validator("green_max", "yellow_max", "orange_max", mode="before")
     @classmethod
-    def _validate_color(cls, value: str, info) -> str:
+    def _coerce_cutoff(cls, value: object, info) -> int:
+        # Runs before pydantic's int parsing and range checks, both of which
+        # raise. Anything unusable becomes the default; anything numeric is
+        # clamped into 0-100 rather than rejected.
+        default = _DEFAULT_CUTOFFS[info.field_name]
+        if isinstance(value, bool) or value is None:
+            return default
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            log.warning(
+                "config: unusable %s %r; using %s", info.field_name, value, default
+            )
+            return default
+        return max(0, min(100, number))
+
+    @field_validator("green_color", "yellow_color", "orange_color", "red_color",
+                     mode="before")
+    @classmethod
+    def _coerce_color(cls, value: object, info) -> str:
         # These strings are interpolated into Qt stylesheets
         # (``background:{color}``). Anything other than a plain #RRGGBB literal
         # could close the declaration and inject arbitrary QSS - including
         # url() fetches - so refuse it and fall back to the band default.
-        text = str(value or "").strip()
+        # Non-string input is rejected here too, before pydantic's str check
+        # can raise.
+        default = _DEFAULT_BAND_COLORS[info.field_name]
+        text = value.strip() if isinstance(value, str) else ""
         if _HEX_COLOR_RE.fullmatch(text):
             return text
-        default = _DEFAULT_BAND_COLORS[info.field_name]
         log.warning(
-            "config: rejecting invalid %s %r; using %s",
-            info.field_name,
-            value,
-            default,
+            "config: rejecting invalid %s %r; using %s", info.field_name, value, default
         )
         return default
 
@@ -196,10 +225,27 @@ class ColorThresholds(BaseModel):
                 self.yellow_max,
                 self.orange_max,
             )
-            self.green_max = 59
-            self.yellow_max = 79
-            self.orange_max = 94
+            # object.__setattr__ avoids re-entering validation under
+            # validate_assignment=True.
+            object.__setattr__(self, "green_max", _DEFAULT_CUTOFFS["green_max"])
+            object.__setattr__(self, "yellow_max", _DEFAULT_CUTOFFS["yellow_max"])
+            object.__setattr__(self, "orange_max", _DEFAULT_CUTOFFS["orange_max"])
         return self
+
+
+def _coerce_colors_payload(value: object) -> object:
+    """Accept only a mapping (or an existing model) for a ``colors`` block.
+
+    A scalar or list in that slot would raise during validation and take the
+    whole config down with it; an empty mapping yields the defaults instead.
+    """
+    if isinstance(value, (ColorThresholds, dict)):
+        return value
+    return {}
+
+
+# Every ``colors`` field uses this so malformed payloads degrade to defaults.
+GaugeColors = Annotated[ColorThresholds, BeforeValidator(_coerce_colors_payload)]
 
 
 class BrowserAccount(BaseModel):
@@ -207,7 +253,7 @@ class BrowserAccount(BaseModel):
     kind: str
     name: str | None = None
     enabled: bool = True
-    colors: ColorThresholds = Field(default_factory=ColorThresholds)
+    colors: GaugeColors = Field(default_factory=ColorThresholds)
 
     @field_validator("id")
     @classmethod
@@ -221,14 +267,14 @@ class BrowserAccount(BaseModel):
 
 
 class CopilotConfig(BaseModel):
-    colors: ColorThresholds = Field(default_factory=ColorThresholds)
+    colors: GaugeColors = Field(default_factory=ColorThresholds)
     username: str | None = None
     billing_org: str | None = None
     monthly_quota: int = Field(default=1500, ge=1)  # AI credits; Pro=1500
 
 
 class OpenRouterConfig(BaseModel):
-    colors: ColorThresholds = Field(default_factory=ColorThresholds)
+    colors: GaugeColors = Field(default_factory=ColorThresholds)
     daily_budget: float | None = Field(default=None, ge=0)
 
 
@@ -268,7 +314,7 @@ def validate_opencode_usage_url(value: str) -> str:
 
 
 class OpenCodeGoConfig(BaseModel):
-    colors: ColorThresholds = Field(default_factory=ColorThresholds)
+    colors: GaugeColors = Field(default_factory=ColorThresholds)
     usage_url: str = DEFAULT_OPENCODE_USAGE_URL
 
     @field_validator("usage_url")

@@ -186,7 +186,11 @@ def _pace_tooltip_line(
 # text sits on top of the fill). Deriving the chip tone by darkening keeps the
 # pairing intact for user-chosen colours instead of only the built-in palette.
 def _color_for_percent(p: float | None, colors: ColorThresholds | None = None) -> str:
-    return color_for_percent(p, colors)
+    # Round-trip through QColor so the value reaching a stylesheet is always a
+    # literal #rrggbb, whatever the caller passed. config.ColorThresholds
+    # already validates, but these strings are interpolated into QSS and that
+    # safety should not depend on validation having run.
+    return QColor(color_for_percent(p, colors)).name()
 
 
 def _chip_fill_for_percent(

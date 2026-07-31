@@ -48,9 +48,15 @@ def _color_for_percent(
 ) -> str:
     """Band colour for the menu-bar dot.
 
-    Delegates to the shared gauge bands so the dot, the expanded bars and the
-    compact chips always agree. Note this also unified the thresholds: the dot
-    previously used its own fixed 75/90 cutoffs while the bars used 60/80/95.
+    Uses the shared gauge bands, so the dot, the expanded bars and the compact
+    chips apply the same thresholds and colours. This unified those cutoffs:
+    the dot previously used its own fixed 75/90 while the bars used 60/80/95.
+
+    Note the dot and the Qt tray icon still choose *which* percentage to show
+    differently - this module prefers the Session metric (see
+    _provider_max_percent) while gauge.provider_max_percent takes the worst of
+    all metrics - so they can disagree on a provider whose weekly reading is
+    far above its session reading. That predates this change.
     """
     if percent is None:
         return NEUTRAL_COLOR

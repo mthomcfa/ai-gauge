@@ -283,6 +283,7 @@ class App(QObject):
                 self._native_status.update(
                     self._snapshots,
                     _enabled_providers(self._config),
+                    self._config,
                 )
                 self._native_status.set_tooltip(f"AI Gauge {__version__}")
                 self._tray = None
@@ -685,6 +686,7 @@ class App(QObject):
             self._native_status.update(
                 self._snapshots,
                 _enabled_providers(self._config),
+                self._config,
             )
             self._native_status.set_tooltip(tooltip)
             return

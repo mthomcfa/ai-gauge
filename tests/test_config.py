@@ -362,18 +362,103 @@ def test_existing_config_without_colors_still_loads_with_defaults():
     assert c.copilot.colors.red_color == "#ef4444"
 
 
-def test_bad_colors_in_config_do_not_wipe_the_whole_config():
+@pytest.mark.parametrize(
+    "colors",
+    [
+        # Non-str / non-int payloads: these hit pydantic's own type coercion,
+        # which raises - and a raise inside Config.load() discards the whole
+        # file. Every one of these previously wiped the user's config.
+        {"green_max": 500},
+        {"green_max": -1},
+        {"green_max": 10**20},
+        {"green_max": "abc"},
+        {"green_max": 59.7},
+        {"green_max": None},
+        {"green_max": True},
+        {"green_color": 123},
+        {"green_color": True},
+        {"green_color": ["#fff"]},
+        {"green_color": None},
+        {"green_color": ""},
+        {"green_color": "#fff"},
+        {"green_color": "red; } * { background: url(http://evil/x) } a {"},
+        {"green_max": 90, "yellow_max": 10, "orange_max": 50},
+        # A colors block that isn't a mapping at all.
+        "nope",
+        None,
+        [],
+        7,
+    ],
+)
+def test_malformed_colors_never_wipe_the_config(colors):
     config_path().parent.mkdir(parents=True, exist_ok=True)
     config_path().write_text(
         json.dumps(
             {
-                "active_refresh_interval_minutes": 4,
-                "copilot": {"username": "octocat", "colors": {"green_color": "nope"}},
+                "active_refresh_interval_minutes": 3,
+                "copilot": {
+                    "username": "octocat",
+                    "monthly_quota": 7000,
+                    "colors": colors,
+                },
+                "openrouter": {"daily_budget": 25.0},
+                "window": {"x": 111, "y": 222},
             }
         ),
         encoding="utf-8",
     )
     c = Config.load()
-    assert c.active_refresh_interval_minutes == 4
+    # Every unrelated setting must survive a bad colours block.
+    assert c.active_refresh_interval_minutes == 3
     assert c.copilot.username == "octocat"
-    assert c.copilot.colors.green_color == "#22c55e"
+    assert c.copilot.monthly_quota == 7000
+    assert c.openrouter.daily_budget == 25.0
+    assert c.window.x == 111 and c.window.y == 222
+    # And the bands are always usable.
+    assert 0 <= c.copilot.colors.green_max <= 100
+    assert c.copilot.colors.green_color.startswith("#")
+
+
+def test_malformed_account_colors_do_not_wipe_the_config():
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        json.dumps(
+            {
+                "active_refresh_interval_minutes": 3,
+                "copilot": {"username": "octocat"},
+                "browser_accounts": [
+                    {"id": "claude", "kind": "claude", "colors": {"green_max": 500}},
+                    {"id": "codex", "kind": "codex", "colors": 7},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    c = Config.load()
+    assert c.copilot.username == "octocat"
+    assert c.active_refresh_interval_minutes == 3
+    assert [a.id for a in c.browser_accounts] == ["claude", "codex"]
+
+
+def test_color_thresholds_clamp_rather_than_reject_numeric_cutoffs():
+    from aigauge.config import ColorThresholds
+
+    # In range after clamping and still ordered -> the clamped value is kept.
+    assert ColorThresholds(green_max=-5).green_max == 0
+    # Clamping to 100 would put green above yellow, so the band set is
+    # repaired to defaults rather than left with an unreachable range.
+    repaired = ColorThresholds(green_max=500)
+    assert repaired.green_max <= repaired.yellow_max <= repaired.orange_max
+    assert (repaired.green_max, repaired.yellow_max) == (59, 79)
+    # A clamped value that stays ordered survives.
+    assert ColorThresholds(green_max=500, yellow_max=100, orange_max=100).green_max == 100
+
+
+def test_color_thresholds_reject_assignment_of_non_hex_color():
+    from aigauge.config import ColorThresholds
+
+    # validate_assignment keeps a runtime mutation from smuggling a payload
+    # into the Qt stylesheet sinks.
+    ct = ColorThresholds()
+    ct.green_color = "red; } * { background: url(http://evil/x) }"
+    assert ct.green_color == "#22c55e"

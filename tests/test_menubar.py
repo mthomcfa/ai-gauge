@@ -148,3 +148,41 @@ def test_status_items_use_compact_provider_labels():
         ("Cx", "57%", OK_COLORS["low"]),
         ("Cp", "...", NEUTRAL_COLOR),
     ]
+
+
+def test_native_mac_status_item_forwards_config_to_status_items(monkeypatch):
+    """The macOS status item is the primary UI on Mac, not a fallback.
+
+    It previously called status_items() without config, so configured gauge
+    colours silently never reached the menu bar - and status_items' `config`
+    default of None meant no TypeError to catch it.
+    """
+    from aigauge import macos_status_item
+    from aigauge.config import Config
+
+    captured = {}
+
+    def fake_status_items(snapshots, providers, config=None):
+        captured["config"] = config
+        return []
+
+    monkeypatch.setattr(macos_status_item, "status_items", fake_status_items)
+
+    class _Button:
+        def setAttributedTitle_(self, _title):
+            pass
+
+    class _Item:
+        def button(self):
+            return _Button()
+
+    item = macos_status_item.NativeMacStatusItem.__new__(
+        macos_status_item.NativeMacStatusItem
+    )
+    item._status_item = _Item()
+    monkeypatch.setattr(macos_status_item, "_attributed_title", lambda items: None)
+
+    config = Config()
+    item.update({}, ("claude",), config)
+
+    assert captured["config"] is config

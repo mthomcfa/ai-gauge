@@ -77,18 +77,22 @@ def thresholds_for_provider(
 
     Falls back to defaults for unknown ids so a caller can never end up
     without a usable band definition.
+
+    Returns a *copy*: callers cache the result and compare by value to decide
+    whether to repaint, so handing back the live config object would make an
+    in-place edit invisible to that check.
     """
     if config is None:
         return ColorThresholds()
     account = browser_account(config, provider)
     if account is not None:
-        return account.colors
+        return account.colors.model_copy(deep=True)
     if provider == "copilot":
-        return config.copilot.colors
+        return config.copilot.colors.model_copy(deep=True)
     if provider == "openrouter":
-        return config.openrouter.colors
+        return config.openrouter.colors.model_copy(deep=True)
     if provider == "opencode_go":
-        return config.opencode_go.colors
+        return config.opencode_go.colors.model_copy(deep=True)
     return ColorThresholds()
 
 

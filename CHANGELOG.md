@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Per-account **gauge colors**: each Claude/Codex/OpenCode account, plus Copilot and OpenRouter, can set its own three severity cutoffs and four band colors from Settings ("Colors" on an account row, "Gauge colors…" on a provider tab). Defaults reproduce the previous appearance.
+
+### Changed
+
+- **The tray and menu-bar indicator now use the same severity cutoffs as the gauges.** They previously had their own fixed 75%/90% thresholds while the bars used 60%/80%/95%, so the indicator turned amber at 75% and red at 90%. It now follows the shared (and configurable) bands, meaning **red starts at 95% instead of 90%** by default. Lower the red cutoff for an account if you want the earlier warning back.
+- Compact summary chips derive their fill by darkening the band color instead of using fixed tones, so custom colors keep the bright-bar / dark-chip pairing. The default chip tones shift very slightly.
+
 ## 0.6.4 - 2026-07-28 — security hardening
 
 Security-hardening release following a full source audit (see

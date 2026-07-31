@@ -382,9 +382,18 @@ class GaugeColorsDialog(QDialog):
                 spin.blockSignals(True)
                 spin.setValue(value)
                 spin.blockSignals(False)
-        self._colors.green_max = green
-        self._colors.yellow_max = yellow
-        self._colors.orange_max = orange
+        # Rebuild in one shot: assigning the cutoffs one at a time would leave
+        # the model transiently out of order, and ColorThresholds repairs an
+        # out-of-order model back to defaults - silently discarding the edit.
+        self._colors = ColorThresholds(
+            green_max=green,
+            yellow_max=yellow,
+            orange_max=orange,
+            green_color=self._colors.green_color,
+            yellow_color=self._colors.yellow_color,
+            orange_color=self._colors.orange_color,
+            red_color=self._colors.red_color,
+        )
         self._refresh()
 
     def _pick_color(self, band: str) -> None:
@@ -411,11 +420,13 @@ class GaugeColorsDialog(QDialog):
             "red": f"{self._colors.orange_max + 1}%+",
         }
         for band, _label in self._BANDS:
-            color = getattr(self._colors, f"{band}_color")
+            # Laundered through QColor for the same reason as widget.py: the
+            # value is interpolated into this button's stylesheet.
+            color = QColor(getattr(self._colors, f"{band}_color")).name()
             swatch = self._swatches[band]
             swatch.setStyleSheet(
                 f"QPushButton {{ background:{color}; color:#111827; "
-                "border:1px solid #4b5563; border-radius:4px; padding:4px 8px; }}"
+                "border:1px solid #4b5563; border-radius:4px; padding:4px 8px; }"
             )
             swatch.setText(color)
             text = ranges[band]
