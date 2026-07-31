@@ -642,7 +642,10 @@ class _MetricRow(QWidget):
             self.pct.setVisible(False)
             self.bar.setVisible(has_timeline)
         else:
-            self.bar.setValue(int(round(percent)))
+            # QProgressBar treats an above-maximum value as out of range and
+            # leaves the chunk unpainted, so a Copilot overage (>100%) rendered
+            # as an empty bar. Clamp the bar while the label keeps the real value.
+            self.bar.setValue(int(round(max(0.0, min(percent, 100.0)))))
             self.pct.setText(f"{percent:.0f}%")
             self.pct.setVisible(True)
             self.bar.setVisible(True)
@@ -753,7 +756,9 @@ class _CompactMetric(QWidget):
         self.pct.setText(_format_summary_percent(percent))
         self.reset.setText(reset if show_reset else "")
         self.reset.setVisible(show_reset and bool(reset))
-        self.bar.setValue(0 if percent is None else int(round(percent)))
+        self.bar.setValue(
+            0 if percent is None else int(round(max(0.0, min(percent, 100.0))))
+        )
         color = _color_for_percent(percent)
         self.bar.setStyleSheet(
             f"QProgressBar {{ background:#374151; border:none; border-radius:3px; }}"

@@ -299,3 +299,91 @@ def test_codex_body_text_fallback_reads_new_visible_cards():
     assert snapshot.status == SnapshotStatus.OK
     assert [metric.percent_used for metric in snapshot.metrics] == [1.0, 6.0]
     assert all(metric.resets_at is not None for metric in snapshot.metrics)
+
+
+def test_codex_accepts_weekly_only_shared_agentic_layout():
+    # Codex can temporarily expose only the shared weekly agentic limit with no
+    # 5-hour Session card. That must produce a usable snapshot instead of an
+    # 'error - stale' partial-render retry loop.
+    snapshot = _build_snapshot(
+        {
+            "logged_out": False,
+            "session": None,
+            "weekly": None,
+            "title": "Codex",
+            "url": CODEX_USAGE_URL,
+            "body_text": (
+                "Personal usage Shared agentic usage limit "
+                "Weekly usage limit 40% used Resets May 19, 2026 at 9:36 AM"
+            ),
+            "has_usage_text": True,
+            "has_percent_text": True,
+        }
+    )
+
+    assert snapshot.status == SnapshotStatus.OK
+    assert [metric.label for metric in snapshot.metrics] == ["Weekly"]
+    assert snapshot.metrics[0].percent_used == 40.0
+
+
+def test_codex_weekly_only_without_shared_layout_markers_still_retries():
+    # A genuinely partial render of the OLD Session+Weekly layout must keep
+    # retrying rather than silently reporting a weekly-only snapshot.
+    snapshot = _build_snapshot(
+        {
+            "logged_out": False,
+            "session": None,
+            "weekly": None,
+            "title": "Codex",
+            "url": CODEX_USAGE_URL,
+            "body_text": "Personal usage Weekly usage limit 40% used",
+            "has_usage_text": True,
+            "has_percent_text": True,
+        }
+    )
+
+    assert snapshot.status == SnapshotStatus.ERROR
+
+
+def test_codex_weekly_only_uses_full_page_marker_not_truncated_body():
+    # body_text is truncated to 2000 chars by the extractor and the analytics
+    # panel can sit past that cut. The layout decision must come from the
+    # full-page boolean, or a valid page is rejected forever as 'stale'.
+    filler = "Task list item. " * 200  # pushes markers past the 2000-char cut
+    snapshot = _build_snapshot(
+        {
+            "logged_out": False,
+            "session": None,
+            "weekly": {"percent": 40.0, "kind": "used", "reset_text": "Mon 9:00 AM"},
+            "title": "Codex",
+            "url": CODEX_USAGE_URL,
+            "body_text": (filler + " Weekly usage limit 40% used")[:2000],
+            "has_shared_agentic_text": True,
+            "has_usage_text": True,
+            "has_percent_text": True,
+        }
+    )
+
+    assert snapshot.status == SnapshotStatus.OK
+    assert [m.label for m in snapshot.metrics] == ["Weekly"]
+
+
+def test_codex_weekly_only_idle_zero_percent_is_treated_as_mid_hydration():
+    # A lone Weekly card at 0% with an idle countdown looks identical to a
+    # half-rendered page. Accepting it would tell the user their whole weekly
+    # quota is untouched, so it must keep retrying instead.
+    snapshot = _build_snapshot(
+        {
+            "logged_out": False,
+            "session": None,
+            "weekly": {"percent": 0.0, "kind": "used", "reset_text": None},
+            "title": "Codex",
+            "url": CODEX_USAGE_URL,
+            "body_text": "Usage breakdown Weekly usage limit 0% used",
+            "has_usage_summary_text": True,
+            "has_usage_text": True,
+            "has_percent_text": True,
+        }
+    )
+
+    assert snapshot.status == SnapshotStatus.ERROR

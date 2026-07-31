@@ -278,3 +278,14 @@ def test_cookie_hydration_includes_enabled_opencode_go(monkeypatch):
 
     assert cookies.hydrate_all_from_keyring(config) == ["opencode_go"]
     assert injected == [("opencode_go", "Cookie: opencode.sid=fresh", None)]
+
+
+def test_parse_opencode_go_keeps_real_auth_session_cookie():
+    # OpenCode's actual session cookie is the host-only `auth` cookie; a
+    # prefix-only allowlist dropped it and silently broke paste-cookie setup.
+    pasted = "Cookie: auth=session-token; _ga=track; opencode.sid=legacy"
+
+    assert _parse_cookie_pairs("opencode_go", pasted) == [
+        ("auth", "session-token"),
+        ("opencode.sid", "legacy"),
+    ]

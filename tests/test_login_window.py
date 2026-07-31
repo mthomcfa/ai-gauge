@@ -40,10 +40,10 @@ def test_logged_blocked_url_drops_query_and_fragment():
 
     assert _safe_url_for_log(url) == "https://accounts.google.com/o/oauth2/v2/auth"
 
-def test_opencode_go_has_verify_target():
-    url, check_js = VERIFY_TARGETS["opencode_go"]
+def test_opencode_go_verify_target_url():
+    url, _check_js = VERIFY_TARGETS["opencode_go"]
 
     assert url.startswith("https://opencode.ai/workspace/")
-    assert "Rolling Usage" in check_js
-    assert "Weekly Usage" in check_js
-    assert "Monthly Usage" in check_js
+    # Behavior of the check itself is covered in tests/test_verify_js.py, which
+    # executes the snippet instead of grepping it: substring assertions here
+    # were satisfied by words appearing in comments.

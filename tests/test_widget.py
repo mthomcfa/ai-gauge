@@ -824,3 +824,17 @@ def test_summary_chip_stores_pace(qtbot):
     chip.set_state("Claude 37%", 37.0, "ok", pace=37)
 
     assert chip._pace_pct == 37  # noqa: SLF001
+
+
+def test_metric_row_bar_clamps_overage_but_label_keeps_real_value(qtbot):
+    # Copilot can exceed 100% of the included allowance. QProgressBar leaves an
+    # above-maximum value unpainted, so the bar must clamp while the percentage
+    # label still reports the true overage.
+    from aigauge.widget import _MetricRow
+
+    row = _MetricRow()
+    qtbot.addWidget(row)
+    row.set_metric("Premium (1650/1500)", 110.0, None)
+
+    assert row.bar._bar.value() == 100
+    assert row.pct.text() == "110%"

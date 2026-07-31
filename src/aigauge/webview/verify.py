@@ -21,12 +21,27 @@ VERIFY_TARGETS = {
         r"""(() => {
           const visibleText = el => ((el && (el.innerText || el.textContent)) || '').replace(/\s+/g, ' ').trim();
           const text = visibleText(document.body);
-          if (/5 hour usage limit/i.test(text) && /Weekly usage limit/i.test(text) && /\d+(?:\.\d+)?\s*%/.test(text)) {
+          // Mirror providers/codex.py::_build_snapshot exactly: a Weekly card
+          // plus EITHER the 5-hour Session card (old layout) OR the
+          // shared-agentic markers (new weekly-only layout). Accepting a bare
+          // weekly card here while the extractor demanded the markers let
+          // sign-in report success and then error forever on every refresh.
+          const hasWeekly = /Weekly usage limit/i.test(text) &&
+            /\d+(?:\.\d+)?\s*%/.test(text);
+          const hasSession = /5 hour usage limit/i.test(text);
+          const sharedAgentic =
+            /shared agentic usage limit|credits remaining|usage breakdown/i.test(text);
+          if (hasWeekly && (hasSession || sharedAgentic)) {
             return true;
           }
-          const labels = Array.from(document.querySelectorAll('button,a,[role="tab"],[role="button"],div,span,p'));
+          // Only interactive elements are real tabs. "Personal usage" is now a
+          // plain heading div; including div/span/p clicked that wrapper forever
+          // and exhausted the verification budget.
+          const labels = Array.from(document.querySelectorAll('button,a,[role="tab"],[role="button"]'));
           const label = labels.find(el => visibleText(el).toLowerCase() === 'personal usage');
-          const target = label && (label.closest('button,a,[role="tab"],[role="button"]') || label);
+          // `labels` is already filtered to interactive elements, so the element
+          // is its own click target.
+          const target = label;
           if (target) target.click();
           return false;
         })()""",
@@ -35,8 +50,25 @@ VERIFY_TARGETS = {
         "https://opencode.ai/workspace/wrk_01KX3HT8MFWCMHR2289KGPZ1RD/go",
         r"""(() => {
           const visibleText = el => ((el && (el.innerText || el.textContent)) || '').replace(/\s+/g, ' ').trim();
-          const text = visibleText(document.body);
-          return /Rolling Usage/i.test(text) && /Weekly Usage/i.test(text) && /Monthly Usage/i.test(text) && /\d+(?:\.\d+)?\s*%/.test(text);
+          const text = visibleText(document.body).toLowerCase();
+          // Verify the authenticated workspace shell rather than rendered usage
+          // meters: a valid account with no usage rows yet was being reported as
+          // signed out. Host and a non-root path are still pinned so a redirect
+          // to /auth or another host cannot satisfy the check.
+          //
+          // Host rule mirrors config.validate_opencode_usage_url (which allows
+          // opencode.ai and its subdomains, and any non-root path) — pinning
+          // the exact host and a /workspace/ path here would permanently fail
+          // verification for a Usage URL this app's own validator accepts.
+          const host = location.hostname.toLowerCase();
+          const hostOk = host === 'opencode.ai' || host.endsWith('.opencode.ai');
+          const pathOk = location.pathname.length > 1;
+          // Require a majority of the shell markers rather than all of them:
+          // 'api keys', 'members' and 'billing' are owner/admin nav entries, so
+          // demanding every marker reported ordinary members as signed out.
+          const shellMarkers = ['usage', 'api keys', 'members', 'billing', 'settings'];
+          const found = shellMarkers.filter(marker => text.includes(marker)).length;
+          return hostOk && pathOk && found >= 3;
         })()""",
     ),
 }

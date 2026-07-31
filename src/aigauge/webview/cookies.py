@@ -31,9 +31,17 @@ _COOKIE_TTL_DAYS = 60
 # own namespace and drop everything else.
 _OPENCODE_COOKIE_PREFIXES = ("opencode", "__secure-opencode", "__host-opencode")
 
+# OpenCode's current session cookie is the host-only `auth` cookie on
+# opencode.ai — it does NOT carry an "opencode" prefix, so the prefix rule
+# alone silently dropped the one cookie that actually authenticates. Allow the
+# exact known session-cookie names as well.
+_OPENCODE_COOKIE_NAMES = ("auth", "__secure-auth", "__host-auth")
+
 
 def _opencode_cookie_allowed(name: str) -> bool:
     lowered = name.strip().lower()
+    if lowered in _OPENCODE_COOKIE_NAMES:
+        return True
     return any(lowered.startswith(prefix) for prefix in _OPENCODE_COOKIE_PREFIXES)
 
 
