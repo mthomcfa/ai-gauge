@@ -208,7 +208,12 @@ class HeadlessScraper(QObject):
             self._last_load_is_error_page,
         )
         if not ok:
-            self._finish(None, "page failed to load")
+            # Hand back what Chromium reported. A transport failure never runs
+            # the extractor, so without this the snapshot - and "Copy
+            # diagnostics" - carry raw={} and the user has nothing to send but
+            # "page failed to load", which does not distinguish a Cloudflare
+            # challenge from a DNS failure from an aborted navigation.
+            self._finish(self._load_failure_context(), "page failed to load")
             return
         # Page DOM may render asynchronously — give React a moment, then evaluate.
         QTimer.singleShot(self._wait_ms, self._run_extractor)
@@ -217,6 +222,28 @@ class HeadlessScraper(QObject):
         if self._finished:
             return
         self._page.runJavaScript(self._extractor_js, self._on_js_result)
+
+
+    def _load_failure_context(self) -> dict[str, Any]:
+        """Everything Chromium told us about a load that never completed.
+
+        Deliberately excludes page content: no extractor ran, so there is none,
+        and the URL goes through _safe_url so query strings and fragments (which
+        can carry session material on provider auth hops) never reach the log or
+        the clipboard.
+        """
+        return {
+            "load_failed": True,
+            "page_url": _safe_url(self._page.url()),
+            "title": self._page.title(),
+            "max_progress": self._max_progress,
+            "load_status": self._last_load_status,
+            "load_error_code": self._last_load_error_code,
+            "load_error_domain": self._last_load_error_domain,
+            "load_error_string": self._last_load_error_string,
+            "is_error_page": self._last_load_is_error_page,
+            "url_changes": self._url_change_count,
+        }
 
     def _on_js_result(self, result: Any) -> None:
         if self._finished:
