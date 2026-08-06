@@ -43,7 +43,7 @@ EXTRACTOR_JS = r"""
   ];
 
   function norm(el) {
-    return (el.textContent || '').replace(/\s+/g, ' ').trim();
+    return ((el && (el.innerText || el.textContent)) || '').replace(/\s+/g, ' ').trim();
   }
 
   function findRowByLabel(label) {
@@ -88,7 +88,15 @@ EXTRACTOR_JS = r"""
     };
   }
 
-  const bodyText = (document.body.textContent || '').replace(/\s+/g, ' ').trim();
+  // innerText, not textContent: textContent concatenates the source of any
+  // <style> element in the body, and Claude inlines them. That flooded
+  // bodyText with CSS - and since CSS is full of "width:100%", the two idle
+  // checks that require the ABSENCE of a percent sign (idleUsagePanel below,
+  // and _looks_like_empty_signed_in_usage in Python) could never fire.
+  // innerText is rendering-aware and omits style/script content. Codex and
+  // webview/verify.py already read text this way; Claude did not.
+  const bodyText = ((document.body && (document.body.innerText || document.body.textContent)) || '')
+    .replace(/\s+/g, ' ').trim();
   const isLoggedOut =
     !!document.querySelector('a[href*="/login"]') &&
     !bodyText.includes('Plan usage limits');
