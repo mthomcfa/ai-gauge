@@ -1,3 +1,5 @@
+import pytest
+
 from aigauge.webview.scraper import HeadlessScraper
 
 
@@ -62,6 +64,8 @@ class _LoadFailStandIn:
     """
 
     _load_failure_context = HeadlessScraper._load_failure_context
+    _finish = HeadlessScraper._finish
+    _cleanup = lambda self: None  # noqa: E731 - no Qt objects to tear down
 
     def __init__(self):
         self._max_progress = 70
@@ -72,6 +76,11 @@ class _LoadFailStandIn:
         self._last_load_is_error_page = False
         self._url_change_count = 1
         self._provider = "claude"
+        self._attempt = 1
+        self._render_terminated = False
+        self._started_at = 0.0
+        self._max_attempts = 1
+        self._RETRYABLE_ERRORS = ()
 
         class _Page:
             def url(self):
@@ -83,10 +92,22 @@ class _LoadFailStandIn:
         self._page = _Page()
         self._finished = False
         self.finished_with: tuple[object, str] | None = None
+        self._url = "https://claude.ai/new"
+        self._last_load_url = "https://claude.ai/new"
 
-    def _finish(self, result, error):
-        self.finished_with = (result, error)
-        self._finished = True
+        outer = self
+
+        class _Done:
+            def emit(self, result, error):
+                outer.finished_with = (result, error)
+
+        self.done = _Done()
+
+        class _Timer:
+            def stop(self):
+                pass
+
+        self._timeout = _Timer()
 
 
 def test_load_failure_context_carries_the_chromium_error_detail():
@@ -126,3 +147,52 @@ def test_failed_load_actually_delivers_the_context_to_the_caller():
     assert error == "page failed to load"
     assert isinstance(result, dict), "the load-failure detail must reach the snapshot"
     assert result["load_error_string"] == "net::ERR_ABORTED"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "timeout",
+        "page failed to load",
+        "extractor returned null",
+        "extractor retry limit exceeded",
+        "some future error nobody has seen yet",
+    ],
+)
+def test_every_payloadless_failure_carries_context(error):
+    """The chokepoint, not the call sites.
+
+    Attaching context at each call site meant patching them one at a time as
+    each failure mode showed up in the wild: "page failed to load" was fixed
+    while "timeout" and "extractor returned null" kept reaching the user as
+    raw={}. Handling it in _finish means a future error path cannot miss it.
+    """
+    stand_in = _LoadFailStandIn()
+    HeadlessScraper._finish(stand_in, None, error)
+
+    assert stand_in.finished_with is not None
+    result, reported = stand_in.finished_with
+    assert reported == error
+    assert isinstance(result, dict), f"{error!r} reached the caller with no context"
+    assert result["failure"] == error
+    assert result["load_error_string"] == "net::ERR_ABORTED"
+    assert "elapsed_s" in result
+
+
+def test_success_is_never_given_a_failure_context():
+    stand_in = _LoadFailStandIn()
+    payload = {"body_text": "real data"}
+    HeadlessScraper._finish(stand_in, payload, "")
+
+    assert stand_in.finished_with == (payload, "")
+
+
+def test_a_real_payload_is_not_replaced_by_failure_context():
+    # The extractor-exhausted path passes its own payload; it is more useful
+    # than load context and must survive.
+    stand_in = _LoadFailStandIn()
+    payload = {"body_text": "what the page rendered"}
+    HeadlessScraper._finish(stand_in, payload, "extractor retry limit exceeded")
+
+    result, _ = stand_in.finished_with
+    assert result is payload

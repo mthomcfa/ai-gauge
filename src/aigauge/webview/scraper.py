@@ -208,12 +208,7 @@ class HeadlessScraper(QObject):
             self._last_load_is_error_page,
         )
         if not ok:
-            # Hand back what Chromium reported. A transport failure never runs
-            # the extractor, so without this the snapshot - and "Copy
-            # diagnostics" - carry raw={} and the user has nothing to send but
-            # "page failed to load", which does not distinguish a Cloudflare
-            # challenge from a DNS failure from an aborted navigation.
-            self._finish(self._load_failure_context(), "page failed to load")
+            self._finish(None, "page failed to load")
             return
         # Page DOM may render asynchronously — give React a moment, then evaluate.
         QTimer.singleShot(self._wait_ms, self._run_extractor)
@@ -224,7 +219,9 @@ class HeadlessScraper(QObject):
         self._page.runJavaScript(self._extractor_js, self._on_js_result)
 
 
-    def _load_failure_context(self) -> dict[str, Any]:
+    def _load_failure_context(
+        self, *, error: str = "", elapsed_s: float | None = None
+    ) -> dict[str, Any]:
         """Everything Chromium told us about a load that never completed.
 
         Deliberately excludes page content: no extractor ran, so there is none,
@@ -232,8 +229,9 @@ class HeadlessScraper(QObject):
         can carry session material on provider auth hops) never reach the log or
         the clipboard.
         """
-        return {
+        context: dict[str, Any] = {
             "load_failed": True,
+            "failure": error,
             "page_url": _safe_url(self._page.url()),
             "title": self._page.title(),
             "max_progress": self._max_progress,
@@ -243,7 +241,12 @@ class HeadlessScraper(QObject):
             "load_error_string": self._last_load_error_string,
             "is_error_page": self._last_load_is_error_page,
             "url_changes": self._url_change_count,
+            "attempt": self._attempt,
+            "render_terminated": self._render_terminated,
         }
+        if elapsed_s is not None:
+            context["elapsed_s"] = round(elapsed_s, 1)
+        return context
 
     def _on_js_result(self, result: Any) -> None:
         if self._finished:
@@ -282,6 +285,14 @@ class HeadlessScraper(QObject):
         if self._finished:
             return
         elapsed = time.monotonic() - self._started_at
+        # Attach what Chromium reported to EVERY failure that has no payload of
+        # its own. Doing this at the call sites meant patching them one at a
+        # time as each new failure mode showed up in the wild - "page failed to
+        # load" was fixed while "timeout" and "extractor returned null" kept
+        # arriving as raw={}, which tells the user nothing and tells us less.
+        # A single chokepoint cannot be missed by a future error path.
+        if error and result is None:
+            result = self._load_failure_context(error=error, elapsed_s=elapsed)
         if error and error in self._RETRYABLE_ERRORS and self._attempt < self._max_attempts:
             log.warning(
                 "scrape retry provider=%s attempt=%s/%s elapsed=%.1fs error=%s "
