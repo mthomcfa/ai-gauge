@@ -68,6 +68,24 @@ def test_codex_verify_accepts_weekly_only_with_shared_agentic_markers():
     )
 
 
+def test_codex_verify_accepts_current_shared_limit_wording():
+    # Real page text from a user's log (2026-08-06). OpenAI moved from
+    # "shared agentic usage limit" to "Codex and Work share the same usage
+    # limit"; verify.py and providers/codex.py must recognise both, or sign-in
+    # and extraction disagree and the tile errors forever.
+    assert _run_check(
+        "codex",
+        body=(
+            "Codex and Work Analytics Personal usage "
+            "Codex and Work share the same usage limit. "
+            "Weekly usage limit 100% remaining "
+            "Workspace monthly credit limit 100% remaining"
+        ),
+        host="chatgpt.com",
+        path="/codex/cloud/settings/analytics",
+    )
+
+
 def test_codex_verify_rejects_bare_weekly_without_layout_markers():
     # Must mirror providers/codex.py::_build_snapshot. Accepting this here while
     # the extractor rejected it made sign-in report success and then error on

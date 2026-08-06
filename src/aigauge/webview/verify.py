@@ -29,8 +29,13 @@ VERIFY_TARGETS = {
           const hasWeekly = /Weekly usage limit/i.test(text) &&
             /\d+(?:\.\d+)?\s*%/.test(text);
           const hasSession = /5 hour usage limit/i.test(text);
+          // Must stay in step with providers/codex.py's markers: accepting a
+          // layout here that the extractor then rejects is what made sign-in
+          // report success and the tile error forever. OpenAI has shipped
+          // several phrasings for the shared limit.
           const sharedAgentic =
-            /shared agentic usage limit|credits remaining|usage breakdown/i.test(text);
+            /shared agentic usage limit|shares? the same usage limit|workspace monthly credit limit|credits remaining|usage breakdown/i
+              .test(text);
           if (hasWeekly && (hasSession || sharedAgentic)) {
             return true;
           }
