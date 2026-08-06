@@ -574,3 +574,64 @@ def test_color_thresholds_reject_assignment_of_non_hex_color():
     ct = ColorThresholds()
     ct.green_color = "red; } * { background: url(http://evil/x) }"
     assert ct.green_color == "#22c55e"
+
+
+@pytest.mark.parametrize(
+    "payload,check",
+    [
+        ({"window": {"height": "abc"}}, lambda c: c.window.height == 220),
+        ({"window": {"height": 5}}, lambda c: c.window.height >= 1),
+        ({"window": {"opacity": 5.0}}, lambda c: c.window.opacity == 1.0),
+        ({"window": {"opacity": -1}}, lambda c: c.window.opacity == 0.3),
+        ({"window": {"ui_scale": -3}}, lambda c: c.window.ui_scale == 0.75),
+        ({"window": {"ui_scale": 99}}, lambda c: c.window.ui_scale == 4.0),
+        ({"copilot": {"monthly_quota": 0}}, lambda c: c.copilot.monthly_quota == 1),
+        ({"copilot": {"monthly_quota": "x"}}, lambda c: c.copilot.monthly_quota == 1500),
+        ({"refresh_interval_minutes": 99999}, lambda c: c.refresh_interval_minutes == 180),
+        ({"active_refresh_interval_minutes": 0}, lambda c: c.active_refresh_interval_minutes == 1),
+        (
+            {"active_refresh_interval_minutes": float("inf")},
+            lambda c: c.active_refresh_interval_minutes == 5,
+        ),
+        ({"openrouter": {"daily_budget": -1}}, lambda c: c.openrouter.daily_budget == 0.0),
+        (
+            {"openrouter": {"daily_budget": float("nan")}},
+            lambda c: c.openrouter.daily_budget is None,
+        ),
+        ({"openrouter": {"daily_budget": True}}, lambda c: c.openrouter.daily_budget is None),
+    ],
+)
+def test_bounded_settings_coerce_instead_of_discarding_their_block(payload, check):
+    """Field(ge=/le=) raises, and a raise costs the whole top-level key.
+
+    A negative daily_budget used to take the user's OpenRouter gauge colours
+    with it, silently. Every bounded setting must clamp instead, so one bad
+    number costs only that number.
+    """
+    base = {
+        "active_refresh_interval_minutes": 3,
+        "copilot": {"username": "octocat"},
+        "window": {"x": 111, "y": 222},
+    }
+    for key, value in payload.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            base[key] = {**base[key], **value}
+        else:
+            base[key] = value
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(json.dumps(base), encoding="utf-8")
+    c = Config.load()
+    assert check(c)
+    # The sibling settings in the same block must survive.
+    assert c.copilot.username == "octocat"
+
+
+def test_bad_budget_no_longer_discards_openrouter_gauge_colours():
+    # This is the exact reported regression.
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        json.dumps({"openrouter": {"daily_budget": -1, "colors": {"green_max": 10}}}),
+        encoding="utf-8",
+    )
+    c = Config.load()
+    assert c.openrouter.colors.green_max == 10

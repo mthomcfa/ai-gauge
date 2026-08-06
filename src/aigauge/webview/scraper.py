@@ -227,7 +227,13 @@ class HeadlessScraper(QObject):
         if isinstance(result, dict) and "__retry_after_ms" in result:
             self._extractor_reruns += 1
             if self._extractor_reruns > 5:
-                self._finish(None, "extractor retry limit exceeded")
+                # Hand back the last payload alongside the error. It carries the
+                # page text the extractor was looking at, and discarding it made
+                # a layout change undiagnosable: the snapshot reached the log and
+                # "Copy diagnostics" with raw_keys=[] and nothing to inspect, so
+                # the only way to see why a provider stopped parsing was to
+                # rebuild the app with extra logging.
+                self._finish(result, "extractor retry limit exceeded")
                 return
             try:
                 delay_ms = int(result.get("__retry_after_ms") or 0)
