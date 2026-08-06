@@ -14,7 +14,29 @@ from .profile import get_profile
 VERIFY_TARGETS = {
     "claude": (
         "https://claude.ai/new#settings/usage",
-        "(() => document.body && document.body.innerText.includes('Plan usage limits'))()",
+        r"""(() => {
+          const text = ((document.body && (document.body.innerText || document.body.textContent)) || '')
+            .replace(/\s+/g, ' ').trim();
+          // Pin the host so an open redirect to another origin cannot satisfy
+          // the check, mirroring the OpenCode target below.
+          const host = location.hostname.toLowerCase();
+          if (host !== 'claude.ai' && !host.endsWith('.claude.ai')) return false;
+          const path = location.pathname.toLowerCase();
+          if (path.startsWith('/login') || path.startsWith('/auth')) return false;
+          // Fast positive: the usage panel rendered.
+          if (/Plan usage limits|Current session|All models/i.test(text)) return true;
+          // Otherwise mirror providers/claude.py's isLoggedOut, INVERTED. This
+          // question is "is the session good?", not "did the usage dialog
+          // render?" - checking only for usage text coupled sign-in to the
+          // usage UI, so a usage-panel change made a perfectly valid session
+          // unverifiable. Same fix already applied to OpenCode below.
+          if (document.querySelector('a[href*="/login"]')) return false;
+          // Require some signed-in app shell so a blank or errored page is not
+          // mistaken for a session.
+          const lowered = text.toLowerCase();
+          const shell = ['new chat', 'chats', 'projects', 'settings', 'account', 'upgrade'];
+          return shell.filter(marker => lowered.includes(marker)).length >= 2;
+        })()""",
     ),
     "codex": (
         "https://chatgpt.com/codex/cloud/settings/analytics#personal-usage",
