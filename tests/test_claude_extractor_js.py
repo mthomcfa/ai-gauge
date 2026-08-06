@@ -113,6 +113,39 @@ def test_both_claude_usage_layouts_are_recognised_as_the_usage_panel(heading):
     assert out.stdout == "true", f"layout not recognised: {heading!r}"
 
 
-def test_weekly_row_falls_back_from_all_models_to_weekly():
-    # The newer layout has no "All models" row at all.
-    assert "readRow('All models') || readRow('Weekly')" in EXTRACTOR_JS
+def _weekly_row_expression() -> str:
+    match = re.search(r"const weeklyAll = ([^;]+);", EXTRACTOR_JS)
+    assert match, "weeklyAll assignment not found; did EXTRACTOR_JS change shape?"
+    return match.group(1)
+
+
+@pytest.mark.parametrize(
+    "available,expected",
+    [
+        # Legacy layout: only "All models" exists.
+        (["All models"], "All models"),
+        # New layout: only "Weekly" exists - the fallback must fire.
+        (["Weekly"], "Weekly"),
+        # Both present: legacy label wins, which is the current contract.
+        (["All models", "Weekly"], "All models"),
+    ],
+)
+def test_weekly_row_resolves_across_both_layouts(available, expected):
+    """Executes the real expression against a stubbed readRow.
+
+    The previous version of this test asserted the source string
+    "readRow('All models') || readRow('Weekly')" appeared in EXTRACTOR_JS.
+    That passes if the line survives only in a comment and fails on
+    reformatting - it tests the text, not the behaviour. I wrote it in the
+    same session in which I flagged that exact pattern five times.
+    """
+    script = f"""
+    const available = new Set({json.dumps(available)});
+    const readRow = label => available.has(label) ? label : null;
+    process.stdout.write(String({_weekly_row_expression()}));
+    """
+    out = subprocess.run(
+        ["node", "-e", script], capture_output=True, text=True, timeout=30
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout == expected
