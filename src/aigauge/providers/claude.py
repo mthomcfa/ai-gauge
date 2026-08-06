@@ -99,10 +99,15 @@ EXTRACTOR_JS = r"""
     .replace(/\s+/g, ' ').trim();
   const isLoggedOut =
     !!document.querySelector('a[href*="/login"]') &&
-    !bodyText.includes('Plan usage limits');
+    !/Plan usage/i.test(bodyText);
 
   const session = readRow('Current session');
-  const weeklyAll = readRow('All models');
+  // Claude ships two usage layouts behind a flag. The older one labels the
+  // seven-day meter "All models"; the newer gauge/bar one labels it "Weekly"
+  // (see its es[] meter table: five_hour -> "Current session", seven_day ->
+  // "Weekly", plus Opus only / Sonnet only / Cowork only / Claude Design).
+  // Requiring "All models" made the newer layout permanently unreadable.
+  const weeklyAll = readRow('All models') || readRow('Weekly');
 
   function onUsageRoute() {
     return /\/settings\/usage/.test(location.pathname) ||
@@ -112,7 +117,7 @@ EXTRACTOR_JS = r"""
   function ensureUsageRoute() {
     if (onUsageRoute()) return null;
     if (location.hostname !== 'claude.ai') return null;
-    if (/Plan usage limits|Current session|All models/i.test(bodyText)) return null;
+    if (/Plan usage|Current session|All models/i.test(bodyText)) return null;
     location.href = '/new#settings/usage';
     return 'opened usage dialog';
   }
@@ -134,10 +139,10 @@ EXTRACTOR_JS = r"""
   // The current Claude UI opens usage as a shell/dialog route. Percent text
   // elsewhere in the shell is not enough; wait for the Session/Weekly rows
   // or for the explicit idle-zero usage panel before handing data to Python.
-  const usagePanelSignals = /Plan usage limits|Current session|All models/i.test(bodyText);
-  const idleUsagePanel = /Plan usage limits/i.test(bodyText) &&
+  const usagePanelSignals = /Plan usage|Current session|All models/i.test(bodyText);
+  const idleUsagePanel = /Plan usage/i.test(bodyText) &&
     /Current session/i.test(bodyText) &&
-    /All models/i.test(bodyText) &&
+    /All models|Weekly/i.test(bodyText) &&
     !/%/.test(bodyText);
   const requiredRowsReady = !!session && !!weeklyAll;
   if (!isLoggedOut && (onUsageRoute() || usagePanelSignals) && !requiredRowsReady && !idleUsagePanel) {
@@ -182,7 +187,7 @@ def _looks_like_empty_signed_in_usage(payload: dict[str, Any]) -> bool:
     # Require positive evidence the usage panel actually rendered. Without
     # this, a partially-loaded page (sidebar only, main pane still fetching)
     # gets misclassified as idle and shown as 0/0.
-    if "plan usage limits" not in body:
+    if "plan usage" not in body:
         return False
     # If percent text is on the page but the row extractor missed it, that's
     # a layout change — not idle.

@@ -79,3 +79,40 @@ def test_body_text_falls_back_to_text_content_when_inner_text_is_absent():
     body_text = _eval_body_text(inner="", text=_VISIBLE)
 
     assert "Plan usage limits" in body_text
+
+
+def _panel_signal_expression() -> str:
+    match = re.search(r"const usagePanelSignals = (/.+?/i)\.test", EXTRACTOR_JS)
+    assert match, "usagePanelSignals not found; did EXTRACTOR_JS change shape?"
+    return match.group(1)
+
+
+@pytest.mark.parametrize(
+    "heading",
+    [
+        # Older layout.
+        "Plan usage limits Current session All models",
+        # Newer gauge/bar layout: heading is "Plan usage" and the seven-day
+        # meter is labelled "Weekly", per Claude's own meter table.
+        "Plan usage Current session Weekly Opus only Sonnet only",
+        # The heading ALONE must be enough. Including "Current session" above
+        # let a regex still pinned to "Plan usage limits" pass on that token,
+        # so the heading change was not actually being tested.
+        "Plan usage Weekly Opus only Sonnet only Claude Design",
+    ],
+)
+def test_both_claude_usage_layouts_are_recognised_as_the_usage_panel(heading):
+    script = f"""
+    const re = {_panel_signal_expression()};
+    process.stdout.write(String(re.test({json.dumps(heading)})));
+    """
+    out = subprocess.run(
+        ["node", "-e", script], capture_output=True, text=True, timeout=30
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout == "true", f"layout not recognised: {heading!r}"
+
+
+def test_weekly_row_falls_back_from_all_models_to_weekly():
+    # The newer layout has no "All models" row at all.
+    assert "readRow('All models') || readRow('Weekly')" in EXTRACTOR_JS
