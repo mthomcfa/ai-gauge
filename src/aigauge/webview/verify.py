@@ -23,8 +23,12 @@ VERIFY_TARGETS = {
           if (host !== 'claude.ai' && !host.endsWith('.claude.ai')) return false;
           const path = location.pathname.toLowerCase();
           if (path.startsWith('/login') || path.startsWith('/auth')) return false;
-          // Fast positive: the usage panel rendered.
-          if (/Plan usage limits|Current session|All models/i.test(text)) return true;
+          // Fast positive: the usage panel rendered. Must accept both
+          // headings, like providers/claude.py - Claude renamed "Plan usage
+          // limits" to "Plan usage", and a marker this file recognises but
+          // the extractor does not (or vice versa) is what made sign-in
+          // report success while the tile errored forever.
+          if (/Plan usage|Current session|All models|Weekly/i.test(text)) return true;
           // Otherwise mirror providers/claude.py's isLoggedOut, INVERTED. This
           // question is "is the session good?", not "did the usage dialog
           // render?" - checking only for usage text coupled sign-in to the

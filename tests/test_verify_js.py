@@ -182,13 +182,19 @@ def test_claude_verify_accepts_a_signed_in_shell_without_the_usage_panel():
     )
 
 
-def test_claude_verify_accepts_the_usage_panel_when_it_does_render():
-    assert _run_check(
-        "claude",
-        body="Plan usage limits Current session 64% used",
-        host="claude.ai",
-        path="/new",
-    )
+@pytest.mark.parametrize(
+    "body",
+    [
+        # Older heading.
+        "Plan usage limits Current session 64% used",
+        # Newer heading, and without "Current session" so the heading alone
+        # has to carry it - otherwise a marker set still pinned to the old
+        # wording would pass on the shared token.
+        "Plan usage Weekly 12% used Opus only 91% used",
+    ],
+)
+def test_claude_verify_accepts_the_usage_panel_when_it_does_render(body):
+    assert _run_check("claude", body=body, host="claude.ai", path="/new")
 
 
 def test_claude_verify_rejects_a_signed_out_landing_page():
