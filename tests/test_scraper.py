@@ -133,20 +133,75 @@ def test_load_failure_context_strips_query_and_fragment_from_the_url():
     assert "SECRET" not in ctx["page_url"]
 
 
-def test_failed_load_actually_delivers_the_context_to_the_caller():
+def _run_deferred(monkeypatch):
+    """Capture what _on_load_finished schedules instead of running it."""
+    scheduled: list = []
+    monkeypatch.setattr(
+        "aigauge.webview.scraper.QTimer.singleShot",
+        lambda ms, cb: scheduled.append((ms, cb)),
+    )
+    return scheduled
+
+
+def test_failed_load_actually_delivers_the_context_to_the_caller(monkeypatch):
     """Guards the wiring, not just the helper.
 
     Asserting _load_failure_context() in isolation passes even if
     _on_load_finished still hands back None - which is exactly the bug.
     """
     stand_in = _LoadFailStandIn()
+    scheduled = _run_deferred(monkeypatch)
     HeadlessScraper._on_load_finished(stand_in, False)
+    for _ms, callback in scheduled:
+        callback()
 
     assert stand_in.finished_with is not None
     result, error = stand_in.finished_with
     assert error == "page failed to load"
     assert isinstance(result, dict), "the load-failure detail must reach the snapshot"
     assert result["load_error_string"] == "net::ERR_ABORTED"
+
+
+def test_the_failure_detail_is_captured_after_chromium_reports_it(monkeypatch):
+    """Found by cold-starting the real app against an unreachable network.
+
+    Chromium emits loadFinished(False) BEFORE the loadingChanged carrying the
+    error code, domain, string and isErrorPage. Finishing synchronously read
+    those fields while they were still empty, so every real load failure was
+    reported as load_error_code=0 / NoErrorDomain / '' - the feature emptying
+    itself at the only moment it exists for. Observed live as
+    net::ERR_CONNECTION_RESET arriving one line *after* the snapshot that
+    should have carried it.
+    """
+    stand_in = _LoadFailStandIn()
+    # Nothing known yet - the state at the instant loadFinished fires.
+    stand_in._last_load_status = "LoadStartedStatus"
+    stand_in._last_load_error_code = 0
+    stand_in._last_load_error_domain = "NoErrorDomain"
+    stand_in._last_load_error_string = ""
+    stand_in._last_load_is_error_page = False
+
+    scheduled = _run_deferred(monkeypatch)
+    HeadlessScraper._on_load_finished(stand_in, False)
+
+    assert stand_in.finished_with is None, "finished before the detail could arrive"
+    assert scheduled and scheduled[0][0] == 0, "must yield exactly one event-loop turn"
+
+    # Chromium now delivers the real reason.
+    stand_in._last_load_status = "LoadFailedStatus"
+    stand_in._last_load_error_code = -101
+    stand_in._last_load_error_domain = "ConnectionErrorDomain"
+    stand_in._last_load_error_string = "net::ERR_CONNECTION_RESET"
+    stand_in._last_load_is_error_page = True
+
+    scheduled[0][1]()
+
+    result, _error = stand_in.finished_with
+    assert result["load_error_code"] == -101
+    assert result["load_error_string"] == "net::ERR_CONNECTION_RESET"
+    assert result["load_error_domain"] == "ConnectionErrorDomain"
+    assert result["is_error_page"] is True
+    assert result["load_status"] == "LoadFailedStatus"
 
 
 @pytest.mark.parametrize(

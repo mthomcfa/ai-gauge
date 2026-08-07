@@ -112,12 +112,19 @@ EXTRACTOR_JS = r"""
     if (pctMatch) {
       const start = pctMatch.index;
       const end = start + pctMatch[0].length;
-      // Trailing wording takes the full vocabulary: "42% left" can only be a
-      // quota. Leading wording takes consumption words only - a countdown
-      // reads "2 hr left" and "2 hr 30 min remaining", so accepting those
-      // before a number would turn the clock into a polarity and invert the
-      // gauge. "used 42%" has no such twin.
-      const word = /^\W*(remaining|left|used|consumed)\b/i.exec(text.slice(end, end + 16))
+      // Scan forward from the percentage, but stop at a digit or a time unit.
+      // That reaches the wording through prose - "64% of your session limit
+      // used" is a real phrasing and an earlier, stricter rule rejected it -
+      // while still refusing to cross into a countdown: in "42% Resets in 3
+      // days left" the scan halts at "3", so the clock's "left" can never be
+      // read as a quota direction and invert the gauge.
+      const tail = text.slice(end, end + 60);
+      const stop = tail.search(/\d|\b(?:sec|second|min|minute|hr|hour|day|week|month)s?\b/i);
+      const forward = stop === -1 ? tail : tail.slice(0, stop);
+      // Leading wording takes consumption words only: a countdown reads
+      // "2 hr left" and "2 hr 30 min remaining", so accepting those before a
+      // number would invert the gauge. "used 42%" has no such twin.
+      const word = /\b(remaining|left|used|consumed)\b/i.exec(forward)
         || /\b(used|consumed)\W*$/i.exec(text.slice(Math.max(0, start - 16), start));
       if (word) {
         kind = /^(remaining|left)$/i.test(word[1]) ? 'remaining' : 'used';

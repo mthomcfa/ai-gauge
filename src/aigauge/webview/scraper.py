@@ -208,7 +208,15 @@ class HeadlessScraper(QObject):
             self._last_load_is_error_page,
         )
         if not ok:
-            self._finish(None, "page failed to load")
+            # Chromium emits loadFinished BEFORE the loadingChanged that
+            # carries the actual failure (error code, domain, string,
+            # isErrorPage). Finishing synchronously snapshotted those fields
+            # while they were still empty, so every load failure reached the
+            # log and "Copy diagnostics" reporting load_error_code=0,
+            # NoErrorDomain and an empty error string - precisely the fields
+            # this context exists to supply, and precisely when they matter.
+            # Yield one event-loop turn so the detail lands first.
+            QTimer.singleShot(0, lambda: self._finish(None, "page failed to load"))
             return
         # Page DOM may render asynchronously — give React a moment, then evaluate.
         QTimer.singleShot(self._wait_ms, self._run_extractor)
