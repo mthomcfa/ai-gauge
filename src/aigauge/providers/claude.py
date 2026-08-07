@@ -112,14 +112,20 @@ EXTRACTOR_JS = r"""
     if (pctMatch) {
       const start = pctMatch.index;
       const end = start + pctMatch[0].length;
-      // Scan forward from the percentage, but stop at a digit or a time unit.
-      // That reaches the wording through prose - "64% of your session limit
-      // used" is a real phrasing and an earlier, stricter rule rejected it -
-      // while still refusing to cross into a countdown: in "42% Resets in 3
-      // days left" the scan halts at "3", so the clock's "left" can never be
-      // read as a quota direction and invert the gauge.
+      // Scan forward from the percentage, but stop at anything that starts
+      // reset/countdown text: a digit, a time unit, or the word reset/renew
+      // itself. That reaches the wording through prose - "64% of your session
+      // limit used" is a real phrasing and an earlier, stricter rule rejected
+      // it - while refusing to cross into a countdown, where "left" means a
+      // clock rather than a quota and would invert the gauge.
+      //
+      // The reset/renew tokens are not redundant with the digit and time-unit
+      // ones: "Resets tomorrow, some left" contains neither, so without them
+      // the scan walked into that "left" and reported a bare percentage as
+      // 58% used.
       const tail = text.slice(end, end + 60);
-      const stop = tail.search(/\d|\b(?:sec|second|min|minute|hr|hour|day|week|month)s?\b/i);
+      const stop = tail.search(
+        /\d|\b(?:reset|renew|sec|second|min|minute|hr|hour|day|week|month)s?\b/i);
       const forward = stop === -1 ? tail : tail.slice(0, stop);
       // Leading wording takes consumption words only: a countdown reads
       // "2 hr left" and "2 hr 30 min remaining", so accepting those before a

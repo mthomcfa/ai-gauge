@@ -254,6 +254,13 @@ def test_polarity_wording_is_reached_through_prose(label, text):
         "Weekly 42% Resets in 3 days left",
         # ...and at a bare time unit with no digit after the percentage.
         "Weekly 42% Resets next week, hours left",
+        # ...and at the word "reset" itself. Found by adversarial review of
+        # this rule: these carry neither a digit nor a time unit, so a scan
+        # stopping only at those walked into the countdown's "left" and
+        # reported a bare percentage as 58% used.
+        "Weekly 42% Resets tomorrow, some left",
+        "Weekly 42% until reset, plenty left",
+        "Weekly 42% renews soon, a little left",
     ],
 )
 def test_the_forward_scan_stops_before_a_countdown(text):
