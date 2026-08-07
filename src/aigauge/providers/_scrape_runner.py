@@ -52,10 +52,16 @@ class ScrapeRunner:
         def _handle(result: Any, error: str) -> None:
             self._scraper = None
             if error or not isinstance(result, dict):
+                # Keep the payload when the scraper managed to capture one. It
+                # is what makes a layout change diagnosable from the log and
+                # from "Copy diagnostics" instead of needing a debug rebuild.
+                # error_dialog._sanitize_raw still redacts emails and truncates
+                # body_text before any of it reaches the clipboard.
                 snapshot = UsageSnapshot(
                     provider=self._account_id,
                     status=SnapshotStatus.ERROR,
                     error=error or "no data extracted",
+                    raw=result if isinstance(result, dict) else {},
                 )
                 self._log.warning(
                     "provider snapshot error provider=%s reason=%s",

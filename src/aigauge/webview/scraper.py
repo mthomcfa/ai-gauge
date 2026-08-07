@@ -218,6 +218,35 @@ class HeadlessScraper(QObject):
             return
         self._page.runJavaScript(self._extractor_js, self._on_js_result)
 
+    def _load_failure_context(
+        self, *, error: str = "", elapsed_s: float | None = None
+    ) -> dict[str, Any]:
+        """Everything Chromium told us about a load that never completed.
+
+        Deliberately excludes page content: no extractor ran, so there is none,
+        and the URL goes through _safe_url so query strings and fragments (which
+        can carry session material on provider auth hops) never reach the log or
+        the clipboard.
+        """
+        context: dict[str, Any] = {
+            "load_failed": True,
+            "failure": error,
+            "page_url": _safe_url(self._page.url()),
+            "title": self._page.title(),
+            "max_progress": self._max_progress,
+            "load_status": self._last_load_status,
+            "load_error_code": self._last_load_error_code,
+            "load_error_domain": self._last_load_error_domain,
+            "load_error_string": self._last_load_error_string,
+            "is_error_page": self._last_load_is_error_page,
+            "url_changes": self._url_change_count,
+            "attempt": self._attempt,
+            "render_terminated": self._render_terminated,
+        }
+        if elapsed_s is not None:
+            context["elapsed_s"] = round(elapsed_s, 1)
+        return context
+
     def _on_js_result(self, result: Any) -> None:
         if self._finished:
             return
@@ -227,7 +256,13 @@ class HeadlessScraper(QObject):
         if isinstance(result, dict) and "__retry_after_ms" in result:
             self._extractor_reruns += 1
             if self._extractor_reruns > 5:
-                self._finish(None, "extractor retry limit exceeded")
+                # Hand back the last payload alongside the error. It carries the
+                # page text the extractor was looking at, and discarding it made
+                # a layout change undiagnosable: the snapshot reached the log and
+                # "Copy diagnostics" with raw_keys=[] and nothing to inspect, so
+                # the only way to see why a provider stopped parsing was to
+                # rebuild the app with extra logging.
+                self._finish(result, "extractor retry limit exceeded")
                 return
             try:
                 delay_ms = int(result.get("__retry_after_ms") or 0)
@@ -249,6 +284,19 @@ class HeadlessScraper(QObject):
         if self._finished:
             return
         elapsed = time.monotonic() - self._started_at
+        # Attach what Chromium reported to EVERY failure that has no payload of
+        # its own. Doing this at the call sites meant patching them one at a
+        # time as each new failure mode showed up in the wild - "page failed to
+        # load" was fixed while "timeout" and "extractor returned null" kept
+        # arriving as raw={}, which tells the user nothing and tells us less.
+        # A single chokepoint cannot be missed by a future error path.
+        #
+        # Keyed on "not a dict" rather than "is None": ScrapeRunner discards
+        # any non-dict result and substitutes raw={}, so a future path handing
+        # back a string or False would silently reproduce the empty-diagnostics
+        # bug through a condition that looked like it covered everything.
+        if error and not isinstance(result, dict):
+            result = self._load_failure_context(error=error, elapsed_s=elapsed)
         if error and error in self._RETRYABLE_ERRORS and self._attempt < self._max_attempts:
             log.warning(
                 "scrape retry provider=%s attempt=%s/%s elapsed=%.1fs error=%s "

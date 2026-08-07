@@ -66,12 +66,20 @@ def _color_for_percent(
 def _provider_max_percent(snapshot: UsageSnapshot | None) -> float | None:
     if snapshot is None or snapshot.status != SnapshotStatus.OK:
         return None
+    # Tagged rows are supplementary breakdown detail, not usage against a
+    # limit - OpenRouter's model rows carry each model's *share of spend*, so a
+    # single model dominating spend would drive this dot red with no quota
+    # anywhere near its cap. gauge.provider_max_percent filters these; this is
+    # the second, independent implementation and it did not, so the fix shipped
+    # for the tray never reached the macOS menu bar.
     for metric in snapshot.metrics:
+        if metric.tag is not None:
+            continue
         if metric.label.lower() == "session" and metric.percent_used is not None:
             return metric.percent_used
     best: float | None = None
     for metric in snapshot.metrics:
-        if metric.percent_used is None:
+        if metric.percent_used is None or metric.tag is not None:
             continue
         if best is None or metric.percent_used > best:
             best = metric.percent_used

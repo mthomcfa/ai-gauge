@@ -207,3 +207,53 @@ def test_status_items_actually_applies_configured_colors():
     assert status_items({"claude": _ok_snap("claude", 50.0)}, ("claude",))[0][2] == (
         ColorThresholds().green_color
     )
+
+
+def test_menu_bar_dot_ignores_tagged_breakdown_metrics():
+    """The macOS dot must filter tags exactly like gauge.provider_max_percent.
+
+    PR #4 fixed the tray path but not this one - menubar has its own
+    independent implementation - so OpenRouter's per-model *share of spend*
+    rows kept driving the menu-bar dot red with no quota near its cap.
+    """
+    from aigauge.menubar import _provider_max_percent
+
+    snapshot = UsageSnapshot(
+        provider="openrouter",
+        status=SnapshotStatus.OK,
+        metrics=[
+            UsageMetric(label="Today ($1/$10)", percent_used=10.0),
+            UsageMetric(label="claude-opus", percent_used=96.0, tag="model_breakdown"),
+        ],
+    )
+    assert _provider_max_percent(snapshot) == 10.0
+
+
+def test_menu_bar_dot_ignores_a_tagged_row_labelled_session():
+    # The "session" short-circuit runs first, so it needs the filter too.
+    from aigauge.menubar import _provider_max_percent
+
+    snapshot = UsageSnapshot(
+        provider="openrouter",
+        status=SnapshotStatus.OK,
+        metrics=[
+            UsageMetric(label="Session", percent_used=99.0, tag="model_breakdown"),
+            UsageMetric(label="Today", percent_used=12.0),
+        ],
+    )
+    assert _provider_max_percent(snapshot) == 12.0
+
+
+def test_menu_bar_and_gauge_agree_on_tag_filtering():
+    from aigauge.gauge import provider_max_percent
+    from aigauge.menubar import _provider_max_percent
+
+    snapshot = UsageSnapshot(
+        provider="openrouter",
+        status=SnapshotStatus.OK,
+        metrics=[
+            UsageMetric(label="Today", percent_used=20.0),
+            UsageMetric(label="gpt", percent_used=88.0, tag="model_breakdown"),
+        ],
+    )
+    assert _provider_max_percent(snapshot) == provider_max_percent(snapshot)

@@ -29,6 +29,44 @@ def test_format_diagnostics_truncates_long_body_text():
     assert out.count("x") < 1000
 
 
+def test_format_diagnostics_caps_page_supplied_strings_other_than_body_text():
+    """The cap must not be an allowlist of one field name.
+
+    Error snapshots now carry page- and Chromium-supplied strings whose length
+    nothing on this side controls: document.title, Chromium's load_error_string
+    and each row's raw text. Truncating only the key literally named body_text
+    stopped covering the payload the moment those fields were added.
+    """
+    snapshot = UsageSnapshot(
+        provider="claude",
+        status=SnapshotStatus.ERROR,
+        error="page failed to load",
+        raw={
+            "load_failed": True,
+            "title": "t" * 20000,
+            "load_error_string": "e" * 20000,
+            "session": {"raw": "r" * 20000},
+        },
+    )
+    out = _format_diagnostics("claude", snapshot)
+
+    assert out.count("t") < 3000, "document.title reached the clipboard uncapped"
+    assert out.count("e") < 3000, "Chromium's error string reached the clipboard uncapped"
+    assert out.count("r") < 3000, "a nested row's raw text reached the clipboard uncapped"
+
+
+def test_format_diagnostics_still_caps_body_text_harder_than_other_strings():
+    # body_text is the largest and most identifying field; its tighter limit
+    # must not be lost to the general cap.
+    snapshot = UsageSnapshot(
+        provider="claude",
+        status=SnapshotStatus.ERROR,
+        error="boom",
+        raw={"body_text": "b" * 20000},
+    )
+    assert _format_diagnostics("claude", snapshot).count("b") < 700
+
+
 def test_format_diagnostics_includes_the_app_version():
     # Fork and upstream ship overlapping release numbers, so a pasted
     # diagnostics blob is ambiguous without the full version string. The

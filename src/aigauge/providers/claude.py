@@ -36,14 +36,24 @@ log = logging.getLogger("aigauge.providers.claude")
 # any percent text elsewhere in the shell.
 EXTRACTOR_JS = r"""
 (() => {
+  // Every meter either layout is known to render. This list is not
+  // decoration: findRowByLabel penalises a container that holds a rival
+  // label, and readRow refuses a container that holds a rival label *and*
+  // more than one percentage. A meter missing from here is a meter whose
+  // number can be silently reported as another meter's.
   const ROW_LABELS = [
     'Current session',
     'All models',
+    'Weekly',
+    'Opus only',
+    'Sonnet only',
+    'Cowork only',
+    'Claude Design',
     'Daily included routine runs'
   ];
 
   function norm(el) {
-    return (el.textContent || '').replace(/\s+/g, ' ').trim();
+    return ((el && (el.innerText || el.textContent)) || '').replace(/\s+/g, ' ').trim();
   }
 
   function findRowByLabel(label) {
@@ -75,26 +85,75 @@ EXTRACTOR_JS = r"""
     const row = findRowByLabel(label);
     if (!row) return null;
     const text = norm(row);
+    const lower = text.toLowerCase();
     const pctMatches = Array.from(text.matchAll(/(\d+(?:\.\d+)?)\s*%/g));
-    const pctMatch = pctMatches[pctMatches.length - 1];
-    const remaining = /remaining/i.test(text);
-    const used = /used/i.test(text);
+
+    // ATTRIBUTION. This reader takes the LAST percentage in whichever element
+    // it picked. When the DOM offers no element isolating one meter, that is
+    // a different meter's number: a container reading "Weekly 12% used Opus
+    // only 91% used Sonnet only 44% used" reported 44 as the weekly figure.
+    // A rival label plus a rival number means the percentage cannot be
+    // attributed, so hand back no number at all. The full row text still
+    // travels in `raw`, which is what makes the layout fixable in one round.
+    const rivalLabel = ROW_LABELS.some(other =>
+      other.toLowerCase() !== label.toLowerCase() &&
+      lower.includes(other.toLowerCase()));
+    const ambiguous = pctMatches.length > 1 && rivalLabel;
+    const pctMatch = ambiguous ? null : pctMatches[pctMatches.length - 1];
+
+    // POLARITY. normalize_percent treats an unknown kind as *used*, so a row
+    // meaning "42% left" was reported as 42% consumed - a plausible number
+    // pointing the wrong way, which is the worst output a quota monitor can
+    // produce. The wording must sit against the percentage: scanning the
+    // whole row would read the "left" in "2 hr left" as a quota direction and
+    // invert the gauge. No wording adjacent to the number means no polarity,
+    // and no polarity means no metric (see _build_snapshot).
+    let kind = 'unknown';
+    if (pctMatch) {
+      const start = pctMatch.index;
+      const end = start + pctMatch[0].length;
+      // Trailing wording takes the full vocabulary: "42% left" can only be a
+      // quota. Leading wording takes consumption words only - a countdown
+      // reads "2 hr left" and "2 hr 30 min remaining", so accepting those
+      // before a number would turn the clock into a polarity and invert the
+      // gauge. "used 42%" has no such twin.
+      const word = /^\W*(remaining|left|used|consumed)\b/i.exec(text.slice(end, end + 16))
+        || /\b(used|consumed)\W*$/i.exec(text.slice(Math.max(0, start - 16), start));
+      if (word) {
+        kind = /^(remaining|left)$/i.test(word[1]) ? 'remaining' : 'used';
+      }
+    }
+
     const resetMatch = text.match(/Resets?\s+(?:in\s+)?(.+?)(?=\s*$|\s+(?:Daily|Weekly|All|Current|Claude|You)\b|\s*\d+%)/i);
     return {
       raw: text.slice(0, 400),
       percent: pctMatch ? parseFloat(pctMatch[1]) : null,
-      kind: remaining ? 'remaining' : (used ? 'used' : 'unknown'),
+      kind: kind,
+      ambiguous: ambiguous,
       reset_text: resetMatch ? resetMatch[1].trim() : null,
     };
   }
 
-  const bodyText = (document.body.textContent || '').replace(/\s+/g, ' ').trim();
+  // innerText, not textContent: textContent concatenates the source of any
+  // <style> element in the body, and Claude inlines them. That flooded
+  // bodyText with CSS - and since CSS is full of "width:100%", the two idle
+  // checks that require the ABSENCE of a percent sign (idleUsagePanel below,
+  // and _looks_like_empty_signed_in_usage in Python) could never fire.
+  // innerText is rendering-aware and omits style/script content. Codex and
+  // webview/verify.py already read text this way; Claude did not.
+  const bodyText = ((document.body && (document.body.innerText || document.body.textContent)) || '')
+    .replace(/\s+/g, ' ').trim();
   const isLoggedOut =
     !!document.querySelector('a[href*="/login"]') &&
-    !bodyText.includes('Plan usage limits');
+    !/Plan usage/i.test(bodyText);
 
   const session = readRow('Current session');
-  const weeklyAll = readRow('All models');
+  // Claude ships two usage layouts behind a flag. The older one labels the
+  // seven-day meter "All models"; the newer gauge/bar one labels it "Weekly"
+  // (see its es[] meter table: five_hour -> "Current session", seven_day ->
+  // "Weekly", plus Opus only / Sonnet only / Cowork only / Claude Design).
+  // Requiring "All models" made the newer layout permanently unreadable.
+  const weeklyAll = readRow('All models') || readRow('Weekly');
 
   function onUsageRoute() {
     return /\/settings\/usage/.test(location.pathname) ||
@@ -104,7 +163,7 @@ EXTRACTOR_JS = r"""
   function ensureUsageRoute() {
     if (onUsageRoute()) return null;
     if (location.hostname !== 'claude.ai') return null;
-    if (/Plan usage limits|Current session|All models/i.test(bodyText)) return null;
+    if (/Plan usage|Current session|All models/i.test(bodyText)) return null;
     location.href = '/new#settings/usage';
     return 'opened usage dialog';
   }
@@ -126,10 +185,10 @@ EXTRACTOR_JS = r"""
   // The current Claude UI opens usage as a shell/dialog route. Percent text
   // elsewhere in the shell is not enough; wait for the Session/Weekly rows
   // or for the explicit idle-zero usage panel before handing data to Python.
-  const usagePanelSignals = /Plan usage limits|Current session|All models/i.test(bodyText);
-  const idleUsagePanel = /Plan usage limits/i.test(bodyText) &&
+  const usagePanelSignals = /Plan usage|Current session|All models/i.test(bodyText);
+  const idleUsagePanel = /Plan usage/i.test(bodyText) &&
     /Current session/i.test(bodyText) &&
-    /All models/i.test(bodyText) &&
+    /All models|Weekly/i.test(bodyText) &&
     !/%/.test(bodyText);
   const requiredRowsReady = !!session && !!weeklyAll;
   if (!isLoggedOut && (onUsageRoute() || usagePanelSignals) && !requiredRowsReady && !idleUsagePanel) {
@@ -164,6 +223,30 @@ def _is_claude_usage_url(url: str) -> bool:
     return parsed.path == "/settings/usage" or "settings/usage" in parsed.fragment
 
 
+def _unreadable_reason(card: dict[str, Any]) -> str | None:
+    """Why this row cannot be turned into a gauge, or None if it can.
+
+    Both cases produce a plausible wrong number rather than an error if left
+    unchecked, which for a quota monitor is the worst available outcome:
+
+    * ``ambiguous`` - the extractor found the label and several percentages in
+      one container and could not say which belonged to this meter.
+    * unknown ``kind`` - no "used"/"remaining" wording sat against the
+      percentage, and ``normalize_percent`` resolves an unknown kind to
+      *used*. A row meaning "42% left" would be shown as 42% consumed.
+
+    A row carrying no percentage at all is not unreadable; it is simply
+    absent, and the idle/empty-panel paths below handle that.
+    """
+    if card.get("ambiguous"):
+        return "several meters share one container"
+    if card.get("percent") is None:
+        return None
+    if card.get("kind") not in ("used", "remaining"):
+        return "no used/remaining wording beside the percentage"
+    return None
+
+
 def _looks_like_empty_signed_in_usage(payload: dict[str, Any]) -> bool:
     if not _is_claude_usage_url(str(payload.get("url") or "")):
         return False
@@ -174,7 +257,7 @@ def _looks_like_empty_signed_in_usage(payload: dict[str, Any]) -> bool:
     # Require positive evidence the usage panel actually rendered. Without
     # this, a partially-loaded page (sidebar only, main pane still fetching)
     # gets misclassified as idle and shown as 0/0.
-    if "plan usage limits" not in body:
+    if "plan usage" not in body:
         return False
     # If percent text is on the page but the row extractor missed it, that's
     # a layout change — not idle.
@@ -253,9 +336,14 @@ def _build_snapshot(
         ("weekly_all", "Weekly", timedelta(days=7)),
     )
     metrics: list[UsageMetric] = []
+    unreadable: list[str] = []
     for key, label, reset_window in rows:
         card = payload.get(key)
         if not card:
+            continue
+        reason = _unreadable_reason(card)
+        if reason:
+            unreadable.append(f"{label} ({reason})")
             continue
         percent = normalize_percent(card.get("percent"), card.get("kind", ""))
         if percent is None:
@@ -275,6 +363,31 @@ def _build_snapshot(
                 note=idle_note or card.get("reset_text"),
                 window=reset_window,
             )
+        )
+
+    # A row we could not read is reported, never quietly dropped. Dropping it
+    # would leave a tile showing one gauge as though that were the whole
+    # picture, or - worse, before this guard - a number belonging to a
+    # different meter. The payload rides along, so one error report contains
+    # the row text needed to teach the extractor the new wording.
+    if unreadable:
+        log_page_diagnosis(
+            log,
+            provider=account_id,
+            classification="unreadable_usage_row",
+            payload=payload,
+            expected_rows=_EXPECTED_ROWS,
+            level=logging.WARNING,
+        )
+        return UsageSnapshot(
+            provider=account_id,
+            status=SnapshotStatus.ERROR,
+            error=(
+                "Claude's usage layout changed: could not read "
+                + ", ".join(unreadable)
+                + ". Use Copy diagnostics to report it."
+            ),
+            raw=payload,
         )
 
     if not metrics:

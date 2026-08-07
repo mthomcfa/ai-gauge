@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import uuid
 from pathlib import Path
@@ -122,16 +123,30 @@ class WindowState(BaseModel):
     x: int | None = None
     y: int | None = None
     width: int = WINDOW_WIDTH
-    height: int = Field(default=220, ge=WINDOW_MIN_HEIGHT, le=WINDOW_MAX_HEIGHT)
+    height: int = 220
     collapsed: bool = False
     always_on_top: bool = True
-    opacity: float = Field(default=0.8, ge=0.3, le=1.0)
+    opacity: float = 0.8
     fade_when_inactive: bool = False
     # Whole-widget zoom. >1 enlarges for high-resolution (4K) displays; <1
     # makes it more compact. Floor is 0.75 — below that the fixed 10-12px fonts
     # become illegible. Applied via Qt's QT_SCALE_FACTOR at launch — see
     # qt_scale_factor_env().
-    ui_scale: float = Field(default=1.0, ge=0.75, le=4.0)
+    ui_scale: float = 1.0
+
+    @field_validator("height", "opacity", "ui_scale", mode="before")
+    @classmethod
+    def _coerce_bounds(cls, value: object, info) -> float | int:
+        spec = {
+            "height": (220, float(WINDOW_MIN_HEIGHT), float(WINDOW_MAX_HEIGHT), True),
+            "opacity": (0.8, 0.3, 1.0, False),
+            "ui_scale": (1.0, 0.75, 4.0, False),
+        }[info.field_name]
+        default, minimum, maximum, integer = spec
+        return _coerce_bounded_number(
+            value, default=default, minimum=minimum, maximum=maximum,
+            field=info.field_name, integer=integer,
+        )
 
 
 class ProviderToggles(BaseModel):
@@ -171,6 +186,46 @@ def _safe_repr(value: object, limit: int = 120) -> str:
     if len(text) > limit:
         return f"{type(value).__name__}, {text[:limit]}..."
     return text
+
+
+def _coerce_bounded_number(
+    value: object,
+    *,
+    default: float | int | None,
+    minimum: float,
+    maximum: float,
+    field: str,
+    integer: bool,
+    allow_none: bool = False,
+) -> float | int | None:
+    """Clamp a user-editable numeric setting instead of rejecting it.
+
+    ``Field(ge=..., le=...)`` raises, and a raise anywhere inside a model
+    reaches ``Config.load()``'s per-key salvage, which discards the entire
+    top-level block that field lives in. A single negative ``daily_budget``
+    therefore took the user's OpenRouter gauge colours with it, silently. Every
+    bounded setting coerces instead, so one bad number costs only that number.
+    """
+    if value is None:
+        return None if allow_none else default
+    # bool is an int subclass; True would otherwise clamp to a real value.
+    if isinstance(value, bool):
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        log.warning(
+            "config: unusable %s (%s); using %s", field, _safe_repr(value), default
+        )
+        return default
+    if not math.isfinite(number):
+        # json.loads accepts Infinity / -Infinity / NaN by default.
+        log.warning(
+            "config: non-finite %s (%s); using %s", field, _safe_repr(value), default
+        )
+        return default
+    number = max(minimum, min(maximum, number))
+    return int(number) if integer else number
 
 
 class ColorThresholds(BaseModel):
@@ -304,12 +359,28 @@ class CopilotConfig(BaseModel):
     colors: GaugeColors = Field(default_factory=ColorThresholds)
     username: str | None = None
     billing_org: str | None = None
-    monthly_quota: int = Field(default=1500, ge=1)  # AI credits; Pro=1500
+    monthly_quota: int = 1500  # AI credits; Pro=1500
+
+    @field_validator("monthly_quota", mode="before")
+    @classmethod
+    def _coerce_quota(cls, value: object) -> int:
+        return _coerce_bounded_number(
+            value, default=1500, minimum=1, maximum=10_000_000,
+            field="monthly_quota", integer=True,
+        )
 
 
 class OpenRouterConfig(BaseModel):
     colors: GaugeColors = Field(default_factory=ColorThresholds)
-    daily_budget: float | None = Field(default=None, ge=0)
+    daily_budget: float | None = None
+
+    @field_validator("daily_budget", mode="before")
+    @classmethod
+    def _coerce_budget(cls, value: object) -> float | None:
+        return _coerce_bounded_number(
+            value, default=None, minimum=0.0, maximum=1_000_000.0,
+            field="daily_budget", integer=False, allow_none=True,
+        )
 
 
 def validate_opencode_usage_url(value: str) -> str:
@@ -387,8 +458,8 @@ def _quarantine_config(path: Path, raw: str) -> None:
 
 
 class Config(BaseModel):
-    active_refresh_interval_minutes: int = Field(default=5, ge=1, le=180)
-    refresh_interval_minutes: int = Field(default=60, ge=1, le=180)
+    active_refresh_interval_minutes: int = 5
+    refresh_interval_minutes: int = 60
     start_at_login: bool = False
     providers: ProviderToggles = Field(default_factory=ProviderToggles)
     browser_accounts: list[BrowserAccount] = Field(
@@ -403,6 +474,17 @@ class Config(BaseModel):
     expanded_tiles: list[str] = Field(default_factory=list)
     collapsed_tiles: list[str] = Field(default_factory=list)
     window: WindowState = Field(default_factory=WindowState)
+
+    @field_validator(
+        "active_refresh_interval_minutes", "refresh_interval_minutes", mode="before"
+    )
+    @classmethod
+    def _coerce_interval(cls, value: object, info) -> int:
+        default = 5 if info.field_name.startswith("active") else 60
+        return _coerce_bounded_number(
+            value, default=default, minimum=1, maximum=180,
+            field=info.field_name, integer=True,
+        )
 
     @classmethod
     def load(cls) -> Config:

@@ -1,10 +1,18 @@
+import json
+import re
+import shutil
+import subprocess
 from datetime import datetime, timedelta
+
+import pytest
 
 from aigauge.models import SnapshotStatus
 from aigauge.providers.codex import (
     CODEX_USAGE_URL,
+    EXTRACTOR_JS,
     _build_snapshot,
     _parse_reset_text,
+    _weekly_only_layout_evidence,
 )
 
 
@@ -387,3 +395,112 @@ def test_codex_weekly_only_idle_zero_percent_is_treated_as_mid_hydration():
     )
 
     assert snapshot.status == SnapshotStatus.ERROR
+
+
+# Payload captured verbatim from a real user's log (0.6.5+cfa.1, 2026-08-06).
+# The account's weekly quota was genuinely untouched - "100% remaining" - and
+# the 0%/idle guard rejected it as a mid-hydration render, so the tile errored
+# on every refresh forever.
+_IDLE_WEEKLY_PAYLOAD = {
+    "body_text": (
+        "Codex and Work Analytics 7D 1M Custom Group by: Day API reference "
+        "Personal usage Code review Workspace usage Leaderboard Balance "
+        "Codex and Work share the same usage limit. Weekly usage limit "
+        "100% remaining Workspace monthly credit limit 100% remaining "
+        "Resets Aug 31, 2026 8:00 PM 0 of 2,500 credits used"
+    ),
+    "has_percent_text": True,
+    # False because the shipped JS only matched "shared agentic usage limit".
+    "has_shared_agentic_text": False,
+    "has_usage_summary_text": True,
+    "has_usage_text": True,
+    "logged_out": False,
+    "session": None,
+    "title": "Codex",
+    "url": "https://chatgpt.com/codex/cloud/settings/analytics?aigauge_ts=1786031234#usage",
+    "weekly": {
+        "kind": "remaining",
+        "percent": 100,
+        "raw": "Weekly usage limit 100% remaining",
+        "reset_text": None,
+    },
+}
+
+
+def test_idle_weekly_only_account_is_not_reported_as_a_partial_render():
+    snap = _build_snapshot(dict(_IDLE_WEEKLY_PAYLOAD))
+    assert snap.status is SnapshotStatus.OK, snap.error
+    weekly = {m.label.lower(): m for m in snap.metrics}["weekly"]
+    assert weekly.percent_used == 0
+
+
+def test_current_page_wording_is_recognised_as_strong_layout_evidence():
+    # The page says "share the same usage limit", not "shared agentic usage
+    # limit". Missing the current wording is what forced the weak-evidence path.
+    assert _weekly_only_layout_evidence(dict(_IDLE_WEEKLY_PAYLOAD)) == "strong"
+
+
+def test_weak_evidence_still_retries_an_idle_lone_weekly_card():
+    # Only generic settings vocabulary: a half-rendered old two-card layout
+    # looks like this, so keep retrying rather than reporting 0% used.
+    payload = dict(_IDLE_WEEKLY_PAYLOAD)
+    payload["body_text"] = "Codex Analytics Personal usage credits remaining"
+    payload["has_usage_summary_text"] = True
+    assert _weekly_only_layout_evidence(payload) == "weak"
+    snap = _build_snapshot(payload)
+    assert snap.status is SnapshotStatus.ERROR
+
+
+def test_strong_evidence_with_real_usage_still_reports_it():
+    payload = dict(_IDLE_WEEKLY_PAYLOAD)
+    payload["weekly"] = {
+        "kind": "remaining",
+        "percent": 40,
+        "raw": "Weekly usage limit 40% remaining",
+        "reset_text": None,
+    }
+    snap = _build_snapshot(payload)
+    assert snap.status is SnapshotStatus.OK
+    weekly = {m.label.lower(): m for m in snap.metrics}["weekly"]
+    assert weekly.percent_used == 60
+
+
+def _shared_limit_regex_literal() -> str:
+    """Pull the real regex out of the production JS source."""
+    match = re.search(
+        r"has_shared_agentic_text:\s*(/.+?/i)\s*\n?\s*\.test", EXTRACTOR_JS, re.S
+    )
+    assert match, "has_shared_agentic_text not found; did EXTRACTOR_JS change shape?"
+    return match.group(1)
+
+
+@pytest.mark.skipif(
+    shutil.which("node") is None, reason="node is required to evaluate the extractor JS"
+)
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "shared agentic usage limit",
+        "Codex and Work share the same usage limit",
+        "Workspace monthly credit limit",
+    ],
+)
+def test_extractor_js_matches_every_known_shared_limit_phrasing(phrase):
+    """Executes the regex from EXTRACTOR_JS, not a copy of it.
+
+    The previous version of this test declared its own copy of the pattern and
+    asserted that copy matched. It passed regardless of what EXTRACTOR_JS
+    contained - deleting the production regex outright left it green - while
+    its name claimed the opposite. Narrowing the real regex must fail here,
+    because a phrasing the extractor misses is precisely how a live account
+    ended up erroring forever.
+    """
+    script = (
+        f"const re = {_shared_limit_regex_literal()};\n"
+        f"process.stdout.write(String(re.test({json.dumps(phrase)})));"
+    )
+    out = subprocess.run(
+        ["node", "-e", script], capture_output=True, text=True, timeout=30
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout == "true", f"extractor does not recognise: {phrase!r}"

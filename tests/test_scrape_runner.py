@@ -136,3 +136,52 @@ def test_scrape_runner_surfaces_transport_error_without_build(fake_scraper):
     assert len(received) == 1
     assert received[0].status == SnapshotStatus.ERROR
     assert received[0].error == "timeout"
+
+
+def test_error_snapshot_keeps_the_payload_for_diagnosis(fake_scraper):
+    """A failed scrape must still carry what the extractor saw.
+
+    When the extractor exhausted its reruns the scraper passed None, so the
+    snapshot reached the log and "Copy diagnostics" with raw={} - and a
+    provider layout change became impossible to diagnose without rebuilding
+    the app with extra logging. That is exactly what happened to Claude.
+    """
+    received: list[UsageSnapshot] = []
+    rn = ScrapeRunner(
+        account_id="claude",
+        url="http://example",
+        extractor_js="",
+        build=lambda payload: _ok_snapshot(),
+        log=logging.getLogger("test"),
+        build_max_attempts=1,
+    )
+    rn.run(received.append)
+
+    payload = {
+        "body_text": "Plan usage limits ... whatever Claude renders now",
+        "url": "https://claude.ai/new",
+        "logged_out": False,
+    }
+    fake_scraper.instances[0].done.emit(payload, "extractor retry limit exceeded")
+
+    assert len(received) == 1
+    snap = received[0]
+    assert snap.status == SnapshotStatus.ERROR
+    assert snap.error == "extractor retry limit exceeded"
+    assert snap.raw == payload, "the page text must survive for diagnostics"
+
+
+def test_error_without_a_payload_still_yields_an_empty_dict(fake_scraper):
+    received: list[UsageSnapshot] = []
+    rn = ScrapeRunner(
+        account_id="claude",
+        url="http://example",
+        extractor_js="",
+        build=lambda payload: _ok_snapshot(),
+        log=logging.getLogger("test"),
+        build_max_attempts=1,
+    )
+    rn.run(received.append)
+    fake_scraper.instances[0].done.emit(None, "timeout")
+
+    assert received[0].raw == {}

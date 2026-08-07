@@ -156,8 +156,14 @@ EXTRACTOR_JS = r"""
     // chars, and the Codex page's task rail can push the analytics panel past
     // that cut — so deciding the weekly-only layout from the truncated copy
     // produced false rejects (a permanent 'error - stale' tile).
+    // STRONG evidence: wording that only the shared-limit layout renders.
+    // OpenAI has shipped several phrasings - "shared agentic usage limit"
+    // (older) and "Codex and Work share the same usage limit" / "Workspace
+    // monthly credit limit" (current). Matching only the first made a real
+    // account read as a partial render.
     has_shared_agentic_text:
-      /shared agentic usage limit/i.test(bodyText),
+      /shared agentic usage limit|shares? the same usage limit|workspace monthly credit limit/i
+        .test(bodyText),
     has_usage_summary_text:
       /credits remaining|usage breakdown/i.test(bodyText),
     body_text: bodyText.slice(0, 2000),
@@ -317,20 +323,44 @@ def _is_weekly_only_usage_layout(payload: dict[str, Any]) -> bool:
     The truncated text is still consulted as a fallback for payloads that
     predate those booleans (e.g. cached snapshots or hand-built test payloads).
     """
+    return _weekly_only_layout_evidence(payload) is not None
+
+
+_STRONG_WEEKLY_LAYOUT_MARKERS = (
+    "shared agentic usage limit",
+    "share the same usage limit",
+    "shares the same usage limit",
+    "workspace monthly credit limit",
+)
+_WEAK_WEEKLY_LAYOUT_MARKERS = ("credits remaining", "usage breakdown")
+
+
+def _weekly_only_layout_evidence(payload: dict[str, Any]) -> str | None:
+    """Classify how confidently the page identifies the shared weekly layout.
+
+    Returns ``"strong"``, ``"weak"``, or ``None``.
+
+    The distinction is load-bearing. A lone Weekly card reading 0% used looks
+    identical to a half-rendered old two-card layout, so the caller keeps
+    retrying on *weak* evidence. But when the page positively names the shared
+    layout, a 0% reading is simply an untouched quota and must be believed -
+    otherwise an idle account errors forever, which is exactly what shipped.
+    """
     text = re.sub(r"\s+", " ", str(payload.get("body_text") or "")).lower()
 
-    # Unambiguous marker for the shared-agentic layout.
-    if payload.get("has_shared_agentic_text") or "shared agentic usage limit" in text:
-        return True
+    if payload.get("has_shared_agentic_text") or any(
+        marker in text for marker in _STRONG_WEEKLY_LAYOUT_MARKERS
+    ):
+        return "strong"
 
-    # "credits remaining" / "usage breakdown" are generic settings-page
-    # vocabulary that also appears beside a partially-rendered old two-card
-    # layout, so they are weaker evidence. They are still accepted, but the
-    # caller additionally refuses a 0%/idle lone weekly card, which is what a
-    # mid-hydration render looks like.
-    if payload.get("has_usage_summary_text"):
-        return True
-    return any(marker in text for marker in ("credits remaining", "usage breakdown"))
+    # Generic settings-page vocabulary that also appears beside a partially
+    # rendered old two-card layout. Accepted, but not trusted enough to
+    # believe a 0% reading.
+    if payload.get("has_usage_summary_text") or any(
+        marker in text for marker in _WEAK_WEEKLY_LAYOUT_MARKERS
+    ):
+        return "weak"
+    return None
 
 
 def _is_logged_out_payload(payload: dict[str, Any]) -> bool:
@@ -415,16 +445,17 @@ def _build_snapshot(
     # Accept a lone Weekly card only when the surrounding page identifies the
     # new shared-agentic layout. This preserves transient-error retries for a
     # genuinely partial render of the older Session + Weekly layout.
-    weekly_only_layout = (
-        set(labels) == {"weekly"} and _is_weekly_only_usage_layout(payload)
+    layout_evidence = (
+        _weekly_only_layout_evidence(payload) if set(labels) == {"weekly"} else None
     )
-    if weekly_only_layout:
+    weekly_only_layout = layout_evidence is not None
+    if weekly_only_layout and layout_evidence == "weak":
         weekly_metric = labels["weekly"]
-        # A lone Weekly card reading 0% with an idle countdown is
-        # indistinguishable from a mid-hydration render, and the
-        # mixed_session_weekly_idle guard below cannot fire without a Session
-        # metric. Accepting it would tell the user their weekly quota is
-        # untouched; keep retrying instead.
+        # On WEAK evidence only, a lone Weekly card reading 0% with an idle
+        # countdown is indistinguishable from a mid-hydration render, so keep
+        # retrying. On strong evidence the page has named the shared layout
+        # outright and 0% means an untouched quota - believe it. Applying this
+        # guard unconditionally made a genuinely idle account error forever.
         if (weekly_metric.percent_used or 0) <= 0 and weekly_metric.reset_label == "idle":
             weekly_only_layout = False
     if metrics and set(labels) != {"session", "weekly"} and not weekly_only_layout:

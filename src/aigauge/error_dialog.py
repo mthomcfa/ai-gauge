@@ -49,6 +49,12 @@ QPushButton:default { background:#2563eb; border-color:#1d4ed8; }
 # text before it can leave the machine.
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 _BODY_TEXT_LIMIT = 500
+# Every other string in the payload is capped too, not just the key that
+# happens to be named body_text. Snapshots now carry page- and Chromium-
+# supplied strings (title, load_error_string, per-row raw text) whose length
+# nothing on this side controls, and a name-based allowlist silently stops
+# covering the payload the moment a new field is added.
+_STRING_LIMIT = 2000
 
 
 def _redact_emails(text: str) -> str:
@@ -59,8 +65,10 @@ def _sanitize_raw(raw: Any) -> Any:
     if isinstance(raw, dict):
         sanitized: dict[str, Any] = {}
         for key, value in raw.items():
-            if key == "body_text" and isinstance(value, str) and len(value) > _BODY_TEXT_LIMIT:
-                value = value[:_BODY_TEXT_LIMIT] + "…[truncated]"
+            if isinstance(value, str):
+                limit = _BODY_TEXT_LIMIT if key == "body_text" else _STRING_LIMIT
+                if len(value) > limit:
+                    value = value[:limit] + "…[truncated]"
             elif isinstance(value, (dict, list)):
                 value = _sanitize_raw(value)
             sanitized[key] = value

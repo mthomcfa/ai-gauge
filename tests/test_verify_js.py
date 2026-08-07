@@ -24,6 +24,7 @@ globalThis.document = {
   body: { innerText: BODY },
   title: TITLE,
   querySelectorAll: () => [],
+  querySelector: (sel) => (LOGIN_LINK && String(sel).includes("/login") ? {} : null),
 };
 globalThis.location = { hostname: HOST, pathname: PATH, href: "https://" + HOST + PATH };
 const result = (CHECK);
@@ -31,13 +32,22 @@ process.stdout.write(JSON.stringify(result === true));
 """
 
 
-def _run_check(provider: str, *, body: str, host: str, path: str, title: str = "") -> bool:
+def _run_check(
+    provider: str,
+    *,
+    body: str,
+    host: str,
+    path: str,
+    title: str = "",
+    login_link: bool = False,
+) -> bool:
     _url, check_js = VERIFY_TARGETS[provider]
     script = (
         _HARNESS.replace("BODY", json.dumps(body))
         .replace("TITLE", json.dumps(title))
         .replace("HOST", json.dumps(host))
         .replace("PATH", json.dumps(path))
+        .replace("LOGIN_LINK", json.dumps(login_link))
         .replace("CHECK", check_js)
     )
     out = subprocess.run(
@@ -63,6 +73,24 @@ def test_codex_verify_accepts_weekly_only_with_shared_agentic_markers():
     assert _run_check(
         "codex",
         body="Personal usage Shared agentic usage limit Weekly usage limit 40% used",
+        host="chatgpt.com",
+        path="/codex/cloud/settings/analytics",
+    )
+
+
+def test_codex_verify_accepts_current_shared_limit_wording():
+    # Real page text from a user's log (2026-08-06). OpenAI moved from
+    # "shared agentic usage limit" to "Codex and Work share the same usage
+    # limit"; verify.py and providers/codex.py must recognise both, or sign-in
+    # and extraction disagree and the tile errors forever.
+    assert _run_check(
+        "codex",
+        body=(
+            "Codex and Work Analytics Personal usage "
+            "Codex and Work share the same usage limit. "
+            "Weekly usage limit 100% remaining "
+            "Workspace monthly credit limit 100% remaining"
+        ),
         host="chatgpt.com",
         path="/codex/cloud/settings/analytics",
     )
@@ -133,4 +161,100 @@ def test_opencode_verify_rejects_root_path_and_sparse_text():
     assert not _run_check("opencode_go", body=_SHELL, host="opencode.ai", path="/")
     assert not _run_check(
         "opencode_go", body="Usage policy", host="opencode.ai", path="/workspace/wrk_1/go"
+    )
+
+
+# ----- Claude -----
+
+
+def test_claude_verify_accepts_a_signed_in_shell_without_the_usage_panel():
+    """The reported failure: signed in, but "Not signed in yet" forever.
+
+    Verification asked "did the usage dialog render?" instead of "is the
+    session good?", so a change to the usage panel made a perfectly valid
+    session unverifiable and sign-in could never complete.
+    """
+    assert _run_check(
+        "claude",
+        body="New chat Chats Projects Settings Claude",
+        host="claude.ai",
+        path="/new",
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # Older heading.
+        "Plan usage limits Current session 64% used",
+        # Newer heading, and without "Current session" so the heading alone
+        # has to carry it - otherwise a marker set still pinned to the old
+        # wording would pass on the shared token.
+        "Plan usage Weekly 12% used Opus only 91% used",
+    ],
+)
+def test_claude_verify_accepts_the_usage_panel_when_it_does_render(body):
+    assert _run_check("claude", body=body, host="claude.ai", path="/new")
+
+
+def test_claude_verify_rejects_a_signed_out_landing_page():
+    """Named for what it actually proves.
+
+    Its previous name claimed to test the login-link veto, but this body
+    carries no app-shell markers either, so it stayed green with the veto
+    deleted outright. The veto's own coverage is
+    test_claude_verify_login_link_overrides_a_convincing_shell below.
+    """
+    assert not _run_check(
+        "claude",
+        body="Log in to Claude Sign up",
+        host="claude.ai",
+        path="/new",
+        login_link=True,
+    )
+    # Same page without the anchor: sparse text alone must not verify.
+    assert not _run_check(
+        "claude", body="Log in to Claude Sign up", host="claude.ai", path="/new"
+    )
+
+
+def test_claude_verify_rejects_the_login_route():
+    assert not _run_check(
+        "claude",
+        body="New chat Chats Projects Settings",
+        host="claude.ai",
+        path="/login",
+    )
+
+
+def test_claude_verify_rejects_a_foreign_host_even_with_signed_in_text():
+    # An open redirect must not be able to satisfy verification.
+    assert not _run_check(
+        "claude",
+        body="Plan usage limits Current session New chat Projects",
+        host="claude.ai.evil.com",
+        path="/new",
+    )
+
+
+def test_claude_verify_rejects_a_blank_or_errored_page():
+    assert not _run_check("claude", body="", host="claude.ai", path="/new")
+    assert not _run_check(
+        "claude", body="Something went wrong", host="claude.ai", path="/new"
+    )
+
+
+def test_claude_verify_login_link_overrides_a_convincing_shell():
+    """The login-link check must be load-bearing on its own.
+
+    An interstitial can render app-shell chrome behind a login prompt; if the
+    shell-marker count were the only gate, that would verify as signed in and
+    the tile would then fail on every refresh.
+    """
+    assert not _run_check(
+        "claude",
+        body="New chat Chats Projects Settings Log in to continue",
+        host="claude.ai",
+        path="/new",
+        login_link=True,
     )
