@@ -5,6 +5,8 @@ from pydantic import ValidationError
 
 from aigauge.config import (
     DEFAULT_OPENCODE_USAGE_URL,
+    WINDOW_MAX_HEIGHT,
+    WINDOW_MIN_HEIGHT,
     BrowserAccount,
     ColorThresholds,
     Config,
@@ -580,7 +582,11 @@ def test_color_thresholds_reject_assignment_of_non_hex_color():
     "payload,check",
     [
         ({"window": {"height": "abc"}}, lambda c: c.window.height == 220),
-        ({"window": {"height": 5}}, lambda c: c.window.height >= 1),
+        # Pinned to the exact clamp, not ">= 1": that weaker assertion was
+        # satisfied by the raw 5, by the default 220 and by the floor alike,
+        # so it could not tell clamping from doing nothing at all.
+        ({"window": {"height": 5}}, lambda c: c.window.height == WINDOW_MIN_HEIGHT),
+        ({"window": {"height": 9999}}, lambda c: c.window.height == WINDOW_MAX_HEIGHT),
         ({"window": {"opacity": 5.0}}, lambda c: c.window.opacity == 1.0),
         ({"window": {"opacity": -1}}, lambda c: c.window.opacity == 0.3),
         ({"window": {"ui_scale": -3}}, lambda c: c.window.ui_scale == 0.75),

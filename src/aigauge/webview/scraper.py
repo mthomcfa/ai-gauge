@@ -218,7 +218,6 @@ class HeadlessScraper(QObject):
             return
         self._page.runJavaScript(self._extractor_js, self._on_js_result)
 
-
     def _load_failure_context(
         self, *, error: str = "", elapsed_s: float | None = None
     ) -> dict[str, Any]:
@@ -291,7 +290,12 @@ class HeadlessScraper(QObject):
         # load" was fixed while "timeout" and "extractor returned null" kept
         # arriving as raw={}, which tells the user nothing and tells us less.
         # A single chokepoint cannot be missed by a future error path.
-        if error and result is None:
+        #
+        # Keyed on "not a dict" rather than "is None": ScrapeRunner discards
+        # any non-dict result and substitutes raw={}, so a future path handing
+        # back a string or False would silently reproduce the empty-diagnostics
+        # bug through a condition that looked like it covered everything.
+        if error and not isinstance(result, dict):
             result = self._load_failure_context(error=error, elapsed_s=elapsed)
         if error and error in self._RETRYABLE_ERRORS and self._attempt < self._max_attempts:
             log.warning(

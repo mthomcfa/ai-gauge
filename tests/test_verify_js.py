@@ -191,14 +191,24 @@ def test_claude_verify_accepts_the_usage_panel_when_it_does_render():
     )
 
 
-def test_claude_verify_rejects_a_login_link_without_a_usage_panel():
-    # Mirrors providers/claude.py's isLoggedOut.
+def test_claude_verify_rejects_a_signed_out_landing_page():
+    """Named for what it actually proves.
+
+    Its previous name claimed to test the login-link veto, but this body
+    carries no app-shell markers either, so it stayed green with the veto
+    deleted outright. The veto's own coverage is
+    test_claude_verify_login_link_overrides_a_convincing_shell below.
+    """
     assert not _run_check(
         "claude",
         body="Log in to Claude Sign up",
         host="claude.ai",
         path="/new",
         login_link=True,
+    )
+    # Same page without the anchor: sparse text alone must not verify.
+    assert not _run_check(
+        "claude", body="Log in to Claude Sign up", host="claude.ai", path="/new"
     )
 
 

@@ -159,16 +159,21 @@ def test_failed_load_actually_delivers_the_context_to_the_caller():
         "some future error nobody has seen yet",
     ],
 )
-def test_every_payloadless_failure_carries_context(error):
+@pytest.mark.parametrize("payload", [None, "", False, "extractor returned a string"])
+def test_every_payloadless_failure_carries_context(error, payload):
     """The chokepoint, not the call sites.
 
     Attaching context at each call site meant patching them one at a time as
     each failure mode showed up in the wild: "page failed to load" was fixed
     while "timeout" and "extractor returned null" kept reaching the user as
     raw={}. Handling it in _finish means a future error path cannot miss it.
+
+    Parametrised over non-dict results as well as None, because ScrapeRunner
+    replaces anything that is not a dict with raw={} - so a condition testing
+    only "is None" would leave the same hole open for the next error path.
     """
     stand_in = _LoadFailStandIn()
-    HeadlessScraper._finish(stand_in, None, error)
+    HeadlessScraper._finish(stand_in, payload, error)
 
     assert stand_in.finished_with is not None
     result, reported = stand_in.finished_with

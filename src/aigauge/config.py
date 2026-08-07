@@ -471,6 +471,10 @@ class Config(BaseModel):
     copilot: CopilotConfig = Field(default_factory=CopilotConfig)
     openrouter: OpenRouterConfig = Field(default_factory=OpenRouterConfig)
     opencode_go: OpenCodeGoConfig = Field(default_factory=OpenCodeGoConfig)
+    expanded_tiles: list[str] = Field(default_factory=list)
+    collapsed_tiles: list[str] = Field(default_factory=list)
+    window: WindowState = Field(default_factory=WindowState)
+
     @field_validator(
         "active_refresh_interval_minutes", "refresh_interval_minutes", mode="before"
     )
@@ -481,10 +485,6 @@ class Config(BaseModel):
             value, default=default, minimum=1, maximum=180,
             field=info.field_name, integer=True,
         )
-
-    expanded_tiles: list[str] = Field(default_factory=list)
-    collapsed_tiles: list[str] = Field(default_factory=list)
-    window: WindowState = Field(default_factory=WindowState)
 
     @classmethod
     def load(cls) -> Config:

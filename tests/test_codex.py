@@ -1,8 +1,15 @@
+import json
+import re
+import shutil
+import subprocess
 from datetime import datetime, timedelta
+
+import pytest
 
 from aigauge.models import SnapshotStatus
 from aigauge.providers.codex import (
     CODEX_USAGE_URL,
+    EXTRACTOR_JS,
     _build_snapshot,
     _parse_reset_text,
     _weekly_only_layout_evidence,
@@ -458,16 +465,42 @@ def test_strong_evidence_with_real_usage_still_reports_it():
     assert weekly.percent_used == 60
 
 
-def test_extractor_js_matches_every_known_shared_limit_phrasing():
-    import re as _re
-    for phrase in (
+def _shared_limit_regex_literal() -> str:
+    """Pull the real regex out of the production JS source."""
+    match = re.search(
+        r"has_shared_agentic_text:\s*(/.+?/i)\s*\n?\s*\.test", EXTRACTOR_JS, re.S
+    )
+    assert match, "has_shared_agentic_text not found; did EXTRACTOR_JS change shape?"
+    return match.group(1)
+
+
+@pytest.mark.skipif(
+    shutil.which("node") is None, reason="node is required to evaluate the extractor JS"
+)
+@pytest.mark.parametrize(
+    "phrase",
+    [
         "shared agentic usage limit",
         "Codex and Work share the same usage limit",
         "Workspace monthly credit limit",
-    ):
-        assert _re.search(
-            r"shared agentic usage limit|shares? the same usage limit"
-            r"|workspace monthly credit limit",
-            phrase,
-            _re.I,
-        ), phrase
+    ],
+)
+def test_extractor_js_matches_every_known_shared_limit_phrasing(phrase):
+    """Executes the regex from EXTRACTOR_JS, not a copy of it.
+
+    The previous version of this test declared its own copy of the pattern and
+    asserted that copy matched. It passed regardless of what EXTRACTOR_JS
+    contained - deleting the production regex outright left it green - while
+    its name claimed the opposite. Narrowing the real regex must fail here,
+    because a phrasing the extractor misses is precisely how a live account
+    ended up erroring forever.
+    """
+    script = (
+        f"const re = {_shared_limit_regex_literal()};\n"
+        f"process.stdout.write(String(re.test({json.dumps(phrase)})));"
+    )
+    out = subprocess.run(
+        ["node", "-e", script], capture_output=True, text=True, timeout=30
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout == "true", f"extractor does not recognise: {phrase!r}"
