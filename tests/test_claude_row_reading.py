@@ -227,3 +227,49 @@ def test_a_bare_percentage_is_not_rescued_by_a_countdown_elsewhere_in_the_row():
     row = _read_row("Weekly", [("Weekly Resets in 2 hr left 42%", 40)])
 
     assert row["kind"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    "label,text",
+    [
+        ("Current session", "Current session 64% of your session limit used"),
+        ("Weekly", "Weekly 64% of the weekly allowance consumed"),
+    ],
+)
+def test_polarity_wording_is_reached_through_prose(label, text):
+    """Found by running the real extractor in a real browser.
+
+    An earlier version of this rule required the wording to sit immediately
+    against the number, separated by punctuation at most. "64% of your session
+    limit used" is an ordinary phrasing and the ORIGINAL code read it fine, so
+    that rule was a regression: it turned a working gauge into an error.
+    """
+    assert _read_row(label, [(text, 40)])["kind"] == "used"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # The scan must halt at the digit, never reaching the clock's "left".
+        "Weekly 42% Resets in 3 days left",
+        # ...and at a bare time unit with no digit after the percentage.
+        "Weekly 42% Resets next week, hours left",
+        # ...and at the word "reset" itself. Found by adversarial review of
+        # this rule: these carry neither a digit nor a time unit, so a scan
+        # stopping only at those walked into the countdown's "left" and
+        # reported a bare percentage as 58% used.
+        "Weekly 42% Resets tomorrow, some left",
+        "Weekly 42% until reset, plenty left",
+        "Weekly 42% renews soon, a little left",
+    ],
+)
+def test_the_forward_scan_stops_before_a_countdown(text):
+    """The reason the scan is bounded rather than unbounded.
+
+    Reading forward to the end of the row would find "left" in "3 days left"
+    and report 58% used for a row that never stated a direction. Stopping at
+    the first digit or time unit keeps prose reachable and clocks out of
+    reach - the two requirements pull in opposite directions and this is the
+    line between them.
+    """
+    assert _read_row("Weekly", [(text, 40)])["kind"] == "unknown"
