@@ -74,18 +74,56 @@ session, which is the weakest possible review posture.
 
 ---
 
-## 2. Release
+## 2. Release — two decisions parked, not tasks
 
-- **No tag has been pushed.** `v1.0.0+cfa.1` would build artifacts for all three
-  platforms. Merging changed nothing; only the tag starts the workflow.
-- **The release pipeline has never been dry-run.** The macOS artifact path
-  restored in PR #5 — including the post-relocation re-sign in `build.sh` — has
-  never been exercised end to end. The first real tag under a new major would
-  also be its first test. Consider a throwaway `v1.0.0+cfa.0`, check the draft
-  release, then delete it.
-- **`scratch/release-dryrun` is a stray remote branch.** It needs deleting by
-  hand: this environment's git proxy denies branch deletes (`403`).
-  `git push origin --delete scratch/release-dryrun`
+> **Both are undecided.** The maintainer has explicitly not committed to either
+> and wants to think about them. The facts below are recorded so the thinking
+> does not have to start from scratch — they are *not* a recommendation to act.
+> Do not do either of these without asking.
+
+### 2.1 Whether to tag a release at all
+
+`v1.0.0+cfa.2` would build artifacts for all three platforms and open a draft
+GitHub Release. Merging changes nothing on its own; only a `v*` tag starts the
+workflow.
+
+What informs the decision:
+
+- **The repository has no tags at all.** `git ls-remote --tags origin` returns
+  nothing, so the release workflow has never run once. A first tag is also the
+  pipeline's first live test.
+- **The macOS artifact path is the untested part.** It was restored in PR #5,
+  including the post-relocation re-sign in `build.sh`, and has never been
+  exercised end to end. Windows and Linux paths are older but equally unrun
+  under this fork.
+- **Nothing depends on a release.** The app is installed from source and works.
+  Tagging buys distributable binaries and provenance attestation; it does not
+  buy the maintainer anything they do not already have.
+- If the pipeline is worth de-risking first, a throwaway tag (`v1.0.0+cfa.0`)
+  exercises it, and the resulting draft release can be deleted without
+  publishing.
+
+### 2.2 Whether to delete `scratch/release-dryrun`
+
+A stray remote branch. It cannot be deleted from the dev environment — the git
+proxy denies branch deletes with `403` — so it needs
+`git push origin --delete scratch/release-dryrun` from the maintainer's machine.
+
+What informs the decision, checked 2026-08-10:
+
+- **It holds nothing that `main` does not**, apart from one commit. Diffed
+  against `main`, it is 3,135 deletions to 90 insertions — i.e. it is behind,
+  not ahead.
+- **Its one unique commit is `8d73d15`**, "scratch: release pipeline dry run at
+  0.0.1+cfa.1 (throwaway, to be deleted)", which only sets the version string to
+  `0.0.1+cfa.1` in four files for a dry run that never happened, because the tag
+  push was blocked.
+- It reads as unmerged history only because PRs #4 and #5 were **squash**-merged,
+  so the branch's originals are not ancestors of `main` even though their
+  content is.
+
+On the evidence, deleting it loses nothing. That is an observation, not a
+decision — it is still the maintainer's call.
 
 ---
 
