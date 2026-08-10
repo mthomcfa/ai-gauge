@@ -567,3 +567,36 @@ def test_an_auth_required_cycle_does_not_count_as_a_failing_one():
     app._record_cycle_outcome()  # noqa: SLF001
 
     assert app._consecutive_error_cycles == 0  # noqa: SLF001
+
+
+def test_the_app_can_actually_be_constructed(qapp, tmp_path, monkeypatch):
+    """Constructs the real App, which nothing else here does.
+
+    Every other test in this file uses ``App.__new__(App)`` and sets the
+    attributes it needs by hand. That skips ``__init__`` entirely, so an
+    attribute read during startup but never assigned there is invisible to the
+    whole suite - and to CI.
+
+    It shipped exactly that way: `_consecutive_error_cycles` was read by
+    `_error_retry_time`, reached from `__init__` via `_restart_timer`, but the
+    assignment landed outside `__init__`. 609 tests passed, six CI jobs passed,
+    and the app raised AttributeError before its window appeared. The stand-in
+    stubs had the attribute set, so they proved the logic and hid the wiring.
+
+    This is deliberately a smoke test rather than a targeted one: it fails for
+    *any* attribute the startup path reads and `__init__` does not provide.
+    """
+    import aigauge.app as app_module
+    import aigauge.config as config_module
+
+    monkeypatch.setattr(app_module, "app_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(config_module, "app_data_dir", lambda: tmp_path)
+
+    app = App()
+
+    # __init__ already reaches _schedule_next_refresh via _restart_timer; call
+    # it again explicitly so the failing path is named in the test, not just
+    # traversed by construction.
+    app._schedule_next_refresh()  # noqa: SLF001
+
+    assert app._consecutive_error_cycles == 0  # noqa: SLF001
