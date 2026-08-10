@@ -33,6 +33,7 @@ class ScrapeRunner:
         wait_ms: int = 5000,
         transport_max_attempts: int = 1,
         build_max_attempts: int = 2,
+        capture_api: bool = False,
         parent: QObject | None = None,
     ):
         self._account_id = account_id
@@ -43,6 +44,7 @@ class ScrapeRunner:
         self._wait_ms = wait_ms
         self._transport_max_attempts = max(1, transport_max_attempts)
         self._build_max_attempts = max(1, build_max_attempts)
+        self._capture_api = capture_api
         self._parent = parent
         self._scraper: HeadlessScraper | None = None
 
@@ -101,6 +103,7 @@ class ScrapeRunner:
                 extractor_js=self._extractor_js,
                 wait_ms=self._wait_ms,
                 max_attempts=self._transport_max_attempts,
+                capture_api=self._capture_api,
                 parent=self._parent,
             )
             self._scraper.done.connect(_handle)

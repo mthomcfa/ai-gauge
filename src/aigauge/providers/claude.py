@@ -219,6 +219,7 @@ EXTRACTOR_JS = r"""
       url: location.href,
       title: document.title,
       body_text: bodyText.slice(0, 8000),
+      api: (window.__ag_api || null),
     };
   }
 
@@ -241,6 +242,7 @@ EXTRACTOR_JS = r"""
       url: location.href,
       title: document.title,
       body_text: bodyText.slice(0, 8000),
+      api: (window.__ag_api || null),
     };
   }
 
@@ -251,6 +253,7 @@ EXTRACTOR_JS = r"""
     url: location.href,
     title: document.title,
     body_text: bodyText.slice(0, 8000),
+    api: (window.__ag_api || null),
   };
 })();
 """
@@ -490,6 +493,11 @@ class ClaudeProvider(Provider):
             wait_ms=7000,
             transport_max_attempts=2,
             build_max_attempts=2,
+            # Discovery, not yet load-bearing: the gauge still reads the DOM.
+            # This records the SHAPE of the JSON the page fetches so a field
+            # mapping can be written from a real account without guessing, and
+            # without any response body leaving the browser context.
+            capture_api=True,
             parent=self._parent,
         )
         self._runner.run(on_done)

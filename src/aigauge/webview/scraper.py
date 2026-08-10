@@ -9,6 +9,7 @@ from PyQt6.QtCore import QObject, QTimer, QUrl, pyqtSignal
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 
 from .page import QuietWebEnginePage
+from .api_capture import install_api_recorder
 from .profile import get_profile
 
 log = logging.getLogger("aigauge.scraper")
@@ -69,6 +70,7 @@ class HeadlessScraper(QObject):
         extractor_js: str,
         wait_ms: int = 4000,
         timeout_ms: int = 25000,
+        capture_api: bool = False,
         max_attempts: int = 1,
         parent: QObject | None = None,
     ):
@@ -78,6 +80,7 @@ class HeadlessScraper(QObject):
         self._extractor_js = extractor_js
         self._wait_ms = wait_ms
         self._timeout_ms = timeout_ms
+        self._capture_api = capture_api
         self._max_attempts = max(1, max_attempts)
         self._attempt = 0
         self._finished = False
@@ -96,6 +99,12 @@ class HeadlessScraper(QObject):
 
         profile = get_profile(provider)
         self._page = QuietWebEnginePage(profile, self, provider=provider)
+        # Must be installed before the first navigation: the recorder wraps
+        # fetch/XHR at DocumentCreation, so a page already loading would have
+        # issued its requests through the originals.
+        self._api_capture_installed = (
+            install_api_recorder(self._page) if capture_api else False
+        )
         self._view = QWebEngineView()
         self._view.setPage(self._page)
         # Offscreen — never .show()
