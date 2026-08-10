@@ -57,7 +57,11 @@ LOGIN_URLS = {
 }
 
 _ACTIVE_MODE_MINUTES = 30
-_STALE_ERROR_RETRY_MINUTES = 1
+_ERROR_RETRY_MINUTES = 1
+# A provider that is simply broken must not be retried every minute forever.
+# After this many consecutive failing cycles the fast retry stops and the
+# normal cadence takes over.
+_ERROR_FAST_RETRY_CYCLES = 3
 _HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000
 _LOG_VALUE_LIMIT = 300
 
@@ -385,6 +389,7 @@ class App(QObject):
             "queue": ",".join(self._refresh_queue),
             "next_refresh_s": self._next_refresh_seconds(),
             "unchanged_cycles": self._unchanged_cycles,
+            "error_cycles": self._consecutive_error_cycles,
         }
 
     def _log_lifecycle_event(self, event: str) -> None:
@@ -481,9 +486,9 @@ class App(QObject):
                 1,
                 int((next_refresh_at - datetime.now()).total_seconds() // 60) or 1,
             )
-        stale_retry = self._stale_error_retry_time(now)
-        if stale_retry is not None and stale_retry < next_refresh_at:
-            next_refresh_at = stale_retry
+        error_retry = self._error_retry_time(now)
+        if error_retry is not None and error_retry < next_refresh_at:
+            next_refresh_at = error_retry
             minutes = max(
                 1,
                 int((next_refresh_at - datetime.now()).total_seconds() // 60) or 1,
@@ -525,14 +530,50 @@ class App(QObject):
                     earliest = target
         return earliest
 
-    def _stale_error_retry_time(self, now: datetime | None = None) -> datetime | None:
-        """Soonest recovery refresh for errors that still have stale metrics."""
+    def _record_cycle_outcome(self) -> None:
+        """Count consecutive failing cycles, so the fast retry can be bounded.
+
+        The reset is the load-bearing half. Without it a provider that failed
+        a few times and later recovered would never earn a fast retry again
+        for the life of the process - the bound would be permanent rather than
+        a backoff.
+        """
+        if any(
+            snap.status == SnapshotStatus.ERROR
+            for snap in self._snapshots.values()
+        ):
+            self._consecutive_error_cycles += 1
+        else:
+            self._consecutive_error_cycles = 0
+
+    def _error_retry_time(self, now: datetime | None = None) -> datetime | None:
+        """Soonest recovery refresh after a provider error.
+
+        This used to require the errored snapshot to still carry stale
+        metrics, which meant the *worse* case got the slower retry: a provider
+        that had never succeeded this run showed nothing at all and then waited
+        a full interval, while one showing a stale-but-plausible number was
+        retried within the minute.
+
+        That is exactly the shape of a cold start. Claude's settings page
+        resolves eight endpoints before it requests usage, and on a fresh
+        launch none of them are cached, so the first scrape can exceed its
+        budget. The retry a minute later runs against a warm cache and
+        succeeds - but until then every restart showed a broken tile for a full
+        refresh interval, at precisely the moment a user is most likely to be
+        looking at the app.
+
+        AUTH_REQUIRED is deliberately excluded: it needs the user to sign in,
+        so retrying it quickly only burns page loads.
+        """
+        if self._consecutive_error_cycles > _ERROR_FAST_RETRY_CYCLES:
+            return None
         if not any(
-            snap.status == SnapshotStatus.ERROR and bool(snap.metrics)
+            snap.status == SnapshotStatus.ERROR
             for snap in self._snapshots.values()
         ):
             return None
-        return (now or datetime.now()) + timedelta(minutes=_STALE_ERROR_RETRY_MINUTES)
+        return (now or datetime.now()) + timedelta(minutes=_ERROR_RETRY_MINUTES)
 
     # ----- Refresh -----
 
@@ -659,6 +700,7 @@ class App(QObject):
                 self._unchanged_cycles = 0
             elif not self._current_refresh_manual:
                 self._unchanged_cycles += 1
+            self._record_cycle_outcome()
             self._last_cycle_signatures = dict(self._cycle_signatures)
             self._current_refresh_manual = False
             self._widget.set_refreshing(False)
