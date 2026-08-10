@@ -1,7 +1,11 @@
 # Next session — parked items
 
-State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.1` at PRs #6–#13,
-609 tests passing, all five providers reading.
+State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#16,
+610 tests passing, all five providers reading.
+
+`1.0.0+cfa.1` does not start — it raises `AttributeError` during `App.__init__`.
+Fixed in `+cfa.2`; the two carry different version strings on purpose, because
+`app_version` in a diagnostics blob has to identify which build produced it.
 
 **Issues are disabled on this repo** (the GitHub API returns `410`), so this
 file is the issue tracker. Enable them at *Settings → General → Features →
@@ -109,6 +113,7 @@ speculative.
 | `webview/verify.py` → Claude check | A `/login` anchor is a hard veto, while `providers/claude.py`'s `isLoggedOut` ANDs it with absent usage text. Verify is stricter than the extractor, in the direction of the reported sign-in loop. | Loosening sign-in semantics without evidence risks the opposite failure: a bad session verifying, then erroring forever. |
 | `menubar.py` → `_provider_max_percent` | Short-circuits on a metric labelled `session`, while `gauge.provider_max_percent` takes the worst metric. The two can disagree for the same provider. | Pre-existing and documented in the module. The tag-filter half was fixed in PR #6; this divergence predates it. |
 | `webview/scraper.py` → timeout | Wall-clock, so it does not account for system sleep. A laptop resumed after two days reported `elapsed_s: 228477` and fired a stale scrape per provider. | Cosmetic in effect — the resumed cycle fails and recovers — but it produces one spurious failure per provider on every resume, and nonsense elapsed values in the log. |
+| `app.py` → `_error_retry_time` | The fast retry is **cycle-wide, not per-provider**. One permanently-failing provider makes every cycle count as failing, so healthy providers get refreshed every minute too until the bound engages — and once it has engaged (the counter never resets, because no cycle is ever clean), a genuinely transient failure on a *different* provider gets no fast retry at all. | Inherited shape: the pre-existing `_stale_error_retry_time` was cycle-wide too. The blast radius grew because any error now triggers it rather than only errors carrying stale metrics. Bounded at three cycles, so the cost is finite. Per-provider retry is the right fix and a bigger change than a close-out warranted. |
 | `webview/api_capture.py` → `sketch` | Numbers survive redaction verbatim, so a numeric account ID in a response would reach the log. Strings and UUIDs are reduced to length markers. | Deliberate: the quota values *are* numbers. Redacting them would defeat the capture. Local-only, and the user controls the log. |
 
 ---
@@ -132,6 +137,16 @@ The cost is not Python. It is three things, in value order:
    5000 for OpenCode — slept unconditionally before the extractor runs, even on
    a page that was ready immediately. The extractor already has a retry protocol
    (`__retry_after_ms`); the fixed wait is dead time.
+
+**A failing Claude cycle can outlast the refresh interval.** Claude runs
+`timeout_ms=40000` × `transport_max_attempts=2` = 80s per scraper, and
+`build_max_attempts=2` allows two scrapers, so a single account can take 160s
+to give up. Two Claude accounts serially is ~5.3 minutes against a 5-minute
+active interval. Nothing overlaps — `refresh_now` returns early while a cycle
+is in flight — but a persistently failing Claude effectively occupies the
+schedule. The budget was raised in PR #11 for a real reason (the page needs it)
+and the fast retry from PR #13 partly offsets it, so this is recorded rather
+than tuned blind.
 
 `start_at_login` also defaults to `False` (`config.py`). Turning it on makes a
 cold start a once-per-boot event rather than something you meet every time you

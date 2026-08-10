@@ -1,7 +1,7 @@
 # Product Data Sheet: AI Gauge (security-hardened fork)
 
 > Describes [mthomcfa/ai-gauge](https://github.com/mthomcfa/ai-gauge) at
-> **1.0.0+cfa.1**, a security-hardening fork of
+> **1.0.0+cfa.2**, a security-hardening fork of
 > [jpajak/ai-gauge](https://github.com/jpajak/ai-gauge). Fork version numbers
 > are its own and do not correspond to upstream releases of the same number.
 
