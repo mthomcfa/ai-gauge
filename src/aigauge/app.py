@@ -143,6 +143,9 @@ def _snapshot_signature(snapshot: UsageSnapshot) -> tuple:
     )
 
 
+_LOG_DICT_KEY_LIMIT = 50
+
+
 def _summarize_for_log(value, *, depth: int = 0):
     if depth > 3:
         return "..."
@@ -155,10 +158,19 @@ def _summarize_for_log(value, *, depth: int = 0):
     if isinstance(value, (int, float, bool)) or value is None:
         return value
     if isinstance(value, dict):
-        return {
+        # Lists were already bounded; dictionaries were not. A page-controlled
+        # payload with tens of thousands of keys produced a 1 MB log line
+        # against a 512 KiB rotation, which discards the user's existing
+        # diagnostics - the log is the one artifact that makes a provider
+        # failure explainable, so losing it is the expensive part.
+        items = sorted(value.items(), key=lambda item: str(item[0]))
+        summarized = {
             str(k): _summarize_for_log(v, depth=depth + 1)
-            for k, v in sorted(value.items(), key=lambda item: str(item[0]))
+            for k, v in items[:_LOG_DICT_KEY_LIMIT]
         }
+        if len(items) > _LOG_DICT_KEY_LIMIT:
+            summarized["..."] = f"{len(items) - _LOG_DICT_KEY_LIMIT} more keys"
+        return summarized
     if isinstance(value, (list, tuple)):
         summarized = [_summarize_for_log(v, depth=depth + 1) for v in value[:5]]
         if len(value) > 5:

@@ -79,3 +79,26 @@ def test_format_diagnostics_includes_the_app_version():
     payload = json.loads(_format_diagnostics("claude", snapshot))
     assert payload["app_version"] == __version__
     assert "+cfa." in payload["app_version"]
+
+
+def test_diagnostics_are_bounded_against_a_page_controlled_payload():
+    """Breadth, not just per-string length.
+
+    Everything in snapshot.raw comes from a provider page. Measured before this
+    cap existed: a 50,000-key payload produced a 1.3 MB clipboard carrying
+    attacker-chosen text into a bug report.
+    """
+    hostile = {"/evil": {"planted": "ATTACKER-CONTROLLED-STRING"}}
+    hostile.update({f"flood{i}": i for i in range(50000)})
+    snapshot = UsageSnapshot(
+        provider="claude",
+        status=SnapshotStatus.ERROR,
+        error="boom",
+        raw={"api": hostile, "rows": list(range(5000))},
+    )
+
+    out = _format_diagnostics("claude", snapshot)
+
+    assert len(out) < 50_000, f"clipboard payload was {len(out)} bytes"
+    assert "more keys" in out, "truncation must be visible, not silent"
+    assert "more items" in out

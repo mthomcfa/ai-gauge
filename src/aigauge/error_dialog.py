@@ -55,6 +55,12 @@ _BODY_TEXT_LIMIT = 500
 # nothing on this side controls, and a name-based allowlist silently stops
 # covering the payload the moment a new field is added.
 _STRING_LIMIT = 2000
+# Breadth, not just depth of a single value. Every field in snapshot.raw comes
+# from a provider page, so a page that returns tens of thousands of keys - or a
+# third-party script on it that plants them - would otherwise put megabytes of
+# its own choosing into the blob users are told to paste into bug reports.
+_MAX_KEYS = 200
+_MAX_ITEMS = 50
 
 
 def _redact_emails(text: str) -> str:
@@ -64,7 +70,9 @@ def _redact_emails(text: str) -> str:
 def _sanitize_raw(raw: Any) -> Any:
     if isinstance(raw, dict):
         sanitized: dict[str, Any] = {}
-        for key, value in raw.items():
+        if len(raw) > _MAX_KEYS:
+            sanitized["…[truncated]"] = f"{len(raw) - _MAX_KEYS} more keys"
+        for key, value in list(raw.items())[:_MAX_KEYS]:
             if isinstance(value, str):
                 limit = _BODY_TEXT_LIMIT if key == "body_text" else _STRING_LIMIT
                 if len(value) > limit:
@@ -74,7 +82,10 @@ def _sanitize_raw(raw: Any) -> Any:
             sanitized[key] = value
         return sanitized
     if isinstance(raw, list):
-        return [_sanitize_raw(item) for item in raw]
+        capped = [_sanitize_raw(item) for item in raw[:_MAX_ITEMS]]
+        if len(raw) > _MAX_ITEMS:
+            capped.append(f"…[truncated] {len(raw) - _MAX_ITEMS} more items")
+        return capped
     return raw
 
 
