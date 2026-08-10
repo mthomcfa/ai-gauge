@@ -21,7 +21,7 @@ Compact monitor for **Claude.ai**, **ChatGPT Codex**, **GitHub Copilot**, **Open
 
 > **Requires Python 3.11+.** Secrets live in the OS-native credential store (Windows Credential Manager / DPAPI, macOS Keychain, Linux Secret Service). Auto-start uses the platform's standard mechanism (Windows Task Scheduler / LaunchAgent / `~/.config/autostart`).
 
-Current version: **0.6.5+cfa.1** — a fork version, see [Versioning](#versioning). Release notes in [CHANGELOG.md](CHANGELOG.md).
+Current version: **1.0.0+cfa.1** — a fork version, see [Versioning](#versioning). Release notes in [CHANGELOG.md](CHANGELOG.md).
 
 AI Gauge is an independent open-source project and unofficial local desktop
 utility. It is not affiliated with Anthropic, OpenAI, GitHub, Microsoft,
@@ -65,7 +65,7 @@ Binaries are published on **[this fork's Releases page](https://github.com/mthom
 | macOS   | `ai-gauge-<file-version>-macos.tar.gz`      | **Apple Silicon only.** Extract, drag `ai-gauge.app` to Applications |
 | Linux   | `ai-gauge-<file-version>-linux.tar.gz`      | extract, run `./ai-gauge/ai-gauge`           |
 
-`<file-version>` is the version with `+` replaced by `-`, so `0.6.5+cfa.1` ships as `ai-gauge-0.6.5-cfa.1-windows.zip`. Print it with `python tools/check_versions.py`.
+`<file-version>` is the version with `+` replaced by `-`, so `1.0.0+cfa.1` ships as `ai-gauge-1.0.0-cfa.1-windows.zip`. Print it with `python tools/check_versions.py`.
 
 **Intel Macs are not covered by the prebuilt archive.** PyInstaller builds for the host architecture and this fork's CI runs on Apple Silicon, so the `.app` is arm64-only. Intel users should [run from source](#run-from-source); the menu-bar UI works identically.
 
@@ -251,7 +251,7 @@ That also means **upstream cannot support this build**, and bugs here may not ex
 Fork releases use a [PEP 440](https://peps.python.org/pep-0440/) local version segment:
 
 ```
-0.6.5+cfa.1
+1.0.0+cfa.1
 └─┬─┘ └─┬─┘
   │     └── fork build counter — identifies this as a fork build
   └──────── this fork's own release counter, NOT an upstream release number

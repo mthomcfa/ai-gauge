@@ -6,9 +6,18 @@
 > earlier `0.6.4` entry predates that convention and **is not** upstream's
 > `v0.6.4`, which is different code.
 
-## Unreleased
+## 1.0.0+cfa.1 - 2026-08-10
 
-Claude stopped reporting entirely after it moved its usage surface, and the
+**First release numbered independently of upstream.** The `+cfa.N` segment
+already marked these builds as this fork's, but `0.6.5` sat inside upstream's
+own `0.6.x` range, so the suffix was the only thing telling them apart — and a
+suffix is exactly what gets dropped in a filename, a bug report or a
+conversation. `1.0.0` makes the divergence structural instead of something a
+reader has to notice. The number before `+` is this fork's counter and always
+has been; it is not a claim about which upstream release the tree matches.
+
+The release itself is the Claude work below. Claude stopped reporting entirely
+after it moved its usage surface, and
 work to fix it exposed several defects in the machinery meant to make such
 breakages diagnosable. Nothing here changes what the gauges mean; it changes
 whether they can be trusted and whether a failure can be explained.

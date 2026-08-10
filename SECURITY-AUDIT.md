@@ -109,7 +109,7 @@ Post-fix verification: **316 tests pass** (from a 265 baseline; +51 regression t
 
 ---
 
-## Addendum — audit of the 0.6.5+cfa.1 → Unreleased work (2026-08-10)
+## Addendum — audit of the 0.6.5+cfa.1 → 1.0.0+cfa.1 work (2026-08-10)
 
 Scope: the diagnosability, route and API-capture changes made after
 `0.6.5+cfa.1`. One exploitable defect was found and fixed; nothing else in the
