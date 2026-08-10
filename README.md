@@ -193,6 +193,8 @@ If the embedded-browser sign-in doesn't work for you (e.g. your account requires
 
 For most users the [pre-built downloads](#download) are easier — this section is for building locally or for maintainers cutting releases. The build machine needs Python 3.11+ and a `.venv` with `pip install -e .[dev]` already run; the resulting binary does **not** require Python on the target machine.
 
+> **Windows: `build.ps1` requires PowerShell 7+.** It declares `#requires -version 7`, so Windows PowerShell 5.1 — still the default `powershell.exe` on Windows 10/11, and what you get from most Start-menu and right-click entries — refuses to run it and reports a `#requires` version error rather than a build failure. Check with `$PSVersionTable.PSVersion`; if it reports 5.x, install PowerShell 7 (`winget install Microsoft.PowerShell`) and build from `pwsh`. This affects the build script only — running the app from source, the tests, and `check_versions.py` all work under 5.1.
+
 | OS      | Command          | Output                       |
 | ------- | ---------------- | ---------------------------- |
 | Windows | `.\build.ps1`    | `dist/ai-gauge/ai-gauge.exe` |
@@ -264,6 +266,24 @@ Fork releases use a [PEP 440](https://peps.python.org/pep-0440/) local version s
 Bug reports, provider-layout fixes, and PRs are welcome. See
 [CONTRIBUTING.md](CONTRIBUTING.md) for environment setup, test commands, and
 the issue templates to use.
+
+## When a tile shows an error
+
+Click the tile to open **error details**, then **Copy diagnostics** — that blob
+carries the page text and the failure reason, and is what makes a report
+actionable. A few messages are worth recognising:
+
+| Message | What it means |
+| ------- | ------------- |
+| `Claude's usage layout changed: could not read <row> …` | The page rendered but the reading could not be justified — either several meters share one container so the percentage cannot be attributed to a row, or there is no "used"/"remaining" wording beside the number. The tile refuses rather than showing a number that may be inverted or belong to a different meter. The blob carries the row's text. |
+| `extractor retry limit exceeded` | The page loaded but never finished rendering usage within the time allowed. |
+| `page failed to load` | A network or browser-level failure. The diagnostics carry Chromium's reason, e.g. `net::ERR_CONNECTION_RESET`. |
+| `Not signed in to <provider>` | The stored session expired. Re-run sign-in, or use **Paste cookie** in Settings. |
+
+Diagnostics for Claude also include an `api` section recording the *shape* of
+the JSON the page fetched — field names, numbers and timestamps, with all other
+strings reduced to a length. It never contains a response body and never leaves
+your machine. See "API response shapes" in [SECURITY.md](SECURITY.md).
 
 ## Notes / limitations
 

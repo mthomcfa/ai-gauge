@@ -162,3 +162,49 @@ def test_upstream_staging_files_are_not_addressed_to_this_repo():
         text = (REPO_ROOT / "audit-artifacts" / name).read_text(encoding="utf-8")
         assert "not filed" in text.lower() or "deliberate human action" in text.lower()
         assert UPSTREAM_REPO in text
+
+
+# --- build prerequisites ---------------------------------------------------
+#
+# build.ps1 declares "#requires -version 7", so Windows PowerShell 5.1 - still
+# the default powershell.exe on Windows 10/11 - refuses to run it and reports a
+# #requires error rather than a build failure. That requirement was stated
+# nowhere: not in the README's build section, not in CONTRIBUTING's stated
+# requirements, not in RELEASING's Windows build step, and not in the upgrade
+# instructions sent to a user, who then lost a build cycle to it.
+
+_WINDOWS_BUILD_DOCS = ["README.md", "CONTRIBUTING.md", "RELEASING.md"]
+
+
+def _required_powershell_major() -> int:
+    """Read the requirement from build.ps1 rather than restating it."""
+    import re
+
+    source = (REPO_ROOT / "build.ps1").read_text(encoding="utf-8")
+    match = re.search(r"#requires\s+-version\s+(\d+)", source, re.IGNORECASE)
+    assert match, "build.ps1 no longer declares a #requires version"
+    return int(match.group(1))
+
+
+@pytest.mark.parametrize("name", _WINDOWS_BUILD_DOCS)
+def test_docs_state_the_powershell_version_build_ps1_demands(name):
+    """Anchored on build.ps1, so bumping it fails here instead of silently.
+
+    The point is not that the words "PowerShell 7" appear somewhere; it is that
+    whatever version build.ps1 actually demands is the version the docs name.
+    """
+    major = _required_powershell_major()
+    text = _read(name)
+
+    assert f"PowerShell {major}" in text, (
+        f"{name} documents the Windows build but never says it needs "
+        f"PowerShell {major}"
+    )
+
+
+@pytest.mark.parametrize("name", _WINDOWS_BUILD_DOCS)
+def test_docs_name_the_shell_that_actually_works(name):
+    # "PowerShell 7" alone is not actionable on a machine whose Start menu says
+    # "Windows PowerShell": the executable is called pwsh, and that is the word
+    # a stuck reader needs.
+    assert "pwsh" in _read(name), f"{name} does not name pwsh"

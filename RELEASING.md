@@ -61,7 +61,9 @@ bare number, so CI fails if the segment is missing.
    versions, but a local pre-flight catches issues sooner:
 
    ```powershell
-   # Windows
+   # Windows — run this from PowerShell 7+ (pwsh), not Windows PowerShell 5.1:
+   # build.ps1 declares "#requires -version 7" and refuses to run under 5.1.
+   # Confirm with $PSVersionTable.PSVersion before you start.
    .venv\Scripts\python.exe tools\check_versions.py
    .venv\Scripts\python.exe -m pytest
    .\build.ps1

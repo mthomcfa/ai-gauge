@@ -106,3 +106,61 @@ Three independent adversarial passes ran over the full branch diff:
 **No security control was defeated by any pass.** The three follow-ups from passes 1–2 (`blob:` main-frame gap — the most material, since the `data:` block had left the same opaque-origin phishing surface open — plus the `_atomic_write` fd-leak and the Windows partial-delete warning) were applied. Pass 3 then found one **functional regression the first two missed and this document originally overstated away**: a single config field rejected by the new strict validators bubbled out of `Config.load()`'s blanket `except` and reset the *entire* config, so an upgrading user with a custom OpenCode URL would silently lose all other settings. Fixed by coercing/dropping the bad field per-field instead (commit `f8d1206`), with tests asserting sibling settings survive. Pass 3's two LOW items (unbounded quarantine files on roaming `%APPDATA%`; Windows reserved device-name ids) and one NOTE (unvalidated URL in "Open usage in browser") were also fixed (`f398181`, `cef527e`) — so the reserved-device-name residual is now closed rather than accepted.
 
 Post-fix verification: **316 tests pass** (from a 265 baseline; +51 regression tests), `bandit` 0 High, `pip-audit` no vulnerable declared dependencies.
+
+---
+
+## Addendum — audit of the 0.6.5+cfa.1 → Unreleased work (2026-08-10)
+
+Scope: the diagnosability, route and API-capture changes made after
+`0.6.5+cfa.1`. One exploitable defect was found and fixed; nothing else in the
+range changed the security posture.
+
+**The finding.** `webview/api_capture.py` records the shape of JSON the Claude
+page fetches, so a provider change can be diagnosed from a real account. It
+exposed that record as `window.__ag_api` in the page's **main world**, which is
+shared with everything the provider page loads — the app's own bundle,
+Cloudflare, RUM, analytics (see "Embedded Browser" above, which already notes
+those subresources). Any of them could reassign it.
+
+Reproduced in a real browser before fixing. A page script running
+
+```js
+window.__ag_api = {"/evil": {…}};
+for (let i = 0; i < 50000; i++) window.__ag_api["flood" + i] = i;
+```
+
+replaced the record wholesale. Measured downstream:
+
+| | before | after |
+| --- | --- | --- |
+| log line | 1,027,859 bytes, against a 512 KiB rotation with 2 backups | 1,098 bytes |
+| clipboard | 1,328,044 bytes carrying attacker-chosen text | 4,667 bytes |
+
+**Impact.** Not credential theft and not code execution — nothing from the page
+is executed, and the capture has no egress path. The material consequence is
+**anti-forensic**: one poisoned scrape rotates the log and three discard the
+diagnostic history entirely, and the log is the only artifact that makes a
+provider failure explainable. Secondarily, "Copy diagnostics" is what users are
+asked to paste into bug reports, so its contents became partly attacker-chosen.
+
+**Fix.** The record moved into a closure behind a non-configurable, getter-only
+property that cannot be reassigned or redefined and does not expose the store.
+Independently, both consumers of `snapshot.raw` now bound breadth as well as
+per-value length. That cap sits at the consumer rather than on a named field:
+an earlier cap keyed to `body_text` stopped covering the payload as soon as new
+page-supplied fields were added, and would have done so again.
+
+**Also checked, no change needed.** `bandit` over `src/aigauge`: 25 findings,
+all LOW, all pre-existing `subprocess` and try/except/pass patterns already
+assessed above, **zero in `api_capture.py`**. No `eval`/`exec`/`pickle`/
+`shell=True`/`innerHTML` in any changed file. Navigation targets are hard-coded
+relative paths, host-pinned and bounded. The only write to a provider origin is
+the extractor's own `__ag_route_tries` key in `sessionStorage`.
+
+**Caveat on assurance.** Unlike the original audit, this pass was **not**
+corroborated by a second engine. A Codex CLI review was attempted and could not
+run: the environment's egress policy denies `api.openai.com`. These findings
+are single-source and should be read as such.
+
+Post-fix verification: **602 tests pass**, with each fix mutation-verified —
+reverted in isolation, the corresponding tests fail.
