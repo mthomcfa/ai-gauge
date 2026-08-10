@@ -216,3 +216,52 @@ def test_claude_opts_in_and_no_other_provider_does():
     assert "capture_api=True" in inspect.getsource(claude)
     for module in (codex, opencode_go):
         assert "capture_api" not in inspect.getsource(module), module.__name__
+
+
+# --- tamper resistance -----------------------------------------------------
+
+
+def _tamper(attack: str) -> dict:
+    """Run the recorder, then let page script try to subvert the capture."""
+    script = f"""
+    globalThis.window = globalThis;
+    globalThis.location = {{ href: 'https://claude.ai/x', hostname: 'claude.ai' }};
+    globalThis.fetch = () => Promise.resolve({{}});
+    globalThis.XMLHttpRequest = function () {{}};
+    globalThis.XMLHttpRequest.prototype.open = function () {{}};
+    {RECORDER_JS}
+    try {{ {attack} }} catch (e) {{}}
+    process.stdout.write(JSON.stringify({READBACK_JS}));
+    """
+    out = subprocess.run(
+        ["node", "-e", script], capture_output=True, text=True, timeout=30
+    )
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout)
+
+
+@pytest.mark.parametrize(
+    "attack",
+    [
+        # Straight reassignment - what a third-party bundle would do.
+        'window.__ag_api = {"/evil": {"planted": "ATTACKER"}};',
+        # Redefine the property outright.
+        'Object.defineProperty(window, "__ag_api", {value: {"/evil": 1}});',
+        # Flood it, to blow past the log rotation.
+        'window.__ag_api = {}; for (let i=0;i<5000;i++) window.__ag_api["f"+i] = i;',
+    ],
+)
+def test_page_script_cannot_replace_the_capture(attack):
+    """The main world is shared with everything the provider page loads.
+
+    Verified against a real browser before this was fixed: a script replacing
+    window.__ag_api with 50,000 keys produced a 1 MB log line against a 512 KiB
+    rotation - destroying the user's existing diagnostics - and put
+    attacker-chosen text into the blob users are told to paste into bug
+    reports. The store now lives in a closure behind a non-configurable getter.
+    """
+    got = _tamper(attack)
+
+    assert "/evil" not in got
+    assert not any(k.startswith("f") for k in got), "flood keys reached the capture"
+    assert "ATTACKER" not in json.dumps(got)

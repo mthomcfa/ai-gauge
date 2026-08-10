@@ -45,15 +45,44 @@ _SCRIPT_NAME = "ai-gauge-api-recorder"
 # so every hook returns the original value and swallows its own errors.
 RECORDER_JS = r"""
 (() => {
-  if (window.__ag_api) return;
   const MAX_URLS = 12;      // distinct paths retained
   const MAX_KEYS = 200;     // total keys sketched per response
   const MAX_DEPTH = 5;
   const MAX_BYTES = 400000;
   const ISO = /^\d{4}-\d{2}-\d{2}T[\d:.]+/;
 
-  window.__ag_api = {};
+  // The store is kept in this closure and exposed only through a
+  // non-configurable getter. Everything on this page - the app's own bundle,
+  // Cloudflare, RUM, analytics - shares the main world, so a plain
+  // window.__ag_api property could simply be reassigned. It was: a script
+  // replacing it with 50,000 keys produced a 1 MB log line against a 512 KiB
+  // rotation, destroying the user's diagnostic history, and put
+  // attacker-chosen text into the blob users are told to paste into bug
+  // reports. A getter cannot be reassigned and does not expose the store.
+  const store = {};
   let urls = 0;
+
+  function snapshot() {
+    const out = {};
+    let n = 0;
+    for (const key of Object.keys(store)) {
+      if (n++ >= MAX_URLS) break;
+      out[key] = store[key];
+    }
+    return out;
+  }
+
+  try {
+    Object.defineProperty(window, '__ag_api', {
+      configurable: false,
+      enumerable: false,
+      get: snapshot,
+    });
+  } catch (e) {
+    // Already installed (redefining a non-configurable property throws), or
+    // the property is locked down. Either way, do not wrap fetch twice.
+    return;
+  }
 
   function sketch(value, depth, budget) {
     if (budget.n++ > MAX_KEYS) return '<truncated>';
@@ -84,8 +113,8 @@ RECORDER_JS = r"""
       if (urls >= MAX_URLS || !text || text.length > MAX_BYTES) return;
       const u = new URL(rawUrl, location.href);
       if (u.hostname !== location.hostname) return;
-      if (u.pathname in window.__ag_api) return;
-      window.__ag_api[u.pathname] = sketch(JSON.parse(text), 0, {n: 0});
+      if (u.pathname in store) return;
+      store[u.pathname] = sketch(JSON.parse(text), 0, {n: 0});
       urls += 1;
     } catch (e) { /* not JSON, or blocked - nothing to record */ }
   }

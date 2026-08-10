@@ -423,3 +423,22 @@ def test_schedule_pulls_stale_error_refresh_forward():
     assert app._timer.started_ms is not None  # noqa: SLF001
     scheduled_minutes = app._timer.started_ms / 60_000  # noqa: SLF001
     assert 0 < scheduled_minutes <= 1.2
+
+
+def test_log_summary_is_bounded_against_a_page_controlled_payload():
+    """The log is the one artifact that makes a provider failure explainable.
+
+    Lists were already bounded; dictionaries were not. Measured before this
+    cap: a 50,000-key payload produced a 1 MB log line against a 512 KiB
+    rotation, so a single poisoned scrape discarded the user's existing
+    diagnostics - losing the evidence is the expensive part, not the noise.
+    """
+    from aigauge.app import _raw_summary
+
+    hostile = {"/evil": {"planted": "ATTACKER-CONTROLLED-STRING"}}
+    hostile.update({f"flood{i}": i for i in range(50000)})
+
+    line = _raw_summary({"api": hostile})
+
+    assert len(line) < 20_000, f"log line was {len(line)} bytes"
+    assert "more keys" in line, "truncation must be visible, not silent"
