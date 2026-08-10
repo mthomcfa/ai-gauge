@@ -6,6 +6,43 @@
 > earlier `0.6.4` entry predates that convention and **is not** upstream's
 > `v0.6.4`, which is different code.
 
+## 1.0.0+cfa.2 - 2026-08-10
+
+**`1.0.0+cfa.1` does not start.** It raises `AttributeError` during `App.__init__`
+before its window appears. If you are on it, upgrade; there is no workaround
+short of rolling back.
+
+This release exists because of that, and the version number is the point: a
+build that crashes on startup and a build that does not must not report the
+same string. `app_version` appears in every diagnostics blob, and that is the
+whole reason `+cfa.N` exists.
+
+### Fixed
+
+- **Startup crash.** `_consecutive_error_cycles` was read by `_error_retry_time`,
+  which `__init__` reaches through `_restart_timer`, but the assignment never
+  landed in `__init__`. Introduced by the refresh change below, in the same
+  release.
+- **A failed provider is retried within the minute rather than the interval.**
+  The recovery path required the errored snapshot to still carry stale metrics,
+  so the *worse* case waited longer: a provider that had never succeeded this
+  run, showing nothing at all, waited a full refresh interval, while one showing
+  a stale-but-plausible number was retried within the minute. That is the shape
+  of a cold start — Claude's settings page resolves eight endpoints before it
+  requests usage, and on a fresh profile none are cached — so every restart
+  showed a broken tile for five minutes before silently fixing itself. Any error
+  now earns the fast retry, bounded at three consecutive failing cycles.
+  `AUTH_REQUIRED` is excluded: signing in is the user's move.
+
+### Testing
+
+- **Nothing constructed a real `App`.** Every test used `App.__new__(App)` with
+  hand-set attributes, so an attribute read at startup but never assigned in
+  `__init__` was invisible to the suite — and the stand-in stubs *had* the
+  missing attribute, so they proved the logic and hid the wiring. A smoke test
+  now builds the real object; it fails for any attribute the startup path reads
+  and `__init__` does not provide.
+
 ## 1.0.0+cfa.1 - 2026-08-10
 
 **First release numbered independently of upstream.** The `+cfa.N` segment
