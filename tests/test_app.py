@@ -322,6 +322,7 @@ def test_lifecycle_context_includes_refresh_state():
     app._inflight = {"claude"}  # noqa: SLF001
     app._refresh_queue = ["copilot"]  # noqa: SLF001
     app._unchanged_cycles = 2  # noqa: SLF001
+    app._consecutive_error_cycles = 0  # noqa: SLF001
     app._timer = _Timer()  # noqa: SLF001
     app._timer.start(125_000)  # noqa: SLF001
 
@@ -354,6 +355,7 @@ def _schedule_app_stub() -> App:
     app._refresh_queue = []  # noqa: SLF001
     app._active_until = datetime.now() - timedelta(minutes=1)  # noqa: SLF001
     app._unchanged_cycles = 5  # noqa: SLF001
+    app._consecutive_error_cycles = 0  # noqa: SLF001
     app._timer = _Timer()  # noqa: SLF001
     app._widget = _Widget()  # noqa: SLF001
     app._snapshots = {}  # noqa: SLF001
@@ -442,3 +444,126 @@ def test_log_summary_is_bounded_against_a_page_controlled_payload():
 
     assert len(line) < 20_000, f"log line was {len(line)} bytes"
     assert "more keys" in line, "truncation must be visible, not silent"
+
+
+def _errored(provider: str, *, metrics=()) -> UsageSnapshot:
+    return UsageSnapshot(
+        provider=provider,
+        status=SnapshotStatus.ERROR,
+        error="extractor retry limit exceeded",
+        metrics=list(metrics),
+    )
+
+
+def test_an_error_with_no_metrics_earns_the_fast_retry():
+    """The cold-start case, and the one that was missed.
+
+    The fast retry used to require the errored snapshot to still carry stale
+    metrics - so a provider that had never succeeded this run, showing nothing
+    at all, waited a full interval, while one showing a stale number was
+    retried within the minute. That is backwards, and it is exactly what a
+    fresh launch produces: Claude's settings page resolves eight endpoints
+    before requesting usage, and on a cold cache the first scrape can exceed
+    its budget. Every restart therefore showed a broken tile for five minutes,
+    at the moment a user is most likely to be looking.
+    """
+    app = _schedule_app_stub()
+    app._snapshots = {"claude": _errored("claude")}  # noqa: SLF001
+
+    app._schedule_next_refresh()  # noqa: SLF001
+
+    # One minute, not the five-minute active interval.
+    assert app._timer.started_ms is not None  # noqa: SLF001
+    assert app._timer.started_ms <= 65_000, (  # noqa: SLF001
+        f"waited {app._timer.started_ms}ms before retrying a failed provider"  # noqa: SLF001
+    )
+
+
+def test_an_error_that_kept_stale_metrics_still_earns_it():
+    # Pre-existing behaviour must survive the generalisation.
+    app = _schedule_app_stub()
+    metric = UsageMetric(label="Session", percent_used=42.0)
+    app._snapshots = {"claude": _errored("claude", metrics=[metric])}  # noqa: SLF001
+
+    app._schedule_next_refresh()  # noqa: SLF001
+
+    assert app._timer.started_ms <= 65_000  # noqa: SLF001
+
+
+def test_a_clean_cycle_uses_the_normal_cadence():
+    app = _schedule_app_stub()
+    app._snapshots = {  # noqa: SLF001
+        "claude": UsageSnapshot(provider="claude", status=SnapshotStatus.OK)
+    }
+
+    app._schedule_next_refresh()  # noqa: SLF001
+
+    assert app._timer.started_ms > 65_000, "healthy providers must not be hammered"  # noqa: SLF001
+
+
+def test_auth_required_is_not_retried_quickly():
+    # Signing in is the user's move; retrying every minute only burns page
+    # loads against a provider that will keep saying no.
+    app = _schedule_app_stub()
+    app._snapshots = {  # noqa: SLF001
+        "claude": UsageSnapshot(
+            provider="claude",
+            status=SnapshotStatus.AUTH_REQUIRED,
+            error="Not signed in to Claude.",
+        )
+    }
+
+    app._schedule_next_refresh()  # noqa: SLF001
+
+    assert app._timer.started_ms > 65_000  # noqa: SLF001
+
+
+def test_a_persistently_broken_provider_stops_being_hammered():
+    """The bound. A transient failure deserves a fast retry; a broken one does
+    not deserve one every minute forever."""
+    app = _schedule_app_stub()
+    app._snapshots = {"claude": _errored("claude")}  # noqa: SLF001
+
+    app._consecutive_error_cycles = 3  # noqa: SLF001
+    app._schedule_next_refresh()  # noqa: SLF001
+    assert app._timer.started_ms <= 65_000, "gave up while still within the bound"  # noqa: SLF001
+
+    app._consecutive_error_cycles = 4  # noqa: SLF001
+    app._schedule_next_refresh()  # noqa: SLF001
+    assert app._timer.started_ms > 65_000, "kept retrying past the bound"  # noqa: SLF001
+
+
+def test_consecutive_error_cycles_reset_once_a_cycle_comes_back_clean():
+    """The bound must be a backoff, not a permanent demotion.
+
+    Without the reset, a provider that failed past the bound and later
+    recovered would never earn a fast retry again for the life of the process.
+    """
+    app = _schedule_app_stub()
+
+    app._snapshots = {"claude": _errored("claude")}  # noqa: SLF001
+    for expected in (1, 2, 3):
+        app._record_cycle_outcome()  # noqa: SLF001
+        assert app._consecutive_error_cycles == expected  # noqa: SLF001
+
+    app._snapshots = {  # noqa: SLF001
+        "claude": UsageSnapshot(provider="claude", status=SnapshotStatus.OK)
+    }
+    app._record_cycle_outcome()  # noqa: SLF001
+
+    assert app._consecutive_error_cycles == 0  # noqa: SLF001
+
+
+def test_an_auth_required_cycle_does_not_count_as_a_failing_one():
+    # It is not a transient failure to back off from; it needs the user.
+    app = _schedule_app_stub()
+    app._consecutive_error_cycles = 2  # noqa: SLF001
+    app._snapshots = {  # noqa: SLF001
+        "claude": UsageSnapshot(
+            provider="claude", status=SnapshotStatus.AUTH_REQUIRED, error="x"
+        )
+    }
+
+    app._record_cycle_outcome()  # noqa: SLF001
+
+    assert app._consecutive_error_cycles == 0  # noqa: SLF001
