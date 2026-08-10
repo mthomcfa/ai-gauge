@@ -31,7 +31,7 @@ AI Gauge is a local desktop utility for monitoring AI service usage across Claud
 - Provider tiles for Claude, Codex, GitHub Copilot, OpenRouter, and OpenCode.
 - OpenCode usage scraping from a user-configured workspace URL, pinned to `https` on `opencode.ai`, with Rolling, Weekly, and Monthly meters and a cookie-paste setup path for accounts that cannot complete Google sign-in in an embedded browser.
 - Per-account configurable gauge colors: each Claude/Codex/OpenCode account, plus Copilot and OpenRouter, can set three severity cutoffs and four band colors, applied consistently to bars, compact chips, the Windows/Linux tray dot, and the macOS menu-bar dots.
-- Claude usage scraping from `https://claude.ai/new#settings/usage`, including session and weekly limits.
+- Claude usage scraping from `https://claude.ai/settings/usage`, including session and weekly limits.
 - Codex usage scraping from `https://chatgpt.com/codex/cloud/settings/analytics#personal-usage`, including session and weekly limits.
 - GitHub Copilot AI credit usage via GitHub REST billing summary endpoints for user or organization billing scopes, with a legacy premium-request fallback.
 - OpenRouter account/key data via `/credits`, `/key`, and `/activity`, including balance, UTC day/month spend, optional daily budget gauge, and top model activity.

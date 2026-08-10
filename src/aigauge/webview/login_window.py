@@ -346,13 +346,14 @@ class LoginWindow(QDialog):
         self._verify_timeout.start(20000)
 
         self._view.load(QUrl(self._verify_url))
-        # loadFinished does NOT fire for a same-document (fragment-only)
-        # navigation. After a fresh sign-in the view is already sitting on
-        # https://claude.ai/new, so loading .../new#settings/usage only changes
-        # the hash — loadFinished never fires and verification would hang until
-        # the 20s timeout ("Could not load verification page (timeout)"). Drive
-        # polling from a timer so the check runs regardless; loadFinished, when
-        # it does fire (full cross-document load), only fast-fails real errors.
+        # Drive polling from a timer rather than from loadFinished, which
+        # does NOT fire for a same-document (fragment-only) navigation. That
+        # bit us when the verify URL was .../new#settings/usage and the view
+        # was already on https://claude.ai/new: the hash-only change emitted no
+        # load event and verification hung until the 20s timeout. The URL is a
+        # real page now, so the event does fire — but the timer stays, because
+        # the next time this surface moves it may well move back to a fragment.
+        # loadFinished, when it fires, only fast-fails genuine load errors.
         QTimer.singleShot(1500, self._begin_verify_polling)
 
     def _on_verify_load_finished(self, ok: bool) -> None:
