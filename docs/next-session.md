@@ -18,11 +18,29 @@ raising and discarding its whole config block. Both landed in PR #6.
 
 ---
 
-## 1. Verification owed — nothing to build, someone has to look
+## 1. Verification — one closed, one still open
 
-### 1.1 Claude's numbers have never been checked against the live page
+### 1.1 Claude's numbers — VERIFIED 2026-08-10, correct
 
-The gauges read. Whether they read *correctly* is unverified.
+Session and Weekly were compared against `https://claude.ai/settings/usage`
+directly and both matched. This is the first time the polarity and attribution
+heuristics have been checked against reality rather than against reconstructed
+layouts, and they came out right.
+
+**What that does and does not establish.** It confirms the heuristics read
+*today's* Claude layout correctly. It does not make them robust: they still
+infer polarity from wording near a number and attribution from DOM proximity,
+and Claude changed this surface three times in the week before the check. The
+API mapper in §3 remains the durable fix — the difference is between "verified
+against the current page" and "no longer guessing".
+
+Re-check after any Claude layout change. The original problem statement is
+kept below because it explains why the refusal behaviour exists.
+
+---
+
+The gauges read. Whether they read *correctly* was unverified until the check
+above.
 
 Session and Weekly percentages come from `readRow` in
 `src/aigauge/providers/claude.py`, which infers **polarity** (used vs
