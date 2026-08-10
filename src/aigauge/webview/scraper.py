@@ -71,6 +71,7 @@ class HeadlessScraper(QObject):
         wait_ms: int = 4000,
         timeout_ms: int = 25000,
         capture_api: bool = False,
+        max_extractor_reruns: int = 5,
         max_attempts: int = 1,
         parent: QObject | None = None,
     ):
@@ -81,6 +82,7 @@ class HeadlessScraper(QObject):
         self._wait_ms = wait_ms
         self._timeout_ms = timeout_ms
         self._capture_api = capture_api
+        self._max_extractor_reruns = max(1, max_extractor_reruns)
         self._max_attempts = max(1, max_attempts)
         self._attempt = 0
         self._finished = False
@@ -272,7 +274,7 @@ class HeadlessScraper(QObject):
             return
         if isinstance(result, dict) and "__retry_after_ms" in result:
             self._extractor_reruns += 1
-            if self._extractor_reruns > 5:
+            if self._extractor_reruns > self._max_extractor_reruns:
                 # Hand back the last payload alongside the error. It carries the
                 # page text the extractor was looking at, and discarding it made
                 # a layout change undiagnosable: the snapshot reached the log and

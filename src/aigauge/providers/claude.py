@@ -178,9 +178,15 @@ EXTRACTOR_JS = r"""
       /settings\/usage/i.test(location.hash);
   }
 
-  // Ordered, because Claude moves this surface. The direct page is current;
-  // the hash form is the older dialog route, kept as a fallback.
-  const ROUTE_CANDIDATES = ['/settings/usage', '/new#settings/usage'];
+  // One candidate, deliberately. The hash form was kept as a fallback and
+  // turned out to be actively harmful: on a settings page that is merely slow
+  // (body_text "Loading..." while eight other endpoints resolve first), no
+  // usage panel has rendered yet, so the fallback fired and navigated away
+  // from the correct route to one we have direct evidence does not open the
+  // dialog at all - discarding the load that was about to succeed, and with
+  // it the recorded API capture. Being on the right route and unhydrated is a
+  // reason to wait, not to re-route.
+  const ROUTE_CANDIDATES = ['/settings/usage'];
 
   function routeTries() {
     try { return parseInt(sessionStorage.getItem('__ag_route_tries') || '0', 10) || 0; }
@@ -490,7 +496,13 @@ class ClaudeProvider(Provider):
             extractor_js=EXTRACTOR_JS,
             build=_build,
             log=log,
-            wait_ms=7000,
+            # The settings route resolves i18n, org, feature, memory, MCP and
+            # marketplace endpoints before usage. Poll sooner but for much
+            # longer: the old 7s wait plus five 1.2s reruns gave up at ~13s,
+            # while the page was still showing "Loading...".
+            wait_ms=3000,
+            max_extractor_reruns=20,
+            timeout_ms=40000,
             transport_max_attempts=2,
             build_max_attempts=2,
             # Discovery, not yet load-bearing: the gauge still reads the DOM.
