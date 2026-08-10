@@ -250,6 +250,7 @@ class App(QObject):
         self._cycle_signatures: dict[str, tuple] = {}
         self._last_cycle_signatures: dict[str, tuple] | None = None
         self._unchanged_cycles = 0
+        self._consecutive_error_cycles = 0
         self._active_until = datetime.now() + timedelta(minutes=_ACTIVE_MODE_MINUTES)
         self._current_refresh_manual = False
         self._pending_manual_refresh = False
