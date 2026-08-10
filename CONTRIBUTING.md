@@ -57,6 +57,14 @@ The version-sync check that gates CI:
 .\.venv\Scripts\python.exe tools\check_versions.py
 ```
 
+## Known open items
+
+GitHub Issues are disabled on this repo. Open defects, deliberate non-fixes
+with their reasoning, and decisions already taken are recorded in
+[docs/next-session.md](docs/next-session.md). Read it before proposing work —
+several obvious-looking changes are listed there as deliberately declined, with
+the evidence for why.
+
 ## Pull request expectations
 
 - Keep changes focused. One PR per logical change.
