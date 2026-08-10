@@ -26,6 +26,11 @@ test suite runs headlessly under `QT_QPA_PLATFORM=offscreen`; manual smoke
 testing is still useful on each OS because tray/menu-bar behavior and native
 credential storage are platform-specific.
 
+Building the Windows binary additionally needs **PowerShell 7+** (`pwsh`);
+`build.ps1` declares `#requires -version 7` and will not run under Windows
+PowerShell 5.1, which is still the default `powershell.exe`. Everything else
+here — the venv, the app, the tests, `check_versions.py` — works under 5.1.
+
 ```powershell
 git clone https://github.com/mthomcfa/ai-gauge.git
 cd ai-gauge

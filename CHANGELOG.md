@@ -6,6 +6,100 @@
 > earlier `0.6.4` entry predates that convention and **is not** upstream's
 > `v0.6.4`, which is different code.
 
+## 1.0.0+cfa.1 - 2026-08-10
+
+**First release numbered independently of upstream.** The `+cfa.N` segment
+already marked these builds as this fork's, but `0.6.5` sat inside upstream's
+own `0.6.x` range, so the suffix was the only thing telling them apart — and a
+suffix is exactly what gets dropped in a filename, a bug report or a
+conversation. `1.0.0` makes the divergence structural instead of something a
+reader has to notice. The number before `+` is this fork's counter and always
+has been; it is not a claim about which upstream release the tree matches.
+
+The release itself is the Claude work below. Claude stopped reporting entirely
+after it moved its usage surface, and
+work to fix it exposed several defects in the machinery meant to make such
+breakages diagnosable. Nothing here changes what the gauges mean; it changes
+whether they can be trusted and whether a failure can be explained.
+
+### Fixed
+
+- **Claude reads again.** Claude moved usage from a dialog opened by the
+  `#settings/usage` hash to a real page at `/settings/usage`, and stopped
+  opening the dialog from the hash at all. The app kept loading the old URL and
+  waiting for rows that were never coming, failing on every refresh. It now
+  loads the real page. The recovery path that should have caught this could
+  not: it asked whether the URL *looked like* a usage route, and since the app
+  navigates to a usage URL itself, that was true from the first poll. Route
+  decisions are now made on what the page actually renders.
+- **The settings page is given time to load.** It resolves eight other
+  endpoints — org, feature, memory, MCP, marketplace, i18n — before it requests
+  usage. The old budget gave up after roughly 13 seconds, while the page still
+  read "Loading...". Claude now polls sooner and for far longer. Other
+  providers are unchanged.
+- **Codex no longer reports an untouched weekly quota as a broken page.** An
+  idle account showing 100% remaining was rejected as a half-rendered layout,
+  so the tile errored permanently. OpenAI's current wording for the shared
+  limit is also recognised; only the older phrasing was.
+- **Claude's page text no longer includes its stylesheets.** Text was read in a
+  way that concatenated the source of inline `<style>` elements. Because CSS is
+  full of `width:100%`, two checks that depend on the *absence* of a percent
+  sign could never fire.
+- **Sign-in verification checks the session, not the usage panel.** It asked
+  whether the usage dialog had rendered, so a change to that panel made a
+  perfectly valid session unverifiable and "I'm signed in" could never succeed.
+- **Failed scrapes say why.** Chromium reports the failure reason *after* it
+  reports that the load finished, so every load failure was recorded with an
+  empty error code and an empty error string — the diagnostics emptying
+  themselves at the only moment they matter. Snapshots now carry the real
+  reason, e.g. `net::ERR_CONNECTION_RESET`.
+- **The menu-bar dot ignores breakdown rows.** OpenRouter's per-model rows
+  carry each model's share of spend, so one model dominating spend drove the
+  dot red with no quota near its cap. The tray was fixed previously; the macOS
+  menu bar is a second implementation and was missed.
+- **A single bad number in `config.json` no longer discards the block around
+  it.** Bounded settings are clamped to their range instead of rejected, so one
+  out-of-range value costs only that value.
+
+### Added
+
+- **A reading that cannot be justified is refused rather than guessed.** Two
+  silent failures were possible: a percentage that could not be attributed to
+  one meter when several share a container, and a percentage with no
+  "used"/"remaining" wording beside it, which was assumed to mean *used* and so
+  displayed "42% left" as 42% consumed. Both produced a plausible wrong number.
+  The tile now reports which row it could not read and why, and carries that
+  row's text for diagnosis.
+- **Diagnostics record the shape of the JSON the Claude page fetches**, so a
+  future change can be diagnosed from a real account instead of inferred from
+  rendered wording. No response body is ever kept: numbers, booleans and
+  timestamps survive, every other string becomes a length marker, and the
+  reduction happens inside the page. Local only — see "API response shapes" in
+  `SECURITY.md`.
+
+### Security
+
+- **Page scripts could poison the local log and the diagnostics clipboard.**
+  The API capture was exposed as an ordinary property in the page's main world,
+  which everything the provider page loads can write to. A script replacing it
+  with 50,000 keys produced a 1 MB log line against a 512 KiB rotation —
+  destroying the existing diagnostics — and put content of its choosing into
+  the blob users are asked to paste into bug reports. The capture now lives
+  behind a property that cannot be reassigned, and both the log and the
+  clipboard bound how much of a provider payload they will reproduce.
+
+### Documentation
+
+- The **PowerShell 7 requirement for `build.ps1`** is documented in the README,
+  `CONTRIBUTING.md` and `RELEASING.md`. The script declares
+  `#requires -version 7` and refuses to run under Windows PowerShell 5.1 — still
+  the default `powershell.exe` — reporting a `#requires` error rather than a
+  build failure. This was stated nowhere and cost a build cycle. A test reads
+  the requirement from `build.ps1` so the docs cannot drift from it.
+- `SECURITY.md` describes what the API-shape capture records and what it
+  discards, and states that scraping rendered text is the fragile layer and
+  that unjustifiable readings are refused rather than shown.
+
 ## 0.6.5+cfa.1 - 2026-07-31
 
 First release under the fork's explicit versioning scheme, plus a substantial

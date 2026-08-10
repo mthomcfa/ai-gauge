@@ -1,1 +1,1 @@
-__version__ = "0.6.5+cfa.1"
+__version__ = "1.0.0+cfa.1"
