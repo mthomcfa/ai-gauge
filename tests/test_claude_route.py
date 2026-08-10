@@ -79,12 +79,22 @@ def test_the_hash_route_no_longer_opening_the_dialog_is_recovered():
     assert r["reason"], "recovery must be reported as a retry reason"
 
 
-def test_a_bounced_direct_route_falls_back_to_the_legacy_hash_route():
-    # Already on /settings/usage but the home screen rendered: navigating there
-    # again is a no-op, so the next candidate must be tried instead.
-    r = _ensure_route("/settings/usage", "", HOME)
+def test_being_on_the_right_route_but_unhydrated_is_never_re_routed():
+    """A slow page must not be navigated away from.
 
-    assert r["navigated"] == "/new#settings/usage"
+    This previously fell back to the legacy hash route, which turned out to be
+    actively harmful. Observed live on 2026-08-10: the settings page loads i18n,
+    org, feature, memory, MCP and marketplace endpoints before usage, so
+    body_text is "Loading..." for seconds. No usage panel has rendered yet, the
+    fallback fired, and it navigated away from the correct route to one we have
+    direct evidence does not open the dialog - discarding the load that was
+    about to succeed, and with it the recorded API capture. One account in that
+    run came back with api={} for exactly this reason while the other, which
+    had not yet re-routed, carried eight endpoints.
+    """
+    for body in (HOME, "Loading..."):
+        r = _ensure_route("/settings/usage", "", body)
+        assert r["navigated"] is None, f"navigated away while body was {body!r}"
 
 
 @pytest.mark.parametrize(

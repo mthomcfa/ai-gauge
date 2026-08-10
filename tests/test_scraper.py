@@ -17,6 +17,7 @@ class _Stand_in:
     def __init__(self):
         self._finished = False
         self._extractor_reruns = 0
+        self._max_extractor_reruns = 5
         self.finished_with: tuple[object, str] | None = None
 
     def _finish(self, result, error):
@@ -256,3 +257,41 @@ def test_a_real_payload_is_not_replaced_by_failure_context():
 
     result, _ = stand_in.finished_with
     assert result is payload
+
+
+@pytest.mark.parametrize("cap", [1, 5, 20])
+def test_the_extractor_rerun_budget_is_honoured(cap):
+    """Behavioural, because the number is what decides success.
+
+    Claude's settings route resolves i18n, org, feature, memory, MCP and
+    marketplace endpoints before usage. The default budget - a 7s wait plus
+    five 1.2s reruns - gave up at roughly 13s while body_text was still
+    "Loading...", so the page never got the chance to render the rows.
+    """
+    stand_in = _Stand_in()
+    stand_in._max_extractor_reruns = cap
+    payload = {"__retry_after_ms": 1200, "body_text": "Loading..."}
+
+    runs = 0
+    for _ in range(cap + 5):
+        if stand_in._finished:
+            break
+        runs += 1
+        try:
+            HeadlessScraper._on_js_result(stand_in, dict(payload))
+        except AttributeError:
+            stand_in._finished = False  # rerun path needs Qt timers
+
+    assert stand_in.finished_with is not None, "never gave up"
+    assert runs == cap + 1, f"gave up after {runs} runs with a cap of {cap}"
+
+
+def test_claude_asks_for_a_longer_hydration_budget_than_the_default():
+    import inspect
+
+    from aigauge.providers import claude
+
+    source = inspect.getsource(claude)
+    assert "max_extractor_reruns=" in source, "Claude must raise the default budget"
+    default = inspect.signature(HeadlessScraper.__init__).parameters
+    assert default["max_extractor_reruns"].default == 5, "default must stay conservative"
