@@ -215,6 +215,8 @@ For a single-file binary (slower first launch), pass `-OneFile` (PowerShell) or 
 
 See [RELEASING.md](RELEASING.md) for maintainer release steps.
 
+Known open items, deliberate non-fixes and the reasoning behind past decisions are tracked in [docs/next-session.md](docs/next-session.md) — GitHub Issues are disabled on this repo, so that file is the tracker.
+
 ## Tests
 
 ```powershell
