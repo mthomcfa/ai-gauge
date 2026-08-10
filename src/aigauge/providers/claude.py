@@ -21,7 +21,7 @@ from .base import Provider
 from .diagnostics import log_page_diagnosis
 from .idle import idle_reset_state
 
-CLAUDE_USAGE_URL = "https://claude.ai/new#settings/usage"
+CLAUDE_USAGE_URL = "https://claude.ai/settings/usage"
 _EXPECTED_ROWS = ("session", "weekly_all")
 log = logging.getLogger("aigauge.providers.claude")
 
@@ -168,17 +168,44 @@ EXTRACTOR_JS = r"""
   // Requiring "All models" made the newer layout permanently unreadable.
   const weeklyAll = readRow('All models') || readRow('Weekly');
 
+  // Rendered evidence that the usage surface is actually on screen. Declared
+  // here, above ensureUsageRoute, because that function's decision must be
+  // based on what the page SHOWS rather than on what the URL says.
+  const usagePanelSignals = /Plan usage|Current session|All models/i.test(bodyText);
+
   function onUsageRoute() {
     return /\/settings\/usage/.test(location.pathname) ||
       /settings\/usage/i.test(location.hash);
   }
 
+  // Ordered, because Claude moves this surface. The direct page is current;
+  // the hash form is the older dialog route, kept as a fallback.
+  const ROUTE_CANDIDATES = ['/settings/usage', '/new#settings/usage'];
+
+  function routeTries() {
+    try { return parseInt(sessionStorage.getItem('__ag_route_tries') || '0', 10) || 0; }
+    catch (e) { return 0; }
+  }
+
   function ensureUsageRoute() {
-    if (onUsageRoute()) return null;
     if (location.hostname !== 'claude.ai') return null;
-    if (/Plan usage|Current session|All models/i.test(bodyText)) return null;
-    location.href = '/new#settings/usage';
-    return 'opened usage dialog';
+    // Gate on rendered evidence, NOT on onUsageRoute(). The app navigates to a
+    // usage URL itself, so a URL-shape test is true from the very first poll
+    // and this recovery path can never run - which is precisely how a moved
+    // usage surface turned into an endless "usage dialog not ready" retry
+    // while the page sat on the signed-in home screen.
+    if (usagePanelSignals) return null;
+    const here = location.pathname + location.hash;
+    let tries = routeTries();
+    // Never re-navigate to where we already are; that is a no-op that would
+    // burn an attempt and, on a route that bounces, spin.
+    while (tries < ROUTE_CANDIDATES.length && ROUTE_CANDIDATES[tries] === here) {
+      tries += 1;
+    }
+    if (tries >= ROUTE_CANDIDATES.length) return null;
+    try { sessionStorage.setItem('__ag_route_tries', String(tries + 1)); } catch (e) {}
+    location.href = ROUTE_CANDIDATES[tries];
+    return 'opening usage page ' + ROUTE_CANDIDATES[tries];
   }
 
   const routeReason = !isLoggedOut ? ensureUsageRoute() : null;
@@ -195,10 +222,10 @@ EXTRACTOR_JS = r"""
     };
   }
 
-  // The current Claude UI opens usage as a shell/dialog route. Percent text
-  // elsewhere in the shell is not enough; wait for the Session/Weekly rows
-  // or for the explicit idle-zero usage panel before handing data to Python.
-  const usagePanelSignals = /Plan usage|Current session|All models/i.test(bodyText);
+  // Percent text elsewhere in the shell is not enough; wait for the
+  // Session/Weekly rows or for the explicit idle-zero usage panel before
+  // handing data to Python. usagePanelSignals is declared above, next to
+  // ensureUsageRoute, which needs the same evidence.
   const idleUsagePanel = /Plan usage/i.test(bodyText) &&
     /Current session/i.test(bodyText) &&
     /All models|Weekly/i.test(bodyText) &&
