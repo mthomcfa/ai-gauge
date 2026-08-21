@@ -20,3 +20,8 @@ dist/
 .claude/
 RELEASE_TODO.local.md
 .DS_Store
+
+.audit-venv/
+.pytest-temp/
+.pytest_cache/
+__pycache__/
