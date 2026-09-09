@@ -560,7 +560,7 @@ def _is_logged_out_payload(payload: dict[str, Any]) -> bool:
     return False
 
 
-def _payload_rows(payload: dict[str, Any], catalog: MeterCatalog) -> dict[str, Any]:
+def _payload_rows(payload: dict[str, Any]) -> dict[str, Any]:
     """Per-meter cards from the payload, keyed by catalog key.
 
     ``rows`` is what the catalog-aware extractor returns. The two top-level
@@ -616,7 +616,7 @@ def _build_snapshot(
     unreadable: list[str] = []
     body_text = str(payload.get("body_text") or "")
     catalog = catalog or load_catalog("codex")
-    rows = _payload_rows(payload, catalog)
+    rows = _payload_rows(payload)
     for spec in catalog.enabled_specs:
         card = rows.get(spec.key) or _body_card_for_spec(spec, body_text, catalog)
         if not card:
