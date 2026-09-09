@@ -622,6 +622,12 @@ def metric_for_spec(
 # --- discovery / adoption --------------------------------------------------
 
 
+# A word a meter could be named after, as opposed to one a count is written
+# with. Three letters is the shortest real one on these pages ("Max", "Opus"
+# is four); "of", "in", "to" and "at" are the ones that show up in "3 of 10".
+_ALPHA_WORD_RE = re.compile(r"[a-z]{3,}")
+
+
 def _overlaps(needle: str, haystack: str) -> bool:
     """Whether ``needle`` sits inside ``haystack`` as whole words."""
     if needle not in haystack:
@@ -630,27 +636,40 @@ def _overlaps(needle: str, haystack: str) -> bool:
 
 
 def _collides_with_known(label: Any, known: Iterable[str]) -> bool:
-    """Whether a candidate label overlaps wording the catalog already has.
+    """Whether a candidate label is a meter the catalog already has.
 
-    Equality is the obvious case. Containment either way is the one that bit:
-    "Current" is a fragment of Claude's "Current session" and "Daily included
-    routine runs 3 of 10" is that meter's row with a count glued on, so both
-    would be adopted as a second meter reporting an existing meter's number
-    under a new name — and a fragment like "Opus" also used to poison the
-    extractor's rival-label attribution.
+    Deliberately narrower than "either label contains the other as whole
+    words". Claude names its meters out of a small vocabulary — session,
+    weekly, daily, Opus, Cowork — so containment in *both* directions refused
+    "Weekly Opus", "Session credits" and "Cowork session", which is the shape
+    a genuinely new Claude meter has. The collision that actually corrupts
+    something, a candidate carrying an existing meter's display label, is
+    refused by equality against ``known_labels()``.
 
-    Whole words, not bare substrings: "Cowork sessions" is a real new meter
-    and contains "Session", which is a display label of an existing one.
+    Three refusals:
+
+    * equality;
+    * a candidate that is a whole-word fragment of something known ("Current"
+      inside "Current session", "Opus" inside "Opus only") — that is the known
+      meter under a shorter name, reporting its number a second time;
+    * a candidate that is something known plus trailing junk and no new word
+      of its own ("Daily included routine runs 3 of 10", "Weekly 42") — that
+      is the known meter's row with its count glued on. Three letters or more
+      makes a word new: "of", "in" and "to" are how a count is written, not
+      what a meter is named after.
     """
     normalized = normalize_label(label)
     if not normalized:
         return True
-    return any(
-        normalized == other
-        or _overlaps(normalized, other)
-        or _overlaps(other, normalized)
-        for other in known
-    )
+    for other in known:
+        if normalized == other or _overlaps(normalized, other):
+            return True
+        if normalized.startswith(f"{other} ") and not any(
+            _ALPHA_WORD_RE.fullmatch(word)
+            for word in normalized[len(other) :].split()
+        ):
+            return True
+    return False
 
 
 def is_adoptable_label(label: Any, *, catalog: MeterCatalog | None = None) -> bool:

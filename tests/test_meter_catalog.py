@@ -704,26 +704,57 @@ def test_junk_labels_are_never_adopted(label, tmp_path):
 @pytest.mark.parametrize(
     "label",
     [
+        "Current session",                    # the alias itself
+        "Session",                            # a display label
         "Current",                            # a fragment of "Current session"
         "Opus",                               # of "Opus only"
         "Design",                             # of "Claude Design"
         "Daily included routine runs 3 of 10",  # that row with its count glued on
-        "Session limit",                      # a relabel, which belongs in aliases
+        "Weekly 42",                          # the same, with the count alone
+        "Opus only 91",
     ],
 )
-def test_a_label_overlapping_a_known_meter_is_not_adopted(label, tmp_path):
-    """A fragment of a known label is that meter again under a second name.
+def test_a_label_that_is_a_known_meter_again_is_not_adopted(label, tmp_path):
+    """Three shapes, all of them an existing meter under a second name.
 
-    It reports the same number twice, and while the fragment was also being
-    injected as a rival label it made the meter it came from unreadable.
+    A fragment ("Current", "Opus") reports the known meter's number twice and
+    used to poison the extractor's rival-label attribution as well; a known
+    label with a count glued onto it ("... 3 of 10") is that meter's row read
+    with the count included. "of" and "3" are not new words.
     """
     assert is_adoptable_label(label, catalog=bundled_catalog("claude")) is False
     assert adopt_rows("claude", [_row(label)], base_dir=tmp_path) == []
 
 
-def test_a_new_meter_that_merely_shares_a_word_is_still_adopted(tmp_path):
-    """Whole words, not bare substrings: "Cowork sessions" contains "Session"."""
-    assert adopt_rows("claude", [_row("Cowork sessions")], base_dir=tmp_path)
+@pytest.mark.parametrize(
+    "label",
+    [
+        "Cowork sessions",   # contains the display label "Session"
+        "Cowork session",
+        "Weekly Opus",       # contains the alias "Weekly" AND "Opus only"'s word
+        "Session credits",
+        "Session limit",
+    ],
+)
+def test_a_new_meter_named_out_of_the_same_vocabulary_is_still_adopted(
+    label, tmp_path
+):
+    """Claude names meters out of a small vocabulary, and reuses it.
+
+    Refusing anything that contains a known label in either direction refused
+    exactly the shapes a genuinely new Claude meter has — "Weekly Opus" is a
+    real sub-limit, not the weekly meter again. A candidate carrying at least
+    one new word of its own is a new meter; the collision that actually
+    corrupts something, an existing meter's *display label*, is still refused
+    by equality.
+
+    "Session limit" is in here as the cost: a page that relabels Session is
+    adopted as an informational meter beside the unreadable primary rather
+    than refused. It gets its own history key, and the fix is still to add the
+    wording to the primary's aliases.
+    """
+    assert is_adoptable_label(label, catalog=bundled_catalog("claude")) is True
+    assert adopt_rows("claude", [_row(label)], base_dir=tmp_path)
 
 
 def test_a_percentage_with_no_reset_text_outside_the_container_is_not_adopted(tmp_path):
