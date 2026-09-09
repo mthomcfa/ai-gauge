@@ -435,11 +435,13 @@ class App(QObject):
                 self._providers[account.id] = ClaudeProvider(
                     parent=self,
                     account_id=account.id,
+                    config=self._config,
                 )
             elif account.kind == "codex":
                 self._providers[account.id] = CodexProvider(
                     parent=self,
                     account_id=account.id,
+                    config=self._config,
                 )
             self._widget.ensure_tile(account.id, display_name_for_account(self._config, account.id))
         if self._config.providers.copilot:
@@ -909,6 +911,9 @@ class App(QObject):
         dlg.setWindowModality(Qt.WindowModality.NonModal)
         dlg.sign_in_clicked.connect(self.open_login)
         dlg.paste_cookie_clicked.connect(self.open_cookie_paste)
+        # The dialog has already cleared the scan timestamps; refresh so the
+        # scan happens now rather than at the next scheduled cycle.
+        dlg.rescan_meters_clicked.connect(lambda: self.refresh_now(manual=True))
         dlg.finished.connect(
             lambda result, dialog=dlg, old_quota=old_copilot_quota, old_budget=old_openrouter_budget: (
                 self._on_settings_finished(dialog, result, old_quota, old_budget)

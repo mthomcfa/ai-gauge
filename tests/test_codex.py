@@ -6,11 +6,14 @@ from datetime import datetime, timedelta
 
 import pytest
 
+from aigauge.gauge import provider_max_percent
 from aigauge.models import SnapshotStatus
+from aigauge.providers.catalog import adopt_rows, load_catalog
 from aigauge.providers.codex import (
     CODEX_USAGE_URL,
     EXTRACTOR_JS,
     _build_snapshot,
+    _parse_body_card,
     _parse_reset_text,
     _weekly_only_layout_evidence,
 )
@@ -504,3 +507,203 @@ def test_extractor_js_matches_every_known_shared_limit_phrasing(phrase):
     )
     assert out.returncode == 0, out.stderr
     assert out.stdout == "true", f"extractor does not recognise: {phrase!r}"
+
+
+# --- one field per usage card ----------------------------------------------
+#
+# Codex's analytics panel can render more cards than the two the app knew
+# about. Every catalog meter becomes its own field; only the 5-hour and weekly
+# cards stay untagged, because tagged metrics are excluded from the tray colour
+# (gauge.provider_max_percent).
+
+
+def _card(percent, kind="used", reset_text=None):
+    return {"percent": percent, "kind": kind, "reset_text": reset_text}
+
+
+def _cards_payload(**rows):
+    payload = {
+        "logged_out": False,
+        "session": _card(42, reset_text="1:55 PM"),
+        "weekly": _card(61, reset_text="Mon 6:00 PM"),
+        "rows": {
+            "session": _card(42, reset_text="1:55 PM"),
+            "weekly": _card(61, reset_text="Mon 6:00 PM"),
+        },
+        "title": "Codex",
+        "url": CODEX_USAGE_URL,
+        "has_usage_text": True,
+        "has_percent_text": True,
+        "body_text": "Personal usage 5 hour usage limit 42% used Weekly usage limit 61% used",
+    }
+    payload["rows"].update(rows)
+    return payload
+
+
+def test_an_extra_card_becomes_an_informational_field(tmp_path):
+    adopt_rows(
+        "codex",
+        [{"label": "Cloud tasks limit", "percent": 12.0, "kind": "used",
+          "reset_text": "Mon 6:00 PM", "in_container": True}],
+        base_dir=tmp_path,
+    )
+    catalog = load_catalog("codex", base_dir=tmp_path)
+    payload = _cards_payload(
+        cloud_tasks_limit=_card(12, reset_text="Mon 6:00 PM"),
+    )
+
+    snapshot = _build_snapshot(payload, catalog=catalog)
+
+    assert snapshot.status == SnapshotStatus.OK
+    assert [m.label for m in snapshot.metrics] == [
+        "Session",
+        "Weekly",
+        "Cloud tasks limit",
+    ]
+    assert [m.label for m in snapshot.metrics if m.tag is None] == [
+        "Session",
+        "Weekly",
+    ]
+
+
+def test_an_extra_card_is_not_mistaken_for_a_partial_render(tmp_path):
+    """The partial-render guard counts primary cards, not every metric.
+
+    It compares the metric labels against {session, weekly}. Counting the
+    breakdown rows too would make every page that renders a third card look
+    like a half-rendered one and retry forever.
+    """
+    adopt_rows(
+        "codex",
+        [{"label": "Cloud tasks limit", "percent": 12.0, "kind": "used",
+          "reset_text": "Mon 6:00 PM", "in_container": True}],
+        base_dir=tmp_path,
+    )
+    payload = _cards_payload(cloud_tasks_limit=_card(12, reset_text="Mon 6:00 PM"))
+
+    snapshot = _build_snapshot(
+        payload, catalog=load_catalog("codex", base_dir=tmp_path)
+    )
+
+    assert snapshot.status == SnapshotStatus.OK
+    assert provider_max_percent(snapshot) == 61
+
+
+def test_a_bare_percentage_is_refused_rather_than_reported_as_used():
+    """The defect recorded in docs/next-session.md, now fixed.
+
+    readCard tested the whole card for "used"/"remaining", so a card rendering
+    only "42%" resolved to *used*. If it meant 42% left, the gauge pointed the
+    wrong way - and a wrong number that looks right is the one failure mode
+    this app cannot announce.
+    """
+    payload = _cards_payload()
+    payload["rows"]["weekly"] = _card(42, kind="unknown")
+    payload["weekly"] = payload["rows"]["weekly"]
+
+    snapshot = _build_snapshot(payload)
+
+    assert snapshot.status == SnapshotStatus.ERROR
+    assert "used/remaining" in (snapshot.error or "")
+    assert not snapshot.metrics, "an unjustified number reached the gauge"
+
+
+def test_a_payload_without_the_rows_block_still_reads_both_cards():
+    # Cached snapshots and hand-built payloads predate `rows`.
+    payload = _cards_payload()
+    payload.pop("rows")
+
+    snapshot = _build_snapshot(payload)
+
+    assert [m.label for m in snapshot.metrics] == ["Session", "Weekly"]
+
+
+# --- polarity, read beside the percentage ----------------------------------
+
+
+def _read_card_source() -> str:
+    """Extract polarityFor + readCardText from production, not a copy."""
+    start = EXTRACTOR_JS.index("function polarityFor")
+    end = EXTRACTOR_JS.index("function readCard(")
+    block = EXTRACTOR_JS[start:end]
+    assert "function readCardText" in block, "readCardText not in the block"
+    return block
+
+
+def _read_card_text(text: str) -> dict:
+    script = f"""
+    {_read_card_source()}
+    process.stdout.write(JSON.stringify(readCardText({json.dumps(text)})));
+    """
+    out = subprocess.run(
+        ["node", "-e", script], capture_output=True, text=True, timeout=30
+    )
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout)
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("5 hour usage limit 42% used Resets 1:55 PM", "used"),
+        ("5 hour usage limit 42% remaining Resets 1:55 PM", "remaining"),
+        ("5 hour usage limit 42% left Resets 1:55 PM", "remaining"),
+        ("5 hour usage limit used 42% Resets 1:55 PM", "used"),
+        # No wording beside the number: refused, not guessed.
+        ("5 hour usage limit 42% Resets 1:55 PM", "unknown"),
+        ("5 hour usage limit 42%", "unknown"),
+    ],
+)
+@pytest.mark.skipif(
+    shutil.which("node") is None, reason="node is required to evaluate the extractor JS"
+)
+def test_codex_polarity_is_read_beside_the_percentage(text, expected):
+    assert _read_card_text(text)["kind"] == expected
+
+
+@pytest.mark.skipif(
+    shutil.which("node") is None, reason="node is required to evaluate the extractor JS"
+)
+def test_a_countdown_saying_left_does_not_flip_the_polarity():
+    """"2 hr left" is a clock, not a quota.
+
+    Scanning the whole card for "left" read it as a direction and inverted the
+    gauge; the forward scan stops before any countdown.
+    """
+    card = _read_card_text("Weekly usage limit 12% used Resets in 2 hr left")
+
+    assert card["kind"] == "used"
+
+
+@pytest.mark.skipif(
+    shutil.which("node") is None, reason="node is required to evaluate the extractor JS"
+)
+def test_wording_from_the_next_card_cannot_set_this_cards_polarity():
+    """The text-window fallback runs into the next card.
+
+    "5 hour usage limit 42% Weekly usage limit 61% remaining" used to resolve
+    the bare 42% to *remaining* off the neighbour's wording.
+    """
+    card = _read_card_text(
+        "5 hour usage limit 42% Weekly usage limit 61% remaining"
+    )
+
+    assert card["percent"] == 42
+    assert card["kind"] == "unknown"
+
+
+def test_the_python_text_fallback_uses_the_same_polarity_rule():
+    """_parse_body_card carried the identical defect and gets the identical fix."""
+    bare = _parse_body_card(
+        "5 hour usage limit 42% Weekly usage limit 61% remaining",
+        "5 hour usage limit",
+        ("Weekly usage limit",),
+    )
+    left = _parse_body_card("5 hour usage limit 42% left", "5 hour usage limit")
+    countdown = _parse_body_card(
+        "Weekly usage limit 12% used Resets in 2 hr left", "Weekly usage limit"
+    )
+
+    assert bare["kind"] == "unknown"
+    assert left["kind"] == "remaining"
+    assert countdown["kind"] == "used"
