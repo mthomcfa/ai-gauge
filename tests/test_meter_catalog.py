@@ -22,6 +22,7 @@ import os
 import stat
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -581,6 +582,80 @@ def test_an_unreadable_override_is_preserved_before_it_is_replaced(tmp_path):
     assert backup.exists(), "the unreadable file was silently overwritten"
     assert "mine" in backup.read_text(encoding="utf-8")
     assert load_catalog("claude", base_dir=tmp_path).spec_for_label("Cowork sessions")
+
+
+def test_a_file_we_could_not_read_is_left_alone_rather_than_replaced(tmp_path):
+    """A read that failed says nothing about the contents.
+
+    A Windows sharing violation - an editor or a backup agent holding the
+    file open - arrived as the same answer a trailing comma does, so a
+    perfectly valid override got quarantined and replaced with the app's own
+    entries. Unreadable means: do not write.
+    """
+    path = tmp_path / "claude.json"
+    original = json.dumps(
+        {
+            "version": 1,
+            "kind": "claude",
+            "meters": [{"key": "opus_only", "window_seconds": 3600}],
+        }
+    )
+    path.write_text(original, encoding="utf-8")
+    real_read_text = Path.read_text
+
+    def refuse(self, *args, **kwargs):
+        if self == path:
+            raise PermissionError(32, "The process cannot access the file")
+        return real_read_text(self, *args, **kwargs)
+
+    with mock.patch.object(Path, "read_text", refuse):
+        assert adopt_rows("claude", [_row("Cowork sessions")], base_dir=tmp_path) == []
+
+    assert real_read_text(path, encoding="utf-8") == original
+    assert not (tmp_path / "claude.json.corrupt").exists()
+
+
+def test_a_quarantine_that_could_not_happen_stops_the_write(tmp_path):
+    """The write is only safe once the old document is somewhere else."""
+    path = tmp_path / "claude.json"
+    original = '{"version": 1, "meters": [{"key": "mine", "enabled": false},]}'
+    path.write_text(original, encoding="utf-8")
+
+    real_replace = os.replace
+
+    def refuse(src, dst, *args, **kwargs):
+        # Only the quarantine rename; the atomic write uses os.replace too,
+        # and failing that one would preserve the file for the wrong reason.
+        if str(dst).endswith(".corrupt"):
+            raise PermissionError(5, "Access is denied")
+        return real_replace(src, dst, *args, **kwargs)
+
+    with mock.patch("aigauge.providers.catalog.os.replace", refuse):
+        assert adopt_rows("claude", [_row("Cowork sessions")], base_dir=tmp_path) == []
+
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_a_second_corruption_does_not_replace_the_first_quarantine(tmp_path, caplog):
+    """The first copy is the one carrying the user's own edits.
+
+    Everything written after it was written by the app, so overwriting the
+    quarantine would trade the hand edits for a document of adopted entries.
+    """
+    path = tmp_path / "claude.json"
+    path.write_text('{"meters": [{"key": "the_hand_edits",]}', encoding="utf-8")
+    adopt_rows("claude", [_row("Cowork sessions")], base_dir=tmp_path)
+
+    backup = tmp_path / "claude.json.corrupt"
+    assert "the_hand_edits" in backup.read_text(encoding="utf-8")
+
+    path.write_text('{"meters": [{"key": "a_later_typo",]}', encoding="utf-8")
+    with caplog.at_level(logging.ERROR, logger="aigauge.providers.catalog"):
+        adopt_rows("claude", [_row("Daily agent runs")], base_dir=tmp_path)
+
+    assert "the_hand_edits" in backup.read_text(encoding="utf-8")
+    assert "discarded" in caplog.text
+    assert load_catalog("claude", base_dir=tmp_path).spec_for_label("Daily agent runs")
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")

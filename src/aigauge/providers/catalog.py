@@ -369,11 +369,26 @@ def _meters_from_document(data: Any) -> list[dict[str, Any]]:
     return [item for item in meters if isinstance(item, dict)]
 
 
+# "We read the file and it is not JSON" and "we could not read the file" are
+# different answers, and only the first says anything about the contents. A
+# Windows sharing violation on a perfectly good override file used to arrive
+# here as the same None a trailing comma does — so a transient PermissionError
+# got a valid file quarantined and replaced with the app's own entries.
+_UNREADABLE = object()
+
+
 def _read_json(path: Path) -> Any:
+    """Parsed JSON; ``None`` if it does not parse, ``_UNREADABLE`` if the read
+    itself failed."""
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        text = path.read_text(encoding="utf-8")
+    except OSError:
         log.exception("meter catalog: cannot read %s", path)
+        return _UNREADABLE
+    try:
+        return json.loads(text)
+    except ValueError:
+        log.exception("meter catalog: %s does not parse", path)
         return None
 
 
@@ -831,26 +846,44 @@ def row_evidence(row: Any) -> str | None:
     return _EMAIL_RE.sub("[redacted-email]", text)[:MAX_EVIDENCE_CHARS]
 
 
-def _quarantine_override(path: Path) -> None:
-    """Keep an unreadable override file rather than writing over it.
+def _quarantine_override(path: Path) -> bool:
+    """Keep an unparsable override file rather than writing over it.
 
     Mirrors ``config._quarantine_config``, for the same reason: the write
     below replaces the whole document, so one trailing comma in a hand-edited
     file used to cost the user every alias, window and disabled flag in it.
     A single fixed suffix, so a repeatedly-failing load cannot fill the
     directory.
+
+    Returns whether the caller may go on to write. A quarantine that failed
+    leaves the document exactly where it was, and writing over it then
+    destroys the thing this function exists to keep.
     """
     backup = path.with_suffix(path.suffix + ".corrupt")
+    if backup.exists():
+        # The first quarantine is the one worth keeping: it holds whatever the
+        # user had accumulated up to the moment their edit broke the file, and
+        # every document written after it was written by the app. Keeping one
+        # fixed name is also what stops a file that fails to parse on every
+        # launch filling the directory with copies.
+        log.error(
+            "meter catalog: %s does not parse and %s already exists; the newer "
+            "unreadable contents are discarded",
+            path,
+            backup,
+        )
+        return True
     try:
         os.replace(path, backup)
     except OSError:
         log.exception("meter catalog: could not preserve %s", path)
-        return
+        return False
     log.error(
         "meter catalog: %s is not readable; previous contents preserved at %s",
         path,
         backup,
     )
+    return True
 
 
 def _write_override(
@@ -864,6 +897,16 @@ def _write_override(
     document: dict[str, Any] = {"version": 1, "kind": kind, "meters": []}
     if path.exists():
         existing = _read_json(path)
+        if existing is _UNREADABLE:
+            # A file we could not read is not a file we may replace. The
+            # document is still there and still the user's; a sharing
+            # violation or a permission change is transient, and writing now
+            # would swap it for one holding only the new entries.
+            log.error(
+                "meter catalog: leaving %s alone; its contents could not be read",
+                path,
+            )
+            return False
         if isinstance(existing, dict):
             document = existing
             meters = document.get("meters")
@@ -872,8 +915,8 @@ def _write_override(
                 if isinstance(meters, list)
                 else []
             )
-        else:
-            _quarantine_override(path)
+        elif not _quarantine_override(path):
+            return False
     document.setdefault("version", 1)
     document.setdefault("kind", kind)
     document["meters"].extend(_spec_to_raw(spec) for spec in new_specs)
