@@ -21,7 +21,7 @@ Compact monitor for **Claude.ai**, **ChatGPT Codex**, **GitHub Copilot**, **Open
 
 > **Requires Python 3.11+.** Secrets live in the OS-native credential store (Windows Credential Manager / DPAPI, macOS Keychain, Linux Secret Service). Auto-start uses the platform's standard mechanism (Windows Task Scheduler / LaunchAgent / `~/.config/autostart`).
 
-Current version: **1.0.0+cfa.2** — a fork version, see [Versioning](#versioning). Release notes in [CHANGELOG.md](CHANGELOG.md).
+Current version: **1.1.0+cfa.3** — a fork version, see [Versioning](#versioning). Release notes in [CHANGELOG.md](CHANGELOG.md).
 
 AI Gauge is an independent open-source project and unofficial local desktop
 utility. It is not affiliated with Anthropic, OpenAI, GitHub, Microsoft,
@@ -65,7 +65,7 @@ Binaries are published on **[this fork's Releases page](https://github.com/mthom
 | macOS   | `ai-gauge-<file-version>-macos.tar.gz`      | **Apple Silicon only.** Extract, drag `ai-gauge.app` to Applications |
 | Linux   | `ai-gauge-<file-version>-linux.tar.gz`      | extract, run `./ai-gauge/ai-gauge`           |
 
-`<file-version>` is the version with `+` replaced by `-`, so `1.0.0+cfa.2` ships as `ai-gauge-1.0.0-cfa.2-windows.zip`. Print it with `python tools/check_versions.py`.
+`<file-version>` is the version with `+` replaced by `-`, so `1.1.0+cfa.3` ships as `ai-gauge-1.1.0-cfa.3-windows.zip`. Print it with `python tools/check_versions.py`.
 
 **Intel Macs are not covered by the prebuilt archive.** PyInstaller builds for the host architecture and this fork's CI runs on Apple Silicon, so the `.app` is arm64-only. Intel users should [run from source](#run-from-source); the menu-bar UI works identically.
 
@@ -189,6 +189,83 @@ If the embedded-browser sign-in doesn't work for you (e.g. your account requires
   Defaults are 5 min active and 60 min idle max.
 - Enable **Start at login** in Settings if you want it to run as a daily utility.
 
+## Usage meters (Claude / Codex)
+
+Claude and Codex publish more than one meter, and both providers reshuffle
+their usage pages regularly. AI Gauge reads **every meter its catalog knows
+about**, and each becomes its own row on the tile:
+
+| Provider | Meters read | Drives the tray colour |
+| --- | --- | --- |
+| Claude | Session (5 h), Weekly (7 d), Opus only, Sonnet only, Cowork only, Claude Design, Daily routine runs | Session + Weekly |
+| Codex | Session (5 h), Weekly (7 d), plus any additional usage card the page shows | Session + Weekly |
+
+Everything else is **informational**: those rows appear when you expand the
+tile (the **▸ Show details** button in the tile header), and they never change
+the tray / menu-bar colour. That is deliberate — Opus sitting at 91% of a sub-limit is not
+the same thing as your account being at 91% of its quota.
+
+### Re-scan meters
+
+Once a week, on the first refresh after seven days, each provider is asked for
+*every* labelled row its usage page renders — not just the ones the catalog
+recognises. New rows are added as informational meters and appear on the next
+refresh. **Settings → General → Re-scan meters now** runs it immediately.
+
+The scan is entirely local: it reads what the embedded browser already
+rendered. Nothing is downloaded, and there is no remote catalog.
+
+### Editing the meter catalog
+
+The shipped definitions live in `src/aigauge/providers/meter_catalog/` and are
+overlaid by an editable file in your app-data directory:
+
+```
+<app data>/meter_catalog/claude.json
+<app data>/meter_catalog/codex.json
+```
+
+(`%APPDATA%/ai-gauge/`, `~/Library/Application Support/ai-gauge/`, or
+`~/.config/ai-gauge/` — see the table above.) Entries are matched by `key`, and
+an override changes only the fields it names:
+
+```json
+{
+  "version": 1,
+  "kind": "claude",
+  "meters": [
+    { "key": "cowork_sessions", "enabled": false },
+    { "key": "weekly_all", "aliases": ["All models", "Weekly", "Weekly limit"] }
+  ]
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `key` | Identifies the meter. An unknown key adds a new meter; a known one edits it. |
+| `label` | What the tile shows. Also the history key, so changing it starts that meter's history over. |
+| `aliases` | The wordings the page may use. Add one here when a provider renames a row and the tile stops reading it. |
+| `window_seconds` | The meter's period, or `null` if unknown. Only affects the reset countdown. |
+| `primary` | `true` lets the meter drive the tray colour. Only Session and Weekly ship as primary, and a discovered meter is never adopted as primary. |
+| `enabled` | `false` hides the meter and stops the app looking for it. This is how you switch off a row the weekly scan picked up. |
+| `polarity` | `"used"` or `"remaining"`, consulted **only** when the page shows no wording beside the percentage. Nothing ships with one: without wording the app refuses the reading rather than guessing, because a quota shown backwards is the one error that does not announce itself. |
+| `status` | `"active"` (the default) means the meter is read. Reserved for a review step; anything else parks the entry without deleting it. |
+
+Every entry also records where it came from, so a meter the app added for
+itself can be judged afterwards — the page has moved on by the time you look:
+
+| Field | Meaning |
+| --- | --- |
+| `source` | `"bundled"` for a shipped meter, `"discovery"` for one the weekly scan adopted. |
+| `first_seen` | When it was adopted (local time, ISO-8601). |
+| `account_id` | Which account's page it was seen on. |
+| `evidence` | The row text that justified it — label, percentage, and reset wording, capped at 200 characters with any email address redacted. |
+
+Unrecognised fields are preserved rather than dropped, so a newer release can
+add one without an older build eating it. Delete the override file to go back
+to the shipped catalog; the weekly scan will re-adopt anything the page still
+shows.
+
 ## Build a standalone binary
 
 For most users the [pre-built downloads](#download) are easier — this section is for building locally or for maintainers cutting releases. The build machine needs Python 3.11+ and a `.venv` with `pip install -e .[dev]` already run; the resulting binary does **not** require Python on the target machine.
@@ -253,7 +330,7 @@ That also means **upstream cannot support this build**, and bugs here may not ex
 Fork releases use a [PEP 440](https://peps.python.org/pep-0440/) local version segment:
 
 ```
-1.0.0+cfa.2
+1.1.0+cfa.3
 └─┬─┘ └─┬─┘
   │     └── fork build counter — identifies this as a fork build
   └──────── this fork's own release counter, NOT an upstream release number
@@ -277,7 +354,7 @@ actionable. A few messages are worth recognising:
 
 | Message | What it means |
 | ------- | ------------- |
-| `Claude's usage layout changed: could not read <row> …` | The page rendered but the reading could not be justified — either several meters share one container so the percentage cannot be attributed to a row, or there is no "used"/"remaining" wording beside the number. The tile refuses rather than showing a number that may be inverted or belong to a different meter. The blob carries the row's text. |
+| `Claude's usage layout changed: could not read <row> …`<br>`Codex's usage layout changed: could not read <row> …` | The page rendered but the reading could not be justified — either several meters share one container so the percentage cannot be attributed to a row, or there is no "used"/"remaining" wording beside the number. The tile refuses rather than showing a number that may be inverted or belong to a different meter. The blob carries the row's text. Only Session and Weekly can produce this; an unreadable informational row is skipped instead. |
 | `extractor retry limit exceeded` | The page loaded but never finished rendering usage within the time allowed. |
 | `page failed to load` | A network or browser-level failure. The diagnostics carry Chromium's reason, e.g. `net::ERR_CONNECTION_RESET`. |
 | `Not signed in to <provider>` | The stored session expired. Re-run sign-in, or use **Paste cookie** in Settings. |
@@ -290,7 +367,7 @@ your machine. See "API response shapes" in [SECURITY.md](SECURITY.md).
 ## Notes / limitations
 
 - **Why an embedded browser instead of reading Chrome cookies?** Chrome 127+ added App-Bound Encryption (mid-2024) that blocks every external Python library from decrypting Chrome/Edge cookies. Owning the browser session ourselves is the only reliable workaround.
-- **Claude / Codex layouts may change.** If a provider tile shows "error" after a UI update upstream, the page-extractor JS in `src/aigauge/providers/{claude,codex}.py` needs adjusting — the rest of the app keeps working.
+- **Claude / Codex layouts may change.** A renamed row is usually a one-line fix: add the new wording to `aliases` in your `meter_catalog` override (see [Editing the meter catalog](#editing-the-meter-catalog)), no rebuild needed. A restructured page can still need the extractor JS in `src/aigauge/providers/{claude,codex}.py` adjusted — the rest of the app keeps working either way.
 - The Copilot REST endpoint returns the _current calendar month_ of billing usage. The widget tracks gross AI credits consumed against the included allowance; net quantity/amount is only the billable overage. Reset is computed as the 1st of the next month. GitHub does not currently expose a reliable personal-plan allowance field, so Settings uses a plan dropdown with a Custom fallback. Annual/request-based accounts are handled with a legacy premium-request fallback.
 - **Copilot usage lags upstream.** The Copilot REST endpoint updates noticeably slower than Claude or Codex — credit counts can take hours to reflect recent activity. The widget shows the most recent value GitHub returns; treat the Copilot tile as a trailing indicator, not real-time.
 - **Copilot AI credits.** GitHub moved Copilot from per-request quotas to token-based AI credits. Code completions and next edit suggestions remain included for paid plans, while Chat, CLI, cloud agent, Spaces, Spark, and third-party coding agents consume AI credits. The app shows the credit usage GitHub returns; if your account is org-billed, enter the billing organization so AI Gauge reads the organization billing pool.

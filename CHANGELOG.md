@@ -6,6 +6,90 @@
 > earlier `0.6.4` entry predates that convention and **is not** upstream's
 > `v0.6.4`, which is different code.
 
+## 1.1.0+cfa.3 - 2026-09-09
+
+Claude and Codex tiles read **every meter their pages show**, not two, and the
+label definitions moved out of the extractor source into a catalog the app can
+extend by itself. Claude changed its usage surface three times in one week
+before this release; a renamed row is now a one-line edit to a JSON file
+instead of a code change.
+
+### Added
+
+- **One field per meter.** Claude reports Session, Weekly, Opus only, Sonnet
+  only, Cowork only, Claude Design and Daily routine runs; Codex reports its
+  5-hour and weekly cards plus any other usage card the page renders. Session
+  and Weekly stay untagged and still drive the tray / menu-bar colour on their
+  own; every other meter is informational, shown when the tile is expanded.
+  Opus at 91% of a sub-limit is not the account being at 91% of its quota.
+- **A meter catalog, in data.** `src/aigauge/providers/meter_catalog/{claude,codex}.json`
+  ships with the app and is overlaid by `<app data>/meter_catalog/<kind>.json`.
+  Each entry carries a canonical key, a stable display label, the page wordings
+  (`aliases`), its window and whether it is primary. The bundled catalog
+  reproduces exactly the labels the extractors carried before it. Format
+  documented in README.md.
+- **A weekly self-scan.** On the first refresh after seven days — or right away
+  via **Settings → General → Re-scan meters now** — each provider is asked for
+  every labelled row its usage container renders, and rows the catalog does not
+  recognise are adopted as informational meters. They appear as fields on the
+  next refresh, and `"enabled": false` in the override file switches one off.
+  Adoption requires a percentage, a short alphabetic label that matches no page
+  furniture, and either reset wording or a position inside the usage container;
+  it is capped at 24 meters per provider and never sets `primary`. The scan is
+  local — it reads what the embedded browser already rendered, downloads
+  nothing, and there is no remote catalog.
+- **Provenance on every adopted meter.** An adopted entry is structurally
+  identical to a bundled one, so each records `source`, `first_seen`, the
+  `account_id` its page belonged to, and the `evidence` that justified it (the
+  row's label, percentage and reset wording, capped at 200 characters with any
+  email redacted — the same treatment the diagnostics blob gets). Bundled
+  entries declare `source: "bundled"`. Unrecognised fields in an override file
+  are preserved rather than dropped, and an entry can carry a `status` other
+  than `"active"` to park it — the hook a later review step needs.
+
+### Fixed
+
+- **Codex read a bare percentage as "used".** `readCard` tested the whole card
+  for "used"/"remaining", so a card rendering only "42%" resolved to 42%
+  consumed — and if it meant 42% *left*, the gauge pointed the wrong way. Worse,
+  the plain-text fallback reads a window that can run into the next card, so one
+  card's wording could set another's polarity. Polarity is now read beside the
+  percentage exactly as Claude's `readRow` does, stopping before any countdown
+  so "2 hr left" cannot invert the gauge, and a card with no wording beside its
+  number is refused rather than guessed. `_parse_body_card` carried the same
+  defect and got the same rule. This was the first entry in
+  `docs/next-session.md`'s known-defect list.
+
+### Changed
+
+- **A Codex card with no readable percentage is no longer shown as a blank
+  gauge.** It counts as absent, which makes the page a partial render and earns
+  a retry, then a plain error. This matches Claude's rule for the same case.
+- **The extractors walk the DOM once per run**, not once per label. The catalog
+  turned a two-label read into a dozen, and `querySelectorAll` plus `innerText`
+  over every element is the expensive part of both extractors.
+- `meter_catalog_last_scan` is a new config key (per provider kind). Missing
+  counts as due, so the first refresh after upgrading scans; so does a
+  timestamp in the future, because a clock change must not switch discovery off
+  for a week.
+
+### Packaging
+
+- The catalog is data next to the code, so both packaging paths name it
+  explicitly: `artifacts` in the hatch wheel config and `--add-data` in
+  `build.sh` / `build.ps1`. A frozen build that silently dropped it would read
+  no meters at all, and only on a user's machine.
+
+### Testing
+
+- 610 → 720 tests. Catalog loading, override merge and alias matching; the
+  seven-day gate including the clock-change case; adoption, its idempotence,
+  its cap and every junk rule; provenance including the email redaction and the
+  preservation of unknown fields; the catalog scan and the discovery scan
+  executed in node against a stub DOM with real containment; Codex polarity for
+  used, remaining and a bare percentage; and that a page relabel keeps one
+  history key rather than forking it.
+
 ## 1.0.0+cfa.2 - 2026-08-10
 
 **`1.0.0+cfa.1` does not start.** It raises `AttributeError` during `App.__init__`

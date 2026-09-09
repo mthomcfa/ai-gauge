@@ -3,6 +3,10 @@
 State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#16,
 610 tests passing, all five providers reading.
 
+> **Updated for `1.1.0+cfa.3`.** The Claude/Codex label definitions moved out of
+> the extractors into a meter catalog (§7), and the Codex polarity defect that
+> headed §4 is fixed. Everything else below stands as written.
+
 `1.0.0+cfa.1` does not start — it raises `AttributeError` during `App.__init__`.
 Fixed in `+cfa.2`; the two carry different version strings on purpose, because
 `app_version` in a diagnostics blob has to identify which build produced it.
@@ -165,7 +169,6 @@ speculative.
 
 | Where | What | Why it was left |
 | --- | --- | --- |
-| `providers/codex.py` → `readCard` | Scans the whole card for used/remaining, so a bare percentage resolves to *used*. Same bug class as Claude's polarity defect. | Codex works today, its structure differs (it takes the *first* percentage and has a text-window fallback that can pull wording from adjacent cards), and its live page is not observable from the dev environment. Changing a working provider on a guess is what caused the previous breakage. |
 | `webview/verify.py` → Claude check | A `/login` anchor is a hard veto, while `providers/claude.py`'s `isLoggedOut` ANDs it with absent usage text. Verify is stricter than the extractor, in the direction of the reported sign-in loop. | Loosening sign-in semantics without evidence risks the opposite failure: a bad session verifying, then erroring forever. |
 | `menubar.py` → `_provider_max_percent` | Short-circuits on a metric labelled `session`, while `gauge.provider_max_percent` takes the worst metric. The two can disagree for the same provider. | Pre-existing and documented in the module. The tag-filter half was fixed in PR #6; this divergence predates it. |
 | `webview/scraper.py` → timeout | Wall-clock, so it does not account for system sleep. A laptop resumed after two days reported `elapsed_s: 228477` and fired a stale scrape per provider. | Cosmetic in effect — the resumed cycle fails and recovers — but it produces one spurious failure per provider on every resume, and nonsense elapsed values in the log. |
@@ -228,3 +231,57 @@ open the app, which is the cheapest win of the four.
   fallback.** It is known not to open the dialog, and while the settings page
   was still loading it fired and navigated away from the page that was about to
   succeed. Being on the right route and unhydrated is a reason to wait.
+
+---
+
+## 7. The meter catalog — what `1.1.0+cfa.3` changed, and what it does not
+
+**The problem it addresses.** Both extractors matched hardcoded English labels,
+so a relabel broke the read and a new meter never appeared at all. Claude
+changed that surface three times in one week (§1.1). The labels now live in
+`src/aigauge/providers/meter_catalog/{claude,codex}.json`, overlaid by
+`app_data_dir()/meter_catalog/<kind>.json`, and every catalog meter becomes its
+own field. Only Session and Weekly stay untagged, so the tray colour is
+unchanged. Format documented in README.md.
+
+**What it is not.** It does not retire the polarity and attribution heuristics
+— §3's API mapper is still the durable fix, and the DOM path is still what the
+gauge reads. What the catalog changes is the *cost* of a relabel: an alias
+added to a JSON file instead of a code change and a release.
+
+**Design decisions worth not relitigating:**
+
+- **The primary path is untouched.** `readRow('Current session')` and
+  `readRow('All models') || readRow('Weekly')` still run first and still seed
+  the catalog scan. A catalog bug can add rows; it cannot take Session or
+  Weekly away.
+- **Discovery is local and adopts nothing that could matter.** It reads rows
+  the page already rendered, adopts only inside the recognised usage container,
+  and never sets `primary` — a row this build has never seen cannot take over
+  the tray colour. No remote catalog was considered; a downloaded catalog is a
+  new egress channel and a new trust boundary in an app whose whole claim is
+  that it has neither.
+- **`label` is deliberately not the page's wording**, because it is the history
+  key. A relabel must not fork `provider::label`.
+- **`polarity` exists but ships unset.** Without wording beside the number the
+  reading is refused, and the hint is an escape hatch for a user who knows what
+  their page renders — not a default.
+- **`status` is parsed and honoured but nothing writes anything but `active`.**
+  It is the hook for routing discovered rows through a review dialog before they
+  take effect; unknown fields on an override entry are preserved for the same
+  reason.
+
+**Open, and deliberately not done here:**
+
+- **Adoption is unreviewed.** A row that passes the junk rules becomes a field
+  on the next refresh with no user confirmation. The provenance fields
+  (`source`, `first_seen`, `account_id`, `evidence`) exist so a review step can
+  be added without re-scanning; that step is a separate change.
+- **Codex discovery needs two percentages in one element** to identify the
+  usage panel, so a page rendering a single card discovers nothing. Harmless
+  today (one card means nothing new to find) but it is the reason a first
+  extra card can take an extra scan to appear.
+- **Nothing has been observed against a live page.** The catalog reproduces the
+  labels the extractors already carried, and the discovery scan is exercised
+  against reconstructed DOMs in node — the same evidence basis, and the same
+  limitation, as §1.1 describes for the row readers.
