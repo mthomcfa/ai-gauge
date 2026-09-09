@@ -180,7 +180,10 @@ EXTRACTOR_TEMPLATE = r"""
   // which is also how a primary meter survives being relabelled - adding the
   // new wording to the override file is enough.
   function readCatalogRows(seed) {
-    const out = {};
+    // Object.create(null), not {}: a plain object inherits constructor,
+    // toString and hasOwnProperty, all truthy, so a catalog key of
+    // "constructor" read as already-filled and its meter was never read.
+    const out = Object.create(null);
     for (const key of Object.keys(seed || {})) {
       if (seed[key]) out[key] = seed[key];
     }
@@ -307,7 +310,10 @@ EXTRACTOR_TEMPLATE = r"""
     // apart from an empty list, and it stamps the weekly scan on the answer.
     if (!container || !container.contains) return null;
     const out = [];
-    const seen = {};
+    // Object.create(null) for the same reason as readCatalogRows's map: with a
+    // plain object, seen["constructor"] is truthy before anything is seen, so
+    // a row labelled "Constructor" was dropped from every scan.
+    const seen = Object.create(null);
     for (const candidate of rowCandidates()) {
       if (out.length >= 40) break;
       const text = candidate.text;

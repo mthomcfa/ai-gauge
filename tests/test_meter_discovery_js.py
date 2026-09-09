@@ -488,6 +488,44 @@ def test_a_discovered_row_carries_the_same_polarity_verdict_as_a_known_one():
     assert by_label["Cowork sessions"]["kind"] == "used"
 
 
+# Page wording that collides with Object.prototype. A plain object used as a
+# map answers `seen["constructor"]` with a function before anything is seen.
+_CONSTRUCTOR_DOM: list[tuple[str, int, int | None]] = [
+    ("", 900, None),
+    ("Plan usage", 600, 0),
+    ("Current session Resets in 2 hr 59 min 64% used", 40, 1),
+    ("Weekly Resets in 3 days 30% used", 40, 1),
+    ("Constructor 5% used", 40, 1),
+]
+
+
+def test_a_row_named_after_an_object_property_is_still_discovered():
+    """`seen["constructor"]` is truthy on a plain object, so the row vanished."""
+    labels = [
+        row["label"] for row in _run(_claude_block(), _CONSTRUCTOR_DOM, "discoverRows()")
+    ]
+
+    assert "Constructor" in labels
+
+
+def test_a_catalog_key_named_after_an_object_property_is_still_read():
+    catalog = MeterCatalog(
+        kind="claude",
+        specs=bundled_catalog("claude").specs
+        + (
+            MeterSpec(
+                key="constructor",
+                label="Constructor",
+                aliases=("Constructor",),
+            ),
+        ),
+    )
+
+    rows = _run(_claude_block(catalog), _CONSTRUCTOR_DOM, "readCatalogRows({})")
+
+    assert rows["constructor"]["percent"] == 5
+
+
 @pytest.mark.parametrize("discover,expected", [(False, None), (True, ["scanned"])])
 def test_discovery_only_runs_when_the_scan_is_due(discover, expected):
     """Executes the real expression against a stubbed discoverRows.
@@ -582,6 +620,20 @@ def test_codex_discovery_never_leaves_the_usage_container():
     discovered = _run(_codex_block(), CODEX_DOM, "discoverCards()")
 
     assert "Fix the flaky test" not in [row["label"] for row in discovered]
+
+
+def test_codex_a_card_named_after_an_object_property_is_still_discovered():
+    dom = [
+        ("", 900, None),
+        ("Personal usage", 600, 0),
+        ("5 hour usage limit 42% used Resets 1:55 PM", 40, 1),
+        ("Weekly usage limit 61% used Resets Mon 6:00 PM", 40, 1),
+        ("Constructor 5% used Resets Mon 6:00 PM", 40, 1),
+    ]
+
+    labels = [row["label"] for row in _run(_codex_block(), dom, "discoverCards()")]
+
+    assert "Constructor" in labels
 
 
 # The workspace-credit layout: no card says "usage limit", and the only text
