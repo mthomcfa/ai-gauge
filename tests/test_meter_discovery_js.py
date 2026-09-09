@@ -432,6 +432,58 @@ def test_the_panels_own_marker_wording_does_not_refuse_the_panel(furniture):
     assert "Cowork sessions" in labels
 
 
+# A nav that carries the marker phrase AND a percentage of its own, so it is
+# an anchor in its own right — a promo ("12% off") beside a real furniture
+# meter ("Storage 88% used"). It is 39 characters against the panel's hundred.
+CLAUDE_NAV_PROMO_DOM: list[tuple[str, int, int | None]] = [
+    ("", 900, None),                                              # 0 body
+    ("", 200, 0),                                                 # 1 settings nav
+    ("Plan usage 12% off Max", 20, 1),                            # 2 the promo
+    ("Storage 88% used", 20, 1),                                  # 3
+    ("", 600, 0),                                                 # 4 the usage panel
+    ("Current session Resets in 2 hr 59 min 64% used", 40, 4),    # 5
+    ("Weekly Resets in 3 days 30% used", 40, 4),                  # 6
+    ("Cowork sessions 7% used", 40, 4),                           # 7
+]
+
+# The same escape with no furniture meter at all: a sidebar of chat titles,
+# each quoting a meter name and carrying a percentage that is not a quota.
+CLAUDE_CHAT_TITLE_DOM: list[tuple[str, int, int | None]] = [
+    ("", 900, None),                                              # 0 body
+    ("", 200, 0),                                                 # 1 the sidebar
+    ("Current session speedup 40% faster", 20, 1),                # 2 a chat title
+    ("Weekly standup notes 10% done", 20, 1),                     # 3
+    ("", 600, 0),                                                 # 4 the usage panel
+    ("Current session Resets in 2 hr 59 min 64% used", 40, 4),    # 5
+    ("Weekly Resets in 3 days 30% used", 40, 4),                  # 6
+    ("Cowork sessions 7% used", 40, 4),                           # 7
+]
+
+
+@pytest.mark.parametrize(
+    ("dom", "furniture"),
+    [
+        (CLAUDE_NAV_PROMO_DOM, {"Storage", "Plan usage"}),
+        (CLAUDE_CHAT_TITLE_DOM, {"Current session speedup", "Weekly standup notes"}),
+    ],
+    ids=["nav promo", "chat titles"],
+)
+def test_the_richer_container_wins_over_the_smaller_one(dom, furniture):
+    """Furniture that carries the marker AND a percentage used to win on size.
+
+    Both of these are legitimate anchors — marker wording with a number beside
+    it — so the bare-marker rule never sees them, and both are far shorter
+    than the panel. Size is the wrong question: the panel is the element
+    holding the catalog's meters and rows that say used or remaining, and it
+    holds more of both.
+    """
+    assert _run(_claude_block(), dom, "usageContainer()._i") == 4
+
+    labels = [row["label"] for row in _run(_claude_block(), dom, "discoverRows()")]
+    assert "Cowork sessions" in labels
+    assert not furniture & set(labels)
+
+
 # The SPA wrapper: <body> is refused outright, but div#root is not <body>, and
 # a panel rendering fewer than two percentages sends the climb straight past
 # it into the wrapper that holds the whole application.
@@ -771,6 +823,53 @@ def test_codex_wrappers_do_not_talk_a_swallowed_page_past_the_ratio():
 
     assert _run(_codex_block(), dom, "usageContainer()") is None
     assert _run(_codex_block(), dom, "discoverCards()") is None
+
+
+CODEX_RAIL_PROMO_DOM: list[tuple[str, int, int | None]] = [
+    ("", 900, None),                                                 # 0 body
+    ("", 200, 0),                                                    # 1 side rail
+    ("Usage limits 20% off Pro", 20, 1),                             # 2 the promo
+    ("Storage 88% used", 20, 1),                                     # 3
+    ("", 600, 0),                                                    # 4 the panel
+    ("5 hour usage limit 42% used Resets 1:55 PM", 40, 4),           # 5
+    ("Weekly usage limit 61% used Resets Mon 6:00 PM", 40, 4),       # 6
+    ("Cloud tasks limit 12% used Resets Mon 6:00 PM", 40, 4),        # 7
+]
+
+CODEX_TASK_TITLE_DOM: list[tuple[str, int, int | None]] = [
+    ("", 900, None),                                                 # 0 body
+    ("", 200, 0),                                                    # 1 task rail
+    ("Weekly usage limit refactor 40% done", 20, 1),                 # 2 a task
+    ("5 hour usage limit audit 10% done", 20, 1),                    # 3
+    ("", 600, 0),                                                    # 4 the panel
+    ("5 hour usage limit 42% used Resets 1:55 PM", 40, 4),           # 5
+    ("Weekly usage limit 61% used Resets Mon 6:00 PM", 40, 4),       # 6
+    ("Cloud tasks limit 12% used Resets Mon 6:00 PM", 40, 4),        # 7
+]
+
+
+@pytest.mark.parametrize(
+    ("dom", "furniture"),
+    [
+        (CODEX_RAIL_PROMO_DOM, {"Storage", "Usage limits"}),
+        (
+            CODEX_TASK_TITLE_DOM,
+            {"Weekly usage limit refactor", "5 hour usage limit audit"},
+        ),
+    ],
+    ids=["rail promo", "task titles"],
+)
+def test_codex_the_richer_container_wins_over_the_smaller_one(dom, furniture):
+    """Same shape on the analytics page: the rail quotes the limits.
+
+    A task title carrying "Weekly usage limit" and a percentage is an anchor
+    like any other, and the rail around it is shorter than the panel.
+    """
+    assert _run(_codex_block(), dom, "usageContainer()._i") == 4
+
+    labels = [row["label"] for row in _run(_codex_block(), dom, "discoverCards()")]
+    assert "Cloud tasks limit" in labels
+    assert not furniture & set(labels)
 
 
 def test_the_workspace_credit_layout_still_finds_its_panel():

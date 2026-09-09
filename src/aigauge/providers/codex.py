@@ -252,6 +252,34 @@ EXTRACTOR_TEMPLATE = r"""
     return rowsLen > 0 && text.length > rowsLen * 4;
   }
 
+  // How much of a usage panel a candidate holds: the catalog meters whose
+  // wording it renders, plus the cards whose percentage carries
+  // used/remaining wording. Size was the whole tiebreak, and page furniture
+  // is always smaller than the panel - a rail reading "Usage limits 20% off
+  // Pro" beside "Storage 88% used" won on length, "Storage" was adopted, and
+  // the real panel was never scanned. A task rail whose titles quote the
+  // limits ("Weekly usage limit refactor 40% done") does it with the marker
+  // wording alone. Richness answers what a panel IS rather than how long it
+  // is; length only settles ties.
+  function richness(el, text) {
+    const lower = text.toLowerCase();
+    let score = 0;
+    for (const entry of CATALOG) {
+      // Once per meter, not once per alias: a meter counted twice is not two.
+      for (const alias of entry.aliases) {
+        if (alias && lower.includes(alias.toLowerCase())) { score++; break; }
+      }
+    }
+    for (const card of leafCards()) {
+      if (card.el !== el && !el.contains(card.el)) continue;
+      // The reader's own polarity verdict, so what is counted here is what
+      // could be adopted.
+      const pctMatch = card.text.match(/(\d+(?:\.\d+)?)\s*%/);
+      if (polarityFor(card.text, pctMatch) !== 'unknown') score++;
+    }
+    return score;
+  }
+
   // The element holding the usage panel, found by walking UP from the wording
   // that names it. Discovery is confined to it: a percentage in the task rail
   // is not a meter, and where it sits is the only way to tell.
@@ -289,6 +317,7 @@ EXTRACTOR_TEMPLATE = r"""
     const bare = marked.filter(c => pctCount(c.text) === 0);
     let best = null;
     let bestLen = Infinity;
+    let bestScore = -1;
     for (const anchor of anchors) {
       let el = anchor.el;
       // Panel-shaped: an ancestor above the anchor holding a percentage and
@@ -302,9 +331,14 @@ EXTRACTOR_TEMPLATE = r"""
           c => el.contains(c.el) && !c.el.contains(anchor.el));
         if (pctCount(text) >= 2) {
           const stray = passedPanel && holdsStray;
-          if (text.length < bestLen && !stray && !swallowedThePage(el, text)) {
-            best = el;
-            bestLen = text.length;
+          if (!stray && !swallowedThePage(el, text)) {
+            const score = richness(el, text);
+            if (score > bestScore ||
+                (score === bestScore && text.length < bestLen)) {
+              best = el;
+              bestLen = text.length;
+              bestScore = score;
+            }
           }
           break;
         }
