@@ -35,6 +35,7 @@ from aigauge.providers.catalog import (
     MAX_CATALOG_SPECS,
     MAX_EVIDENCE_CHARS,
     SOURCE_DISCOVERY,
+    SOURCE_USER,
     STATUS_ACTIVE,
     MeterCatalog,
     MeterSpec,
@@ -200,6 +201,70 @@ def test_override_appends_unknown_keys(tmp_path):
 
     assert catalog.spec_for_key("cloud_runs").label == "Cloud runs"
     assert len(catalog.specs) == len(bundled_catalog("claude").specs) + 1
+
+
+def test_a_partial_entry_applies_wherever_it_sits_in_the_file(tmp_path):
+    """Merging in file order lost a disable written above the definition."""
+    _write_override(
+        tmp_path,
+        "claude",
+        [
+            {"key": "cloud_runs", "enabled": False},
+            {"key": "cloud_runs", "label": "Cloud runs", "aliases": ["Cloud runs"]},
+        ],
+    )
+
+    spec = load_catalog("claude", base_dir=tmp_path).spec_for_key("cloud_runs")
+
+    assert spec.label == "Cloud runs"
+    assert spec.enabled is False
+
+
+def test_a_hand_added_entry_is_recorded_as_the_users(tmp_path):
+    """Only the packaged file is "bundled"; provenance is not a default."""
+    _write_override(
+        tmp_path,
+        "claude",
+        [{"key": "cloud_runs", "label": "Cloud runs", "aliases": ["Cloud runs"]}],
+    )
+
+    spec = load_catalog("claude", base_dir=tmp_path).spec_for_key("cloud_runs")
+
+    assert spec.source == SOURCE_USER
+    assert spec.adopted is False
+
+
+def test_a_discovered_meter_this_build_now_ships_is_dropped(tmp_path, caplog):
+    """An adopted row outlives the release that adds the real meter.
+
+    Left alone it reports the same number a second time, under the label the
+    page happened to use rather than the one history keys on.
+    """
+    _write_override(
+        tmp_path,
+        "claude",
+        [
+            {
+                "key": "cowork_sessions",
+                "label": "Cowork only",
+                "aliases": ["Cowork only"],
+                "source": "discovery",
+            }
+        ],
+    )
+
+    with caplog.at_level(logging.INFO, logger="aigauge.providers.catalog"):
+        catalog = load_catalog("claude", base_dir=tmp_path)
+
+    assert catalog.spec_for_key("cowork_sessions") is None
+    assert catalog.spec_for_key("cowork_only") is not None
+    assert "superseded" in caplog.text
+
+
+def test_a_discovered_meter_the_build_does_not_ship_is_kept(tmp_path):
+    adopt_rows("claude", [_row("Cowork sessions")], base_dir=tmp_path)
+
+    assert load_catalog("claude", base_dir=tmp_path).spec_for_label("Cowork sessions")
 
 
 def test_an_unreadable_override_leaves_the_bundled_catalog_intact(tmp_path):

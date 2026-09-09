@@ -59,6 +59,10 @@ MAX_EVIDENCE_CHARS = 200
 
 SOURCE_BUNDLED = "bundled"
 SOURCE_DISCOVERY = "discovery"
+# An entry that appeared in the override file with no provenance of its own:
+# somebody typed it. Only the packaged file is "bundled", which is what the
+# extractor's rival-label set keys off.
+SOURCE_USER = "user"
 # Reserved for a review step: an entry whose status is not "active" is loaded
 # and preserved but not read. Nothing writes anything else yet.
 STATUS_ACTIVE = "active"
@@ -290,7 +294,7 @@ def _coerce_optional_str(value: Any, *, limit: int = 200) -> str | None:
     return text[:limit] if text else None
 
 
-def _spec_from_raw(raw: Any) -> MeterSpec | None:
+def _spec_from_raw(raw: Any, *, default_source: str = SOURCE_BUNDLED) -> MeterSpec | None:
     if not isinstance(raw, dict):
         return None
     key = str(raw.get("key") or "").strip().lower()
@@ -304,7 +308,7 @@ def _spec_from_raw(raw: Any) -> MeterSpec | None:
         return None
     source = str(raw.get("source") or "").strip().lower()
     if not source:
-        source = SOURCE_DISCOVERY if raw.get("adopted") else SOURCE_BUNDLED
+        source = SOURCE_DISCOVERY if raw.get("adopted") else default_source
     return MeterSpec(
         key=key,
         label=label,
@@ -443,29 +447,74 @@ def _apply_override(spec: MeterSpec, raw: dict[str, Any]) -> MeterSpec:
     return replace(spec, **changes) if changes else spec
 
 
+def _drop_superseded(kind: str, specs: list[MeterSpec]) -> list[MeterSpec]:
+    """Forget a discovered meter the build has since learned for itself.
+
+    A row adopted before a release shipped that meter would otherwise stay in
+    the override file for good, reporting the same number under a second
+    label. The bundled entry wins: it carries the real window, the display
+    label history keys on, and possibly ``primary``.
+    """
+    covered: set[str] = set()
+    for spec in specs:
+        if spec.source != SOURCE_BUNDLED:
+            continue
+        covered.update(normalize_label(alias) for alias in spec.aliases)
+        covered.add(normalize_label(spec.label))
+    kept: list[MeterSpec] = []
+    dropped: list[str] = []
+    for spec in specs:
+        if (
+            spec.source == SOURCE_DISCOVERY
+            and spec.aliases
+            and all(normalize_label(alias) in covered for alias in spec.aliases)
+        ):
+            dropped.append(spec.key)
+            continue
+        kept.append(spec)
+    if dropped:
+        log.info(
+            "meter catalog: %s discovered meters superseded by bundled ones: %s",
+            kind,
+            ", ".join(dropped),
+        )
+    return kept
+
+
 def load_catalog(kind: str, *, base_dir: Path | None = None) -> MeterCatalog:
     """Bundled definitions with the app-data override file merged over them.
 
     Override entries are matched by ``key``: a known key updates only the
     fields it names (so ``{"key": "opus_only", "enabled": false}`` just turns
     that meter off), an unknown key is appended.
+
+    Two passes, because one file can do both jobs to one key. Merging in file
+    order meant ``{"key": "x", "enabled": false}`` sitting *above* the entry
+    that defines ``x`` was applied to nothing and then thrown away by the
+    definition below it. New meters are collected first; then every entry is
+    applied as an overlay, whatever its position.
     """
     catalog = bundled_catalog(kind)
     path = override_path(kind, base_dir=base_dir)
     if not path.exists():
         return catalog
+    raws = _meters_from_document(_read_json(path))
     specs = list(catalog.specs)
     by_key = {spec.key: index for index, spec in enumerate(specs)}
-    for raw in _meters_from_document(_read_json(path)):
+    for raw in raws:
         key = str(raw.get("key") or "").strip().lower()
         if key in by_key:
-            specs[by_key[key]] = _apply_override(specs[by_key[key]], raw)
             continue
-        spec = _spec_from_raw(raw)
+        spec = _spec_from_raw(raw, default_source=SOURCE_USER)
         if spec is None:
             continue
         by_key[spec.key] = len(specs)
         specs.append(spec)
+    for raw in raws:
+        index = by_key.get(str(raw.get("key") or "").strip().lower())
+        if index is not None:
+            specs[index] = _apply_override(specs[index], raw)
+    specs = _drop_superseded(kind, specs)
     if len(specs) > MAX_CATALOG_SPECS:
         log.warning(
             "meter catalog: %s defines %d meters; reading the first %d",
