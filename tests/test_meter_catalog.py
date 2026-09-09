@@ -763,6 +763,7 @@ def test_junk_labels_are_never_adopted(label, tmp_path):
         "Daily included routine runs 3 of 10",  # that row with its count glued on
         "Weekly 42",                          # the same, with the count alone
         "Opus only 91",
+        "Weekly 3-of-10",                     # the count again, hyphenated
     ],
 )
 def test_a_label_that_is_a_known_meter_again_is_not_adopted(label, tmp_path):
@@ -785,6 +786,7 @@ def test_a_label_that_is_a_known_meter_again_is_not_adopted(label, tmp_path):
         "Weekly Opus",       # contains the alias "Weekly" AND "Opus only"'s word
         "Session credits",
         "Session limit",
+        "Weekly sub-limit",  # a new word the trailing-junk rule cannot see
     ],
 )
 def test_a_new_meter_named_out_of_the_same_vocabulary_is_still_adopted(
@@ -803,6 +805,12 @@ def test_a_new_meter_named_out_of_the_same_vocabulary_is_still_adopted(
     adopted as an informational meter beside the unreadable primary rather
     than refused. It gets its own history key, and the fix is still to add the
     wording to the primary's aliases.
+
+    "Weekly sub-limit" is the hyphen: the trailing-junk rule asked whether
+    each leftover token was a whole alphabetic word, and "sub-limit" is not
+    one, so a real new meter read as the weekly meter with junk on the end. It
+    asks whether the remainder holds a run of three letters at all — which
+    "3-of-10" still does not, hyphens or no hyphens (see the refused list).
     """
     assert is_adoptable_label(label, catalog=bundled_catalog("claude")) is True
     assert adopt_rows("claude", [_row(label)], base_dir=tmp_path)
