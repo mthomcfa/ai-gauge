@@ -358,6 +358,20 @@ added to a JSON file instead of a code change and a release.
   percentage under a personal label. Scanning both means returning a list of
   containers and merging the scans, which is a change to every caller of the
   discovery payload.
+- **The "passed the panel" test is a percentage, not a second anchor.**
+  `passedPanel` is set by the first ancestor above the anchor that holds a
+  percentage and no bare marker, and a card's own wrapper qualifies. So a panel
+  whose cards each sit in a wrapper of their own *and* whose heading is a
+  `div`/`section`/`li` reading "Plan usage" is refused as though the climb had
+  left it, and discovery is inert on that layout (`discovery_no_container`
+  once a day). The mirror case: a single-meter panel whose heading is that bare
+  marker never sets `passedPanel`, so the SPA root above it is scored instead
+  of refused, and only the page-swallowing ratio stands between its furniture
+  and `in_container`. Both are pre-existing shapes of the stray rule narrowed,
+  not widened, by the `passedPanel` qualification; neither touches the primary
+  reads; and both want a live page before choosing the rule — an ancestor
+  bearing a second *anchor* would separate a wrapper from a panel, at the cost
+  of never recognising a single-meter panel at all.
 - **Nothing has been observed against a live page.** The catalog reproduces the
   labels the extractors already carried, and the discovery scan is exercised
   against reconstructed DOMs in node — the same evidence basis, and the same
