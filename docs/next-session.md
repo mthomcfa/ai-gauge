@@ -254,17 +254,20 @@ added to a JSON file instead of a code change and a release.
 - **The primary path is untouched.** `readRow('Current session')` and
   `readRow('All models') || readRow('Weekly')` still run first and still seed
   the catalog scan.
-- **An adopted row cannot affect Session/Weekly attribution.** This is the
-  invariant, and it did not hold when the catalog shipped: `ROW_LABELS` is the
-  *rival* set — `readRowText` refuses to attribute a percentage whose container
-  also names another meter — and it was built from every enabled alias,
-  adopted ones included. An adopted "Current" or "Opus" therefore made the
-  primary Session row `ambiguous`, which is an ERROR snapshot on every refresh,
-  permanently. `ROW_LABELS` is now built from **bundled specs only** (enabled
-  or not: a disabled meter's row is still on the page and can still steal a
-  number), and adoption additionally refuses any label that contains, or is
-  contained by, a known alias or label as whole words. Discovered meters are
-  read through `CATALOG`, which is a read list and not an attribution one.
+- **An adopted row can cost Session/Weekly their number, and must never give
+  them the wrong one.** `ROW_LABELS` is the *rival* set — `readRowText` takes
+  the LAST percentage in the container it picked unless a rival label is in
+  there too — and this went round twice. Built from every alias, an adopted
+  fragment like "Current" or "Opus" made the primary Session row `ambiguous`
+  on every refresh; narrowed to bundled specs, an adopted "Cowork sessions"
+  sharing a collapsed container with Session made Session report *7% used* as
+  an OK snapshot. The second is worse: a refusal is visible and recoverable, a
+  plausible number pointing at the wrong meter is neither. So the rival set is
+  every spec's aliases again — bundled, discovered and hand-added, enabled or
+  not, because the page renders them all — and the fragments are refused at
+  *adoption* instead, by `_collides_with_known`, which is the one place that
+  can decide it before the entry exists. Display labels stay out of the rival
+  set: "Session" is a fragment of "Current session".
 - **A meter is adopted with no window.** Same reasoning as `polarity` below:
   inferring a period from the wording is a guess, and a wrong window makes an
   active meter read "idle" instead of showing its number. `infer_window` is

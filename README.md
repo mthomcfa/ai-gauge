@@ -243,7 +243,7 @@ an override changes only the fields it names:
 | Field | Meaning |
 | --- | --- |
 | `key` | Identifies the meter. An unknown key adds a new meter; a known one edits it. An entry for a new key needs `label` and `aliases` as well — one that only names a key it does not recognise is dropped with a warning in the log. |
-| `label` | What the tile shows. Also the history key, so changing it starts that meter's history over. |
+| `label` | What the tile shows. Also the history key (`provider::label`), so changing it starts that meter's history over. **Do not rename one meter's `label` to another meter's**: two entries sharing a label share one history key, which merges the two series and reads as a period rollover on every refresh — whichever entry the loader saw last wins, so the tile can show either meter's number under that name. Renaming a bundled meter to something new is fine; it just starts a fresh history. |
 | `aliases` | The wordings the page may use. Add one here when a provider renames a row and the tile stops reading it. |
 | `window_seconds` | The meter's period, or `null` if unknown. Drives the reset countdown and the pace line in the tile's tooltip ("you are 40% through the window"), so a wrong value is worse than none. |
 | `boundaries` | Where this meter's text stops, for Codex's plain-text fallback: the app reads from the meter's alias up to the first of these words. Defaults to every *other* meter's aliases, which is normally right — set it when a page puts something else between the cards. |
@@ -265,9 +265,13 @@ itself can be judged afterwards — the page has moved on by the time you look:
 Unrecognised fields are preserved rather than dropped, so a newer release can
 add one without an older build eating it. If the file cannot be parsed — a
 trailing comma is the usual one — it is moved to `<kind>.json.corrupt` before
-anything is written over it, and the log says so. Delete the override file to
-go back to the shipped catalog; the weekly scan will re-adopt anything the page
-still shows and you have not disabled.
+anything is written over it, and the log says so; a second corruption keeps
+that first copy and discards the newer one, because the first is the one
+holding your edits. If the file cannot be *read* at all — locked by an editor
+or a backup agent — nothing is written over it and the adoption is skipped
+until the next scan. Delete the override file to go back to the shipped
+catalog; the weekly scan will re-adopt anything the page still shows and you
+have not disabled.
 
 ## Build a standalone binary
 
