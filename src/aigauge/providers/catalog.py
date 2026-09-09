@@ -528,6 +528,37 @@ def metric_for_spec(
 # --- discovery / adoption --------------------------------------------------
 
 
+def _overlaps(needle: str, haystack: str) -> bool:
+    """Whether ``needle`` sits inside ``haystack`` as whole words."""
+    if needle not in haystack:
+        return False
+    return re.search(rf"\b{re.escape(needle)}\b", haystack) is not None
+
+
+def _collides_with_known(label: Any, known: Iterable[str]) -> bool:
+    """Whether a candidate label overlaps wording the catalog already has.
+
+    Equality is the obvious case. Containment either way is the one that bit:
+    "Current" is a fragment of Claude's "Current session" and "Daily included
+    routine runs 3 of 10" is that meter's row with a count glued on, so both
+    would be adopted as a second meter reporting an existing meter's number
+    under a new name — and a fragment like "Opus" also used to poison the
+    extractor's rival-label attribution.
+
+    Whole words, not bare substrings: "Cowork sessions" is a real new meter
+    and contains "Session", which is a display label of an existing one.
+    """
+    normalized = normalize_label(label)
+    if not normalized:
+        return True
+    return any(
+        normalized == other
+        or _overlaps(normalized, other)
+        or _overlaps(other, normalized)
+        for other in known
+    )
+
+
 def is_adoptable_label(label: Any, *, catalog: MeterCatalog | None = None) -> bool:
     """Whether a discovered row's label may become a new meter.
 
@@ -549,13 +580,17 @@ def is_adoptable_label(label: Any, *, catalog: MeterCatalog | None = None) -> bo
     normalized = normalize_label(text)
     if any(marker in normalized for marker in _NON_METER_MARKERS):
         return False
-    if catalog is not None and normalize_label(text) in catalog.known_labels():
+    if catalog is not None and _collides_with_known(text, catalog.known_labels()):
         return False
     return True
 
 
-def _adoptable_row(row: Any, *, catalog: MeterCatalog) -> str | None:
-    """Return the label to adopt from a discovered row, or None."""
+def _adoptable_row(row: Any) -> str | None:
+    """Return the label a discovered row could be adopted under, or None.
+
+    Shape only. The collision checks live in ``adopt_rows``, which has to test
+    a candidate against the labels adopted earlier in the same scan too.
+    """
     if not isinstance(row, dict):
         return None
     percent = row.get("percent")
@@ -567,7 +602,7 @@ def _adoptable_row(row: Any, *, catalog: MeterCatalog) -> str | None:
     if not row.get("reset_text") and not row.get("in_container"):
         return None
     label = clean_label(row.get("label"))
-    if not is_adoptable_label(label, catalog=catalog):
+    if not is_adoptable_label(label):
         return None
     return label
 
@@ -653,8 +688,8 @@ def adopt_rows(
                 MAX_ADOPTED_METERS,
             )
             break
-        label = _adoptable_row(row, catalog=catalog)
-        if label is None or normalize_label(label) in seen_labels:
+        label = _adoptable_row(row)
+        if label is None or _collides_with_known(label, seen_labels):
             continue
         seen_labels.add(normalize_label(label))
         key = _adopted_key(label, taken_keys)
@@ -808,6 +843,29 @@ def clear_scans(config: Any) -> None:
 # --- extractor plumbing ----------------------------------------------------
 
 
+def bundled_row_labels(catalog: MeterCatalog) -> list[str]:
+    """The rival-label set the extractors score attribution against.
+
+    Bundled specs only, enabled or not. ROW_LABELS is not a list of meters to
+    read — ``readRowText`` refuses a percentage whose container also mentions
+    one of these, so an adopted "Current" or "Session" made the *primary*
+    Session row ambiguous and errored the whole snapshot on every refresh
+    thereafter. The rival set is about attributing the meters this build
+    ships; a meter the page taught us is read through CATALOG instead.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for spec in catalog.specs:
+        if spec.source != SOURCE_BUNDLED:
+            continue
+        for alias in spec.aliases:
+            normalized = normalize_label(alias)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                out.append(alias)
+    return out
+
+
 def extractor_source(template: str, catalog: MeterCatalog, *, discover: bool) -> str:
     """Fill a provider's extractor template with the catalog it should read.
 
@@ -816,7 +874,7 @@ def extractor_source(template: str, catalog: MeterCatalog, *, discover: bool) ->
     character, so a catalog entry cannot become JavaScript.
     """
     return (
-        template.replace("__AG_ROW_LABELS__", json.dumps(list(catalog.aliases())))
+        template.replace("__AG_ROW_LABELS__", json.dumps(bundled_row_labels(catalog)))
         .replace("__AG_CATALOG__", json.dumps(catalog.to_js()))
         .replace("__AG_DISCOVER__", "true" if discover else "false")
     )

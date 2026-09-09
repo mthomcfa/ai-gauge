@@ -486,6 +486,31 @@ def test_junk_labels_are_never_adopted(label, tmp_path):
     assert adopt_rows("claude", [_row(label)], base_dir=tmp_path) == []
 
 
+@pytest.mark.parametrize(
+    "label",
+    [
+        "Current",                            # a fragment of "Current session"
+        "Opus",                               # of "Opus only"
+        "Design",                             # of "Claude Design"
+        "Daily included routine runs 3 of 10",  # that row with its count glued on
+        "Session limit",                      # a relabel, which belongs in aliases
+    ],
+)
+def test_a_label_overlapping_a_known_meter_is_not_adopted(label, tmp_path):
+    """A fragment of a known label is that meter again under a second name.
+
+    It reports the same number twice, and while the fragment was also being
+    injected as a rival label it made the meter it came from unreadable.
+    """
+    assert is_adoptable_label(label, catalog=bundled_catalog("claude")) is False
+    assert adopt_rows("claude", [_row(label)], base_dir=tmp_path) == []
+
+
+def test_a_new_meter_that_merely_shares_a_word_is_still_adopted(tmp_path):
+    """Whole words, not bare substrings: "Cowork sessions" contains "Session"."""
+    assert adopt_rows("claude", [_row("Cowork sessions")], base_dir=tmp_path)
+
+
 def test_a_percentage_with_no_reset_text_outside_the_container_is_not_adopted(tmp_path):
     row = _row("Cowork sessions", reset_text=None, in_container=False)
 
@@ -618,6 +643,32 @@ def test_catalog_labels_reach_the_extractor_as_data_not_code():
     # A JSON string literal, so the quote is escaped and the label stays a
     # label. Spliced in raw it would have closed the array and run.
     assert source == 'const L = ["\'); alert(1); //"];'
+
+
+def _row_labels(catalog) -> list[str]:
+    return json.loads(extractor_source("__AG_ROW_LABELS__", catalog, discover=False))
+
+
+def test_the_rival_label_set_carries_bundled_meters_only(tmp_path):
+    """ROW_LABELS decides attribution, not what gets read.
+
+    A row whose container also names another meter has no attributable
+    percentage, so putting an adopted label in here lets a discovered row
+    make a *primary* meter unreadable.
+    """
+    adopt_rows("claude", [_row("Cowork sessions")], base_dir=tmp_path)
+
+    labels = _row_labels(load_catalog("claude", base_dir=tmp_path))
+
+    assert "Cowork sessions" not in labels
+    assert labels == LEGACY_CLAUDE_ROW_LABELS
+
+
+def test_a_disabled_bundled_meter_still_counts_as_a_rival(tmp_path):
+    """Disabling stops us reading it; the page still renders its row."""
+    _write_override(tmp_path, "claude", [{"key": "opus_only", "enabled": False}])
+
+    assert "Opus only" in _row_labels(load_catalog("claude", base_dir=tmp_path))
 
 
 def test_discovery_is_off_unless_the_scan_is_due():

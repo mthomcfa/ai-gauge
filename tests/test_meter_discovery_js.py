@@ -19,6 +19,8 @@ import subprocess
 import pytest
 
 from aigauge.providers.catalog import (
+    SOURCE_BUNDLED,
+    SOURCE_DISCOVERY,
     MeterCatalog,
     MeterSpec,
     bundled_catalog,
@@ -165,6 +167,60 @@ def test_a_relabelled_primary_meter_is_recovered_by_adding_an_alias():
     assert "session" not in before
     assert after["session"]["percent"] == 64
     assert after["session"]["kind"] == "used"
+
+
+def _with_extra(source: str) -> MeterCatalog:
+    return MeterCatalog(
+        kind="claude",
+        specs=bundled_catalog("claude").specs
+        + (
+            MeterSpec(
+                key="cowork_sessions",
+                label="Cowork sessions",
+                aliases=("Cowork sessions",),
+                source=source,
+            ),
+        ),
+    )
+
+
+# A layout that collapses two meters into one element. Claude has shipped
+# rows like this; it is also the only shape in which the rival-label rule can
+# fire, because a leaf element isolating one meter has one percentage.
+_COLLAPSED_DOM: list[tuple[str, int, int | None]] = [
+    ("Plan usage Cowork sessions 7% used Current session Resets in 2 hr 59 min "
+     "64% used Weekly Resets in 3 days 30% used", 600, None),
+    ("Cowork sessions 7% used Current session Resets in 2 hr 59 min 64% used", 40, 0),
+    ("Weekly Resets in 3 days 30% used", 40, 0),
+]
+
+
+def test_an_adopted_label_cannot_make_a_primary_row_unreadable():
+    """ROW_LABELS is the rival set, and a rival costs the row its number.
+
+    An adopted label that turns up inside the Session row made the primary
+    read `ambiguous` — an ERROR snapshot on every refresh, for as long as the
+    entry sat in the override file. Discovered meters are read through
+    CATALOG; only the meters this build ships belong in the rival set.
+    """
+    rows = _run(_claude_block(_with_extra(SOURCE_DISCOVERY)), _COLLAPSED_DOM,
+                "readCatalogRows({})")
+
+    assert rows["session"]["ambiguous"] is False
+    assert rows["session"]["percent"] == 64
+
+
+def test_a_bundled_rival_still_refuses_to_attribute_the_percentage():
+    """The control: the attribution rule itself is untouched.
+
+    The same DOM and the same label, shipped rather than discovered, still
+    refuses to guess which meter the number belongs to.
+    """
+    rows = _run(_claude_block(_with_extra(SOURCE_BUNDLED)), _COLLAPSED_DOM,
+                "readCatalogRows({})")
+
+    assert rows["session"]["ambiguous"] is True
+    assert rows["session"]["percent"] is None
 
 
 def test_discovery_returns_the_rows_the_catalog_does_not_know():
