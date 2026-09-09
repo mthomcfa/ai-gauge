@@ -123,6 +123,7 @@ _NON_METER_MARKERS = (
 # credit limit", which is a real meter - the blocklist has to reject furniture
 # without rejecting a limit that happens to be named after where it applies.
 
+
 def normalize_label(text: Any) -> str:
     """Case-folded, whitespace-collapsed form used for every alias comparison."""
     return re.sub(r"\s+", " ", str(text or "")).strip().lower()
@@ -294,7 +295,9 @@ def _coerce_optional_str(value: Any, *, limit: int = 200) -> str | None:
     return text[:limit] if text else None
 
 
-def _spec_from_raw(raw: Any, *, default_source: str = SOURCE_BUNDLED) -> MeterSpec | None:
+def _spec_from_raw(
+    raw: Any, *, default_source: str = SOURCE_BUNDLED
+) -> MeterSpec | None:
     if not isinstance(raw, dict):
         return None
     key = str(raw.get("key") or "").strip().lower()

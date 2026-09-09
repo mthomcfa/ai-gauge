@@ -490,7 +490,8 @@ def test_no_two_meters_share_a_display_label_after_a_scan(tmp_path):
 
     adopt_rows("claude", rows, base_dir=tmp_path)
 
-    labels = [normalize_label(s.label) for s in load_catalog("claude", base_dir=tmp_path).specs]
+    catalog = load_catalog("claude", base_dir=tmp_path)
+    labels = [normalize_label(spec.label) for spec in catalog.specs]
     assert len(labels) == len(set(labels))
 
 
@@ -589,7 +590,8 @@ def test_the_override_file_is_written_owner_only_and_atomically(tmp_path):
 
     path = tmp_path / "claude.json"
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    assert [p.name for p in tmp_path.iterdir()] == ["claude.json"], "temp file left behind"
+    left = [p.name for p in tmp_path.iterdir()]
+    assert left == ["claude.json"], f"temp file left behind: {left}"
 
 
 def test_adoption_stops_at_the_cap(tmp_path):

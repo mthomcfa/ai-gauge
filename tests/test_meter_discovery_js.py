@@ -269,7 +269,7 @@ CLAUDE_NAV_DOM: list[tuple[str, int, int | None]] = [
     ("Current session Resets in 2 hr 59 min 64% used", 40, 4),    # 6
     ("Weekly Resets in 3 days 30% used", 40, 4),                  # 7
     ("Cowork sessions 7% used", 40, 4),                           # 8
-    ("", 100, 0),                                                 # 9 the rest of the page
+    ("", 100, 0),                                                 # 9 rest of the page
     ("Storage 88% used", 20, 9),                                  # 10
     ("Referral bonus 15% off", 20, 9),                            # 11
     ("Save 20% on Max", 20, 9),                                   # 12
