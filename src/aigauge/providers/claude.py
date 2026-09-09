@@ -277,23 +277,36 @@ EXTRACTOR_TEMPLATE = r"""
     // with it. That is how a panel rendering fewer than two percentages
     // reached the SPA's root wrapper, where every piece of page furniture
     // counts as `in_container`.
+    //
+    // Only once the climb has passed the panel, though: the panel's own
+    // heading, a tab strip ("Daily | Weekly | Monthly") or a footnote about
+    // limits is a bare marker sitting INSIDE the panel and on no path up from
+    // a row, so counting it refused the real panel outright - leaving
+    // discovery permanently inert on that layout and saying so once a day as
+    // `discovery_no_container`.
     const bare = marked.filter(c => pctCount(c.text) === 0);
     let best = null;
     let bestLen = Infinity;
     for (const anchor of anchors) {
       let el = anchor.el;
+      // Panel-shaped: an ancestor above the anchor holding a percentage and
+      // no stray marker. A stray above THAT one is the climb leaving the
+      // panel; a stray at or below it is the panel's own furniture.
+      let passedPanel = false;
       for (let depth = 0; depth < 12 && el; depth++) {
         if (el === document.body || el === document.documentElement) break;
         const text = norm(el);
+        const holdsStray = bare.some(
+          c => el.contains(c.el) && !c.el.contains(anchor.el));
         if (pctCount(text) >= 2) {
-          const stray = bare.some(
-            c => el.contains(c.el) && !c.el.contains(anchor.el));
+          const stray = passedPanel && holdsStray;
           if (text.length < bestLen && !stray && !swallowedThePage(el, text)) {
             best = el;
             bestLen = text.length;
           }
           break;
         }
+        if (depth > 0 && !holdsStray && pctCount(text) >= 1) passedPanel = true;
         el = el.parentElement;
       }
     }

@@ -398,6 +398,40 @@ def test_a_smaller_marked_region_outside_the_panel_does_not_win():
     assert not {"Storage", "Cache"} & set(labels)
 
 
+@pytest.mark.parametrize(
+    "furniture",
+    [
+        "Plan usage",                        # the panel's own heading
+        "Weekly limits reset every Monday",  # a footnote under the rows
+        "Daily | Weekly | Monthly",          # a tab strip over them
+    ],
+)
+def test_the_panels_own_marker_wording_does_not_refuse_the_panel(furniture):
+    """A bare marker inside the panel is the panel describing itself.
+
+    Every one of these is marker wording with no percentage of its own,
+    sitting inside the panel and on no path up from any row — the shape the
+    overreach rule was written to refuse. Refusing it here refused the real
+    panel, so discovery never ran at all on a page whose panel carries a
+    heading, a footnote or a period tab strip. Position inside the panel does
+    not matter to the answer, which is containment, so one shape covers all
+    three.
+    """
+    dom = [
+        ("", 900, None),                                              # 0 body
+        ("", 600, 0),                                                 # 1 the panel
+        (furniture, 20, 1),                                           # 2
+        ("Current session Resets in 2 hr 59 min 64% used", 40, 1),    # 3
+        ("Weekly Resets in 3 days 30% used", 40, 1),                  # 4
+        ("Cowork sessions 7% used", 40, 1),                           # 5
+    ]
+
+    assert _run(_claude_block(), dom, "usageContainer()._i") == 1
+
+    labels = [row["label"] for row in _run(_claude_block(), dom, "discoverRows()")]
+    assert "Cowork sessions" in labels
+
+
 # The SPA wrapper: <body> is refused outright, but div#root is not <body>, and
 # a panel rendering fewer than two percentages sends the climb straight past
 # it into the wrapper that holds the whole application.
@@ -691,6 +725,36 @@ CODEX_SPA_ROOT_DOM: list[tuple[str, int, int | None]] = [
 def test_codex_a_panel_with_one_card_does_not_promote_the_spa_root():
     assert _run(_codex_block(), CODEX_SPA_ROOT_DOM, "usageContainer()") is None
     assert _run(_codex_block(), CODEX_SPA_ROOT_DOM, "discoverCards()") is None
+
+
+@pytest.mark.parametrize(
+    "furniture",
+    [
+        "Usage limits",                            # the panel's own heading
+        "Usage limits reset Monday at 6:00 PM",    # a footnote under the cards
+        "Usage limits Analytics",                  # a tab strip over them
+    ],
+)
+def test_codex_the_panels_own_marker_wording_does_not_refuse_the_panel(furniture):
+    """Codex's panel says "Usage limits" over its own cards.
+
+    Same shape as the Claude case: marker wording with no percentage of its
+    own, inside the panel and on no path up from a card, which refused the
+    panel that renders it.
+    """
+    dom = [
+        ("", 900, None),                                              # 0 body
+        ("", 600, 0),                                                 # 1 the panel
+        (furniture, 20, 1),                                           # 2
+        ("5 hour usage limit 42% used Resets 1:55 PM", 40, 1),        # 3
+        ("Weekly usage limit 61% used Resets Mon 6:00 PM", 40, 1),    # 4
+        ("Cloud tasks limit 12% used Resets Mon 6:00 PM", 40, 1),     # 5
+    ]
+
+    assert _run(_codex_block(), dom, "usageContainer()._i") == 1
+
+    labels = [row["label"] for row in _run(_codex_block(), dom, "discoverCards()")]
+    assert "Cloud tasks limit" in labels
 
 
 def test_codex_wrappers_do_not_talk_a_swallowed_page_past_the_ratio():
