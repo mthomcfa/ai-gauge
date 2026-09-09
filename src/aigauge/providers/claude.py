@@ -192,20 +192,73 @@ EXTRACTOR_TEMPLATE = r"""
     return out;
   }
 
-  // The smallest element that holds the whole usage panel. Discovery is
-  // confined to it: a percentage in the sidebar or a chat title is not a meter,
-  // and the only way to tell the difference is where it sits. Two percentages,
-  // because one is a single row - the panel is the smallest element holding
-  // more than one of them.
+  function pctCount(text) {
+    return (text.match(/\d+(?:\.\d+)?\s*%/g) || []).length;
+  }
+
+  // Wording that names the usage panel. "Plan usage" alone was both too narrow
+  // and too broad: the settings nav carries a "Plan usage" item, while a panel
+  // that renames its heading stops being findable at all. This is the same
+  // alternation the sibling checks below already use, plus every primary alias
+  // the catalog carries - so teaching the app a relabelled meter also teaches
+  // it where the panel is.
+  const PANEL_MARKER = /plan usage|current session|all models|weekly/i;
+  function marksUsagePanel(text) {
+    if (PANEL_MARKER.test(text)) return true;
+    const lower = text.toLowerCase();
+    for (const entry of CATALOG) {
+      if (!entry.primary) continue;
+      for (const alias of entry.aliases) {
+        if (alias && lower.includes(alias.toLowerCase())) return true;
+      }
+    }
+    return false;
+  }
+
+  // A container that reached past the panel is worse than no container at all:
+  // `in_container` is the whole difference between a meter and page furniture,
+  // and every percentage on the page sits inside one of these. A panel is
+  // mostly its rows; an element several times longer than the rows it holds
+  // swallowed the page around them.
+  function swallowedThePage(el, text) {
+    let rowsLen = 0;
+    for (const candidate of rowCandidates()) {
+      if (candidate.el === el || !el.contains(candidate.el)) continue;
+      if (pctCount(candidate.text) !== 1) continue;
+      rowsLen += candidate.text.length;
+    }
+    return rowsLen > 0 && text.length > rowsLen * 4;
+  }
+
+  // The element holding the usage panel, found by walking UP from the wording
+  // that names it. Discovery is confined to it: a percentage in the sidebar or
+  // a chat title is not a meter, and the only way to tell is where it sits.
+  //
+  // Taking the smallest element holding the marker and two percentages picked
+  // <body> whenever the marker also appeared outside the panel, which is the
+  // ordinary case - and inside <body>, "Storage 88%" and "Save 20%" are meters.
+  // Anchoring on the innermost elements that carry the marker and climbing to
+  // the first ancestor holding two percentages keeps the answer inside the
+  // panel. <body> is refused outright.
   function usageContainer() {
+    const marked = rowCandidates().filter(c => marksUsagePanel(c.text));
+    const anchors = marked.filter(
+      c => !marked.some(other => other !== c && c.el.contains(other.el)));
     let best = null;
     let bestLen = Infinity;
-    for (const candidate of rowCandidates()) {
-      if ((candidate.text.match(/\d+(?:\.\d+)?\s*%/g) || []).length < 2) continue;
-      if (!/plan usage/i.test(candidate.text)) continue;
-      if (candidate.text.length < bestLen) {
-        best = candidate.el;
-        bestLen = candidate.text.length;
+    for (const anchor of anchors) {
+      let el = anchor.el;
+      for (let depth = 0; depth < 12 && el; depth++) {
+        if (el === document.body || el === document.documentElement) break;
+        const text = norm(el);
+        if (pctCount(text) >= 2) {
+          if (text.length < bestLen && !swallowedThePage(el, text)) {
+            best = el;
+            bestLen = text.length;
+          }
+          break;
+        }
+        el = el.parentElement;
       }
     }
     return best;

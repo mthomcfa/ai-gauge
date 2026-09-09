@@ -196,19 +196,72 @@ EXTRACTOR_TEMPLATE = r"""
     return out;
   }
 
-  // The smallest element holding the whole usage panel. Discovery is confined
-  // to it: a percentage in the task rail is not a meter, and where it sits is
-  // the only way to tell. Two percentages, because one is a single card - the
-  // panel is the smallest element that holds more than one of them.
+  function pctCount(text) {
+    return (text.match(/\d+(?:\.\d+)?\s*%/g) || []).length;
+  }
+
+  // Wording that names the usage panel. "usage limit" alone was both too
+  // narrow and too broad: the analytics page carries prose about usage limits
+  // above the cards, while the workspace-credit layout never says "usage
+  // limit" at all. Plus every primary alias the catalog carries, so teaching
+  // the app a relabelled card also teaches it where the panel is.
+  const PANEL_MARKER = /usage limit|credit limit/i;
+  function marksUsagePanel(text) {
+    if (PANEL_MARKER.test(text)) return true;
+    const lower = text.toLowerCase();
+    for (const entry of CATALOG) {
+      if (!entry.primary) continue;
+      for (const alias of entry.aliases) {
+        if (alias && lower.includes(alias.toLowerCase())) return true;
+      }
+    }
+    return false;
+  }
+
+  // A container that reached past the panel is worse than no container at all:
+  // `in_container` is the whole difference between a meter and page furniture,
+  // and every percentage on the page sits inside one of these. A panel is
+  // mostly its cards; an element several times longer than the cards it holds
+  // swallowed the page around them.
+  function swallowedThePage(el, text) {
+    let rowsLen = 0;
+    for (const candidate of cardCandidates()) {
+      if (candidate.el === el || !el.contains(candidate.el)) continue;
+      if (pctCount(candidate.text) !== 1) continue;
+      rowsLen += candidate.text.length;
+    }
+    return rowsLen > 0 && text.length > rowsLen * 4;
+  }
+
+  // The element holding the usage panel, found by walking UP from the wording
+  // that names it. Discovery is confined to it: a percentage in the task rail
+  // is not a meter, and where it sits is the only way to tell.
+  //
+  // Taking the smallest element holding the marker and two percentages picked
+  // <body> whenever the marker also appeared outside the panel, which is the
+  // ordinary case - and inside <body>, a task's "90% done" is a meter.
+  // Anchoring on the innermost elements that carry the marker and climbing to
+  // the first ancestor holding two percentages keeps the answer inside the
+  // panel. <body> is refused outright.
   function usageContainer() {
+    const marked = cardCandidates().filter(c => marksUsagePanel(c.text));
+    const anchors = marked.filter(
+      c => !marked.some(other => other !== c && c.el.contains(other.el)));
     let best = null;
     let bestLen = Infinity;
-    for (const candidate of cardCandidates()) {
-      if ((candidate.text.match(/\d+(?:\.\d+)?\s*%/g) || []).length < 2) continue;
-      if (!/usage limit/i.test(candidate.text)) continue;
-      if (candidate.text.length < bestLen) {
-        best = candidate.el;
-        bestLen = candidate.text.length;
+    for (const anchor of anchors) {
+      let el = anchor.el;
+      for (let depth = 0; depth < 12 && el; depth++) {
+        if (el === document.body || el === document.documentElement) break;
+        const text = visibleText(el);
+        if (pctCount(text) >= 2) {
+          if (text.length < bestLen && !swallowedThePage(el, text)) {
+            best = el;
+            bestLen = text.length;
+          }
+          break;
+        }
+        el = el.parentElement;
       }
     }
     return best;

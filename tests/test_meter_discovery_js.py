@@ -5,9 +5,12 @@ out of the production extractor source and run against a stub DOM. Asserting
 that the source *mentions* a catalog would pass on a comment, which is the
 failure mode this repo has already shipped three times.
 
-The stub DOM is a real tree — each node names its parent — because both
-discovery scans are defined by containment: a percentage in the sidebar or the
-task rail is not a meter, and where it sits is the only way to tell.
+The stub DOM is a real tree — each node carries its OWN text and names its
+parent, and an ancestor's ``innerText`` is derived from its descendants, the
+way a browser renders it. Both discovery scans are defined by containment: a
+percentage in the sidebar or the task rail is not a meter, and where it sits
+is the only way to tell. Hand-written ancestor text could silently disagree
+with its children, which is precisely the relationship under test.
 """
 
 from __future__ import annotations
@@ -33,11 +36,11 @@ pytestmark = pytest.mark.skipif(
     shutil.which("node") is None, reason="node is required to evaluate the extractor JS"
 )
 
-_DOM_STUB = """
+_DOM_STUB = r"""
 const RAW = %(dom)s;
 const NODES = RAW.map((n, i) => ({
-  innerText: n[0],
-  textContent: n[0],
+  _own: n[0],
+  _children: [],
   tagName: 'DIV',
   className: '',
   _i: i,
@@ -47,6 +50,7 @@ const NODES = RAW.map((n, i) => ({
 }));
 NODES.forEach(el => {
   el.parentElement = el._parent === null ? null : NODES[el._parent];
+  if (el.parentElement) el.parentElement._children.push(el);
   el.contains = other => {
     let cur = other;
     while (cur) {
@@ -56,11 +60,19 @@ NODES.forEach(el => {
     return false;
   };
 });
+// Derived, not declared: a node's rendered text is its own text plus its
+// descendants', so a container cannot be given text its children do not have.
+function derive(el) {
+  return [el._own].concat(el._children.map(derive))
+    .filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+}
+NODES.forEach(el => { el.innerText = derive(el); el.textContent = el.innerText; });
 globalThis.document = {
   querySelectorAll: () => NODES,
   querySelector: () => null,
   title: 'stub',
   body: NODES[0],
+  documentElement: null,
 };
 """
 
@@ -91,24 +103,21 @@ def _run(js: str, dom: list[tuple[str, int, int | None]], expression: str):
 
 # --- Claude ----------------------------------------------------------------
 #
-# One container (index 0) holding one element per rendered row, plus a sidebar
-# row outside it carrying a percentage of its own.
+# The body (index 0) holding the usage panel, the panel holding one element per
+# rendered row, and a row outside the panel carrying a percentage of its own.
 
 CLAUDE_DOM: list[tuple[str, int, int | None]] = [
-    ("Plan usage Current session Resets in 2 hr 59 min 64% used "
-     "Weekly Resets in 3 days 30% used Opus only Resets in 3 days 91% used "
-     "Sonnet only 44% used Cowork sessions 7% used "
-     "Daily included routine runs Resets in 5 hr 12% used "
-     "Upgrade to Max 20% off", 600, None),
-    ("Current session Resets in 2 hr 59 min 64% used", 40, 0),
-    ("Weekly Resets in 3 days 30% used", 40, 0),
-    ("Opus only Resets in 3 days 91% used", 40, 0),
-    ("Sonnet only 44% used", 40, 0),
-    ("Cowork sessions 7% used", 40, 0),
-    ("Daily included routine runs Resets in 5 hr 12% used", 40, 0),
-    ("Upgrade to Max 20% off", 40, 0),
+    ("", 900, None),
+    ("Plan usage", 600, 0),
+    ("Current session Resets in 2 hr 59 min 64% used", 40, 1),
+    ("Weekly Resets in 3 days 30% used", 40, 1),
+    ("Opus only Resets in 3 days 91% used", 40, 1),
+    ("Sonnet only 44% used", 40, 1),
+    ("Cowork sessions 7% used", 40, 1),
+    ("Daily included routine runs Resets in 5 hr 12% used", 40, 1),
+    ("Upgrade to Max 20% off", 40, 1),
     # Outside the usage panel entirely.
-    ("Storage 88% used", 40, None),
+    ("Storage 88% used", 40, 0),
 ]
 
 
@@ -142,9 +151,10 @@ def test_the_seeded_primary_rows_are_never_re_read():
 def test_a_relabelled_primary_meter_is_recovered_by_adding_an_alias():
     """What the override file buys: a page relabel is a data change."""
     dom = [
-        ("Plan usage Session limit 64% used Weekly Resets in 3 days 30% used", 600, None),
-        ("Session limit 64% used", 40, 0),
-        ("Weekly Resets in 3 days 30% used", 40, 0),
+        ("", 900, None),
+        ("Plan usage", 600, 0),
+        ("Session limit 64% used", 40, 1),
+        ("Weekly Resets in 3 days 30% used", 40, 1),
     ]
     relabelled = MeterCatalog(
         kind="claude",
@@ -188,10 +198,10 @@ def _with_extra(source: str) -> MeterCatalog:
 # rows like this; it is also the only shape in which the rival-label rule can
 # fire, because a leaf element isolating one meter has one percentage.
 _COLLAPSED_DOM: list[tuple[str, int, int | None]] = [
-    ("Plan usage Cowork sessions 7% used Current session Resets in 2 hr 59 min "
-     "64% used Weekly Resets in 3 days 30% used", 600, None),
-    ("Cowork sessions 7% used Current session Resets in 2 hr 59 min 64% used", 40, 0),
-    ("Weekly Resets in 3 days 30% used", 40, 0),
+    ("", 900, None),
+    ("Plan usage", 600, 0),
+    ("Cowork sessions 7% used Current session Resets in 2 hr 59 min 64% used", 40, 1),
+    ("Weekly Resets in 3 days 30% used", 40, 1),
 ]
 
 
@@ -245,6 +255,81 @@ def test_discovery_skips_an_element_wrapping_several_meters():
     assert not any(row["label"].startswith("Plan usage") for row in discovered)
 
 
+# The shape that made `in_container` meaningless: the marker phrase renders in
+# the settings nav, outside the panel, so the smallest element holding it and
+# two percentages was <body> - and every percentage on the page is inside
+# <body>.
+CLAUDE_NAV_DOM: list[tuple[str, int, int | None]] = [
+    ("", 900, None),                                              # 0 body
+    ("", 200, 0),                                                 # 1 settings nav
+    ("Plan usage", 20, 1),                                        # 2 nav item
+    ("Account", 20, 1),                                           # 3 nav item
+    ("", 600, 0),                                                 # 4 the usage panel
+    ("Usage", 20, 4),                                             # 5 panel heading
+    ("Current session Resets in 2 hr 59 min 64% used", 40, 4),    # 6
+    ("Weekly Resets in 3 days 30% used", 40, 4),                  # 7
+    ("Cowork sessions 7% used", 40, 4),                           # 8
+    ("", 100, 0),                                                 # 9 the rest of the page
+    ("Storage 88% used", 20, 9),                                  # 10
+    ("Referral bonus 15% off", 20, 9),                            # 11
+    ("Save 20% on Max", 20, 9),                                   # 12
+]
+
+
+def test_the_container_is_the_panel_when_the_marker_also_sits_in_the_nav():
+    assert _run(_claude_block(), CLAUDE_NAV_DOM, "usageContainer()._i") == 4
+
+
+def test_furniture_outside_the_panel_is_not_discovered():
+    discovered = _run(_claude_block(), CLAUDE_NAV_DOM, "discoverRows()")
+    labels = [row["label"] for row in discovered]
+
+    assert "Cowork sessions" in labels
+    assert not {"Storage", "Referral bonus", "Save"} & set(labels)
+
+
+def test_a_relabelled_primary_meter_also_relocates_the_panel():
+    """The catalog is how a relabel is fixed, so the marker follows it.
+
+    Nothing in this DOM matches the fixed marker phrases; the panel is found
+    through the primary aliases the catalog injects.
+    """
+    dom = [
+        ("", 900, None),
+        ("Usage", 600, 0),
+        ("Session limit 64% used", 40, 1),
+        ("7 day limit 30% used", 40, 1),
+        ("Storage 88% used", 40, 0),
+    ]
+    relabelled = MeterCatalog(
+        kind="claude",
+        specs=(
+            MeterSpec(key="session", label="Session", aliases=("Session limit",),
+                      primary=True),
+            MeterSpec(key="weekly_all", label="Weekly", aliases=("7 day limit",),
+                      primary=True),
+        ),
+    )
+
+    assert _run(_claude_block(relabelled), dom, "usageContainer()._i") == 1
+
+
+def test_a_container_that_swallowed_the_page_is_refused():
+    """No container beats a container of everything: discovery then finds
+    nothing rather than adopting the page around the panel."""
+    dom = [
+        ("", 900, None),
+        # A wrapper that is mostly page copy: two rows and the whole article
+        # around them.
+        ("Plan usage " + "some page copy " * 40, 600, 0),
+        ("Current session 64% used", 40, 1),
+        ("Weekly 30% used", 40, 1),
+    ]
+
+    assert _run(_claude_block(), dom, "usageContainer()") is None
+    assert _run(_claude_block(), dom, "discoverRows()") is None
+
+
 def test_a_discovered_row_carries_the_same_polarity_verdict_as_a_known_one():
     discovered = _run(_claude_block(), CLAUDE_DOM, "discoverRows()")
     by_label = {row["label"]: row for row in discovered}
@@ -284,14 +369,13 @@ def test_discovery_only_runs_when_the_scan_is_due(discover, expected):
 # --- Codex -----------------------------------------------------------------
 
 CODEX_DOM: list[tuple[str, int, int | None]] = [
-    ("Personal usage 5 hour usage limit 42% used Resets 1:55 PM "
-     "Weekly usage limit 61% used Resets Mon 6:00 PM "
-     "Cloud tasks limit 12% used Resets Mon 6:00 PM", 600, None),
-    ("5 hour usage limit 42% used Resets 1:55 PM", 40, 0),
-    ("Weekly usage limit 61% used Resets Mon 6:00 PM", 40, 0),
-    ("Cloud tasks limit 12% used Resets Mon 6:00 PM", 40, 0),
+    ("", 900, None),
+    ("Personal usage", 600, 0),
+    ("5 hour usage limit 42% used Resets 1:55 PM", 40, 1),
+    ("Weekly usage limit 61% used Resets Mon 6:00 PM", 40, 1),
+    ("Cloud tasks limit 12% used Resets Mon 6:00 PM", 40, 1),
     # The task rail, which sits outside the analytics panel.
-    ("Fix the flaky test 90% done", 40, None),
+    ("Fix the flaky test 90% done", 40, 0),
 ]
 
 
@@ -321,3 +405,28 @@ def test_codex_discovery_never_leaves_the_usage_container():
     discovered = _run(_codex_block(), CODEX_DOM, "discoverCards()")
 
     assert "Fix the flaky test" not in [row["label"] for row in discovered]
+
+
+# The workspace-credit layout: no card says "usage limit", and the only text
+# that does is prose sitting above the panel. The old marker resolved to
+# <body>, which put the task rail inside the usage container.
+CODEX_CREDIT_DOM: list[tuple[str, int, int | None]] = [
+    ("", 900, None),                                                    # 0 body
+    ("Codex and Work share the same usage limit.", 30, 0),              # 1 prose
+    ("", 600, 0),                                                       # 2 the panel
+    ("Workspace monthly credit limit 37% used Resets Apr 1", 40, 2),    # 3
+    ("Cloud tasks 12% used Resets Mon 6:00 PM", 40, 2),                 # 4
+    ("Fix the flaky test 90% done", 40, 0),                             # 5 task rail
+]
+
+
+def test_the_workspace_credit_layout_still_finds_its_panel():
+    assert _run(_codex_block(), CODEX_CREDIT_DOM, "usageContainer()._i") == 2
+
+
+def test_the_task_rail_is_not_inside_the_workspace_credit_panel():
+    discovered = _run(_codex_block(), CODEX_CREDIT_DOM, "discoverCards()")
+    labels = [row["label"] for row in discovered]
+
+    assert "Workspace monthly credit limit" in labels
+    assert "Fix the flaky test" not in labels
