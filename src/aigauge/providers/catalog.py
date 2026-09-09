@@ -51,6 +51,9 @@ CATALOG_SCAN_INTERVAL = timedelta(days=7)
 # alphabetic, with a percentage beside it - or the override file fills up with
 # page furniture and every refresh grows another junk gauge.
 MAX_LABEL_CHARS = 40
+# A catalog is a page's meters, not a page's elements. A file this long is a
+# runaway scan or a hand-edit gone wrong, and every entry costs a DOM walk.
+MAX_CATALOG_SPECS = 200
 MAX_ADOPTED_METERS = 24
 MAX_EVIDENCE_CHARS = 200
 
@@ -169,10 +172,20 @@ class MeterSpec:
         normalized = normalize_label(label)
         return any(normalize_label(alias) == normalized for alias in self.aliases)
 
-    def to_js(self, *, all_aliases: Sequence[str] = ()) -> dict[str, Any]:
+    def to_js(self, *, alias_index: Sequence[tuple[str, str]] = ()) -> dict[str, Any]:
+        """The extractor-facing form of this meter.
+
+        ``alias_index`` pairs every catalog alias with its normalized form,
+        computed once per catalog: the default boundary set is "every alias
+        that is not mine", and asking ``matches()`` for that was a
+        normalize_label call per alias per spec.
+        """
         boundaries = list(self.boundaries)
         if not boundaries:
-            boundaries = [a for a in all_aliases if not self.matches(a)]
+            own = {normalize_label(alias) for alias in self.aliases}
+            boundaries = [
+                alias for alias, normalized in alias_index if normalized not in own
+            ]
         return {
             "key": self.key,
             "label": self.label,
@@ -237,8 +250,10 @@ class MeterCatalog:
         return None
 
     def to_js(self) -> list[dict[str, Any]]:
-        all_aliases = self.aliases()
-        return [spec.to_js(all_aliases=all_aliases) for spec in self.enabled_specs]
+        alias_index = tuple(
+            (alias, normalize_label(alias)) for alias in self.aliases()
+        )
+        return [spec.to_js(alias_index=alias_index) for spec in self.enabled_specs]
 
 
 # --- loading ---------------------------------------------------------------
@@ -361,7 +376,13 @@ def bundled_path(kind: str) -> Path:
     ``importlib.resources`` first so a zipped or frozen install resolves the
     same way the wheel does; ``__file__`` is the fallback for loaders that hand
     back no traversable resource.
+
+    ``kind`` reaches a path join, so it is validated here rather than at the
+    callers: every one of them has to get it right, and this one cannot be
+    bypassed.
     """
+    if _KIND_RE.fullmatch(kind) is None:
+        raise ValueError(f"unsafe meter catalog kind: {kind!r}")
     name = f"{kind}.json"
     try:
         return Path(str(resources.files(__package__).joinpath(CATALOG_DIR_NAME, name)))
@@ -370,13 +391,13 @@ def bundled_path(kind: str) -> Path:
 
 
 def override_path(kind: str, *, base_dir: Path | None = None) -> Path:
+    if _KIND_RE.fullmatch(kind) is None:
+        raise ValueError(f"unsafe meter catalog kind: {kind!r}")
     root = Path(base_dir) if base_dir is not None else app_data_dir() / CATALOG_DIR_NAME
     return root / f"{kind}.json"
 
 
 def bundled_catalog(kind: str) -> MeterCatalog:
-    if _KIND_RE.fullmatch(kind) is None:
-        raise ValueError(f"unsafe meter catalog kind: {kind!r}")
     specs: list[MeterSpec] = []
     for raw in _meters_from_document(_read_json(bundled_path(kind))):
         spec = _spec_from_raw(raw)
@@ -445,6 +466,14 @@ def load_catalog(kind: str, *, base_dir: Path | None = None) -> MeterCatalog:
             continue
         by_key[spec.key] = len(specs)
         specs.append(spec)
+    if len(specs) > MAX_CATALOG_SPECS:
+        log.warning(
+            "meter catalog: %s defines %d meters; reading the first %d",
+            kind,
+            len(specs),
+            MAX_CATALOG_SPECS,
+        )
+        specs = specs[:MAX_CATALOG_SPECS]
     return MeterCatalog(kind=kind, specs=tuple(specs))
 
 

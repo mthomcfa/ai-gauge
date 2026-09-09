@@ -32,6 +32,7 @@ from aigauge.providers.catalog import (
     BREAKDOWN_TAG,
     CATALOG_SCAN_INTERVAL,
     MAX_ADOPTED_METERS,
+    MAX_CATALOG_SPECS,
     MAX_EVIDENCE_CHARS,
     SOURCE_DISCOVERY,
     STATUS_ACTIVE,
@@ -40,6 +41,7 @@ from aigauge.providers.catalog import (
     _spec_to_raw,
     adopt_rows,
     bundled_catalog,
+    bundled_path,
     clear_scans,
     extractor_source,
     is_adoptable_label,
@@ -225,6 +227,42 @@ def test_an_override_entry_with_an_unsafe_key_is_dropped(tmp_path):
 
 def test_the_override_path_lives_under_the_app_data_dir():
     assert override_path("claude") == app_data_dir() / "meter_catalog" / "claude.json"
+
+
+@pytest.mark.parametrize("kind", ["../../etc/passwd", "claude/../../x", "", "Claude"])
+def test_a_kind_that_is_not_a_plain_name_never_reaches_a_path(kind, tmp_path):
+    """Both path builders check, because every caller would have to otherwise."""
+    with pytest.raises(ValueError):
+        override_path(kind, base_dir=tmp_path)
+    with pytest.raises(ValueError):
+        bundled_path(kind)
+
+
+def test_a_runaway_override_file_is_capped(tmp_path):
+    _write_override(
+        tmp_path,
+        "claude",
+        [
+            {"key": f"meter_{i}", "label": f"Meter {i}", "aliases": [f"Meter {i}"]}
+            for i in range(MAX_CATALOG_SPECS + 50)
+        ],
+    )
+
+    catalog = load_catalog("claude", base_dir=tmp_path)
+
+    assert len(catalog.specs) == MAX_CATALOG_SPECS
+
+
+def test_a_meters_default_boundaries_are_every_other_alias():
+    """What bounds Codex's plain-text card window. Pinned across the rewrite
+    of how that list is built."""
+    catalog = bundled_catalog("claude")
+
+    entry = {item["key"]: item for item in catalog.to_js()}["session"]
+
+    assert entry["boundaries"] == [
+        alias for alias in catalog.aliases() if alias != "Current session"
+    ]
 
 
 # --- turning a row into a metric -------------------------------------------
