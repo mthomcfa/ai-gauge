@@ -30,6 +30,7 @@ KEYRING_SERVICE = "ai-gauge"
 KEYRING_GITHUB_PAT = "github-pat"
 KEYRING_OPENROUTER_KEY = "openrouter-key"
 KEYRING_OPENROUTER_MGMT_KEY = "openrouter-mgmt-key"
+KEYRING_AZURE_CLIENT_SECRET = "azure-client-secret"
 WINDOW_WIDTH = 340
 WINDOW_MIN_HEIGHT = 80
 WINDOW_MAX_HEIGHT = 420
@@ -155,6 +156,10 @@ class ProviderToggles(BaseModel):
     copilot: bool = True
     openrouter: bool = False
     opencode_go: bool = False
+    # Off by default: Azure needs an app registration and a subscription id
+    # before it can report anything, so an enabled-by-default tile would show
+    # every user an auth error they never asked for.
+    azure: bool = False
 
 
 _HEX_COLOR_RE = re.compile(r"#[0-9A-Fa-f]{6}")
@@ -383,6 +388,176 @@ class OpenRouterConfig(BaseModel):
         )
 
 
+_GUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+# An ARM resource id, as pinned under the Foundry sub-heading. Anchored on the
+# real shape rather than "starts with a slash": these strings are interpolated
+# into request URLs and compared against ids returned by ARM, so a value that
+# is not an ARM id is never useful and might be a URL in disguise.
+_ARM_RESOURCE_ID_RE = re.compile(
+    r"/subscriptions/(?P<sub>[^/]+)"
+    r"/resourceGroups/(?P<rg>[A-Za-z0-9._()\-]{1,90})"
+    r"/providers/(?P<ns>[A-Za-z0-9.]{1,64})"
+    r"/(?P<type>[A-Za-z0-9]{1,64})"
+    r"/(?P<name>[A-Za-z0-9._\-]{1,128})$",
+    re.IGNORECASE,
+)
+# Azure resource group names; also the shape accepted for the optional
+# resource-group filter setting.
+_RESOURCE_GROUP_RE = re.compile(r"[A-Za-z0-9._()\-]{1,90}")
+
+
+def validate_azure_guid(value: str, field: str = "id") -> str:
+    """Return ``value`` if it is a bare GUID, else raise ValueError.
+
+    Tenant, client, and subscription ids all go straight into a request URL or
+    an OAuth form body. Requiring the canonical 8-4-4-4-12 form means a pasted
+    URL, a path fragment, or a header-splitting payload can never reach either.
+    """
+    text = (value or "").strip()
+    if _GUID_RE.fullmatch(text) is None:
+        raise ValueError(f"Azure {field} must be a GUID (8-4-4-4-12 hex digits)")
+    return text
+
+
+def validate_azure_resource_id(value: str) -> str:
+    """Return ``value`` if it is a well-formed ARM resource id, else raise."""
+    text = (value or "").strip()
+    if any(ord(ch) < 0x20 or ch in "\\ " for ch in text):
+        raise ValueError("Azure resource id contains illegal characters")
+    match = _ARM_RESOURCE_ID_RE.fullmatch(text)
+    if match is None:
+        raise ValueError(
+            "Azure resource id must look like /subscriptions/<guid>/resourceGroups/"
+            "<name>/providers/<namespace>/<type>/<name>"
+        )
+    validate_azure_guid(match.group("sub"), "subscription id")
+    return text
+
+
+def validate_azure_resource_group(value: str) -> str:
+    """Return ``value`` if it is a plausible resource-group name, else raise."""
+    text = (value or "").strip()
+    if _RESOURCE_GROUP_RE.fullmatch(text) is None:
+        raise ValueError(
+            "Resource group names use letters, digits, and . _ ( ) - only"
+        )
+    return text
+
+
+class AzureConfig(BaseModel):
+    """Azure month-to-date spend monitor.
+
+    Every field here is reachable from a hand-edited ``config.json``, so - like
+    every other block in this file - validation *coerces* rather than raises.
+    A raise would reach ``Config.load()``'s blanket handler and cost the user
+    settings they never touched. An unusable id becomes ``None``, which the
+    provider reports as "not configured" rather than sending anywhere.
+    """
+
+    colors: GaugeColors = Field(default_factory=ColorThresholds)
+    tenant_id: str | None = None
+    client_id: str | None = None
+    subscription_id: str | None = None
+    # In the currency the Cost Management API reports for this subscription.
+    # There is no assumption that it is USD anywhere in this feature.
+    monthly_allowance: float | None = None
+    # Day of month the allowance resets. Capped at 28 so the boundary exists in
+    # every month - a "31st" reset has no defensible meaning in February, and
+    # guessing one silently mis-states the period the gauge measures.
+    reset_day: int = 1
+    top_rows: int = 6
+    include_marketplace: bool = False
+    resource_group: str | None = None
+    # Foundry sub-heading: pinned resource ids, used instead of discovery when
+    # the app registration lacks the Reader role needed to list accounts.
+    foundry_resource_ids: list[str] = Field(default_factory=list)
+
+    @field_validator("tenant_id", "client_id", "subscription_id", mode="before")
+    @classmethod
+    def _coerce_guid(cls, value: object, info) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            log.warning(
+                "config: unusable azure %s (%s); ignoring",
+                info.field_name,
+                _safe_repr(value),
+            )
+            return None
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return validate_azure_guid(text, info.field_name)
+        except ValueError:
+            log.warning("config: rejecting invalid azure %s; ignoring", info.field_name)
+            return None
+
+    @field_validator("monthly_allowance", mode="before")
+    @classmethod
+    def _coerce_allowance(cls, value: object) -> float | None:
+        return _coerce_bounded_number(
+            value, default=None, minimum=0.0, maximum=100_000_000.0,
+            field="monthly_allowance", integer=False, allow_none=True,
+        )
+
+    @field_validator("reset_day", mode="before")
+    @classmethod
+    def _coerce_reset_day(cls, value: object) -> int:
+        return _coerce_bounded_number(
+            value, default=1, minimum=1, maximum=28,
+            field="reset_day", integer=True,
+        )
+
+    @field_validator("top_rows", mode="before")
+    @classmethod
+    def _coerce_top_rows(cls, value: object) -> int:
+        return _coerce_bounded_number(
+            value, default=6, minimum=1, maximum=6,
+            field="top_rows", integer=True,
+        )
+
+    @field_validator("include_marketplace", mode="before")
+    @classmethod
+    def _coerce_marketplace(cls, value: object) -> bool:
+        return bool(value) if isinstance(value, bool) else False
+
+    @field_validator("resource_group", mode="before")
+    @classmethod
+    def _coerce_resource_group(cls, value: object) -> str | None:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            return validate_azure_resource_group(value)
+        except ValueError:
+            log.warning("config: rejecting invalid azure resource_group; ignoring")
+            return None
+
+    @field_validator("foundry_resource_ids", mode="before")
+    @classmethod
+    def _coerce_resource_ids(cls, value: object) -> list[str]:
+        if not isinstance(value, list):
+            if value is not None:
+                log.warning("config: azure foundry_resource_ids is not a list; ignoring")
+            return []
+        out: list[str] = []
+        # Bounded: this list is rendered as tile rows and sent as a filter, and
+        # a poisoned config could otherwise make it arbitrarily long.
+        for item in value[:50]:
+            if not isinstance(item, str):
+                continue
+            try:
+                out.append(validate_azure_resource_id(item))
+            except ValueError:
+                log.warning("config: rejecting invalid azure foundry resource id")
+        return out
+
+    def is_configured(self) -> bool:
+        return bool(self.tenant_id and self.client_id and self.subscription_id)
+
+
 def validate_opencode_usage_url(value: str) -> str:
     """Return ``value`` if it is a safe OpenCode usage URL, else raise ValueError.
 
@@ -471,6 +646,7 @@ class Config(BaseModel):
     copilot: CopilotConfig = Field(default_factory=CopilotConfig)
     openrouter: OpenRouterConfig = Field(default_factory=OpenRouterConfig)
     opencode_go: OpenCodeGoConfig = Field(default_factory=OpenCodeGoConfig)
+    azure: AzureConfig = Field(default_factory=AzureConfig)
     expanded_tiles: list[str] = Field(default_factory=list)
     collapsed_tiles: list[str] = Field(default_factory=list)
     window: WindowState = Field(default_factory=WindowState)
@@ -708,6 +884,7 @@ def display_name_for_account(config: Config, account_id: str) -> str:
         "copilot": "Copilot",
         "openrouter": "OpenRouter",
         "opencode_go": "OpenCode",
+        "azure": "Microsoft · Azure",
     }.get(account_id, account_id)
 
 
@@ -804,6 +981,33 @@ def set_openrouter_mgmt_key(key: str | None) -> None:
     else:
         try:
             keyring.delete_password(KEYRING_SERVICE, KEYRING_OPENROUTER_MGMT_KEY)
+        except keyring.errors.KeyringError:
+            pass
+
+
+def get_azure_client_secret() -> str | None:
+    """Read the Entra ID application secret from the OS credential store.
+
+    There is no plaintext-file fallback here, deliberately. The legacy
+    ``secrets.dat`` path exists only to migrate PATs written by an older
+    release; a secret introduced now has no such history and must never be
+    written anywhere but the keychain.
+    """
+    try:
+        secret = keyring.get_password(KEYRING_SERVICE, KEYRING_AZURE_CLIENT_SECRET)
+        if secret:
+            return secret
+    except keyring.errors.KeyringError:
+        pass
+    return None
+
+
+def set_azure_client_secret(secret: str | None) -> None:
+    if secret:
+        keyring.set_password(KEYRING_SERVICE, KEYRING_AZURE_CLIENT_SECRET, secret)
+    else:
+        try:
+            keyring.delete_password(KEYRING_SERVICE, KEYRING_AZURE_CLIENT_SECRET)
         except keyring.errors.KeyringError:
             pass
 
