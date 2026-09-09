@@ -321,6 +321,40 @@ def test_a_runaway_override_file_is_capped(tmp_path):
     assert len(catalog.specs) == MAX_CATALOG_SPECS
 
 
+def test_the_cap_does_not_un_know_the_entries_past_it(tmp_path):
+    """The cap is a read budget, not an amnesia.
+
+    Only the first MAX_CATALOG_SPECS meters are read, because each one costs
+    a DOM walk per refresh. But an entry past the cap is still in the file and
+    still written back, so a scan that could not see it re-adopted the same
+    row - and a meter the user had switched off came back, one entry longer,
+    every week.
+    """
+    fillers = [
+        {"key": f"meter_{i}", "label": f"Meter {i}", "aliases": [f"Meter {i}"]}
+        for i in range(MAX_CATALOG_SPECS + 3)
+    ]
+    parked = {
+        "key": "zebra_sessions",
+        "label": "Zebra sessions",
+        "aliases": ["Zebra sessions"],
+        "enabled": False,
+        "source": SOURCE_DISCOVERY,
+    }
+    _write_override(tmp_path, "claude", fillers + [parked])
+
+    catalog = load_catalog("claude", base_dir=tmp_path)
+    assert len(catalog.specs) == MAX_CATALOG_SPECS
+    assert catalog.spec_for_key("zebra_sessions") is None, "past the read cap"
+
+    assert adopt_rows("claude", [_row("Zebra sessions")], base_dir=tmp_path) == []
+
+    document = json.loads((tmp_path / "claude.json").read_text(encoding="utf-8"))
+    keys = [meter["key"] for meter in document["meters"]]
+    assert keys.count("zebra_sessions") == 1
+    assert not any(key.startswith("zebra_sessions_") for key in keys)
+
+
 def test_a_meters_default_boundaries_are_every_other_alias():
     """What bounds Codex's plain-text card window. Pinned across the rewrite
     of how that list is built."""

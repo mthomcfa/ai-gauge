@@ -505,7 +505,7 @@ def _drop_superseded(kind: str, specs: list[MeterSpec]) -> list[MeterSpec]:
     return kept
 
 
-def load_catalog(kind: str, *, base_dir: Path | None = None) -> MeterCatalog:
+def _merged_specs(kind: str, *, base_dir: Path | None = None) -> list[MeterSpec]:
     """Bundled definitions with the app-data override file merged over them.
 
     Override entries are matched by ``key``: a known key updates only the
@@ -517,11 +517,17 @@ def load_catalog(kind: str, *, base_dir: Path | None = None) -> MeterCatalog:
     that defines ``x`` was applied to nothing and then thrown away by the
     definition below it. New meters are collected first; then every entry is
     applied as an overlay, whatever its position.
+
+    Uncapped: ``load_catalog`` reads the first ``MAX_CATALOG_SPECS`` because
+    each one costs a DOM walk per refresh, but adoption has to see the whole
+    file. An entry past the cap is still in the document and still written
+    back, so a scan that could not see it adopted the same row again — which
+    made the file one entry longer, every week.
     """
     catalog = bundled_catalog(kind)
     path = override_path(kind, base_dir=base_dir)
     if not path.exists():
-        return catalog
+        return list(catalog.specs)
     raws = _meters_from_document(_read_json(path))
     specs = list(catalog.specs)
     by_key = {spec.key: index for index, spec in enumerate(specs)}
@@ -538,7 +544,18 @@ def load_catalog(kind: str, *, base_dir: Path | None = None) -> MeterCatalog:
         index = by_key.get(str(raw.get("key") or "").strip().lower())
         if index is not None:
             specs[index] = _apply_override(specs[index], raw)
-    specs = _drop_superseded(kind, specs)
+    return _drop_superseded(kind, specs)
+
+
+def load_catalog(kind: str, *, base_dir: Path | None = None) -> MeterCatalog:
+    """The meters this build reads: ``_merged_specs``, capped.
+
+    A catalog is a page's meters, not its elements, and every entry costs a
+    DOM walk per refresh - so a file with hundreds of them is a runaway scan
+    or a hand edit gone wrong and only the first ``MAX_CATALOG_SPECS`` are
+    read.
+    """
+    specs = _merged_specs(kind, base_dir=base_dir)
     if len(specs) > MAX_CATALOG_SPECS:
         log.warning(
             "meter catalog: %s defines %d meters; reading the first %d",
@@ -787,10 +804,16 @@ def adopt_rows(
     if not isinstance(rows, list) or not rows:
         return []
     first_seen = (now or datetime.now()).replace(microsecond=0).isoformat()
-    catalog = load_catalog(kind, base_dir=base_dir)
-    existing_adopted = sum(1 for spec in catalog.specs if spec.adopted)
-    taken_keys = {spec.key for spec in catalog.specs}
-    seen_labels = set(catalog.known_labels())
+    # The whole file, not the capped view the extractor gets. An entry past
+    # the cap is still in the document, still written back, and still on the
+    # page - so adoption has to know its label and its key or it re-adopts the
+    # same row as <key>_2 and the file grows by one every scan.
+    known = MeterCatalog(
+        kind=kind, specs=tuple(_merged_specs(kind, base_dir=base_dir))
+    )
+    existing_adopted = sum(1 for spec in known.specs if spec.adopted)
+    taken_keys = {spec.key for spec in known.specs}
+    seen_labels = set(known.known_labels())
 
     adopted: list[MeterSpec] = []
     for row in rows:
