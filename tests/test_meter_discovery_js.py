@@ -366,6 +366,35 @@ def test_discovery_only_runs_when_the_scan_is_due(discover, expected):
     assert json.loads(out.stdout) == expected
 
 
+def test_an_alias_that_looks_like_an_injection_marker_leaves_valid_js(tmp_path):
+    """A label is data. Spliced as source it took the extractor out entirely.
+
+    ``node --check`` rather than a string assertion: the failure was a
+    SyntaxError, and only a parser can say the source is still a program.
+    """
+    catalog = MeterCatalog(
+        kind="claude",
+        specs=(
+            MeterSpec(
+                key="session",
+                label="__AG_CATALOG__",
+                aliases=("__AG_CATALOG__", "__AG_ROW_LABELS__"),
+                primary=True,
+            ),
+        ),
+    )
+    path = tmp_path / "extractor.js"
+    path.write_text(
+        extractor_source(CLAUDE_TEMPLATE, catalog, discover=True), encoding="utf-8"
+    )
+
+    out = subprocess.run(
+        ["node", "--check", str(path)], capture_output=True, text=True, timeout=30
+    )
+
+    assert out.returncode == 0, out.stderr
+
+
 # --- Codex -----------------------------------------------------------------
 
 CODEX_DOM: list[tuple[str, int, int | None]] = [

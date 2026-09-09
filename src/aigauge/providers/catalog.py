@@ -901,15 +901,26 @@ def bundled_row_labels(catalog: MeterCatalog) -> list[str]:
     return out
 
 
+_MARKER_RE = re.compile(r"__AG_(ROW_LABELS|CATALOG|DISCOVER)__")
+
+
 def extractor_source(template: str, catalog: MeterCatalog, *, discover: bool) -> str:
     """Fill a provider's extractor template with the catalog it should read.
 
     The labels are data, so they travel as JSON literals rather than being
     spliced into the source: ``json.dumps`` escapes quotes and every non-ASCII
     character, so a catalog entry cannot become JavaScript.
+
+    One pass, not three chained replaces. Each replace rescanned the text the
+    previous one had inserted, so a label reading ``__AG_CATALOG__`` — page
+    wording, or a hand edit — spliced a JSON array into the middle of a string
+    literal and the whole extractor stopped parsing. Every meter for that
+    provider then read as a layout change, with nothing in the payload to say
+    why.
     """
-    return (
-        template.replace("__AG_ROW_LABELS__", json.dumps(bundled_row_labels(catalog)))
-        .replace("__AG_CATALOG__", json.dumps(catalog.to_js()))
-        .replace("__AG_DISCOVER__", "true" if discover else "false")
-    )
+    values = {
+        "ROW_LABELS": json.dumps(bundled_row_labels(catalog)),
+        "CATALOG": json.dumps(catalog.to_js()),
+        "DISCOVER": "true" if discover else "false",
+    }
+    return _MARKER_RE.sub(lambda match: values[match.group(1)], template)

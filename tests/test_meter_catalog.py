@@ -705,6 +705,22 @@ def test_a_disabled_bundled_meter_still_counts_as_a_rival(tmp_path):
     assert "Opus only" in _row_labels(load_catalog("claude", base_dir=tmp_path))
 
 
+def test_an_alias_that_looks_like_an_injection_marker_stays_data():
+    """The markers are filled in one pass, so inserted text is not rescanned."""
+    catalog = MeterCatalog(
+        kind="claude",
+        specs=(MeterSpec(key="k", label="K", aliases=("__AG_DISCOVER__",)),),
+    )
+
+    source = extractor_source(
+        "const L = __AG_ROW_LABELS__; const D = __AG_DISCOVER__;",
+        catalog,
+        discover=True,
+    )
+
+    assert source == 'const L = ["__AG_DISCOVER__"]; const D = true;'
+
+
 def test_discovery_is_off_unless_the_scan_is_due():
     catalog = bundled_catalog("claude")
 
