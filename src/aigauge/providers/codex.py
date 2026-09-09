@@ -219,7 +219,10 @@ EXTRACTOR_TEMPLATE = r"""
   // applies the label rules before anything is adopted.
   function discoverCards() {
     const container = usageContainer();
-    if (!container || !container.contains) return [];
+    // null, not []: "the panel showed nothing new" is a completed scan and
+    // "there was no panel to look in" is not one. Python cannot tell those
+    // apart from an empty list, and it stamps the weekly scan on the answer.
+    if (!container || !container.contains) return null;
     const out = [];
     const seen = {};
     for (const candidate of cardCandidates()) {
@@ -782,21 +785,44 @@ class CodexProvider(Provider):
         # interval does the scan and the others read the result.
         discover = scan_due(self._config, "codex")
 
+        # ScrapeRunner rebuilds the snapshot after a transient error, so this
+        # closure runs more than once per refresh. A scan is a once-per-refresh
+        # event: without the flag the second attempt adopts again and saves the
+        # config again.
+        scanned = False
+
         def _build(payload: dict[str, Any]) -> UsageSnapshot:
-            snapshot_catalog = catalog
-            if discover and isinstance(payload.get("discovered"), list):
-                if adopt_rows(
-                    "codex",
-                    payload["discovered"],
-                    account_id=self._account_id,
-                ):
-                    snapshot_catalog = load_catalog("codex")
-                record_scan(self._config, "codex")
-            return _build_snapshot(
-                payload,
-                account_id=self._account_id,
-                catalog=snapshot_catalog,
+            nonlocal scanned
+            # Classify first. A logged-out, challenged or half-rendered page
+            # still carries cards, and adopting from one writes page furniture
+            # into the catalog permanently while burning the weekly scan (and
+            # the "Re-scan meters now" button) on a page we could not read.
+            snapshot = _build_snapshot(
+                payload, account_id=self._account_id, catalog=catalog
             )
+            if not discover or scanned or snapshot.status != SnapshotStatus.OK:
+                return snapshot
+            discovered = payload.get("discovered")
+            if not isinstance(discovered, list):
+                # The usage panel was never located, so the scan did not look.
+                # Distinguishable in the log from a scan that found nothing.
+                log_page_diagnosis(
+                    log,
+                    provider=self._account_id,
+                    classification="discovery_no_container",
+                    payload=payload,
+                    expected_rows=_EXPECTED_ROWS,
+                )
+                return snapshot
+            scanned = True
+            if adopt_rows("codex", discovered, account_id=self._account_id):
+                snapshot = _build_snapshot(
+                    payload,
+                    account_id=self._account_id,
+                    catalog=load_catalog("codex"),
+                )
+            record_scan(self._config, "codex")
+            return snapshot
 
         cache_buster = int(datetime.now().timestamp())
         self._runner = ScrapeRunner(

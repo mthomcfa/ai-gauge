@@ -17,6 +17,7 @@ not pass one.
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -804,6 +805,127 @@ def test_a_completed_scan_adopts_new_rows_and_records_the_scan(fake_runner):
     catalog = load_catalog("claude")
     assert catalog.spec_for_label("Cowork sessions") is not None
     assert catalog.spec_for_label("Upgrade to Max") is None
+    assert scan_due(config, "claude") is False
+
+
+_OK_PAYLOAD = {
+    "logged_out": False,
+    "session": {"percent": 5, "kind": "used", "reset_text": "6 min"},
+    "weekly_all": {"percent": 26, "kind": "used", "reset_text": "Thu 9:59 AM"},
+    "title": "Claude",
+    "url": "https://claude.ai/settings/usage",
+    "body_text": "Plan usage Current session 5% used Weekly 26% used",
+}
+
+
+def _payload(**extra) -> dict:
+    return {**_OK_PAYLOAD, **extra}
+
+
+def test_a_page_we_could_not_read_neither_adopts_nor_burns_the_scan(fake_runner):
+    """A logged-out or challenged page still renders rows.
+
+    Adopting from one writes page furniture into the catalog for good, and
+    stamping the scan means the real page is not looked at for another week -
+    including when the user pressed "Re-scan meters now".
+    """
+    from aigauge.providers.claude import ClaudeProvider
+
+    config = Config()
+    ClaudeProvider(config=config).refresh(lambda snapshot: None)
+
+    snapshot = fake_runner.last["build"](
+        {
+            "logged_out": True,
+            "title": "Claude",
+            "url": "https://claude.ai/login",
+            "body_text": "Log in to Claude",
+            "discovered": [_row("Cowork sessions")],
+        }
+    )
+
+    assert snapshot.status == SnapshotStatus.AUTH_REQUIRED
+    assert load_catalog("claude").spec_for_label("Cowork sessions") is None
+    assert scan_due(config, "claude") is True
+
+
+def test_codex_also_refuses_to_scan_a_page_it_could_not_read(fake_runner):
+    """The same guard, in the other provider's copy of it."""
+    from aigauge.providers.codex import CodexProvider
+
+    config = Config()
+    CodexProvider(config=config).refresh(lambda snapshot: None)
+
+    snapshot = fake_runner.last["build"](
+        {
+            "logged_out": True,
+            "title": "Log in",
+            "url": "https://chatgpt.com/auth/login",
+            "body_text": "Log in to continue",
+            "discovered": [_row("Cloud tasks limit")],
+        }
+    )
+
+    assert snapshot.status == SnapshotStatus.AUTH_REQUIRED
+    assert load_catalog("codex").spec_for_label("Cloud tasks limit") is None
+    assert scan_due(config, "codex") is True
+
+
+def test_a_build_retry_stamps_the_scan_exactly_once(fake_runner, monkeypatch):
+    """ScrapeRunner rebuilds after a transient error; the scan is one event."""
+    from aigauge.providers.claude import ClaudeProvider
+
+    saves: list[int] = []
+    monkeypatch.setattr(Config, "save", lambda self: saves.append(1))
+    config = Config()
+    ClaudeProvider(config=config).refresh(lambda snapshot: None)
+    discovered = [_row("Cowork sessions")]
+
+    # The first attempt lands on a half-rendered page: rows, but nothing the
+    # snapshot can be built from.
+    errored = fake_runner.last["build"](
+        {
+            "logged_out": False,
+            "title": "Claude",
+            "url": "https://claude.ai/settings/usage",
+            "body_text": "Plan usage 50%",
+            "discovered": discovered,
+        }
+    )
+    assert errored.status == SnapshotStatus.ERROR
+    assert saves == []
+
+    fake_runner.last["build"](_payload(discovered=discovered))
+    fake_runner.last["build"](_payload(discovered=discovered))
+
+    assert saves == [1]
+
+
+def test_a_scan_that_found_no_usage_container_is_not_a_completed_scan(
+    fake_runner, caplog
+):
+    """"Found nothing" and "could not look" are different answers."""
+    from aigauge.providers.claude import ClaudeProvider
+
+    config = Config()
+    ClaudeProvider(config=config).refresh(lambda snapshot: None)
+
+    with caplog.at_level(logging.INFO, logger="aigauge.providers.claude"):
+        snapshot = fake_runner.last["build"](_payload(discovered=None))
+
+    assert snapshot.status == SnapshotStatus.OK
+    assert scan_due(config, "claude") is True
+    assert "classification=discovery_no_container" in caplog.text
+
+
+def test_a_scan_that_found_nothing_new_still_counts(fake_runner):
+    from aigauge.providers.claude import ClaudeProvider
+
+    config = Config()
+    ClaudeProvider(config=config).refresh(lambda snapshot: None)
+
+    fake_runner.last["build"](_payload(discovered=[]))
+
     assert scan_due(config, "claude") is False
 
 
