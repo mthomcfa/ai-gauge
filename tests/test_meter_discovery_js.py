@@ -882,3 +882,45 @@ def test_the_task_rail_is_not_inside_the_workspace_credit_panel():
 
     assert "Workspace monthly credit limit" in labels
     assert "Fix the flaky test" not in labels
+
+
+# KNOWN LIMITATION, deliberately parked. Two usage panels on one page - a
+# personal one and a team one - are two legitimate candidates, and only one
+# container is returned, so the other panel's meters are invisible to
+# discovery. The pick is the richer panel, which is the one holding the
+# catalog's own meters.
+CODEX_TWO_PANEL_DOM: list[tuple[str, int, int | None]] = [
+    ("", 900, None),                                                    # 0 body
+    ("", 400, 0),                                                       # 1 personal
+    ("Personal usage", 20, 1),                                          # 2 heading
+    ("5 hour usage limit 42% used Resets 1:55 PM", 40, 1),              # 3
+    ("Weekly usage limit 61% used Resets Mon 6:00 PM", 40, 1),          # 4
+    ("Cloud tasks limit 12% used Resets Mon 6:00 PM", 40, 1),           # 5
+    ("", 400, 0),                                                       # 6 team
+    ("Team usage", 20, 6),                                              # 7 heading
+    ("Team weekly usage limit 55% used Resets Mon 6:00 PM", 40, 6),     # 8
+    ("Team cloud tasks limit 8% used Resets Mon 6:00 PM", 40, 6),       # 9
+]
+
+
+def test_only_one_of_two_usage_panels_is_scanned():
+    """A second panel is not discovered — and not misread either.
+
+    Documents today's behaviour rather than asking for it. `usageContainer()`
+    answers with one element, so a page rendering a personal panel and a team
+    panel side by side has half its meters outside the container and adopts
+    nothing from them. The half that is scanned is the richer panel, and every
+    row it hands back carries its own number: the failure is a meter that
+    never appears, not a team percentage under a personal label, which is the
+    direction this whole path is built to fail in. Scanning both would mean
+    returning a list of containers, and that is a change to every caller.
+    """
+    assert _run(_codex_block(), CODEX_TWO_PANEL_DOM, "usageContainer()._i") == 1
+
+    discovered = _run(_codex_block(), CODEX_TWO_PANEL_DOM, "discoverCards()")
+
+    assert {row["label"]: row["percent"] for row in discovered} == {
+        "5 hour usage limit": 42,
+        "Weekly usage limit": 61,
+        "Cloud tasks limit": 12,
+    }
