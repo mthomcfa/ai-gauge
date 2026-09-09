@@ -973,6 +973,10 @@ def fetch_foundry_resource_ids(token: str, subscription_id: str) -> set[str]:
 
 @dataclass
 class _State:
+    # (tenant_id, client_id) the cached data was fetched with. State is keyed
+    # by subscription, so pointing the same subscription at a different app
+    # registration would otherwise keep serving the old tenant's numbers.
+    identity: tuple[str, str] | None = None
     last_fetch_at: datetime | None = None
     blocked_until: datetime | None = None
     consecutive_errors: int = 0
@@ -1064,8 +1068,21 @@ class AzureProvider(Provider):
             return
 
         subscription_id = azure_cfg.subscription_id or ""
+        tenant_id = azure_cfg.tenant_id or ""
+        client_id = azure_cfg.client_id or ""
         state = state_for(subscription_id)
         now = datetime.now()
+
+        identity = (tenant_id, client_id)
+        if state.identity is not None and state.identity != identity:
+            # Re-pointed at a different app registration: everything cached
+            # here describes the old one, including the throttle window.
+            log.info(
+                "provider api diagnosis provider=azure "
+                "classification=identity_changed cache_cleared=1"
+            )
+            _STATES[subscription_id] = state = _State()
+        state.identity = identity
 
         # Serve the cache rather than the API. The refresh loop above this can
         # fire every five minutes when the user is active, and every minute
@@ -1090,8 +1107,6 @@ class AzureProvider(Provider):
                 return
 
         state.last_fetch_at = now
-        tenant_id = azure_cfg.tenant_id or ""
-        client_id = azure_cfg.client_id or ""
 
         def work() -> UsageSnapshot:
             return self._fetch(

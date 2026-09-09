@@ -258,3 +258,159 @@ def test_account_and_provider_colors_persist_through_apply(qtbot, monkeypatch):
 
     assert config.browser_accounts[0].colors.green_color == "#111111"
     assert config.copilot.colors.red_color == "#222222"
+
+
+# --- Microsoft section -----------------------------------------------------
+
+SUB = "11111111-1111-1111-1111-111111111111"
+TENANT = "22222222-2222-2222-2222-222222222222"
+
+
+def _tab_titles(dialog: SettingsDialog) -> list[str]:
+    from PyQt6.QtWidgets import QTabWidget
+
+    tabs = dialog.findChild(QTabWidget)
+    assert tabs is not None
+    return [tabs.tabText(i) for i in range(tabs.count())]
+
+
+def _group_titles(dialog: SettingsDialog) -> list[str]:
+    from PyQt6.QtWidgets import QGroupBox
+
+    return [box.title() for box in dialog.findChildren(QGroupBox)]
+
+
+def test_microsoft_tab_holds_the_three_sub_headings(qtbot):
+    """Azure, Foundry and Copilot are one vendor relationship to the person
+    configuring them, and Foundry only means anything beside the Azure block
+    it configures."""
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+
+    assert "Microsoft" in _tab_titles(dialog)
+    assert "GitHub Copilot" not in _tab_titles(dialog)
+    titles = _group_titles(dialog)
+    for heading in ("Azure", "Foundry", "Copilot"):
+        assert heading in titles
+
+
+def test_copilot_controls_survive_the_move_unchanged(qtbot, monkeypatch):
+    """Copilot moved under the Microsoft heading; nothing about it changed."""
+    monkeypatch.setattr(settings_dialog, "set_start_at_login", lambda enabled: None)
+    config = Config()
+    dialog = SettingsDialog(config)
+    qtbot.addWidget(dialog)
+
+    dialog.gh_username.setText("octocat")
+    dialog.gh_billing_org.setText("acme")
+    dialog._set_quota_selection(1500)  # noqa: SLF001
+    dialog.apply_to(config)
+
+    assert config.copilot.username == "octocat"
+    assert config.copilot.billing_org == "acme"
+    assert config.copilot.monthly_quota == 1500
+
+
+def test_azure_settings_round_trip(qtbot, monkeypatch):
+    monkeypatch.setattr(settings_dialog, "set_start_at_login", lambda enabled: None)
+    config = Config()
+    dialog = SettingsDialog(config)
+    qtbot.addWidget(dialog)
+
+    dialog.azure_cb.setChecked(True)
+    dialog.azure_tenant.setText(TENANT)
+    dialog.azure_client.setText(TENANT)
+    dialog.azure_subscription.setText(SUB)
+    dialog.azure_allowance.setValue(150.0)
+    dialog.azure_reset_day.setValue(15)
+    dialog.azure_top_rows.setValue(4)
+    dialog.azure_marketplace_cb.setChecked(True)
+    dialog.azure_resource_group.setText("rg-ai")
+    dialog.apply_to(config)
+
+    assert config.providers.azure is True
+    assert config.azure.subscription_id == SUB
+    assert config.azure.monthly_allowance == 150.0
+    assert config.azure.reset_day == 15
+    assert config.azure.top_rows == 4
+    assert config.azure.include_marketplace is True
+    assert config.azure.resource_group == "rg-ai"
+
+
+def test_azure_rejects_a_non_guid_and_keeps_the_previous_value(qtbot, monkeypatch):
+    """These ids are interpolated into request URLs; a rejected field must not
+    block the rest of the save either."""
+    warned: list = []
+    monkeypatch.setattr(settings_dialog, "set_start_at_login", lambda enabled: None)
+    monkeypatch.setattr(
+        settings_dialog.QMessageBox, "warning", lambda *a, **k: warned.append(a)
+    )
+    config = Config()
+    config.azure.subscription_id = SUB
+    dialog = SettingsDialog(config)
+    qtbot.addWidget(dialog)
+
+    dialog.azure_subscription.setText("https://evil.example.com/../x")
+    dialog.azure_allowance.setValue(42.0)
+    dialog.apply_to(config)
+
+    assert config.azure.subscription_id == SUB
+    assert dialog.azure_subscription.text() == SUB
+    # The rest of the save still went through.
+    assert config.azure.monthly_allowance == 42.0
+    assert warned
+
+
+def test_pinned_foundry_ids_accept_arm_paths_and_drop_the_rest(qtbot, monkeypatch):
+    warned: list = []
+    monkeypatch.setattr(settings_dialog, "set_start_at_login", lambda enabled: None)
+    monkeypatch.setattr(
+        settings_dialog.QMessageBox, "warning", lambda *a, **k: warned.append(a)
+    )
+    config = Config()
+    dialog = SettingsDialog(config)
+    qtbot.addWidget(dialog)
+
+    good = (
+        f"/subscriptions/{SUB}/resourceGroups/rg-ai/providers/"
+        "Microsoft.CognitiveServices/accounts/my-foundry"
+    )
+    dialog.azure_foundry_ids.setPlainText(f"{good}\n\nnot-a-resource-id\n")
+    dialog.apply_to(config)
+
+    assert config.azure.foundry_resource_ids == [good]
+    assert dialog.azure_foundry_ids.toPlainText() == good
+    assert warned
+
+
+def test_azure_secret_is_saved_to_the_credential_store(qtbot, monkeypatch):
+    stored: dict[str, str | None] = {"value": None}
+    monkeypatch.setattr(
+        settings_dialog, "set_azure_client_secret", lambda s: stored.update(value=s)
+    )
+    monkeypatch.setattr(
+        settings_dialog, "get_azure_client_secret", lambda: stored["value"]
+    )
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+
+    dialog.azure_secret_edit.setText("s3cret")
+    assert dialog._save_azure_secret() is True  # noqa: SLF001
+    assert stored["value"] == "s3cret"
+
+
+def test_azure_secret_save_is_read_back_before_it_is_believed(qtbot, monkeypatch):
+    """A keychain that silently refuses the write would otherwise leave a tile
+    asking for a secret the user thinks they saved."""
+    warned: list = []
+    monkeypatch.setattr(settings_dialog, "set_azure_client_secret", lambda s: None)
+    monkeypatch.setattr(settings_dialog, "get_azure_client_secret", lambda: None)
+    monkeypatch.setattr(
+        settings_dialog.QMessageBox, "warning", lambda *a, **k: warned.append(a)
+    )
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+
+    dialog.azure_secret_edit.setText("s3cret")
+    assert dialog._save_azure_secret() is False  # noqa: SLF001
+    assert warned
