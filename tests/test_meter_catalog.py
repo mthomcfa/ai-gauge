@@ -43,6 +43,7 @@ from aigauge.providers.catalog import (
     is_adoptable_label,
     load_catalog,
     metric_for_spec,
+    normalize_label,
     override_path,
     record_scan,
     row_evidence,
@@ -361,6 +362,63 @@ def test_a_parked_entry_is_not_adopted_again(tmp_path):
     )
 
     assert adopt_rows("claude", [_row("Cloud runs")], base_dir=tmp_path) == []
+
+
+def test_a_page_row_named_after_a_display_label_is_not_adopted(tmp_path):
+    """Claude renders "Session" and "Daily routine runs" as labels, not aliases.
+
+    Adopting one gives two specs with the same ``label``, and ``label`` is the
+    history key and what ratio.py selects Session/Weekly by.
+    """
+    rows = [_row("Session", percent=3.0, reset_text="400 hr"),
+            _row("Daily routine runs")]
+
+    assert adopt_rows("claude", rows, base_dir=tmp_path) == []
+
+
+def test_no_two_meters_share_a_display_label_after_a_scan(tmp_path):
+    rows = [
+        _row("Session", percent=3.0, reset_text="400 hr"),
+        _row("Weekly", percent=9.0),
+        _row("Cowork sessions"),
+    ]
+
+    adopt_rows("claude", rows, base_dir=tmp_path)
+
+    labels = [normalize_label(s.label) for s in load_catalog("claude", base_dir=tmp_path).specs]
+    assert len(labels) == len(set(labels))
+
+
+def test_a_row_sharing_a_meters_display_label_cannot_fork_its_history(tmp_path):
+    """What the collision actually costs: `history` keys on provider::label.
+
+    Two specs labelled "Session" with different reset times land on one key,
+    and every refresh looks like a period rollover - `history.jsonl` fills up
+    with fabricated periods. Two refreshes here produced two of them.
+    """
+    adopt_rows("claude", [_row("Session", percent=3.0, reset_text="400 hr")],
+               base_dir=tmp_path)
+    catalog = load_catalog("claude", base_dir=tmp_path)
+
+    def _snapshot() -> UsageSnapshot:
+        metrics = []
+        for spec in catalog.enabled_specs:
+            metric = metric_for_spec(
+                spec,
+                {"percent": 3.0, "kind": "used"},
+                resets_at=datetime.now() + (spec.window or timedelta(hours=400)),
+            )
+            if metric is not None:
+                metrics.append(metric)
+        return UsageSnapshot(
+            provider="claude", status=SnapshotStatus.OK, metrics=metrics
+        )
+
+    store = HistoryStore(base_dir=tmp_path)
+    store.record_snapshot(_snapshot())
+
+    assert store.record_snapshot(_snapshot()) == []
+    assert not (tmp_path / "history.jsonl").exists()
 
 
 def test_known_labels_covers_every_spec_whatever_its_state():
