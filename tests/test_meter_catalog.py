@@ -319,6 +319,61 @@ def test_a_row_the_catalog_already_knows_is_not_adopted(tmp_path):
     assert not (tmp_path / "claude.json").exists()
 
 
+def test_disabling_an_adopted_meter_stops_it_being_adopted_again(tmp_path):
+    """Otherwise "off" means "back next week as Cowork sessions_2"."""
+    rows = [_row("Cowork sessions")]
+    key = adopt_rows("claude", rows, base_dir=tmp_path)[0].key
+    path = tmp_path / "claude.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    for meter in document["meters"]:
+        if meter["key"] == key:
+            meter["enabled"] = False
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    assert adopt_rows("claude", rows, base_dir=tmp_path) == []
+    keys = [spec.key for spec in load_catalog("claude", base_dir=tmp_path).specs]
+    assert keys.count(key) == 1
+    assert f"{key}_2" not in keys
+
+
+def test_disabling_a_bundled_meter_does_not_resurrect_it_under_a_new_key(tmp_path):
+    _write_override(tmp_path, "claude", [{"key": "opus_only", "enabled": False}])
+
+    assert adopt_rows("claude", [_row("Opus only")], base_dir=tmp_path) == []
+
+    keys = [spec.key for spec in load_catalog("claude", base_dir=tmp_path).specs]
+    assert "opus_only_2" not in keys
+
+
+def test_a_parked_entry_is_not_adopted_again(tmp_path):
+    """A review that rejects a discovered row must be able to make it stick."""
+    _write_override(
+        tmp_path,
+        "claude",
+        [
+            {
+                "key": "cloud_runs",
+                "label": "Cloud runs",
+                "aliases": ["Cloud runs"],
+                "status": "pending",
+            }
+        ],
+    )
+
+    assert adopt_rows("claude", [_row("Cloud runs")], base_dir=tmp_path) == []
+
+
+def test_known_labels_covers_every_spec_whatever_its_state():
+    catalog = bundled_catalog("claude")
+
+    known = catalog.known_labels()
+
+    assert "opus only" in known
+    # Display labels too: "Session" is no alias of anything, and a page row
+    # reading "Session" must not become a second meter with that history key.
+    assert "session" in known and "weekly" in known
+
+
 def test_adoption_preserves_hand_edits_already_in_the_override(tmp_path):
     _write_override(tmp_path, "claude", [{"key": "opus_only", "enabled": False}])
 
@@ -776,9 +831,10 @@ def test_an_unknown_field_on_an_entry_is_preserved_not_eaten(tmp_path):
 def test_an_entry_awaiting_review_is_loaded_but_not_read(tmp_path):
     """The hook the review step needs: `status` gates without deleting.
 
-    Nothing writes anything but "active" yet, so this changes no behaviour
-    today - it means a later release can park an entry without an older or a
-    newer loader disagreeing about what the file says.
+    This is about *reading* only. Whether a parked entry can be adopted again
+    is a different property, pinned by the adoption tests above - gating the
+    read while leaving the label adoptable is how "parked" became "comes back
+    next week under a new key".
     """
     _write_override(
         tmp_path,

@@ -213,6 +213,25 @@ class MeterCatalog:
                     out.append(alias)
         return tuple(out)
 
+    def known_labels(self) -> frozenset[str]:
+        """Normalized aliases *and* display labels of *every* spec.
+
+        Adoption checks against this rather than ``aliases()``, which only
+        sees enabled active meters. A meter the user switched off is still a
+        meter this catalog knows: re-adopting it as ``<key>_2`` on the next
+        scan is how "disabled" turned into "comes back with a new name".
+        Display labels are in here for the same reason - a bundled label that
+        is not also an alias ("Session", "Weekly") would otherwise be adopted
+        as a second meter sharing one history key.
+        """
+        out: set[str] = set()
+        for spec in self.specs:
+            for text in (*spec.aliases, spec.label):
+                normalized = normalize_label(text)
+                if normalized:
+                    out.add(normalized)
+        return frozenset(out)
+
     def spec_for_key(self, key: str) -> MeterSpec | None:
         for spec in self.specs:
             if spec.key == key:
@@ -514,7 +533,9 @@ def is_adoptable_label(label: Any, *, catalog: MeterCatalog | None = None) -> bo
 
     Rejects page furniture: anything long, non-alphabetic, or carrying wording
     that never names a meter. A label the catalog already knows is not
-    adoptable either — that is a match, not a discovery.
+    adoptable either — that is a match, not a discovery. "Knows" means
+    ``known_labels``: every spec, enabled or not, because a disabled meter
+    that gets re-adopted under a new key cannot be switched off at all.
     """
     text = clean_label(label)
     if not text or len(text) > MAX_LABEL_CHARS:
@@ -528,7 +549,7 @@ def is_adoptable_label(label: Any, *, catalog: MeterCatalog | None = None) -> bo
     normalized = normalize_label(text)
     if any(marker in normalized for marker in _NON_METER_MARKERS):
         return False
-    if catalog is not None and catalog.spec_for_label(text) is not None:
+    if catalog is not None and normalize_label(text) in catalog.known_labels():
         return False
     return True
 
@@ -621,7 +642,7 @@ def adopt_rows(
     catalog = load_catalog(kind, base_dir=base_dir)
     existing_adopted = sum(1 for spec in catalog.specs if spec.adopted)
     taken_keys = {spec.key for spec in catalog.specs}
-    seen_labels = {normalize_label(alias) for alias in catalog.aliases()}
+    seen_labels = set(catalog.known_labels())
 
     adopted: list[MeterSpec] = []
     for row in rows:
