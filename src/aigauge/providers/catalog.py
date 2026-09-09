@@ -816,20 +816,35 @@ def _write_override(
 
 
 def _parse_iso(value: Any) -> datetime | None:
+    """Parse a scan stamp as *naive local* time.
+
+    ``record_scan`` writes naive local stamps, but the file is editable and a
+    later build could write an offset. A tz-aware value parses happily and
+    then raises TypeError the moment it is compared with ``datetime.now()`` —
+    out of ``scan_due``, out of ``refresh()``, and the tile errors on every
+    refresh with nothing the user can do about it.
+    """
     if not isinstance(value, str):
         return None
     try:
-        return datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value)
     except ValueError:
         return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone().replace(tzinfo=None)
+    return parsed
 
 
 def scan_due(config: Any, kind: str, *, now: datetime | None = None) -> bool:
     """Whether this refresh should ask the page for *all* of its rows.
 
-    Never scanned (a fresh install, or the user asked for a re-scan) counts as
-    due. So does a timestamp in the future, which is a clock change rather than
-    a reason to stop scanning for a week.
+    Never scanned — a fresh install, or the user asked for a re-scan — counts
+    as due, and so does a stamp that cannot be read.
+
+    A stamp in the *future* is a clock that moved (a DST rollback, a corrected
+    system time), and treating it as due meant scanning on every single
+    refresh until the clock caught up. It is clamped to now instead, so the
+    next scan is one normal interval away.
     """
     if config is None:
         return False
@@ -838,7 +853,10 @@ def scan_due(config: Any, kind: str, *, now: datetime | None = None) -> bool:
     if last is None:
         return True
     now = now or datetime.now()
-    return last > now or now - last >= CATALOG_SCAN_INTERVAL
+    if last > now:
+        record_scan(config, kind, now=now)
+        return False
+    return now - last >= CATALOG_SCAN_INTERVAL
 
 
 def record_scan(

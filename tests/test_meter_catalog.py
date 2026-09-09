@@ -597,13 +597,35 @@ def test_the_scan_comes_due_again_after_the_interval():
     assert scan_due(config, "claude", now=now) is True
 
 
-def test_a_timestamp_from_the_future_is_treated_as_due():
-    """A clock change must not switch discovery off for a week."""
+def test_a_timestamp_from_the_future_is_clamped_rather_than_believed():
+    """A clock change is not a reason to scan on every refresh.
+
+    Treating it as due meant discovery ran on each refresh — a config save
+    and a full-page scan every time — until the clock caught up, which for a
+    DST rollback is an hour and for a corrected system clock can be months.
+    """
     config = Config()
     now = datetime.now()
     record_scan(config, "claude", now=now + timedelta(days=30), save=False)
 
-    assert scan_due(config, "claude", now=now) is True
+    assert scan_due(config, "claude", now=now) is False
+    assert datetime.fromisoformat(config.meter_catalog_last_scan["claude"]) <= now
+
+
+def test_a_timezone_aware_stamp_is_read_rather_than_raising():
+    """It raised TypeError out of refresh(), erroring the tile permanently."""
+    now = datetime.now()
+    aware = (now.astimezone() - timedelta(days=1)).isoformat()
+    config = Config.model_validate({"meter_catalog_last_scan": {"claude": aware}})
+
+    assert scan_due(config, "claude", now=now) is False
+
+
+@pytest.mark.parametrize("stamp", ["garbage", "", "2026-13-45T00:00:00"])
+def test_an_unreadable_scan_stamp_counts_as_due(stamp):
+    config = Config.model_validate({"meter_catalog_last_scan": {"claude": stamp}})
+
+    assert scan_due(config, "claude") is True
 
 
 def test_a_provider_with_no_config_never_scans():
