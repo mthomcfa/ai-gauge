@@ -881,11 +881,13 @@ def _write_override(
         path.parent.mkdir(parents=True, exist_ok=True)
         # Same write discipline as the secrets file: a reader sees the old
         # document or the new one, never half of either, and the file carries
-        # page-derived labels and an account id so it is owner-only.
+        # page-derived labels and an account id so it is owner-only. Windows
+        # has no POSIX mode (and no os.fchmod); there the file sits under the
+        # user-scoped %APPDATA% like the rest of the app data.
         _atomic_write(
             path,
             (json.dumps(document, indent=2) + "\n").encode("utf-8"),
-            mode=0o600,
+            mode=None if os.name == "nt" else 0o600,
         )
     except OSError:
         log.exception("meter catalog: cannot write %s", path)
