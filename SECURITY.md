@@ -58,7 +58,15 @@ Not secrets, but written from provider pages and worth knowing about:
 | `<app-data>/meter_catalog/<kind>.json.corrupt` | The previous contents of that file when it could not be parsed, kept rather than overwritten. Same suffix convention as the config file. |
 
 Both are written atomically — a temp file in the same directory plus
-`os.replace` — and created `0600`, owner-only, before any bytes are written.
+`os.replace` — so a reader sees the old document or the new one, never half of
+either. On macOS and Linux the file is created `0600`, owner-only, before any
+bytes are written. **On Windows there is no POSIX mode**: the override file
+relies on the user-scoped `%APPDATA%` location, exactly like `config.json` and
+the browser profiles beside it, and it is not DPAPI-encrypted or given an
+explicit DACL the way `secrets.dat` is. It holds no credentials — page labels,
+an account id and redacted evidence — but another account with administrative
+rights on the machine can read it.
+
 The catalog is built entirely from what the embedded browser already rendered:
 nothing is downloaded, there is no remote catalog, and none of it is sent
 anywhere.
