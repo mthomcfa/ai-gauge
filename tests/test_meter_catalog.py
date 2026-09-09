@@ -297,7 +297,24 @@ def test_the_override_path_lives_under_the_app_data_dir():
     assert override_path("claude") == app_data_dir() / "meter_catalog" / "claude.json"
 
 
-@pytest.mark.parametrize("kind", ["../../etc/passwd", "claude/../../x", "", "Claude"])
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "../../etc/passwd",
+        "claude/../../x",
+        "",
+        "Claude",
+        # Windows device names. `nul.json` is the null device, not a file:
+        # the write vanishes and the read never returns what was written.
+        # Same list config._is_safe_profile_id refuses for profile ids.
+        "con",
+        "nul",
+        "prn",
+        "aux",
+        "com1",
+        "lpt9",
+    ],
+)
 def test_a_kind_that_is_not_a_plain_name_never_reaches_a_path(kind, tmp_path):
     """Both path builders check, because every caller would have to otherwise."""
     with pytest.raises(ValueError):

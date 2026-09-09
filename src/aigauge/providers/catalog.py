@@ -31,7 +31,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from ..config import app_data_dir
+from ..config import _is_safe_profile_id, app_data_dir
 from ..models import UsageMetric
 from ._common import normalize_percent
 from .idle import idle_reset_state
@@ -84,6 +84,20 @@ _KIND_RE = re.compile(r"[a-z0-9_]{1,32}")
 # Codex's own five-hour card starts with one ("5 hour usage limit"); the
 # letter/digit counts below are what keep a stray number out.
 _LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 .,'&()/+-]*")
+
+
+def _is_safe_kind(kind: Any) -> bool:
+    """Whether ``kind`` may be joined into the catalog's filesystem path.
+
+    The shape rule is ours - we generate these ids - and the reserved-name
+    rule is ``config._is_safe_profile_id``'s, which already knows that
+    Windows resolves ``con``, ``nul``, ``com1`` and friends to a device
+    whatever extension follows. ``nul.json`` is not a file: writes to it
+    vanish, and a read never returns the document that was written.
+    """
+    text = kind if isinstance(kind, str) else ""
+    return _KIND_RE.fullmatch(text) is not None and _is_safe_profile_id(text)
+
 
 # Wording that appears next to a percentage but never names a meter. Matched as
 # a substring of the normalized label, so "Manage plan" and "plan usage limits"
@@ -409,7 +423,7 @@ def bundled_path(kind: str) -> Path:
     callers: every one of them has to get it right, and this one cannot be
     bypassed.
     """
-    if _KIND_RE.fullmatch(kind) is None:
+    if not _is_safe_kind(kind):
         raise ValueError(f"unsafe meter catalog kind: {kind!r}")
     name = f"{kind}.json"
     try:
@@ -419,7 +433,7 @@ def bundled_path(kind: str) -> Path:
 
 
 def override_path(kind: str, *, base_dir: Path | None = None) -> Path:
-    if _KIND_RE.fullmatch(kind) is None:
+    if not _is_safe_kind(kind):
         raise ValueError(f"unsafe meter catalog kind: {kind!r}")
     root = Path(base_dir) if base_dir is not None else app_data_dir() / CATALOG_DIR_NAME
     return root / f"{kind}.json"
