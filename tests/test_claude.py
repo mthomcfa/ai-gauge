@@ -398,6 +398,24 @@ def test_a_breakdown_row_the_page_renders_oddly_does_not_fail_the_snapshot():
     assert [m.label for m in snapshot.metrics if m.tag is None] == ["Session", "Weekly"]
 
 
+def test_a_page_with_only_breakdown_rows_errors_rather_than_showing_no_gauge():
+    """No primary meter read means the page was not read.
+
+    The tile would otherwise render OK with nothing on it, and the refresh
+    would never retry - the failure looks like an idle account.
+    """
+    payload = _full_payload()
+    payload.pop("session")
+    payload.pop("weekly_all")
+    for key in ("session", "weekly_all"):
+        payload["rows"].pop(key)
+
+    snapshot = _build_snapshot(payload)
+
+    assert snapshot.status == SnapshotStatus.ERROR
+    assert "layout may have changed" in (snapshot.error or "")
+
+
 def test_a_payload_without_the_rows_block_still_reads_both_primary_meters():
     # Cached snapshots and hand-built payloads predate `rows`.
     payload = _full_payload()

@@ -589,6 +589,29 @@ def _build_snapshot(
             raw=payload,
         )
 
+    # Something untagged has to have been read. A page that yields only
+    # informational rows - a relabelled Session, a Weekly row the extractor no
+    # longer finds - would otherwise render an OK tile with no gauge on it and
+    # no error to explain why. Codex has had this guard since its
+    # partial-render bug; Claude was missing it.
+    if metrics and not any(
+        metric.tag is None and metric.percent_used is not None for metric in metrics
+    ):
+        log_page_diagnosis(
+            log,
+            provider=account_id,
+            classification="layout_changed",
+            payload=payload,
+            expected_rows=_EXPECTED_ROWS,
+            level=logging.WARNING,
+        )
+        return UsageSnapshot(
+            provider=account_id,
+            status=SnapshotStatus.ERROR,
+            error="Could not read usage from page (layout may have changed).",
+            raw=payload,
+        )
+
     if not metrics:
         if _looks_like_empty_signed_in_usage(payload):
             log_page_diagnosis(
