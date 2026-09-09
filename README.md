@@ -14,14 +14,14 @@
 
 If you pay for multiple AI subscriptions and frequently check your usage, AI Gauge might help. It shows session and weekly usage, reset times, account balances, and spend in a compact always-visible view, so you can get the most out of what you're paying for.
 
-Compact monitor for **Claude.ai**, **ChatGPT Codex**, **GitHub Copilot**, **OpenRouter**, and **OpenCode** usage. Manual + auto refresh, with a platform-native UI on each OS:
+Compact monitor for **Claude.ai**, **ChatGPT Codex**, **Microsoft** (Azure spend + Copilot), **OpenRouter**, and **OpenCode** usage. Manual + auto refresh, with a platform-native UI on each OS:
 
 - **Windows / Linux** — always-on-top draggable frameless widget plus a system-tray icon.
 - **macOS** — Stats-style menu-bar item (`● 42% ● 78% ● 15%`); the panel opens as a popover when you click it.
 
 > **Requires Python 3.11+.** Secrets live in the OS-native credential store (Windows Credential Manager / DPAPI, macOS Keychain, Linux Secret Service). Auto-start uses the platform's standard mechanism (Windows Task Scheduler / LaunchAgent / `~/.config/autostart`).
 
-Current version: **1.0.0+cfa.2** — a fork version, see [Versioning](#versioning). Release notes in [CHANGELOG.md](CHANGELOG.md).
+Current version: **1.2.0+cfa.4** — a fork version, see [Versioning](#versioning). Release notes in [CHANGELOG.md](CHANGELOG.md).
 
 AI Gauge is an independent open-source project and unofficial local desktop
 utility. It is not affiliated with Anthropic, OpenAI, GitHub, Microsoft,
@@ -142,8 +142,121 @@ On first launch the widget appears with enabled provider tiles. Claude and Codex
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Claude.ai**      | **Sign in (recommended):** opens an embedded browser. <b>Don't click "Continue with Google"</b> — Google refuses to authenticate inside embedded browsers. If your account is Google-linked, just type that same email into the **Enter your email** box and use the **magic link** sent to your inbox. **Paste cookie:** fallback if magic-link is unavailable; see below. Add extra Claude subscriptions from **Settings → Claude**. |
 | **ChatGPT Codex**  | Same as Claude — use email + magic link in the embedded browser, or paste cookie as a fallback. If your OpenAI account routes through Google or a passkey, use **Paste cookie**; embedded browsers often cannot complete those flows. Add extra Codex subscriptions from **Settings → Codex**.                                                                                                                                                 |
-| **GitHub Copilot** | Create a **fine-grained PAT** at <https://github.com/settings/personal-access-tokens/new>. For personal plans, add **Account permissions → Plan → Read**. Paste into Settings; set your monthly AI credit allowance (Pro=1,500, Pro+=7,000, Max=20,000). If Copilot is billed through an organization, enter the billing org and use a token/account with org billing access and **Organization permissions → Administration → Read**. |
+| **Microsoft — Copilot** | Create a **fine-grained PAT** at <https://github.com/settings/personal-access-tokens/new>. For personal plans, add **Account permissions → Plan → Read**. Paste into **Settings → Microsoft → Copilot**; set your monthly AI credit allowance (Pro=1,500, Pro+=7,000, Max=20,000). If Copilot is billed through an organization, enter the billing org and use a token/account with org billing access and **Organization permissions → Administration → Read**. |
+| **Microsoft — Azure**   | Needs an Entra ID app registration; see [Azure month-to-date spend](#azure-month-to-date-spend) below. |
 | **OpenRouter**     | Create an inference API key at <https://openrouter.ai/keys> and paste it into Settings. To show account balance and model activity, also create a management key at <https://openrouter.ai/settings/provisioning-keys>. Management keys cannot be used for inference; AI Gauge stores it separately and only uses it for OpenRouter management endpoints. Daily spend budget is optional.                                                    |
+
+### Azure month-to-date spend
+
+The **Microsoft** tab in Settings holds three sub-headings: **Azure**,
+**Foundry**, and **Copilot**. Azure and Copilot are separate providers with
+separate credentials; they share a tab because they are one vendor
+relationship to the person configuring them.
+
+The Azure tile shows month-to-date spend against a monthly allowance, broken
+into component rows by Azure service:
+
+```
+Microsoft · Azure
+Spend this month (CAD 36.10 of 150.00)      resets Oct 1
+[■■■■■■■░░░░░░░░░░░░░░░░░░░░░░]
+  Foundry                    12.40   34%
+  Azure OpenAI                8.05   22%
+  Container Apps              6.90   19%
+  Marketplace models          4.10   11%
+  Storage                     1.20    3%
+  Other (3 services)          3.45   10%
+  Forecast end of month      ~71.00  47%
+```
+
+Only the top row counts toward the tray/menu-bar colour. The component rows
+are shares of spend, not usage against a limit, so a single service at 96% of
+the month's spend must not turn the tray red.
+
+#### Setting it up
+
+1. **Register an application.** Azure portal → **Microsoft Entra ID** → **App
+   registrations** → **New registration**. Single tenant is fine; no redirect
+   URI is needed — this uses client credentials, not an interactive sign-in.
+2. **Create a client secret.** In the new registration → **Certificates &
+   secrets** → **New client secret**. Copy the secret **Value** (not the Secret
+   ID); it is shown only once.
+3. **Grant it two roles on the subscription.** Azure portal → your
+   subscription → **Access control (IAM)** → **Add role assignment**, with the
+   app registration as the member:
+   - **Cost Management Reader** — cost queries, the forecast, and budgets.
+   - **Reader** — listing resources (to find Foundry resources by kind) and
+     reading the subscription's offer type.
+
+   Reader is optional in the narrow sense that the spend gauge still works
+   without it, but you then lose the Foundry roll-up and the sponsorship
+   warning, and you have to pin Foundry resource IDs by hand.
+4. **Fill in Settings → Microsoft → Azure.** Directory (tenant) ID,
+   Application (client) ID, the client secret, and the Subscription ID — all
+   three IDs are GUIDs, and anything else is refused. Set a monthly allowance
+   and the day of the month it resets.
+5. **Enable the tile** on the **General** tab (Microsoft Azure).
+
+#### Allowance and reset semantics
+
+- The allowance is **a number you state**, in your subscription's own billing
+  currency. The tile shows whichever currency the API reports and never assumes
+  dollars.
+- If the subscription already has a **monthly cost Budget** in Azure, that
+  amount is used instead, so the figure does not live in two places.
+- **Reset day** defaults to 1 (calendar month). Set it to the day your credit
+  actually renews — a Visual Studio credit resets on its own anniversary, not
+  on the 1st, and querying the calendar month would measure the wrong window.
+  Capped at 28 so the date exists in February.
+
+#### Cost is gross of credits
+
+Cost Management reports **consumption**, and explicitly excludes free and
+prepaid credits — there is no credit line in the data to subtract. So:
+
+- This gauge measures spend against the allowance you entered. It is **not** a
+  live read of your remaining Visual Studio or MCA credit balance.
+- **Azure Sponsorship offers are not supported by Cost Management at all.** They
+  report zero cost while the sponsorship credit drains. AI Gauge detects this
+  from the subscription's offer type and shows a warning row instead of a 0%
+  gauge, because a reassuring gauge here is a failure you cannot see.
+
+#### Foundry is a row, not a tile
+
+Microsoft Foundry (formerly Azure AI Foundry) bills **per token to the Azure
+subscription**. Its spend is already inside the Azure total, so a separate
+Foundry tile would show the same money twice with nothing saying so. It is a
+roll-up row inside the Azure tile instead, and every cost row lands in exactly
+one bucket, so the rows always sum to the total.
+
+Foundry resources are found by resource **kind** (`AIServices`). That matters:
+Azure OpenAI, Speech, Vision, Language and Foundry all share the
+`Microsoft.CognitiveServices/accounts` resource type, so filtering by type
+would fold all of them into the Foundry row. If the app registration cannot
+list resources, pin the resource IDs under **Settings → Microsoft → Foundry**,
+one per line.
+
+#### Refresh rate and lag
+
+Cost Management data lags **8–24 hours** (up to 72 on pay-as-you-go) and is
+refreshed about six times a day, so there is nothing to gain from polling it
+often. The tile therefore fetches **at most once per hour** regardless of the
+app's refresh interval, and serves its cached result in between with the
+timestamp of the real fetch. It also honours the API's own back-off headers on
+a 429. Cost Management rate limits are shared across your whole tenant, so this
+throttle protects anything else you run against the same subscription.
+
+The tile's top row always says which date the numbers are actually from.
+
+#### Checking it against a real account
+
+```bash
+python -m aigauge.providers.azure --probe
+```
+
+Prints the offer type, how many Foundry resources were found, the service
+names and currency the API actually returned, the bucket breakdown, the
+budget, and the forecast — with all IDs and resource names stripped.
 
 ### Multiple Claude / Codex accounts
 
@@ -155,7 +268,7 @@ Sessions persist between runs under the per-OS app-data directory:
 
 | OS      | App data                                  | Secrets backend                           |
 | ------- | ----------------------------------------- | ----------------------------------------- |
-| Windows | `%APPDATA%/ai-gauge/`                     | Credential Manager (GitHub PAT + OpenRouter keys) + DPAPI-encrypted `secrets.dat` (cookies, since the Credential Manager blob limit is too small for ChatGPT JWTs) |
+| Windows | `%APPDATA%/ai-gauge/`                     | Credential Manager (GitHub PAT, OpenRouter keys, Azure client secret) + DPAPI-encrypted `secrets.dat` (cookies, since the Credential Manager blob limit is too small for ChatGPT JWTs) |
 | macOS   | `~/Library/Application Support/ai-gauge/` | Login Keychain                            |
 | Linux   | `~/.config/ai-gauge/`                     | Secret Service (GNOME Keyring / KWallet)  |
 
@@ -183,7 +296,7 @@ If the embedded-browser sign-in doesn't work for you (e.g. your account requires
 - **macOS:** the menu-bar item shows tinted status dots for enabled provider/account tiles. Click it to open the panel as a popover; click outside to dismiss. Right-click for the same Refresh / Settings / Quit menu.
 - **Linux without a system tray** (stock GNOME): the floating widget stays visible and serves the same Show / Refresh / Settings / Quit menu via right-click on the widget.
 - **Collapse / expand:** click the **−** button in the widget header to shrink to the compact pill view. Enabled provider/account chips wrap onto additional rows when needed, with named secondary Claude/Codex accounts using just the account name to save space.
-- **Hide unused providers:** uncheck Claude / Codex / Copilot / OpenRouter in Settings to remove their group from the widget — useful if you only use one or two of them.
+- **Hide unused providers:** uncheck Claude / Codex / Copilot / Microsoft Azure / OpenRouter in Settings to remove their group from the widget — useful if you only use one or two of them.
 - Auto-refresh is adaptive: manual refresh or changed usage enters the active
   cadence, then unchanged results back off toward the configured max interval.
   Defaults are 5 min active and 60 min idle max.
@@ -296,3 +409,6 @@ your machine. See "API response shapes" in [SECURITY.md](SECURITY.md).
 - **Copilot AI credits.** GitHub moved Copilot from per-request quotas to token-based AI credits. Code completions and next edit suggestions remain included for paid plans, while Chat, CLI, cloud agent, Spaces, Spark, and third-party coding agents consume AI credits. The app shows the credit usage GitHub returns; if your account is org-billed, enter the billing organization so AI Gauge reads the organization billing pool.
 - **OpenRouter uses two key types.** The inference key is used for `/key` spend data. The management key is required for `/credits` account balance and `/activity` model history. Without a management key, AI Gauge still shows key-level spend but cannot show balance or model activity.
 - **OpenRouter time windows are UTC.** Today/month spend come from OpenRouter's current UTC day and month fields. Model activity comes from OpenRouter's default `/activity` history window: the last 30 completed UTC days, excluding the current UTC day.
+- **Azure spend is gross of credits, and lags.** Cost Management excludes free and prepaid credits, so the Azure gauge measures consumption against an allowance you state — it is not a live credit balance. Data lags 8–24 h (up to 72 h on pay-as-you-go), so the tile fetches at most hourly and always shows the date the numbers are from. See [Azure month-to-date spend](#azure-month-to-date-spend).
+- **Azure Sponsorship subscriptions are not supported by Cost Management.** They report zero cost while the credit drains; AI Gauge shows a warning row rather than an empty gauge.
+- **Azure is one subscription at a time.** Multi-subscription roll-up is not implemented; point the tile at the subscription whose spend you care about, or use the resource-group filter to narrow it further.

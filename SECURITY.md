@@ -38,11 +38,18 @@ uses its native credential store; the threat model is the same shape on
 all three: same-user processes can decrypt the data, but other local users
 cannot.
 
-| OS      | Cookies                                                      | GitHub PAT / OpenRouter keys |
-| ------- | ------------------------------------------------------------ | ---------------------------- |
+| OS      | Cookies                                                      | GitHub PAT / OpenRouter keys / Azure client secret |
+| ------- | ------------------------------------------------------------ | -------------------------------------------------- |
 | Windows | DPAPI-encrypted `%APPDATA%/ai-gauge/secrets.dat`             | Windows Credential Manager   |
 | macOS   | Login Keychain                                               | Login Keychain               |
 | Linux   | Secret Service (GNOME Keyring / KWallet) via `keyring`       | same                         |
+
+The Azure Entra ID client secret is stored under the `ai-gauge` service with
+the key `azure-client-secret`. It has **no plaintext fallback on any platform**,
+deliberately: the legacy `secret_storage` file path exists only to migrate PATs
+written by an older release, and a secret introduced now has no such history.
+The tenant, client, and subscription IDs are not secrets and live in
+`config.json`, where they are validated as GUIDs before use.
 
 Embedded browser profiles live under `<app-data>/profiles/{account-id}/` on
 every OS. The default Claude and Codex account IDs are `claude` and `codex`;
@@ -100,14 +107,57 @@ sending the embedded browser to an arbitrary URL.
 ## Privacy
 
 AI Gauge does not include telemetry or a backend service. Provider requests
-are made from the local app to Claude.ai, ChatGPT, GitHub, and OpenRouter
-endpoints needed to read usage information. Nothing the app records is sent
-anywhere: there is no egress path out of the diagnostic code.
+are made from the local app to the provider endpoints needed to read usage
+information. Nothing the app records is sent anywhere: there is no egress path
+out of the diagnostic code.
+
+### Network destinations
+
+Every host the app contacts, and why. There are no others; nothing is proxied
+through a service operated by this project.
+
+| Host | Used by | Purpose |
+| ---- | ------- | ------- |
+| `claude.ai` | Claude | Embedded-browser sign-in and usage page |
+| `chatgpt.com` | Codex | Embedded-browser sign-in and usage page |
+| `opencode.ai` | OpenCode | Embedded-browser sign-in and usage page |
+| `api.github.com` | Copilot | Billing usage REST endpoints |
+| `openrouter.ai` | OpenRouter | `/credits`, `/key`, `/activity` |
+| `login.microsoftonline.com` | Azure | OAuth2 client-credentials token request |
+| `management.azure.com` | Azure | Cost Management query and forecast, Consumption budgets, subscription offer type, Cognitive Services account list |
+
+The last two are new in 1.2.0+cfa.4. Both are contacted only when the Azure
+tile is enabled *and* a tenant, client, and subscription ID are configured; an
+unconfigured tile makes no request at all. The Azure provider limits itself to
+one live fetch per hour, which is also a courtesy to the rest of the tenant:
+Azure Cost Management rate limits are shared tenant-wide rather than per
+application.
+
+The embedded browser's navigation allowlist is separate from and stricter than
+this table; see [Embedded Browser](#embedded-browser). No Azure traffic goes
+through the embedded browser — it is plain `requests` with a 15-second timeout,
+like Copilot and OpenRouter.
 
 Diagnostic logs are written locally to `<app-data>/ai-gauge.log`. Logs
 are intended to avoid recording
-raw cookies, personal access tokens, OpenRouter keys, and sensitive response
-bodies. Review logs before sharing them in an issue.
+raw cookies, personal access tokens, OpenRouter keys, Azure client secrets and
+bearer tokens, and sensitive response bodies. Review logs before sharing them
+in an issue.
+
+**Copy diagnostics** additionally redacts Azure identifiers before the blob
+reaches the clipboard: GUIDs become `<guid>`, and resource-group and resource
+names become `<redacted>`. A subscription or tenant GUID identifies the account
+the way an email address does, and resource names are chosen by the account
+holder — they routinely name a client or a project. The resource *shape* is
+kept, so a bug report still says which provider and resource type was involved.
+The Azure provider also builds its own diagnostic payload as an allowlist that
+contains no identifiers at all, so the redaction pass is defence in depth
+rather than the only guard.
+
+Entra ID's error responses are not passed through. An `AADSTS…` description
+embeds the tenant and application GUIDs, and that string would otherwise reach
+the tile, the log, and the clipboard; only the HTTP status and the short error
+code (e.g. `invalid_client`) are kept.
 
 ### API response shapes (Claude only)
 

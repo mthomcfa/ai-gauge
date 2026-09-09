@@ -3,6 +3,10 @@
 State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#16,
 610 tests passing, all five providers reading.
 
+> **Updated 2026-09-09** by the Microsoft/Azure work (`1.2.0+cfa.4`, 688 tests).
+> Its own parked items are in [§7](#7-parked-from-the-microsoftazure-work).
+> Everything in §§1–6 below is unchanged and still current.
+
 `1.0.0+cfa.1` does not start — it raises `AttributeError` during `App.__init__`.
 Fixed in `+cfa.2`; the two carry different version strings on purpose, because
 `app_version` in a diagnostics blob has to identify which build produced it.
@@ -228,3 +232,76 @@ open the app, which is the cheapest win of the four.
   fallback.** It is known not to open the dialog, and while the settings page
   was still loading it fired and navigated away from the page that was about to
   succeed. Being on the right route and unhydrated is a reason to wait.
+
+---
+
+## 7. Parked from the Microsoft/Azure work
+
+Added 2026-09-09 with the Azure month-to-date spend tile (`1.2.0+cfa.4`).
+
+### 7.1 Unverified against a live Azure account — run the probe first
+
+The provider was written against the REST specification
+(`Azure/azure-rest-api-specs`) and current Microsoft documentation, not against
+a real subscription. Everything below is a *shape* the docs support but a live
+account has not confirmed. One command settles all of it:
+
+```bash
+python -m aigauge.providers.azure --probe
+```
+
+| What | Why it might differ | What the code does |
+| --- | --- | --- |
+| Cost metric name — `Cost` vs `PreTaxCost` | MCA and EA/pay-as-you-go disagree, and every example in the REST spec uses `PreTaxCost` while the automation docs use `Cost`. | Tries `Cost`, retries once on a 400 with `PreTaxCost`, then remembers which worked. The response column is found by name-candidate list, then by "first numeric non-date column". |
+| `ClientType: ai-gauge` request header | Documented in Q&A and SDK behaviour (it maps to the SDK's ApplicationID), not in the REST reference. If it is ignored we share the anonymous rate-limit bucket — a throughput question, not a correctness one. | Sent on every ARM request. |
+| `ResourceGroupName` as the filter dimension | The optional resource-group filter uses this name; the docs show `ResourceGroup` in some places. | Only used when the user sets the filter; leaving it blank avoids the question. |
+| Whether Marketplace model charges really carry a distinct `ResourceId` | The design assumes they do, and buckets them by id like Foundry. If they share a resource id with something else the row would absorb it. | Off by default; the toggle is the opt-in. |
+| Whether a Foundry resource's cost rows carry the *account* id rather than a project child id | Projects are `accounts/projects` children and are documented as billing to the parent. If cost rows name the child, the roll-up under-reports. | The probe prints the resource ids found and the bucket totals, so a mismatch shows up as a Foundry row that is smaller than expected. |
+
+`api-version`s were all confirmed present in the spec repo: Cost Management
+`2025-03-01`, Consumption budgets `2024-08-01`, Cognitive Services `2024-10-01`,
+subscriptions `2022-12-01`. Newer stable versions exist for the first three
+(`2026-06-01`, `2026-06-01`, `2026-07-01`) and were **not** adopted — there is
+no feature here that needs them, and an unnecessary version bump is an
+unnecessary source of behaviour change.
+
+### 7.2 Deliberately not built
+
+- **"Pin Foundry to the compact chip."** Offered as optional in the brief and
+  skipped. The compact chip shows one number with one colour, and the Foundry
+  row's percentage is a *share of spend*, not usage against a limit — the same
+  category error that `gauge.provider_max_percent` exists to prevent. Doing it
+  properly means deciding what the chip's colour should mean for a share, which
+  is a design question, not a wiring one. The plumbing (`COMPACT_DISPLAY_NAMES`
+  in `widget.py`) is where it would go.
+- **Multi-subscription support.** One subscription per install. Two would need
+  either two tiles (and a second throttle budget against a tenant-wide rate
+  limit) or a roll-up with a currency-mismatch problem, since subscriptions can
+  bill in different currencies. Neither is a small change, and the owner has one
+  subscription.
+- **A Vercel provider.** Named in the brief as a future provider; nothing was
+  started. Worth noting that its shape is closer to OpenRouter's (an API key and
+  a spend number) than to Azure's.
+- **Per-provider refresh throttling in `app.py`.** §4 records that the error
+  fast-retry is cycle-wide, and Azure would have been the provider most hurt by
+  it. Rather than fix the shared scheduler, the Azure provider defends itself
+  with its own hourly floor. That is the right defence for a tenant-shared rate
+  limit either way — a scheduler fix would not remove the need for it — but it
+  does mean §4's entry is still open and one more provider now works around it
+  rather than through it.
+
+### 7.3 Known soft spots in what was built
+
+- **Throttle state is module-level and keyed by subscription id.** That is what
+  makes it survive `App._build_providers()` on every settings save, which is the
+  whole point. It also means it is process-global: two `AzureProvider` instances
+  for the same subscription share one budget (correct), and the state is not
+  written to disk, so a restart is a fresh hour (acceptable — a restart is a
+  human action, not a loop).
+- **`data as of` is derived, not reported.** Cost Management does not return a
+  freshness timestamp, so the tile uses the latest `UsageDate` that carries
+  non-zero cost. A genuinely zero-cost day inside the period reads as "no data
+  yet" for that day. There is no better signal available.
+- **The forecast row trusts Cost Management's own projection** rather than
+  extrapolating locally. When it is unavailable the row is simply absent, which
+  is honest but means the row silently comes and goes early in a period.

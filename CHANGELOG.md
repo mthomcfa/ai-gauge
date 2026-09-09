@@ -6,6 +6,84 @@
 > earlier `0.6.4` entry predates that convention and **is not** upstream's
 > `v0.6.4`, which is different code.
 
+## 1.2.0+cfa.4 - 2026-09-09
+
+Adds a **Microsoft** section: Azure, Foundry, and Copilot under one heading.
+Copilot is unchanged and simply moves under it. Azure is new.
+
+### Added
+
+- **Azure month-to-date spend tile.** Reads Cost Management for the current
+  allowance period and shows spend against a monthly allowance, decomposed
+  into component rows by Azure service. Off by default; it needs an Entra ID
+  app registration before it can report anything.
+
+  Authentication is OAuth2 client credentials against
+  `login.microsoftonline.com`, with no MSAL dependency — the flow is one form
+  POST, and every other REST provider here already speaks plain `requests`.
+  The client secret lives in the OS credential store; the tenant, client, and
+  subscription IDs live in the config file and must all be GUIDs.
+
+  The app registration needs **Cost Management Reader** (cost queries,
+  forecasts, budgets) and **Reader** (to list resources and read the
+  subscription's offer) on the subscription.
+
+- **Foundry as a roll-up row, not a tile.** Microsoft Foundry (formerly Azure
+  AI Foundry) bills per token to the Azure subscription, so its spend is
+  already inside the Azure total. A second tile would show the same money
+  twice with nothing in the layout saying so; a row inside the Azure tile
+  makes the double-count structurally impossible, because every cost row lands
+  in exactly one bucket and the buckets sum to the query total exactly.
+
+  Foundry resources are identified by resource **kind** (`AIServices`), never
+  by resource type: Azure OpenAI, Speech, Vision, Language and Foundry all
+  share `Microsoft.CognitiveServices/accounts`, so a type filter would sweep
+  all of them into the Foundry row. Service *names* are only ever used to
+  label rows — they already shifted once, when "Azure AI Services" became
+  "Foundry Tools". Resources can be pinned by ID in Settings for an app
+  registration that lacks the Reader role.
+
+- **Optional rows.** A forecast row when Cost Management has enough history to
+  produce one (omitted, not errored, when it does not), and a "Marketplace
+  models" row behind a settings toggle, which costs a second query.
+
+- **Allowance from a real Azure Budget when one exists.** A monthly cost Budget
+  on the subscription is used in preference to the number typed into Settings,
+  so the figure does not have to be kept in two places.
+
+### Changed
+
+- **Settings: the GitHub Copilot tab is now a Microsoft tab** with Azure,
+  Foundry and Copilot sub-headings. Copilot's controls moved unchanged.
+- **Copy diagnostics redacts Azure identifiers** alongside email addresses.
+  Subscription and tenant GUIDs identify the account the way an email address
+  does, and resource-group and resource names are chosen by the account holder
+  and routinely name a client or a project. The resource *shape* is preserved,
+  so a pasted blob still says which provider and resource type was involved.
+
+### Notes
+
+- **Cost Management is gross of credits.** It reports consumption and excludes
+  free and prepaid credit; there is no credit line to subtract. The gauge
+  therefore measures spend against an allowance *you* state and is not a live
+  read of a Visual Studio or MCA credit balance. Said on the tile, in the
+  settings hint, and in the README.
+- **The data lags.** 8–24 hours on EA/MCA, up to 72 on pay-as-you-go,
+  refreshed about six times a day. Every snapshot carries the latest usage date
+  it actually saw, so the tile reports how old the number is instead of
+  implying it is live.
+- **The tile fetches at most once an hour.** Cost Management quotas are shared
+  tenant-wide, and the refresh loop above this can fire every five minutes when
+  active and every minute during the error fast-retry. Between fetches the
+  cached result is served with its original timestamp. Microsoft's own guidance
+  is no more than once per day.
+- **Azure Sponsorship offers get a warning instead of a gauge.** Cost
+  Management does not support them: it reports zero while the sponsorship
+  credit drains, and a reassuring 0% gauge is a lie the user has no way to
+  detect. Detected from `subscriptionPolicies.quotaId`.
+- **The tile never assumes a currency.** Amounts are shown in whatever the
+  API's `Currency` column reports, with the code printed alongside.
+
 ## 1.0.0+cfa.2 - 2026-08-10
 
 **`1.0.0+cfa.1` does not start.** It raises `AttributeError` during `App.__init__`
