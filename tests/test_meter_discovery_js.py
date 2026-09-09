@@ -364,6 +364,98 @@ def test_a_container_that_swallowed_the_page_is_refused():
     assert _run(_claude_block(), dom, "discoverRows()") is None
 
 
+# A nav that carries the marker phrase AND percentages of its own. The panel
+# is the bigger element, so "smallest marked element holding two percentages"
+# picked the nav — and the real panel was never scanned at all.
+CLAUDE_NAV_WITH_FURNITURE: list[tuple[str, int, int | None]] = [
+    ("", 900, None),                                              # 0 body
+    ("", 200, 0),                                                 # 1 settings nav
+    ("Plan usage", 20, 1),                                        # 2 nav item
+    ("Storage 88% used", 20, 1),                                  # 3
+    ("Cache 12% used", 20, 1),                                    # 4
+    ("", 600, 0),                                                 # 5 the usage panel
+    ("Current session Resets in 2 hr 59 min 64% used", 40, 5),    # 6
+    ("Weekly Resets in 3 days 30% used", 40, 5),                  # 7
+    ("Cowork sessions 7% used", 40, 5),                           # 8
+]
+
+
+def test_a_smaller_marked_region_outside_the_panel_does_not_win():
+    """A bare marker mention is a nav item, not a panel.
+
+    The nav holds the phrase and two percentages in 42 characters; the panel
+    needs a hundred. Anchoring on the marker alone therefore preferred the
+    nav, and Storage/Cache became the meters while Session and Weekly were
+    never looked at.
+    """
+    assert _run(_claude_block(), CLAUDE_NAV_WITH_FURNITURE, "usageContainer()._i") == 5
+
+    labels = [
+        row["label"]
+        for row in _run(_claude_block(), CLAUDE_NAV_WITH_FURNITURE, "discoverRows()")
+    ]
+    assert "Cowork sessions" in labels
+    assert not {"Storage", "Cache"} & set(labels)
+
+
+# The SPA wrapper: <body> is refused outright, but div#root is not <body>, and
+# a panel rendering fewer than two percentages sends the climb straight past
+# it into the wrapper that holds the whole application.
+CLAUDE_SPA_ROOT_DOM: list[tuple[str, int, int | None]] = [
+    ("", 900, None),                                              # 0 body
+    ("", 880, 0),                                                 # 1 div#root
+    ("", 100, 1),                                                 # 2 settings nav
+    ("Plan usage", 20, 2),                                        # 3 nav item
+    ("", 200, 1),                                                 # 4 the usage panel
+    ("Current session Resets in 2 hr 59 min 64% used", 40, 4),    # 5 its only meter
+    ("", 100, 1),                                                 # 6 rest of the page
+    ("Storage 88% used", 20, 6),                                  # 7
+    ("Save 20% on Max", 20, 6),                                   # 8
+]
+
+
+def test_a_panel_with_one_meter_does_not_promote_the_spa_root():
+    """No container beats a container of the whole application.
+
+    The climb passes the panel (one percentage) and lands on the wrapper under
+    <body>, which holds the nav and the footer as well — so every percentage
+    on the page reads as `in_container`. The bare "Plan usage" nav item inside
+    it, on no path up from the anchor, is the evidence that the climb left the
+    panel.
+    """
+    assert _run(_claude_block(), CLAUDE_SPA_ROOT_DOM, "usageContainer()") is None
+    assert _run(_claude_block(), CLAUDE_SPA_ROOT_DOM, "discoverRows()") is None
+
+
+def _deeply_nested_page_swallower() -> list[tuple[str, int, int | None]]:
+    """Two rows, each buried six wrappers deep inside a page-sized element."""
+    dom: list[tuple[str, int, int | None]] = [
+        ("", 900, None),
+        ("Plan usage " + "some page copy " * 40, 600, 0),
+    ]
+    for text in ("Current session 64% used", "Weekly 30% used"):
+        parent = 1
+        for _ in range(6):
+            dom.append(("", 100, parent))
+            parent = len(dom) - 1
+        dom.append((text, 40, parent))
+    return dom
+
+
+def test_wrappers_around_a_row_do_not_talk_a_swallowed_page_past_the_ratio():
+    """The ratio counts rows, and a wrapper is not a row.
+
+    Every wrapper between a row and the container reports that row's
+    percentage too, so summing all single-percentage descendants multiplied
+    the rows total by the nesting depth. Six layers was enough to make an
+    element that is mostly page copy look like a panel that is mostly rows.
+    """
+    dom = _deeply_nested_page_swallower()
+
+    assert _run(_claude_block(), dom, "usageContainer()") is None
+    assert _run(_claude_block(), dom, "discoverRows()") is None
+
+
 def test_a_nested_wrapper_does_not_become_a_second_meter():
     """A wrapper that adds a heading in front of one row is that row again.
 
@@ -503,6 +595,67 @@ CODEX_CREDIT_DOM: list[tuple[str, int, int | None]] = [
     ("Cloud tasks 12% used Resets Mon 6:00 PM", 40, 2),                 # 4
     ("Fix the flaky test 90% done", 40, 0),                             # 5 task rail
 ]
+
+
+# The same two escapes on the Codex page: a rail that carries the marker
+# wording and percentages of its own, and a panel with a single card sitting
+# inside the SPA wrapper.
+CODEX_RAIL_WITH_FURNITURE: list[tuple[str, int, int | None]] = [
+    ("", 900, None),                                                 # 0 body
+    ("", 200, 0),                                                    # 1 side rail
+    ("Usage limits", 20, 1),                                         # 2 rail item
+    ("Storage 88% used", 20, 1),                                     # 3
+    ("Cache 12% used", 20, 1),                                       # 4
+    ("", 600, 0),                                                    # 5 the panel
+    ("5 hour usage limit 42% used Resets 1:55 PM", 40, 5),           # 6
+    ("Weekly usage limit 61% used Resets Mon 6:00 PM", 40, 5),       # 7
+    ("Cloud tasks limit 12% used Resets Mon 6:00 PM", 40, 5),        # 8
+]
+
+
+def test_codex_a_smaller_marked_region_outside_the_panel_does_not_win():
+    assert _run(_codex_block(), CODEX_RAIL_WITH_FURNITURE, "usageContainer()._i") == 5
+
+    labels = [
+        row["label"]
+        for row in _run(_codex_block(), CODEX_RAIL_WITH_FURNITURE, "discoverCards()")
+    ]
+    assert "Cloud tasks limit" in labels
+    assert not {"Storage", "Cache"} & set(labels)
+
+
+CODEX_SPA_ROOT_DOM: list[tuple[str, int, int | None]] = [
+    ("", 900, None),                                                 # 0 body
+    ("", 880, 0),                                                    # 1 the SPA root
+    ("", 100, 1),                                                    # 2 side rail
+    ("Usage limits", 20, 2),                                         # 3 rail item
+    ("", 200, 1),                                                    # 4 the panel
+    ("Weekly usage limit 61% used Resets Mon 6:00 PM", 40, 4),       # 5 its only card
+    ("", 100, 1),                                                    # 6 task rail
+    ("Fix the flaky test 90% done", 20, 6),                          # 7
+    ("Deploy the fix 20% done", 20, 6),                              # 8
+]
+
+
+def test_codex_a_panel_with_one_card_does_not_promote_the_spa_root():
+    assert _run(_codex_block(), CODEX_SPA_ROOT_DOM, "usageContainer()") is None
+    assert _run(_codex_block(), CODEX_SPA_ROOT_DOM, "discoverCards()") is None
+
+
+def test_codex_wrappers_do_not_talk_a_swallowed_page_past_the_ratio():
+    dom: list[tuple[str, int, int | None]] = [
+        ("", 900, None),
+        ("Weekly usage limit " + "some page copy " * 40, 600, 0),
+    ]
+    for text in ("5 hour usage limit 42% used", "Weekly usage limit 61% used"):
+        parent = 1
+        for _ in range(6):
+            dom.append(("", 100, parent))
+            parent = len(dom) - 1
+        dom.append((text, 40, parent))
+
+    assert _run(_codex_block(), dom, "usageContainer()") is None
+    assert _run(_codex_block(), dom, "discoverCards()") is None
 
 
 def test_the_workspace_credit_layout_still_finds_its_panel():

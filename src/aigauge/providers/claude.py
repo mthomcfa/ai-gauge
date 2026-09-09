@@ -216,6 +216,22 @@ EXTRACTOR_TEMPLATE = r"""
     return false;
   }
 
+  // The rows themselves, as opposed to the wrappers around them: an element
+  // carrying one percentage and no percentage-bearing descendant of its own.
+  // Every wrapper between a row and the panel reports that row's percentage
+  // too, so counting all of them multiplied the rows total by the nesting
+  // depth - and six layers of wrapper was enough to let an element holding
+  // the whole page pass the ratio below.
+  let leafRowCache = null;
+  function leafRows() {
+    if (leafRowCache) return leafRowCache;
+    const bearing = rowCandidates().filter(c => pctCount(c.text) >= 1);
+    leafRowCache = bearing.filter(
+      c => pctCount(c.text) === 1 &&
+        !bearing.some(other => other !== c && c.el.contains(other.el)));
+    return leafRowCache;
+  }
+
   // A container that reached past the panel is worse than no container at all:
   // `in_container` is the whole difference between a meter and page furniture,
   // and every percentage on the page sits inside one of these. A panel is
@@ -223,10 +239,9 @@ EXTRACTOR_TEMPLATE = r"""
   // swallowed the page around them.
   function swallowedThePage(el, text) {
     let rowsLen = 0;
-    for (const candidate of rowCandidates()) {
-      if (candidate.el === el || !el.contains(candidate.el)) continue;
-      if (pctCount(candidate.text) !== 1) continue;
-      rowsLen += candidate.text.length;
+    for (const row of leafRows()) {
+      if (row.el === el || !el.contains(row.el)) continue;
+      rowsLen += row.text.length;
     }
     return rowsLen > 0 && text.length > rowsLen * 4;
   }
@@ -243,8 +258,22 @@ EXTRACTOR_TEMPLATE = r"""
   // panel. <body> is refused outright.
   function usageContainer() {
     const marked = rowCandidates().filter(c => marksUsagePanel(c.text));
+    // Innermost first, then: an anchor has to carry a percentage of its own.
+    // A bare mention of the marker is a nav item, a heading or prose about
+    // limits, not a panel, and climbing from one let a settings nav holding
+    // "Plan usage" beside "Storage 88%" become the container - a SMALLER
+    // element than the panel, so it won, and the real panel was never
+    // scanned.
     const anchors = marked.filter(
-      c => !marked.some(other => other !== c && c.el.contains(other.el)));
+      c => !marked.some(other => other !== c && c.el.contains(other.el)) &&
+        pctCount(c.text) >= 1);
+    // Those bare markers again, this time as evidence of overreach: one of
+    // them inside a candidate container but not on the path up from the
+    // anchor means the climb left the panel and took a slice of the page
+    // with it. That is how a panel rendering fewer than two percentages
+    // reached the SPA's root wrapper, where every piece of page furniture
+    // counts as `in_container`.
+    const bare = marked.filter(c => pctCount(c.text) === 0);
     let best = null;
     let bestLen = Infinity;
     for (const anchor of anchors) {
@@ -253,7 +282,9 @@ EXTRACTOR_TEMPLATE = r"""
         if (el === document.body || el === document.documentElement) break;
         const text = norm(el);
         if (pctCount(text) >= 2) {
-          if (text.length < bestLen && !swallowedThePage(el, text)) {
+          const stray = bare.some(
+            c => el.contains(c.el) && !c.el.contains(anchor.el));
+          if (text.length < bestLen && !stray && !swallowedThePage(el, text)) {
             best = el;
             bestLen = text.length;
           }
