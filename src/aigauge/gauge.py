@@ -93,6 +93,8 @@ def thresholds_for_provider(
         return config.openrouter.colors.model_copy(deep=True)
     if provider == "opencode_go":
         return config.opencode_go.colors.model_copy(deep=True)
+    if provider == "azure":
+        return config.azure.colors.model_copy(deep=True)
     return ColorThresholds()
 
 

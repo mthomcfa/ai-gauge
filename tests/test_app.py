@@ -196,6 +196,40 @@ def test_refresh_order_prioritizes_openrouter_without_reordering_tiles():
     ]
 
 
+def test_refresh_order_puts_both_cheap_rest_providers_first():
+    """Azure is a handful of JSON calls and self-throttles to one live fetch
+    per hour, so it costs nothing to refresh early - and an early tile fills
+    while a Claude/Codex scrape is still loading a page."""
+    providers = {
+        "claude": object(),
+        "copilot": object(),
+        "azure": object(),
+        "openrouter": object(),
+    }
+
+    assert _refresh_provider_order(providers) == [
+        "openrouter",
+        "azure",
+        "claude",
+        "copilot",
+    ]
+
+
+def test_enabled_providers_places_azure_next_to_copilot():
+    config = Config()
+    config.providers.azure = True
+
+    enabled = _enabled_providers(config)
+    assert "azure" in enabled
+    assert abs(enabled.index("azure") - enabled.index("copilot")) == 1
+
+
+def test_enabled_providers_omits_azure_by_default():
+    # Azure needs an app registration before it can report anything; an
+    # on-by-default tile would show every user an auth error they never asked for.
+    assert "azure" not in _enabled_providers(Config())
+
+
 def test_enabled_providers_includes_enabled_browser_accounts():
     config = Config()
     config.browser_accounts.append(

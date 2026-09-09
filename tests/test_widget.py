@@ -94,6 +94,35 @@ def test_reenabled_provider_returns_to_canonical_order(qtbot):
     assert _tile_order(widget) == ["claude", "codex", "copilot"]
 
 
+def test_microsoft_tiles_render_as_a_pair(qtbot):
+    """Copilot and Azure are the two halves of the Microsoft section, so they
+    must sit next to each other however the tiles happen to be created."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+
+    widget.ensure_tile("openrouter", "OpenRouter")
+    widget.ensure_tile("azure", "Microsoft · Azure")
+    widget.ensure_tile("claude", "Claude")
+    widget.ensure_tile("copilot", "Copilot")
+
+    order = _tile_order(widget)
+    assert order == ["claude", "copilot", "azure", "openrouter"]
+
+
+def test_azure_summary_chip_uses_the_short_name(qtbot):
+    """The tile header has room for "Microsoft · Azure"; a chip does not, and a
+    chip that wraps costs a whole row in the collapsed panel."""
+    from aigauge.widget import UsageWidget as _UsageWidget
+
+    widget = _UsageWidget(Config())
+    qtbot.addWidget(widget)
+    chip = widget._summary_chip("azure")  # noqa: SLF001
+    qtbot.addWidget(chip)
+
+    assert chip._text.startswith("Azure")  # noqa: SLF001
+    assert "Microsoft" not in chip._text  # noqa: SLF001
+
+
 def test_browser_account_tiles_group_by_provider_kind(qtbot):
     config = Config()
     config.browser_accounts.append(

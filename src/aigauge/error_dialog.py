@@ -48,6 +48,22 @@ QPushButton:default { background:#2563eb; border-color:#1d4ed8; }
 # clipboard for bug reports, so redact email-shaped strings and cap the raw page
 # text before it can leave the machine.
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+# Azure identifiers. The Azure provider already builds its snapshot.raw as an
+# allowlist that contains no ids at all, so this is defence in depth rather
+# than the only guard - but an error string, a request URL echoed by requests,
+# or a future provider can all still carry one, and a subscription or tenant
+# GUID is an account identifier the way an email address is.
+_GUID_RE = re.compile(
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+)
+# Resource-group and resource names are chosen by the account holder and often
+# name a client, a project, or a person. The shape is kept so a reader can still
+# tell what kind of resource was involved.
+_RESOURCE_GROUP_RE = re.compile(r"(?i)(/resourceGroups/)[^/\s\"']+")
+_RESOURCE_NAME_RE = re.compile(
+    r"(?i)(/providers/[A-Za-z0-9.]+/[A-Za-z0-9]+/)[^/\s\"']+"
+)
 _BODY_TEXT_LIMIT = 500
 # Every other string in the payload is capped too, not just the key that
 # happens to be named body_text. Snapshots now carry page- and Chromium-
@@ -65,6 +81,23 @@ _MAX_ITEMS = 50
 
 def _redact_emails(text: str) -> str:
     return _EMAIL_RE.sub("[redacted-email]", text)
+
+
+def _redact_azure_ids(text: str) -> str:
+    """Strip Azure identifiers while leaving the resource *shape* readable.
+
+    ``/subscriptions/<guid>/resourceGroups/<redacted>/providers/
+    Microsoft.CognitiveServices/accounts/<redacted>`` still tells a reader
+    which provider and resource type was involved, which is the part that helps
+    with a bug report, without naming the subscription or the resource.
+
+    Order matters: the resource-name pass runs before the resource-group pass
+    would otherwise have consumed it, and the GUID pass runs last so it also
+    catches ids that are not part of an ARM path.
+    """
+    text = _RESOURCE_NAME_RE.sub(r"\1<redacted>", text)
+    text = _RESOURCE_GROUP_RE.sub(r"\1<redacted>", text)
+    return _GUID_RE.sub("<guid>", text)
 
 
 def _sanitize_raw(raw: Any) -> Any:
@@ -100,7 +133,9 @@ def _format_diagnostics(provider: str, snapshot: UsageSnapshot) -> str:
         "error": snapshot.error,
         "raw": _sanitize_raw(snapshot.raw),
     }
-    return _redact_emails(json.dumps(payload, indent=2, default=str))
+    return _redact_azure_ids(
+        _redact_emails(json.dumps(payload, indent=2, default=str))
+    )
 
 
 def reveal_path(path) -> None:

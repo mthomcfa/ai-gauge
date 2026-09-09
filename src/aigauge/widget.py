@@ -64,7 +64,11 @@ ROW_BAR_HEIGHT = 8
 PACE_TICK_OVERHANG = 2
 CHIP_NOTCH_HEIGHT = 4
 CHIP_NOTCH_HALF_WIDTH = 3.5
-PROVIDER_ORDER = ("claude", "codex", "opencode_go", "copilot", "openrouter")
+# Azure sits next to Copilot so the two Microsoft tiles render as a pair.
+PROVIDER_ORDER = ("claude", "codex", "opencode_go", "copilot", "azure", "openrouter")
+# The tile header has room for "Microsoft · Azure"; a summary chip does not,
+# and a chip that wraps costs a whole row in the collapsed panel.
+COMPACT_DISPLAY_NAMES = {"azure": "Azure"}
 COLLAPSED_MIN_HEIGHT = WINDOW_COLLAPSED_HEIGHT
 
 
@@ -1659,7 +1663,9 @@ class UsageWidget(QWidget):
             and provider not in ("claude", "codex")
             and account.name
             and account.name.strip()
-            else display_name_for_account(self._config, provider)
+            else COMPACT_DISPLAY_NAMES.get(
+                provider, display_name_for_account(self._config, provider)
+            )
         )
         snapshot = self._snapshots.get(provider)
         percent: float | None = None

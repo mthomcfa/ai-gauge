@@ -102,3 +102,40 @@ def test_diagnostics_are_bounded_against_a_page_controlled_payload():
     assert len(out) < 50_000, f"clipboard payload was {len(out)} bytes"
     assert "more keys" in out, "truncation must be visible, not silent"
     assert "more items" in out
+
+
+def test_format_diagnostics_redacts_azure_identifiers():
+    """A subscription or tenant GUID identifies the account the way an email
+    address does, and resource-group and resource names are chosen by the
+    account holder - they routinely name a client, a project, or a person."""
+    snapshot = UsageSnapshot(
+        provider="azure",
+        status=SnapshotStatus.ERROR,
+        error=(
+            "Azure rejected the cost query for /subscriptions/"
+            "11111111-2222-3333-4444-555555555555/resourceGroups/rg-acme-prod"
+            "/providers/Microsoft.CognitiveServices/accounts/acme-foundry"
+        ),
+        raw={"tenant": "99999999-8888-7777-6666-555555555555"},
+    )
+    out = _format_diagnostics("azure", snapshot)
+    assert "11111111-2222-3333-4444-555555555555" not in out
+    assert "99999999-8888-7777-6666-555555555555" not in out
+    assert "rg-acme-prod" not in out
+    assert "acme-foundry" not in out
+    # The shape survives, so a bug report still says what kind of resource it was.
+    assert "/subscriptions/<guid>/resourceGroups/<redacted>" in out
+    assert "Microsoft.CognitiveServices/accounts/<redacted>" in out
+
+
+def test_format_diagnostics_leaves_non_azure_text_alone():
+    snapshot = UsageSnapshot(
+        provider="copilot",
+        status=SnapshotStatus.ERROR,
+        error="GitHub API 403",
+        raw={"usageItems": [], "sku": "copilot_ai_credits"},
+    )
+    out = _format_diagnostics("copilot", snapshot)
+    assert "copilot_ai_credits" in out
+    assert "<redacted>" not in out
+    assert "<guid>" not in out
