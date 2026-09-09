@@ -501,9 +501,8 @@ _CONSTRUCTOR_DOM: list[tuple[str, int, int | None]] = [
 
 def test_a_row_named_after_an_object_property_is_still_discovered():
     """`seen["constructor"]` is truthy on a plain object, so the row vanished."""
-    labels = [
-        row["label"] for row in _run(_claude_block(), _CONSTRUCTOR_DOM, "discoverRows()")
-    ]
+    discovered = _run(_claude_block(), _CONSTRUCTOR_DOM, "discoverRows()")
+    labels = [row["label"] for row in discovered]
 
     assert "Constructor" in labels
 

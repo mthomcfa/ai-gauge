@@ -654,8 +654,8 @@ def metric_for_spec(
 
 
 # A word a meter could be named after, as opposed to one a count is written
-# with. Three letters is the shortest real one on these pages ("Max", "Opus"
-# is four); "of", "in", "to" and "at" are the ones that show up in "3 of 10".
+# with. Three letters is the shortest real one on these pages ("Max"; "Opus"
+# is four), while "of", "in", "to" and "at" are what "3 of 10" is made of.
 _ALPHA_WORD_RE = re.compile(r"[a-z]{3,}")
 
 
@@ -695,9 +695,8 @@ def _collides_with_known(label: Any, known: Iterable[str]) -> bool:
     for other in known:
         if normalized == other or _overlaps(normalized, other):
             return True
-        if normalized.startswith(f"{other} ") and not any(
-            _ALPHA_WORD_RE.fullmatch(word)
-            for word in normalized[len(other) :].split()
+        if normalized.startswith(f"{other} ") and not _ALPHA_WORD_RE.search(
+            normalized[len(other) :]
         ):
             return True
     return False
