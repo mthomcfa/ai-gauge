@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import stat
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
@@ -753,6 +754,93 @@ def test_a_row_with_no_used_or_remaining_wording_is_not_adopted(kind, tmp_path):
     row = _row("Cowork sessions", kind=kind)
 
     assert adopt_rows("claude", [row], base_dir=tmp_path) == []
+
+
+# --- switching the primary meters off ---------------------------------------
+
+
+def _without_primaries(kind: str) -> MeterCatalog:
+    return MeterCatalog(
+        kind=kind,
+        specs=tuple(
+            replace(spec, enabled=False) if spec.primary else spec
+            for spec in bundled_catalog(kind).specs
+        ),
+    )
+
+
+def test_switching_both_primaries_off_is_a_setting_not_a_layout_change():
+    """The guard is about a page that stopped rendering Session and Weekly.
+
+    With both primaries disabled there is no untagged metric to find, so the
+    guard fired on every refresh and the tile showed "the layout may have
+    changed" - about the user's own override file, permanently, with no
+    setting that could clear it.
+    """
+    from aigauge.providers.claude import _build_snapshot
+
+    payload = {
+        "logged_out": False,
+        "title": "Claude",
+        "url": "https://claude.ai/settings/usage",
+        "body_text": "Plan usage Opus only 91% used",
+        "rows": {"opus_only": {"percent": 91, "kind": "used", "reset_text": "3 days"}},
+    }
+
+    snapshot = _build_snapshot(payload, catalog=_without_primaries("claude"))
+
+    assert snapshot.status == SnapshotStatus.OK
+    assert [metric.label for metric in snapshot.metrics] == ["Opus only"]
+    assert all(metric.tag == BREAKDOWN_TAG for metric in snapshot.metrics)
+
+
+def test_codex_answers_the_same_way_with_its_primaries_off():
+    """Codex reaches it through expected_primary, which is empty in that case."""
+    from aigauge.providers.codex import _build_snapshot
+
+    payload = {
+        "logged_out": False,
+        "title": "Codex",
+        "url": "https://chatgpt.com/codex/cloud/settings/analytics",
+        "body_text": "Cloud tasks limit 12% used",
+        "has_percent_text": True,
+        "rows": {
+            "cloud_tasks": {"percent": 12, "kind": "used", "reset_text": "Mon 6:00 PM"}
+        },
+    }
+    catalog = MeterCatalog(
+        kind="codex",
+        specs=_without_primaries("codex").specs
+        + (
+            MeterSpec(
+                key="cloud_tasks",
+                label="Cloud tasks",
+                aliases=("Cloud tasks limit",),
+            ),
+        ),
+    )
+
+    snapshot = _build_snapshot(payload, catalog=catalog)
+
+    assert snapshot.status == SnapshotStatus.OK
+    assert [metric.label for metric in snapshot.metrics] == ["Cloud tasks"]
+
+
+def test_a_page_of_informational_rows_alone_is_still_a_layout_change():
+    """The control: with Session and Weekly enabled, the guard still fires."""
+    from aigauge.providers.claude import _build_snapshot
+
+    payload = {
+        "logged_out": False,
+        "title": "Claude",
+        "url": "https://claude.ai/settings/usage",
+        "body_text": "Plan usage Opus only 91% used",
+        "rows": {"opus_only": {"percent": 91, "kind": "used", "reset_text": "3 days"}},
+    }
+
+    snapshot = _build_snapshot(payload, catalog=bundled_catalog("claude"))
+
+    assert snapshot.status == SnapshotStatus.ERROR
 
 
 # --- discovery: the weekly gate --------------------------------------------

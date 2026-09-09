@@ -597,10 +597,11 @@ def _build_snapshot(
         )
 
     rows = _payload_rows(payload)
+    catalog = catalog or load_catalog("claude")
     metrics: list[UsageMetric] = []
     unreadable: list[str] = []
     skipped: list[str] = []
-    for spec in (catalog or load_catalog("claude")).enabled_specs:
+    for spec in catalog.enabled_specs:
         card = rows.get(spec.key)
         if not card:
             continue
@@ -660,7 +661,14 @@ def _build_snapshot(
     # longer finds - would otherwise render an OK tile with no gauge on it and
     # no error to explain why. Codex has had this guard since its
     # partial-render bug; Claude was missing it.
-    if metrics and not any(
+    #
+    # Unless the catalog has no primary meter enabled: then a tile of
+    # informational rows is what the user asked for by switching Session and
+    # Weekly off, and "the layout may have changed" is a permanent error about
+    # their own setting. Codex reaches the same answer through its
+    # expected_primary set, which is empty in that case.
+    expects_primary = any(spec.primary for spec in catalog.enabled_specs)
+    if expects_primary and metrics and not any(
         metric.tag is None and metric.percent_used is not None for metric in metrics
     ):
         log_page_diagnosis(
