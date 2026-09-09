@@ -160,18 +160,33 @@ instead of a code change.
   nav and in Codex's prose above the cards. Page furniture ("Storage 88%",
   "Save 20%") was then inside the usage container. The panel is found by
   walking up from a marker that carries a percentage of its own — a bare
-  mention is a nav item, not a panel, and a nav that also renders two
-  percentages is *smaller* than the panel and used to win outright. A candidate
-  holding one of those bare markers off the path from the anchor is refused as
-  well: that is how a panel with a single meter promoted the SPA's root
-  wrapper, which is not `<body>` and so escaped the outright refusal. `<body>`
-  itself is still refused, and so is a container several times longer than the
-  rows it holds — counting the rows themselves, since counting every wrapper
-  around them multiplied the total by the nesting depth and let a
-  page-swallowing element through.
+  mention is a nav item, not a panel — and among the candidates that survive,
+  the *richest* wins: the one holding the most of the catalog's meters and the
+  most rows whose percentage says used or remaining. Size was the old
+  tiebreak, and furniture that carries the marker and a number of its own
+  ("Plan usage 12% off Max" beside "Storage 88% used", a sidebar of chat
+  titles) is always shorter than the panel, so it won and the panel was never
+  scanned. A candidate holding a bare marker off the path from its anchor is
+  refused as well, once the climb has passed something panel-shaped: that is
+  how a panel with a single meter promoted the SPA's root wrapper, which is
+  not `<body>` and so escaped the outright refusal — while a panel's own
+  heading, tab strip or footnote is a bare marker *inside* the panel, and
+  refusing on those refused the panel itself. `<body>` itself is still
+  refused, and so is a container several times longer than the rows it holds —
+  counting the rows themselves, since counting every wrapper around them
+  multiplied the total by the nesting depth and let a page-swallowing element
+  through. Only one container is returned, so a page rendering two usage
+  panels has the richer one scanned and the other one's meters left
+  undiscovered.
 - **The extractor's injection markers are filled in one pass.** Three chained
   replaces rescanned inserted text, so a label reading `__AG_CATALOG__` spliced
   JSON into a string literal and the whole extractor stopped parsing.
+- **A meter past the read cap is still a rival.** The 200-meter cap is a budget
+  for DOM walks, and naming a meter in the extractor's rival set costs no walk:
+  built from the capped catalog, an entry past the cap was a meter the page
+  still renders and the extractor no longer knew about, so one sharing a
+  collapsed container with Session could hand Session its percentage. The rival
+  set is built from the whole file, the way adoption already reads it.
 - **`kind` is validated inside both path builders** — shape, and the Windows
   device names (`con`, `nul`, `com1`…) `config` already refuses for profile ids,
   because `nul.json` is a device and not a file. A catalog is capped at 200
@@ -188,7 +203,7 @@ instead of a code change.
 
 ### Testing
 
-- 610 → 813 tests. Catalog loading, override merge, load order and alias
+- 610 → 827 tests. Catalog loading, override merge, load order and alias
   matching; the seven-day gate including the clock-change, future-stamp and
   timezone cases; adoption, its idempotence, its cap and every junk rule,
   including that a disabled meter is not adopted again and that a display-label
@@ -201,8 +216,11 @@ instead of a code change.
   polarity for used, remaining and a bare percentage; and that a page relabel
   keeps one history key rather than forking it. Plus, for each way out of the
   usage panel, a stub DOM that takes it: a nav carrying the marker and its own
-  percentages, an SPA root wrapper reached from a single-meter panel, and rows
-  buried six wrappers deep inside a page-swallowing element. And the collapsed
+  percentages, a nav carrying the marker and a percentage too, an SPA root
+  wrapper reached from a single-meter panel, and rows buried six wrappers deep
+  inside a page-swallowing element. Plus the panel's own heading, tab strip and
+  footnote, which name the meters without measuring them and used to refuse the
+  panel that renders them. And the collapsed
   container in both orders, which is where a rival label is the difference
   between Session refusing and Session reporting another meter's number.
 

@@ -268,15 +268,28 @@ added to a JSON file instead of a code change and a release.
   *adoption* instead, by `_collides_with_known`, which is the one place that
   can decide it before the entry exists. Display labels stay out of the rival
   set: "Session" is a fragment of "Current session".
-- **The usage container is found from a marker that has a number beside it.**
-  A bare mention of the marker phrase is a nav item, a heading or prose about
-  limits, and climbing from one let a settings nav that also renders "Storage
-  88%" win on size — it is smaller than the panel. A candidate is refused when
-  it holds one of those bare markers off the path from its anchor: that is the
-  evidence the climb left the panel, and it is what stops a panel with a single
-  meter promoting the SPA root wrapper (which is not `<body>`, so the outright
-  refusal never saw it). The "swallowed the page" ratio counts leaf rows only;
-  counting every wrapper around a row counted the row once per nesting level.
+- **The usage container is found from a marker that has a number beside it,
+  and the richest candidate wins.** A bare mention of the marker phrase is a
+  nav item, a heading or prose about limits, and climbing from one let a
+  settings nav that also renders "Storage 88%" win on size — it is smaller
+  than the panel. Size was the wrong tiebreak in general: furniture that
+  carries the marker *and* a percentage ("Plan usage 12% off Max" beside
+  "Storage 88% used", a sidebar of chat titles quoting the meter names) is a
+  legitimate anchor and still shorter than the panel, so it won and the panel
+  was never scanned. Candidates are scored by how much of a usage panel they
+  hold — the catalog meters whose wording they render plus the leaf rows whose
+  percentage says used or remaining — and length only settles ties. A
+  candidate is still refused when it holds a bare marker off the path from its
+  anchor, but only once the climb has passed something panel-shaped (an
+  ancestor above the anchor with a percentage and no stray of its own): that
+  is the evidence the climb left the panel, and it is what stops a panel with
+  a single meter promoting the SPA root wrapper (which is not `<body>`, so the
+  outright refusal never saw it). Without that qualification the rule refused
+  the panel's own heading, period tab strip and footnote — marker wording
+  inside the panel, on no path up from a row — so `usageContainer()` answered
+  null and discovery was inert on that layout, once a day, forever. The
+  "swallowed the page" ratio counts leaf rows only; counting every wrapper
+  around a row counted the row once per nesting level.
 - **The overlap rule refuses fragments, not vocabulary.** Claude names its
   meters out of a handful of words, so refusing any candidate containing a
   known label refused "Weekly Opus" and "Cowork session" too. Refused now: the
@@ -336,6 +349,15 @@ added to a JSON file instead of a code change and a release.
   usage panel, so a page rendering a single card discovers nothing. Harmless
   today (one card means nothing new to find) but it is the reason a first
   extra card can take an extra scan to appear.
+- **Only one usage panel is scanned.** `usageContainer()` answers with a single
+  element, so a page rendering two panels — a personal one and a team one,
+  each with its own meters — has the richer one scanned and the other's meters
+  outside the container, where nothing is adopted from them. Pinned as a
+  known-limitation test (`test_only_one_of_two_usage_panels_is_scanned`),
+  because the failure is a meter that never appears rather than a team
+  percentage under a personal label. Scanning both means returning a list of
+  containers and merging the scans, which is a change to every caller of the
+  discovery payload.
 - **Nothing has been observed against a live page.** The catalog reproduces the
   labels the extractors already carried, and the discovery scan is exercised
   against reconstructed DOMs in node — the same evidence basis, and the same
