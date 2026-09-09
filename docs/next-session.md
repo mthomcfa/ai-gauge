@@ -268,6 +268,35 @@ added to a JSON file instead of a code change and a release.
   *adoption* instead, by `_collides_with_known`, which is the one place that
   can decide it before the entry exists. Display labels stay out of the rival
   set: "Session" is a fragment of "Current session".
+- **The usage container is found from a marker that has a number beside it.**
+  A bare mention of the marker phrase is a nav item, a heading or prose about
+  limits, and climbing from one let a settings nav that also renders "Storage
+  88%" win on size — it is smaller than the panel. A candidate is refused when
+  it holds one of those bare markers off the path from its anchor: that is the
+  evidence the climb left the panel, and it is what stops a panel with a single
+  meter promoting the SPA root wrapper (which is not `<body>`, so the outright
+  refusal never saw it). The "swallowed the page" ratio counts leaf rows only;
+  counting every wrapper around a row counted the row once per nesting level.
+- **The overlap rule refuses fragments, not vocabulary.** Claude names its
+  meters out of a handful of words, so refusing any candidate containing a
+  known label refused "Weekly Opus" and "Cowork session" too. Refused now: the
+  same wording, a whole-word fragment of a known label, and a known label with
+  a count glued on. The accepted cost is that a *relabel* ("Session limit") is
+  adopted as an informational meter beside the unreadable primary rather than
+  refused; it gets its own history key, and adding the wording to the primary's
+  aliases is still the fix.
+- **A file we could not read is not a file we may replace.** A failed read
+  (`OSError`) and a failed parse (`ValueError`) are different answers, and only
+  the second says the contents are worthless — collapsing them had a Windows
+  sharing violation quarantine a valid override and replace it. A quarantine
+  that fails aborts the write, and a second corruption keeps the *first*
+  `.corrupt`: that copy holds the user's own edits, and everything written
+  after it was written by the app.
+- **A scan that found no panel is stamped short, not left due.** The diagnosis
+  is right and the cadence was not: the same line every refresh, forever. It
+  re-attempts daily (`CATALOG_NO_CONTAINER_RETRY`). A payload that never
+  reached the scan still leaves it due, so a page that failed to render cannot
+  spend a scan the user armed by hand.
 - **A meter is adopted with no window.** Same reasoning as `polarity` below:
   inferring a period from the wording is a guess, and a wrong window makes an
   active meter read "idle" instead of showing its number. `infer_window` is
