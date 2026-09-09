@@ -303,7 +303,27 @@ EXTRACTOR_TEMPLATE = r"""
       card.in_container = true;
       out.push(card);
     }
-    return out;
+    // Nested wrappers: a parent that puts a heading in front of one card
+    // renders that card's number under a longer label, and both are
+    // candidates. Same percentage, same reset text, and one label ending in
+    // the other means one card described twice - keep the child.
+    const deduped = [];
+    for (const row of out) {
+      const lower = row.label.toLowerCase();
+      let merged = false;
+      for (let i = 0; i < deduped.length; i++) {
+        const other = deduped[i];
+        const otherLower = other.label.toLowerCase();
+        if (other.percent !== row.percent) continue;
+        if ((other.reset_text || '') !== (row.reset_text || '')) continue;
+        if (!lower.endsWith(otherLower) && !otherLower.endsWith(lower)) continue;
+        if (row.label.length < other.label.length) deduped[i] = row;
+        merged = true;
+        break;
+      }
+      if (!merged) deduped.push(row);
+    }
+    return deduped;
   }
 
   const bodyText = visibleText(document.body);
@@ -670,6 +690,7 @@ def _build_snapshot(
 
     metrics: list[UsageMetric] = []
     unreadable: list[str] = []
+    skipped: list[str] = []
     body_text = str(payload.get("body_text") or "")
     catalog = catalog or load_catalog("codex")
     rows = _payload_rows(payload)
@@ -684,12 +705,24 @@ def _build_snapshot(
             # take Session and Weekly down with it.
             if spec.primary:
                 unreadable.append(f"{spec.label} ({reason})")
+            else:
+                skipped.append(f"{spec.label} ({reason})")
             continue
         metric = metric_for_spec(
             spec, card, resets_at=_parse_reset_text(card.get("reset_text"))
         )
         if metric is not None:
             metrics.append(metric)
+
+    # An informational card is dropped rather than failing the snapshot, but a
+    # silent drop is invisible: the tile just shows one gauge fewer than the
+    # page does, and nothing says which meter went or why.
+    if skipped:
+        log.info(
+            "provider skipped unreadable rows provider=%s rows=%s",
+            account_id,
+            "; ".join(skipped),
+        )
 
     # A card we could not read is reported, never quietly dropped: a bare
     # percentage has no polarity, and normalize_percent would resolve it to

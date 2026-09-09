@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 import shutil
 import subprocess
@@ -564,6 +565,27 @@ def test_an_extra_card_becomes_an_informational_field(tmp_path):
         "Session",
         "Weekly",
     ]
+
+
+def test_an_informational_card_that_cannot_be_read_says_so_in_the_log(
+    tmp_path, caplog
+):
+    """Dropping it is right; dropping it silently is not."""
+    adopt_rows(
+        "codex",
+        [{"label": "Cloud tasks limit", "percent": 12.0, "kind": "used",
+          "reset_text": "Mon 6:00 PM", "in_container": True}],
+        base_dir=tmp_path,
+    )
+    payload = _cards_payload(cloud_tasks_limit=_card(12, kind="unknown"))
+
+    with caplog.at_level(logging.INFO, logger="aigauge.providers.codex"):
+        snapshot = _build_snapshot(
+            payload, catalog=load_catalog("codex", base_dir=tmp_path)
+        )
+
+    assert snapshot.status == SnapshotStatus.OK
+    assert "Cloud tasks limit" in caplog.text
 
 
 def test_an_extra_card_is_not_mistaken_for_a_partial_render(tmp_path):

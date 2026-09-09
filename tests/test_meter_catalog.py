@@ -42,7 +42,6 @@ from aigauge.providers.catalog import (
     bundled_catalog,
     clear_scans,
     extractor_source,
-    infer_window,
     is_adoptable_label,
     load_catalog,
     metric_for_spec,
@@ -555,17 +554,24 @@ def test_a_row_without_a_percentage_is_not_adopted(tmp_path):
     assert adopt_rows("claude", [_row("Cowork sessions", percent=None)], base_dir=tmp_path) == []
 
 
-@pytest.mark.parametrize(
-    "label,expected",
-    [
-        ("Daily included routine runs", timedelta(days=1)),
-        ("Weekly agent runs", timedelta(days=7)),
-        ("5 hour usage limit", timedelta(hours=5)),
-        ("Cowork only", None),
-    ],
-)
-def test_window_inference_only_fires_on_wording_we_already_use(label, expected):
-    assert infer_window(label) == expected
+def test_an_adopted_meter_is_given_no_window(tmp_path):
+    """The same refusal to guess that keeps `polarity` unset.
+
+    A window inferred from the wording is a guess, and a wrong one makes an
+    active meter read "idle" instead of showing its number. The user can put
+    the real period in the override file.
+    """
+    spec = adopt_rows("claude", [_row("Daily agent runs")], base_dir=tmp_path)[0]
+
+    assert spec.window is None
+
+
+@pytest.mark.parametrize("kind", ["unknown", "", None])
+def test_a_row_with_no_used_or_remaining_wording_is_not_adopted(kind, tmp_path):
+    """unreadable_reason would refuse it on every refresh anyway."""
+    row = _row("Cowork sessions", kind=kind)
+
+    assert adopt_rows("claude", [row], base_dir=tmp_path) == []
 
 
 # --- discovery: the weekly gate --------------------------------------------

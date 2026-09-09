@@ -330,6 +330,28 @@ def test_a_container_that_swallowed_the_page_is_refused():
     assert _run(_claude_block(), dom, "discoverRows()") is None
 
 
+def test_a_nested_wrapper_does_not_become_a_second_meter():
+    """A wrapper that adds a heading in front of one row is that row again.
+
+    Both elements are candidates, both carry the same percentage and reset
+    text, and one label ends in the other — so the page would grow a "Included
+    Cowork sessions" meter beside "Cowork sessions", reporting one number
+    twice.
+    """
+    dom = [
+        ("", 900, None),                                          # 0 body
+        ("Plan usage", 600, 0),                                   # 1 panel
+        ("Included", 60, 1),                                      # 2 wrapper
+        ("Cowork sessions 7% used Resets in 3 days", 30, 2),      # 3 the row
+        ("Current session 64% used Resets in 2 hr", 40, 1),       # 4
+    ]
+
+    labels = [row["label"] for row in _run(_claude_block(), dom, "discoverRows()")]
+
+    assert "Cowork sessions" in labels
+    assert "Included Cowork sessions" not in labels
+
+
 def test_a_discovered_row_carries_the_same_polarity_verdict_as_a_known_one():
     discovered = _run(_claude_block(), CLAUDE_DOM, "discoverRows()")
     by_label = {row["label"]: row for row in discovered}

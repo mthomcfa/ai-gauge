@@ -1,3 +1,5 @@
+import logging
+
 from aigauge.gauge import provider_max_percent
 from aigauge.models import SnapshotStatus
 from aigauge.providers.catalog import adopt_rows, load_catalog
@@ -414,6 +416,23 @@ def test_a_page_with_only_breakdown_rows_errors_rather_than_showing_no_gauge():
 
     assert snapshot.status == SnapshotStatus.ERROR
     assert "layout may have changed" in (snapshot.error or "")
+
+
+def test_an_informational_row_that_cannot_be_read_says_so_in_the_log(caplog):
+    """Dropping it is right; dropping it silently is not.
+
+    The tile just shows one gauge fewer than the page does, and without this
+    nothing says which meter went missing or why.
+    """
+    payload = _full_payload()
+    payload["rows"]["opus_only"] = _row(42, kind="unknown")
+
+    with caplog.at_level(logging.INFO, logger="aigauge.providers.claude"):
+        snapshot = _build_snapshot(payload)
+
+    assert snapshot.status == SnapshotStatus.OK
+    assert "Opus only" in caplog.text
+    assert "no used/remaining wording" in caplog.text
 
 
 def test_a_payload_without_the_rows_block_still_reads_both_primary_meters():

@@ -116,16 +116,6 @@ _NON_METER_MARKERS = (
 # credit limit", which is a real meter - the blocklist has to reject furniture
 # without rejecting a limit that happens to be named after where it applies.
 
-# Window inference for adopted meters. Only the wordings the existing meters
-# already use; anything else gets no window, which is safe (window only gates
-# the idle-countdown display).
-_WINDOW_HINTS: tuple[tuple[re.Pattern[str], timedelta], ...] = (
-    (re.compile(r"\bdaily\b|\bper day\b|\b24[- ]hour\b", re.IGNORECASE), timedelta(days=1)),
-    (re.compile(r"\bweekly\b|\b7[- ]day\b", re.IGNORECASE), timedelta(days=7)),
-    (re.compile(r"\b5[- ]hour\b|\bsession\b", re.IGNORECASE), timedelta(hours=5)),
-)
-
-
 def normalize_label(text: Any) -> str:
     """Case-folded, whitespace-collapsed form used for every alias comparison."""
     return re.sub(r"\s+", " ", str(text or "")).strip().lower()
@@ -603,6 +593,13 @@ def _adoptable_row(row: Any) -> str | None:
     # is not a meter.
     if not row.get("reset_text") and not row.get("in_container"):
         return None
+    # A row the reader can never read is not a meter. Without used/remaining
+    # wording beside the number ``unreadable_reason`` refuses it on every
+    # refresh — guessing would report "42% left" as 42% consumed — so adopting
+    # it only files an entry nobody can use. It also drops most upsell copy,
+    # which is where "Save 20%" comes from.
+    if str(row.get("kind") or "").strip().lower() not in ("used", "remaining"):
+        return None
     label = clean_label(row.get("label"))
     if not is_adoptable_label(label):
         return None
@@ -619,13 +616,6 @@ def _adopted_key(label: str, taken: Iterable[str]) -> str:
         key = f"{base}_{suffix}"
         suffix += 1
     return key
-
-
-def infer_window(label: str) -> timedelta | None:
-    for pattern, window in _WINDOW_HINTS:
-        if pattern.search(label):
-            return window
-    return None
 
 
 def _spec_to_raw(spec: MeterSpec) -> dict[str, Any]:
@@ -701,7 +691,12 @@ def adopt_rows(
                 key=key,
                 label=label,
                 aliases=(label,),
-                window=infer_window(label),
+                # No window, for the same reason nothing is adopted with a
+                # polarity: a guess from the wording is a guess. A wrong
+                # window makes an active meter read "idle" (see
+                # idle_reset_state), and the user can set the real one in the
+                # override file.
+                window=None,
                 primary=False,
                 source=SOURCE_DISCOVERY,
                 status=STATUS_ACTIVE,
