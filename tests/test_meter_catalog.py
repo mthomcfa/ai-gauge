@@ -1365,6 +1365,37 @@ def test_codex_also_retries_a_missing_usage_container_daily(fake_runner):
     ) is True
 
 
+def test_an_unreadable_informational_row_is_named_once_per_refresh(
+    fake_runner, caplog
+):
+    """Adoption rebuilds the snapshot, and the rebuild logged the line again.
+
+    Two identical lines out of one refresh read as two meters gone rather
+    than one, which is the opposite of what the line is for.
+    """
+    from aigauge.providers.claude import ClaudeProvider
+
+    config = Config()
+    ClaudeProvider(config=config).refresh(lambda snapshot: None)
+    payload = _payload(
+        rows={
+            "session": {"percent": 5, "kind": "used", "reset_text": "6 min"},
+            "weekly_all": {"percent": 26, "kind": "used", "reset_text": "Thu 9:59 AM"},
+            # No used/remaining wording beside the number: refused, not guessed.
+            "opus_only": {"percent": 91, "kind": "unknown", "reset_text": "3 days"},
+        },
+        discovered=[_row("Cowork sessions")],
+    )
+
+    with caplog.at_level(logging.INFO, logger="aigauge.providers.claude"):
+        snapshot = fake_runner.last["build"](payload)
+
+    assert snapshot.status == SnapshotStatus.OK
+    assert load_catalog("claude").spec_for_label("Cowork sessions") is not None
+    assert caplog.text.count("provider skipped unreadable rows") == 1
+    assert "Opus only" in caplog.text
+
+
 def test_a_scan_that_found_nothing_new_still_counts(fake_runner):
     from aigauge.providers.claude import ClaudeProvider
 

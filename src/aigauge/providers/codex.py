@@ -690,6 +690,7 @@ def _build_snapshot(
     *,
     account_id: str = "codex",
     catalog: MeterCatalog | None = None,
+    log_skipped: bool = True,
 ) -> UsageSnapshot:
     if _is_logged_out_payload(payload):
         log_page_diagnosis(
@@ -749,7 +750,7 @@ def _build_snapshot(
     # An informational card is dropped rather than failing the snapshot, but a
     # silent drop is invisible: the tile just shows one gauge fewer than the
     # page does, and nothing says which meter went or why.
-    if skipped:
+    if skipped and log_skipped:
         log.info(
             "provider skipped unreadable rows provider=%s rows=%s",
             account_id,
@@ -946,6 +947,11 @@ class CodexProvider(Provider):
                     payload,
                     account_id=self._account_id,
                     catalog=load_catalog("codex"),
+                    # The cards this refresh could not read were named in the
+                    # log by the build above, off the same payload. Adoption
+                    # adds meters, never makes one unreadable, so repeating
+                    # the line here only doubled it.
+                    log_skipped=False,
                 )
             record_scan(self._config, "codex")
             return snapshot
