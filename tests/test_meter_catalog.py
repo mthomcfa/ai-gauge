@@ -1232,6 +1232,34 @@ def test_a_due_scan_turns_discovery_on_in_the_injected_extractor(
     assert "const DISCOVER = false;" in settled_source
 
 
+def test_a_meter_past_the_read_cap_is_still_a_rival(fake_runner):
+    """The cap is a budget for DOM walks, and naming a rival is not one.
+
+    ROW_LABELS was built from the capped catalog, so the entries past
+    MAX_CATALOG_SPECS were meters the page still renders and the extractor no
+    longer knew about: one of them sharing a collapsed container with Session
+    made Session report *its* percentage, as an OK snapshot. Adoption already
+    reads the whole file for the same reason.
+    """
+    from aigauge.providers.claude import ClaudeProvider
+
+    _write_override(
+        override_path("claude").parent,
+        "claude",
+        [
+            {"key": f"meter_{i}", "label": f"Meter {i}", "aliases": [f"Meter {i}"]}
+            for i in range(MAX_CATALOG_SPECS + 4)
+        ],
+    )
+
+    ClaudeProvider().refresh(lambda snapshot: None)
+    source = fake_runner.last["extractor_js"]
+    row_labels = json.loads(source.split("const ROW_LABELS = ")[1].split(";\n")[0])
+
+    assert load_catalog("claude").spec_for_label("Meter 203") is None, "past the cap"
+    assert "Meter 203" in row_labels
+
+
 def test_a_provider_with_no_config_never_asks_for_a_scan(fake_runner):
     from aigauge.providers.claude import ClaudeProvider
 

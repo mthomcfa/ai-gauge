@@ -581,6 +581,17 @@ def load_catalog(kind: str, *, base_dir: Path | None = None) -> MeterCatalog:
     return MeterCatalog(kind=kind, specs=tuple(specs))
 
 
+def uncapped_catalog(kind: str, *, base_dir: Path | None = None) -> MeterCatalog:
+    """Every meter the file defines, cap and all.
+
+    The read cap is a budget for DOM walks, and only reading costs one. The
+    rival set costs nothing per refresh and a meter missing from it is a meter
+    whose number can be reported as another meter's, so it is built from the
+    whole document - as adoption already is, for the same reason.
+    """
+    return MeterCatalog(kind=kind, specs=tuple(_merged_specs(kind, base_dir=base_dir)))
+
+
 # --- reading a row into a metric -------------------------------------------
 
 
@@ -821,9 +832,7 @@ def adopt_rows(
     # the cap is still in the document, still written back, and still on the
     # page - so adoption has to know its label and its key or it re-adopts the
     # same row as <key>_2 and the file grows by one every scan.
-    known = MeterCatalog(
-        kind=kind, specs=tuple(_merged_specs(kind, base_dir=base_dir))
-    )
+    known = uncapped_catalog(kind, base_dir=base_dir)
     existing_adopted = sum(1 for spec in known.specs if spec.adopted)
     taken_keys = {spec.key for spec in known.specs}
     seen_labels = set(known.known_labels())
@@ -1145,8 +1154,19 @@ def rival_row_labels(catalog: MeterCatalog) -> list[str]:
 _MARKER_RE = re.compile(r"__AG_(ROW_LABELS|CATALOG|DISCOVER)__")
 
 
-def extractor_source(template: str, catalog: MeterCatalog, *, discover: bool) -> str:
+def extractor_source(
+    template: str,
+    catalog: MeterCatalog,
+    *,
+    discover: bool,
+    rivals: MeterCatalog | None = None,
+) -> str:
     """Fill a provider's extractor template with the catalog it should read.
+
+    ``rivals`` is the catalog ROW_LABELS is built from, which is wider than
+    the one that gets read: reading a meter costs a DOM walk per refresh and
+    is capped, while naming one as a rival costs nothing and leaving it out
+    lets its number be reported as another meter's. Defaults to ``catalog``.
 
     The labels are data, so they travel as JSON literals rather than being
     spliced into the source: ``json.dumps`` escapes quotes and every non-ASCII
@@ -1160,7 +1180,9 @@ def extractor_source(template: str, catalog: MeterCatalog, *, discover: bool) ->
     why.
     """
     values = {
-        "ROW_LABELS": json.dumps(rival_row_labels(catalog)),
+        "ROW_LABELS": json.dumps(
+            rival_row_labels(catalog if rivals is None else rivals)
+        ),
         "CATALOG": json.dumps(catalog.to_js()),
         "DISCOVER": "true" if discover else "false",
     }

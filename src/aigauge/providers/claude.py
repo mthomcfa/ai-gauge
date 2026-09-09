@@ -25,6 +25,7 @@ from .catalog import (
     record_no_container_scan,
     record_scan,
     scan_due,
+    uncapped_catalog,
     unreadable_reason,
 )
 from .codex import _parse_reset_text  # reuse the same heuristic parser
@@ -853,7 +854,14 @@ class ClaudeProvider(Provider):
             account_id=self._account_id,
             url=CLAUDE_USAGE_URL,
             extractor_js=extractor_source(
-                EXTRACTOR_TEMPLATE, catalog, discover=discover
+                EXTRACTOR_TEMPLATE,
+                catalog,
+                discover=discover,
+                # The rival set is the whole file, not the capped read: a
+                # meter past the cap is still on the page, and one missing
+                # from ROW_LABELS is one whose number can be reported as
+                # another meter's.
+                rivals=uncapped_catalog("claude"),
             ),
             build=_build,
             log=log,
