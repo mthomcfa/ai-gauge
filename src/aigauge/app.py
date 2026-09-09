@@ -129,6 +129,14 @@ def _adaptive_refresh_minutes(
 
 
 def _snapshot_signature(snapshot: UsageSnapshot) -> tuple:
+    """What counts as "this provider changed" for the adaptive refresh cadence.
+
+    Untagged metrics only. Tagged ones are informational — per-model rows,
+    every breakdown meter the catalog knows — and a provider that renders a
+    dozen of them offers a dozen numbers that can twitch, each one resetting
+    the backoff. The cadence should follow the meters the tile is actually
+    about.
+    """
     return (
         snapshot.status.value,
         snapshot.error,
@@ -143,6 +151,7 @@ def _snapshot_signature(snapshot: UsageSnapshot) -> tuple:
                 metric.reset_label,
             )
             for metric in snapshot.metrics
+            if metric.tag is None
         ),
     )
 
