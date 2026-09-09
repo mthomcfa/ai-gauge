@@ -95,6 +95,8 @@ def get_token(
         },
         headers={"Accept": "application/json"},
         timeout=REQUEST_TIMEOUT,
+        # A redirect would mean talking to a host other than Entra ID.
+        allow_redirects=False,
     )
     if response.status_code != 200:
         code = ""

@@ -653,15 +653,23 @@ def _json(response: requests.Response) -> Any:
 
 
 def arm_post(token: str, url: str, body: dict, what: str) -> requests.Response:
+    # allow_redirects=False on every ARM call: the only host this module
+    # speaks to is fixed, so a redirect is a failure, never something to follow.
     response = requests.post(
-        url, json=body, headers=_headers(token), timeout=REQUEST_TIMEOUT
+        url,
+        json=body,
+        headers=_headers(token),
+        timeout=REQUEST_TIMEOUT,
+        allow_redirects=False,
     )
     _check(response, what)
     return response
 
 
 def arm_get(token: str, url: str, what: str) -> requests.Response:
-    response = requests.get(url, headers=_headers(token), timeout=REQUEST_TIMEOUT)
+    response = requests.get(
+        url, headers=_headers(token), timeout=REQUEST_TIMEOUT, allow_redirects=False
+    )
     _check(response, what)
     return response
 
