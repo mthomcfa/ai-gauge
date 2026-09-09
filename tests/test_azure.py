@@ -774,6 +774,56 @@ def test_429_serves_the_cache_and_records_the_backoff(monkeypatch, config):
 
 
 @responses.activate
+def test_fixing_a_wrong_secret_clears_the_backoff_immediately(monkeypatch, config):
+    """The moment after a user fixes a bad secret is exactly when they are
+    watching the tile to see whether the fix worked."""
+    secret = {"value": "wrong"}
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: secret["value"])
+    responses.add(responses.POST, TOKEN_URL, json={"error": "invalid_client"}, status=401)
+    provider = az.AzureProvider(config)
+
+    first = _run(provider, monkeypatch)
+    assert first.status == SnapshotStatus.AUTH_REQUIRED
+    state = az.state_for(SUB)
+    assert state.blocked_until is not None
+
+    # Same wrong secret: still backing off, so Entra ID is not hit again.
+    calls = len(responses.calls)
+    assert _run(provider, monkeypatch).status == SnapshotStatus.AUTH_REQUIRED
+    assert len(responses.calls) == calls
+
+    # Corrected secret: retried at once.
+    secret["value"] = "right"
+    responses.reset()
+    _stub_everything()
+    assert _run(provider, monkeypatch).status == SnapshotStatus.OK
+
+
+@responses.activate
+def test_changing_the_app_registration_discards_the_other_tenants_numbers(
+    monkeypatch, config
+):
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    provider = az.AzureProvider(config)
+    _run(provider, monkeypatch)
+    assert az.state_for(SUB).aggregate is not None
+
+    config.azure.tenant_id = "44444444-4444-4444-4444-444444444444"
+    responses.reset()
+    responses.add(
+        responses.POST,
+        f"https://login.microsoftonline.com/{config.azure.tenant_id}"
+        "/oauth2/v2.0/token",
+        json={"error": "invalid_client"},
+        status=401,
+    )
+    snapshot = _run(provider, monkeypatch)
+    # Not the cached OK snapshot from the previous tenant.
+    assert snapshot.status == SnapshotStatus.AUTH_REQUIRED
+
+
+@responses.activate
 def test_permission_failure_becomes_auth_required_with_a_hint(monkeypatch, config):
     monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
     responses.add(

@@ -34,6 +34,7 @@ Group on names, classify on ids.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
 from dataclasses import dataclass, field
@@ -973,10 +974,12 @@ def fetch_foundry_resource_ids(token: str, subscription_id: str) -> set[str]:
 
 @dataclass
 class _State:
-    # (tenant_id, client_id) the cached data was fetched with. State is keyed
-    # by subscription, so pointing the same subscription at a different app
-    # registration would otherwise keep serving the old tenant's numbers.
-    identity: tuple[str, str] | None = None
+    # Which credentials the cached data belongs to. State is keyed by
+    # subscription, so pointing the same subscription at a different app
+    # registration would otherwise keep serving the old tenant's numbers - and,
+    # worse, a user who has just fixed a wrong client secret would keep seeing
+    # the auth error for the rest of the backoff window. See _identity().
+    identity: tuple[str, str, str] | None = None
     last_fetch_at: datetime | None = None
     blocked_until: datetime | None = None
     consecutive_errors: int = 0
@@ -994,6 +997,20 @@ class _State:
 # user pressed OK - exactly the hammering this is here to prevent.
 _STATES: dict[str, _State] = {}
 _STATES_LOCK = threading.Lock()
+
+
+def _identity(tenant_id: str, client_id: str, client_secret: str) -> tuple[str, str, str]:
+    """A change detector for the credential set, not a place to keep a secret.
+
+    The secret is reduced to a truncated digest purely so that *rotating* it
+    invalidates the cached backoff: without this, a user who fixed a wrong
+    client secret would go on seeing the auth error until the backoff expired,
+    which is exactly when they are looking at the tile to see whether the fix
+    worked. An unchanged wrong secret still backs off, so a bad credential is
+    not retried every five minutes against Entra ID.
+    """
+    digest = hashlib.sha256(client_secret.encode("utf-8", "replace")).hexdigest()
+    return (tenant_id, client_id, digest[:16])
 
 
 def state_for(subscription_id: str) -> _State:
@@ -1073,7 +1090,7 @@ class AzureProvider(Provider):
         state = state_for(subscription_id)
         now = datetime.now()
 
-        identity = (tenant_id, client_id)
+        identity = _identity(tenant_id, client_id, secret)
         if state.identity is not None and state.identity != identity:
             # Re-pointed at a different app registration: everything cached
             # here describes the old one, including the throttle window.
@@ -1081,7 +1098,9 @@ class AzureProvider(Provider):
                 "provider api diagnosis provider=azure "
                 "classification=identity_changed cache_cleared=1"
             )
-            _STATES[subscription_id] = state = _State()
+            state = _State()
+            with _STATES_LOCK:
+                _STATES[subscription_id] = state
         state.identity = identity
 
         # Serve the cache rather than the API. The refresh loop above this can
