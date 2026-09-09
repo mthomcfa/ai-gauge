@@ -234,7 +234,7 @@ an override changes only the fields it names:
   "version": 1,
   "kind": "claude",
   "meters": [
-    { "key": "cowork_sessions", "enabled": false },
+    { "key": "cowork_only", "enabled": false },
     { "key": "weekly_all", "aliases": ["All models", "Weekly", "Weekly limit"] }
   ]
 }
@@ -242,29 +242,32 @@ an override changes only the fields it names:
 
 | Field | Meaning |
 | --- | --- |
-| `key` | Identifies the meter. An unknown key adds a new meter; a known one edits it. |
+| `key` | Identifies the meter. An unknown key adds a new meter; a known one edits it. An entry for a new key needs `label` and `aliases` as well — one that only names a key it does not recognise is dropped with a warning in the log. |
 | `label` | What the tile shows. Also the history key, so changing it starts that meter's history over. |
 | `aliases` | The wordings the page may use. Add one here when a provider renames a row and the tile stops reading it. |
-| `window_seconds` | The meter's period, or `null` if unknown. Only affects the reset countdown. |
+| `window_seconds` | The meter's period, or `null` if unknown. Drives the reset countdown and the pace line in the tile's tooltip ("you are 40% through the window"), so a wrong value is worse than none. |
+| `boundaries` | Where this meter's text stops, for Codex's plain-text fallback: the app reads from the meter's alias up to the first of these words. Defaults to every *other* meter's aliases, which is normally right — set it when a page puts something else between the cards. |
 | `primary` | `true` lets the meter drive the tray colour. Only Session and Weekly ship as primary, and a discovered meter is never adopted as primary. |
-| `enabled` | `false` hides the meter and stops the app looking for it. This is how you switch off a row the weekly scan picked up. |
+| `enabled` | `false` hides the meter, stops the app looking for it, **and stops the weekly scan adopting that row again** under a new key. This is how you switch off a row the scan picked up. |
 | `polarity` | `"used"` or `"remaining"`, consulted **only** when the page shows no wording beside the percentage. Nothing ships with one: without wording the app refuses the reading rather than guessing, because a quota shown backwards is the one error that does not announce itself. |
-| `status` | `"active"` (the default) means the meter is read. Reserved for a review step; anything else parks the entry without deleting it. |
+| `status` | `"active"` (the default) means the meter is read. Reserved for a review step; anything else parks the entry — it is not read, and not adopted again either. |
 
 Every entry also records where it came from, so a meter the app added for
 itself can be judged afterwards — the page has moved on by the time you look:
 
 | Field | Meaning |
 | --- | --- |
-| `source` | `"bundled"` for a shipped meter, `"discovery"` for one the weekly scan adopted. |
+| `source` | `"bundled"` for a shipped meter, `"discovery"` for one the weekly scan adopted, `"user"` for one you added by hand. Written once, when the entry is created: an entry you add without a `source` becomes `"user"` and stays that way. |
 | `first_seen` | When it was adopted (local time, ISO-8601). |
 | `account_id` | Which account's page it was seen on. |
 | `evidence` | The row text that justified it — label, percentage, and reset wording, capped at 200 characters with any email address redacted. |
 
 Unrecognised fields are preserved rather than dropped, so a newer release can
-add one without an older build eating it. Delete the override file to go back
-to the shipped catalog; the weekly scan will re-adopt anything the page still
-shows.
+add one without an older build eating it. If the file cannot be parsed — a
+trailing comma is the usual one — it is moved to `<kind>.json.corrupt` before
+anything is written over it, and the log says so. Delete the override file to
+go back to the shipped catalog; the weekly scan will re-adopt anything the page
+still shows and you have not disabled.
 
 ## Build a standalone binary
 

@@ -47,7 +47,7 @@ $args = @(
     # The meter catalog is data next to the code, so --paths does not carry it.
     # Without it every Claude/Codex meter is unreadable in a frozen build.
     # Windows uses ';' as the --add-data separator.
-    "--add-data", "src\aigauge\providers\meter_catalog;aigauge\providers\meter_catalog",
+    "--add-data", "src\aigauge\providers\meter_catalog\*.json;aigauge\providers\meter_catalog",
     "--collect-all", "PyQt6.QtWebEngineWidgets",
     "--collect-all", "PyQt6.QtWebEngineCore",
     "pyinstaller_entry.py"

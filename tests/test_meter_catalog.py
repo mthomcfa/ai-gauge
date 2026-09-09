@@ -885,8 +885,10 @@ def test_the_wheel_config_names_the_catalog():
     [
         # PyInstaller's --add-data separator is os.pathsep, so the two scripts
         # cannot share one string.
-        ("build.sh", "src/aigauge/providers/meter_catalog:aigauge/providers/meter_catalog"),
-        ("build.ps1", r"src\aigauge\providers\meter_catalog;aigauge\providers\meter_catalog"),
+        ("build.sh",
+         "src/aigauge/providers/meter_catalog/*.json:aigauge/providers/meter_catalog"),
+        ("build.ps1",
+         r"src\aigauge\providers\meter_catalog\*.json;aigauge\providers\meter_catalog"),
     ],
 )
 def test_the_pyinstaller_builds_bundle_the_catalog(script, spec):

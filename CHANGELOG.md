@@ -32,20 +32,41 @@ instead of a code change.
   via **Settings → General → Re-scan meters now** — each provider is asked for
   every labelled row its usage container renders, and rows the catalog does not
   recognise are adopted as informational meters. They appear as fields on the
-  next refresh, and `"enabled": false` in the override file switches one off.
-  Adoption requires a percentage, a short alphabetic label that matches no page
-  furniture, and either reset wording or a position inside the usage container;
-  it is capped at 24 meters per provider and never sets `primary`. The scan is
-  local — it reads what the embedded browser already rendered, downloads
-  nothing, and there is no remote catalog.
+  next refresh, and `"enabled": false` in the override file switches one off
+  **and keeps it off**: a disabled or parked entry is still a label the catalog
+  knows, so the next scan does not adopt it again under a new key.
+  Adoption requires a percentage, used/remaining wording beside it (a row the
+  reader can never read is not a meter), a short alphabetic label that matches
+  no page furniture, and either reset wording or a position inside the usage
+  container. A label that collides with a meter the catalog already has — the
+  same wording, or one contained in the other as whole words — is refused: it
+  would report an existing meter's number under a second name, and a label
+  matching an existing *display* label would share that meter's history key.
+  An adopted meter is given no window for the same reason it is given no
+  polarity: a period guessed from the wording can make an active meter read
+  "idle". Adoption is capped at 24 meters per provider and never sets
+  `primary`. The scan is local — it reads what the embedded browser already
+  rendered, downloads nothing, and there is no remote catalog.
+- **The scan only counts when the page could actually be read.** Adoption and
+  the weekly stamp happen after the snapshot is classified, only on an OK
+  snapshot, only when the extractor found a usage container, and once per
+  refresh. A logged-out, challenged or half-rendered page would otherwise adopt
+  whatever it happened to render — permanently — and spend the week's scan on a
+  page nobody could read. The extractor distinguishes "the panel showed nothing
+  new" from "there was no panel to look in"; the second leaves the scan due and
+  says so in the log.
 - **Provenance on every adopted meter.** An adopted entry is structurally
   identical to a bundled one, so each records `source`, `first_seen`, the
   `account_id` its page belonged to, and the `evidence` that justified it (the
   row's label, percentage and reset wording, capped at 200 characters with any
   email redacted — the same treatment the diagnostics blob gets). Bundled
-  entries declare `source: "bundled"`. Unrecognised fields in an override file
-  are preserved rather than dropped, and an entry can carry a `status` other
-  than `"active"` to park it — the hook a later review step needs.
+  entries declare `source: "bundled"`; an entry added by hand with no `source`
+  becomes `"user"`, because only the packaged file is bundled. Unrecognised
+  fields in an override file are preserved rather than dropped, and an entry
+  can carry a `status` other than `"active"` to park it — the hook a later
+  review step needs. A discovered meter whose wording a later bundled meter
+  covers is dropped at load with one `superseded` line, rather than reporting
+  the same number twice for ever.
 
 ### Fixed
 
@@ -69,9 +90,43 @@ instead of a code change.
   turned a two-label read into a dozen, and `querySelectorAll` plus `innerText`
   over every element is the expensive part of both extractors.
 - `meter_catalog_last_scan` is a new config key (per provider kind). Missing
-  counts as due, so the first refresh after upgrading scans; so does a
-  timestamp in the future, because a clock change must not switch discovery off
-  for a week.
+  counts as due, so the first refresh after upgrading scans, and so does a
+  stamp that cannot be read. A stamp in the *future* — a DST rollback, a
+  corrected system clock — is clamped to now rather than treated as due, which
+  had meant scanning on every refresh until the clock caught up. A
+  timezone-aware stamp is converted to local time instead of raising
+  `TypeError` out of `refresh()` and erroring the tile permanently.
+- **The adaptive refresh cadence follows the primary meters only.** Its
+  signature hashed every metric, so with a dozen informational rows per
+  provider any one of them twitching reset the backoff that exists to stop
+  polling a provider that is not moving.
+- **Claude requires that a primary meter was actually read.** A payload of
+  informational rows only used to build an OK snapshot with no gauge on the
+  tile and nothing to retry. Codex has refused that since its partial-render
+  bug.
+
+### Security
+
+- **The override file is written atomically and owner-only** (`0600`, temp file
+  plus `os.replace`), the same discipline `secrets.dat` gets. It carries
+  page-derived labels, capped evidence and the account id a meter was seen on.
+  A file that cannot be parsed is moved to `<kind>.json.corrupt` and logged at
+  ERROR rather than being overwritten with only the new entries — one trailing
+  comma in a hand edit used to cost every other edit in the file.
+- **The usage container cannot be `<body>`.** Discovery is confined to the
+  element holding the usage panel, and that element was chosen as the smallest
+  one carrying a marker phrase and two percentages — which is `<body>` whenever
+  the phrase also appears outside the panel, as it does in Claude's settings
+  nav and in Codex's prose above the cards. Page furniture ("Storage 88%",
+  "Save 20%") was then inside the usage container. The panel is now found by
+  walking up from the marker to its first ancestor holding two percentages,
+  `<body>` is refused outright, and so is a container several times longer than
+  the rows it holds.
+- **The extractor's injection markers are filled in one pass.** Three chained
+  replaces rescanned inserted text, so a label reading `__AG_CATALOG__` spliced
+  JSON into a string literal and the whole extractor stopped parsing.
+- **`kind` is validated inside both path builders**, and a catalog is capped at
+  200 meters.
 
 ### Packaging
 
@@ -82,13 +137,18 @@ instead of a code change.
 
 ### Testing
 
-- 610 → 725 tests. Catalog loading, override merge and alias matching; the
-  seven-day gate including the clock-change case; adoption, its idempotence,
-  its cap and every junk rule; provenance including the email redaction and the
-  preservation of unknown fields; the catalog scan and the discovery scan
-  executed in node against a stub DOM with real containment; Codex polarity for
-  used, remaining and a bare percentage; and that a page relabel keeps one
-  history key rather than forking it.
+- 610 → 777 tests. Catalog loading, override merge, load order and alias
+  matching; the seven-day gate including the clock-change, future-stamp and
+  timezone cases; adoption, its idempotence, its cap and every junk rule,
+  including that a disabled meter is not adopted again and that a display-label
+  collision cannot fabricate a history rollover; provenance including the email
+  redaction and the preservation of unknown fields; the catalog scan and the
+  discovery scan executed in node against a stub DOM whose containers derive
+  their text from their children, covering the settings-nav layout, the
+  workspace-credit layout and nested wrappers; `node --check` on an extractor
+  built from a catalog whose label looks like an injection marker; Codex
+  polarity for used, remaining and a bare percentage; and that a page relabel
+  keeps one history key rather than forking it.
 
 ## 1.0.0+cfa.2 - 2026-08-10
 

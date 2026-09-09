@@ -253,8 +253,31 @@ added to a JSON file instead of a code change and a release.
 
 - **The primary path is untouched.** `readRow('Current session')` and
   `readRow('All models') || readRow('Weekly')` still run first and still seed
-  the catalog scan. A catalog bug can add rows; it cannot take Session or
-  Weekly away.
+  the catalog scan.
+- **An adopted row cannot affect Session/Weekly attribution.** This is the
+  invariant, and it did not hold when the catalog shipped: `ROW_LABELS` is the
+  *rival* set — `readRowText` refuses to attribute a percentage whose container
+  also names another meter — and it was built from every enabled alias,
+  adopted ones included. An adopted "Current" or "Opus" therefore made the
+  primary Session row `ambiguous`, which is an ERROR snapshot on every refresh,
+  permanently. `ROW_LABELS` is now built from **bundled specs only** (enabled
+  or not: a disabled meter's row is still on the page and can still steal a
+  number), and adoption additionally refuses any label that contains, or is
+  contained by, a known alias or label as whole words. Discovered meters are
+  read through `CATALOG`, which is a read list and not an attribution one.
+- **A meter is adopted with no window.** Same reasoning as `polarity` below:
+  inferring a period from the wording is a guess, and a wrong window makes an
+  active meter read "idle" instead of showing its number. `infer_window` is
+  gone rather than unused.
+- **A scan is stamped only from a page that produced an OK snapshot and that
+  actually had a usage container**, once per refresh. Stamping on any payload
+  carrying a `discovered` list meant a logged-out or half-rendered page adopted
+  its furniture permanently and burned the week's scan — including a scan the
+  user had just armed with "Re-scan meters now" — and stamped twice per
+  refresh, because `ScrapeRunner` rebuilds the snapshot after a transient
+  error. The extractor returns `discovered: null` when it never found a
+  container, so "found nothing" and "could not look" are distinguishable in
+  Python and in the log (`classification=discovery_no_container`).
 - **Discovery is local and adopts nothing that could matter.** It reads rows
   the page already rendered, adopts only inside the recognised usage container,
   and never sets `primary` — a row this build has never seen cannot take over
@@ -285,3 +308,24 @@ added to a JSON file instead of a code change and a release.
   labels the extractors already carried, and the discovery scan is exercised
   against reconstructed DOMs in node — the same evidence basis, and the same
   limitation, as §1.1 describes for the row readers.
+- **Nothing retires an adopted meter.** A row the page stops rendering keeps
+  its entry, and the 24-meter cap is a ratchet: once it is reached, a genuinely
+  new meter can never be adopted, because nothing below it is ever released.
+  Retiring an entry not seen in N consecutive scans would fix both, and it
+  belongs with the review dialog — a meter the user has approved must not be
+  retired behind their back.
+- **The junk blocklist is a substring list.** `_NON_METER_MARKERS` matches
+  anywhere in the normalized label, so a real meter named after one of those
+  words is refused ("Account credits" dies on "account"), while furniture
+  worded differently gets through. And `_LABEL_RE` is ASCII-only, so a
+  localised page adopts nothing at all. Both want the review dialog before
+  they want loosening: a refusal is invisible today, and that is what makes
+  either one hard to judge.
+- **A future bundled key could collide with an adopted one.** Adopted keys are
+  derived from the page label (`daily_agent_runs`), and nothing reserves them.
+  If a later release ships a bundled meter under a key some user's file already
+  holds, `load_catalog` merges the override *onto* the bundled entry and the
+  adopted label wins. `_drop_superseded` handles the common shape of this (an
+  adopted meter whose aliases the bundled catalog has since learned is dropped
+  at load), but not a key collision with different wording. Namespacing
+  adopted keys is the fix, and it is a file-format change.
