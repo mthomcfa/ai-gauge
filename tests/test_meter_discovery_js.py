@@ -205,19 +205,53 @@ _COLLAPSED_DOM: list[tuple[str, int, int | None]] = [
 ]
 
 
-def test_an_adopted_label_cannot_make_a_primary_row_unreadable():
+# The same collapsed element with the two meters the other way round. This is
+# the shape that decides the rule: readRowText takes the LAST percentage, so
+# here the adopted meter's number is the one Session walks off with.
+_COLLAPSED_DOM_SWAPPED: list[tuple[str, int, int | None]] = [
+    ("", 900, None),
+    ("Plan usage", 600, 0),
+    ("Current session Resets in 2 hr 59 min 64% used Cowork sessions 7% used", 40, 1),
+    ("Weekly Resets in 3 days 30% used", 40, 1),
+]
+
+
+@pytest.mark.parametrize("dom", [_COLLAPSED_DOM, _COLLAPSED_DOM_SWAPPED])
+def test_an_adopted_label_makes_a_shared_container_ambiguous(dom):
     """ROW_LABELS is the rival set, and a rival costs the row its number.
 
-    An adopted label that turns up inside the Session row made the primary
-    read `ambiguous` — an ERROR snapshot on every refresh, for as long as the
-    entry sat in the override file. Discovered meters are read through
-    CATALOG; only the meters this build ships belong in the rival set.
+    An adopted meter sharing a collapsed container with Session must cost
+    Session its percentage, not hand it the adopted meter's: readRowText takes
+    the LAST percentage in the container, so with "Cowork sessions" out of the
+    rival set the primary Session row reported 7% used as an OK snapshot.
+    Refusing is recoverable; a plausible wrong number is not.
     """
-    rows = _run(_claude_block(_with_extra(SOURCE_DISCOVERY)), _COLLAPSED_DOM,
+    rows = _run(_claude_block(_with_extra(SOURCE_DISCOVERY)), dom,
                 "readCatalogRows({})")
 
-    assert rows["session"]["ambiguous"] is False
-    assert rows["session"]["percent"] == 64
+    assert rows["session"]["ambiguous"] is True
+    assert rows["session"]["percent"] is None
+
+
+def test_an_adopted_label_still_leaves_every_row_readable_on_the_clean_page():
+    """The cost of the rule, measured: on a page that isolates its rows, none.
+
+    Every meter, primary and adopted alike, still reads its own number - the
+    rival rule only fires where two meters share one container and there is
+    genuinely no way to tell which percentage is whose.
+    """
+    rows = _run(_claude_block(_with_extra(SOURCE_DISCOVERY)), CLAUDE_DOM,
+                "readCatalogRows({})")
+
+    assert {key: row["percent"] for key, row in rows.items()} == {
+        "session": 64,
+        "weekly_all": 30,
+        "opus_only": 91,
+        "sonnet_only": 44,
+        "daily_routine_runs": 12,
+        "cowork_sessions": 7,
+    }
+    assert not any(row["ambiguous"] for row in rows.values())
 
 
 def test_a_bundled_rival_still_refuses_to_attribute_the_percentage():

@@ -816,19 +816,37 @@ def _row_labels(catalog) -> list[str]:
     return json.loads(extractor_source("__AG_ROW_LABELS__", catalog, discover=False))
 
 
-def test_the_rival_label_set_carries_bundled_meters_only(tmp_path):
+def test_the_rival_label_set_carries_every_meter_the_page_renders(tmp_path):
     """ROW_LABELS decides attribution, not what gets read.
 
-    A row whose container also names another meter has no attributable
-    percentage, so putting an adopted label in here lets a discovered row
-    make a *primary* meter unreadable.
+    ``readRowText`` takes the LAST percentage in the container it picked
+    unless a rival label is in there too, so a label missing from this set is
+    a meter whose number can be reported as another meter's. An adopted meter
+    sharing a collapsed container with Session made Session report the adopted
+    meter's percentage - silently, and as an OK snapshot.
     """
     adopt_rows("claude", [_row("Cowork sessions")], base_dir=tmp_path)
 
     labels = _row_labels(load_catalog("claude", base_dir=tmp_path))
 
-    assert "Cowork sessions" not in labels
-    assert labels == LEGACY_CLAUDE_ROW_LABELS
+    assert labels == LEGACY_CLAUDE_ROW_LABELS + ["Cowork sessions"]
+
+
+def test_a_hand_added_meter_also_counts_as_a_rival(tmp_path):
+    """A label the user typed names a row the page renders next to a number.
+
+    Refusing to attribute is recoverable and misattributing is not, and a bad
+    hand edit is undone by deleting the line that caused it.
+    """
+    _write_override(
+        tmp_path,
+        "claude",
+        [{"key": "mine", "label": "Team credits", "aliases": ["Team credits"]}],
+    )
+
+    catalog = load_catalog("claude", base_dir=tmp_path)
+    assert catalog.spec_for_key("mine").source == SOURCE_USER
+    assert "Team credits" in _row_labels(catalog)
 
 
 def test_a_disabled_bundled_meter_still_counts_as_a_rival(tmp_path):
@@ -836,6 +854,19 @@ def test_a_disabled_bundled_meter_still_counts_as_a_rival(tmp_path):
     _write_override(tmp_path, "claude", [{"key": "opus_only", "enabled": False}])
 
     assert "Opus only" in _row_labels(load_catalog("claude", base_dir=tmp_path))
+
+
+def test_a_display_label_is_not_a_rival(tmp_path):
+    """The page renders aliases.
+
+    "Session" is the Session meter's display label and a fragment of its alias
+    "Current session", so admitting display labels would make every collapsed
+    Session row ambiguous.
+    """
+    labels = _row_labels(bundled_catalog("claude"))
+
+    assert "Current session" in labels
+    assert "Session" not in labels
 
 
 def test_an_alias_that_looks_like_an_injection_marker_stays_data():

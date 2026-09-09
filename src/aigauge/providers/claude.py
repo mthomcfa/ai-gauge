@@ -46,11 +46,12 @@ log = logging.getLogger("aigauge.providers.claude")
 EXTRACTOR_TEMPLATE = r"""
 (() => {
   // Every meter either layout is known to render, injected from the meter
-  // catalog (providers/meter_catalog/claude.json plus the app-data override).
-  // This list is not decoration: findRowByLabel penalises a container that
-  // holds a rival label, and readRow refuses a container that holds a rival
-  // label *and* more than one percentage. A meter missing from here is a meter
-  // whose number can be silently reported as another meter's.
+  // catalog (providers/meter_catalog/claude.json plus the app-data override):
+  // bundled, discovered and hand-added alike, because the page renders them
+  // all. This list is not decoration: findRowByLabel penalises a container
+  // that holds a rival label, and readRow refuses a container that holds a
+  // rival label *and* more than one percentage. A meter missing from here is a
+  // meter whose number can be silently reported as another meter's.
   const ROW_LABELS = __AG_ROW_LABELS__;
   // [{key, label, aliases, boundaries, primary}] - one entry per meter the
   // catalog defines. Each becomes its own field on the snapshot.

@@ -60,8 +60,8 @@ MAX_EVIDENCE_CHARS = 200
 SOURCE_BUNDLED = "bundled"
 SOURCE_DISCOVERY = "discovery"
 # An entry that appeared in the override file with no provenance of its own:
-# somebody typed it. Only the packaged file is "bundled", which is what the
-# extractor's rival-label set keys off.
+# somebody typed it. Only the packaged file is "bundled"; the distinction is
+# what tells a reviewer which meters the app invented for itself.
 SOURCE_USER = "user"
 # Reserved for a review step: an entry whose status is not "active" is loaded
 # and preserved but not read. Nothing writes anything else yet.
@@ -974,21 +974,32 @@ def clear_scans(config: Any) -> None:
 # --- extractor plumbing ----------------------------------------------------
 
 
-def bundled_row_labels(catalog: MeterCatalog) -> list[str]:
+def rival_row_labels(catalog: MeterCatalog) -> list[str]:
     """The rival-label set the extractors score attribution against.
 
-    Bundled specs only, enabled or not. ROW_LABELS is not a list of meters to
-    read — ``readRowText`` refuses a percentage whose container also mentions
-    one of these, so an adopted "Current" or "Session" made the *primary*
-    Session row ambiguous and errored the whole snapshot on every refresh
-    thereafter. The rival set is about attributing the meters this build
-    ships; a meter the page taught us is read through CATALOG instead.
+    Every spec's aliases, enabled or not, whatever the entry's provenance.
+    ROW_LABELS is not a list of meters to read: ``readRowText`` takes the LAST
+    percentage in the container it picked unless a rival label is in there
+    too, so a meter missing from this set is a meter whose number can be
+    reported as another meter's. Claude collapses two meters into one
+    container often enough that an adopted "Cowork sessions" beside Session
+    made Session report 7% — silently, and as an OK snapshot.
+
+    Refusing to attribute is the safe direction and misattributing is not, so
+    hand-added entries are in here too: a label the user typed names a row the
+    page renders next to a number exactly as a discovered one does, and a bad
+    hand edit costs a refusal the user undoes by deleting the line they just
+    wrote — where an adopted entry used to come back on the next scan. The
+    fragment attack this set was briefly narrowed for ("Current", "Opus") is
+    refused at adoption by ``_collides_with_known`` instead.
+
+    Aliases only, not display labels: the page renders aliases, and a display
+    label that is a fragment of one ("Session" inside "Current session") would
+    make every collapsed row ambiguous.
     """
     seen: set[str] = set()
     out: list[str] = []
     for spec in catalog.specs:
-        if spec.source != SOURCE_BUNDLED:
-            continue
         for alias in spec.aliases:
             normalized = normalize_label(alias)
             if normalized and normalized not in seen:
@@ -1015,7 +1026,7 @@ def extractor_source(template: str, catalog: MeterCatalog, *, discover: bool) ->
     why.
     """
     values = {
-        "ROW_LABELS": json.dumps(bundled_row_labels(catalog)),
+        "ROW_LABELS": json.dumps(rival_row_labels(catalog)),
         "CATALOG": json.dumps(catalog.to_js()),
         "DISCOVER": "true" if discover else "false",
     }
