@@ -31,6 +31,7 @@ from aigauge.history import HistoryStore
 from aigauge.models import SnapshotStatus, UsageMetric, UsageSnapshot
 from aigauge.providers.catalog import (
     BREAKDOWN_TAG,
+    CATALOG_NO_CONTAINER_RETRY,
     CATALOG_SCAN_INTERVAL,
     MAX_ADOPTED_METERS,
     MAX_CATALOG_SPECS,
@@ -1191,10 +1192,16 @@ def test_a_build_retry_stamps_the_scan_exactly_once(fake_runner, monkeypatch):
     assert saves == [1]
 
 
-def test_a_scan_that_found_no_usage_container_is_not_a_completed_scan(
+def test_a_scan_that_found_no_usage_container_is_diagnosed_then_retried_daily(
     fake_runner, caplog
 ):
-    """"Found nothing" and "could not look" are different answers."""
+    """"Found nothing" and "could not look" are different answers.
+
+    The second is worth a log line, but it is the same line on every refresh:
+    a panel rendering fewer than two percentages keeps that shape until the
+    page changes, so leaving the scan due diagnosed it once a minute forever.
+    It comes due again in a day rather than a week.
+    """
     from aigauge.providers.claude import ClaudeProvider
 
     config = Config()
@@ -1204,8 +1211,39 @@ def test_a_scan_that_found_no_usage_container_is_not_a_completed_scan(
         snapshot = fake_runner.last["build"](_payload(discovered=None))
 
     assert snapshot.status == SnapshotStatus.OK
-    assert scan_due(config, "claude") is True
     assert "classification=discovery_no_container" in caplog.text
+    assert scan_due(config, "claude") is False
+    assert scan_due(
+        config, "claude", now=datetime.now() + CATALOG_NO_CONTAINER_RETRY
+    ) is True
+
+
+def test_codex_also_retries_a_missing_usage_container_daily(fake_runner):
+    """The same stamp, in the other provider's copy of it."""
+    from aigauge.providers.codex import CodexProvider
+
+    config = Config()
+    CodexProvider(config=config).refresh(lambda snapshot: None)
+
+    snapshot = fake_runner.last["build"](
+        {
+            "logged_out": False,
+            "session": {"percent": 42, "kind": "used", "reset_text": "1:55 PM"},
+            "weekly": {"percent": 61, "kind": "used", "reset_text": "Mon 6:00 PM"},
+            "title": "Codex",
+            "url": "https://chatgpt.com/codex/cloud/settings/analytics",
+            "body_text": "5 hour usage limit 42% used Weekly usage limit 61% used",
+            "has_percent_text": True,
+            "has_usage_text": True,
+            "discovered": None,
+        }
+    )
+
+    assert snapshot.status == SnapshotStatus.OK
+    assert scan_due(config, "codex") is False
+    assert scan_due(
+        config, "codex", now=datetime.now() + CATALOG_NO_CONTAINER_RETRY
+    ) is True
 
 
 def test_a_scan_that_found_nothing_new_still_counts(fake_runner):

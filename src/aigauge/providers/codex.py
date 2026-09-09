@@ -23,6 +23,7 @@ from .catalog import (
     extractor_source,
     load_catalog,
     metric_for_spec,
+    record_no_container_scan,
     record_scan,
     scan_due,
     unreadable_reason,
@@ -930,6 +931,14 @@ class CodexProvider(Provider):
                     payload=payload,
                     expected_rows=_EXPECTED_ROWS,
                 )
+                if "discovered" in payload:
+                    # The extractor ran the scan and answered null: there is
+                    # no panel it can find. Re-attempt daily rather than on
+                    # every refresh. A payload with no "discovered" key at all
+                    # is an extractor that never got that far, and that must
+                    # not spend the scan.
+                    scanned = True
+                    record_no_container_scan(self._config, "codex")
                 return snapshot
             scanned = True
             if adopt_rows("codex", discovered, account_id=self._account_id):

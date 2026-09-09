@@ -45,6 +45,13 @@ BREAKDOWN_TAG = "meter_breakdown"
 
 CATALOG_DIR_NAME = "meter_catalog"
 CATALOG_SCAN_INTERVAL = timedelta(days=7)
+# How long a scan that ran but found no usage panel waits before trying again.
+# A panel rendering fewer than two percentages is a page shape, not a blip, so
+# that answer repeats on every refresh - and with the scan left due it was
+# diagnosed in the log every time the tile refreshed, forever. Daily: often
+# enough to pick the panel back up the day it returns, rare enough to be one
+# log line.
+CATALOG_NO_CONTAINER_RETRY = timedelta(days=1)
 
 # Adoption guards. A discovered row has to look like a meter label - short,
 # alphabetic, with a percentage beside it - or the override file fills up with
@@ -1011,6 +1018,29 @@ def record_scan(
         config.save()
     except Exception:  # noqa: BLE001 - a scan stamp must never break a refresh
         log.exception("meter catalog: cannot persist the %s scan time", kind)
+
+
+def record_no_container_scan(
+    config: Any,
+    kind: str,
+    *,
+    now: datetime | None = None,
+    save: bool = True,
+) -> None:
+    """Stamp a scan that ran and found no usage panel to look in.
+
+    Not a completed scan - it read no rows and adopted nothing - so it is
+    backdated to leave ``CATALOG_NO_CONTAINER_RETRY`` of the interval rather
+    than the whole of it. Left due, the diagnosis was logged on every single
+    refresh for as long as the page kept that shape.
+    """
+    now = now or datetime.now()
+    record_scan(
+        config,
+        kind,
+        now=now - (CATALOG_SCAN_INTERVAL - CATALOG_NO_CONTAINER_RETRY),
+        save=save,
+    )
 
 
 def clear_scans(config: Any) -> None:
