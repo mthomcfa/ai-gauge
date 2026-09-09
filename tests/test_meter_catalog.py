@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import stat
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -455,6 +457,37 @@ def test_an_adopted_meter_can_be_switched_off_by_editing_the_override(tmp_path):
     assert load_catalog("claude", base_dir=tmp_path).spec_for_label(
         "Cowork sessions"
     ) is None
+
+
+def test_an_unreadable_override_is_preserved_before_it_is_replaced(tmp_path):
+    """A trailing comma must not cost the user their hand edits.
+
+    The write replaces the whole document, so an override file that cannot be
+    parsed is moved aside rather than discarded — the same treatment a
+    corrupt config gets.
+    """
+    path = tmp_path / "claude.json"
+    path.write_text(
+        '{"version": 1, "meters": [{"key": "mine", "enabled": false},]}',
+        encoding="utf-8",
+    )
+
+    adopt_rows("claude", [_row("Cowork sessions")], base_dir=tmp_path)
+
+    backup = tmp_path / "claude.json.corrupt"
+    assert backup.exists(), "the unreadable file was silently overwritten"
+    assert "mine" in backup.read_text(encoding="utf-8")
+    assert load_catalog("claude", base_dir=tmp_path).spec_for_label("Cowork sessions")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_the_override_file_is_written_owner_only_and_atomically(tmp_path):
+    """It carries page-derived labels and the account they were seen on."""
+    adopt_rows("claude", [_row("Cowork sessions")], base_dir=tmp_path)
+
+    path = tmp_path / "claude.json"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert [p.name for p in tmp_path.iterdir()] == ["claude.json"], "temp file left behind"
 
 
 def test_adoption_stops_at_the_cap(tmp_path):

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
@@ -32,6 +33,7 @@ from typing import Any, Iterable, Sequence
 
 from ..config import app_data_dir
 from ..models import UsageMetric
+from ..secret_storage import _atomic_write
 from ._common import normalize_percent
 from .idle import idle_reset_state
 
@@ -753,6 +755,28 @@ def row_evidence(row: Any) -> str | None:
     return _EMAIL_RE.sub("[redacted-email]", text)[:MAX_EVIDENCE_CHARS]
 
 
+def _quarantine_override(path: Path) -> None:
+    """Keep an unreadable override file rather than writing over it.
+
+    Mirrors ``config._quarantine_config``, for the same reason: the write
+    below replaces the whole document, so one trailing comma in a hand-edited
+    file used to cost the user every alias, window and disabled flag in it.
+    A single fixed suffix, so a repeatedly-failing load cannot fill the
+    directory.
+    """
+    backup = path.with_suffix(path.suffix + ".corrupt")
+    try:
+        os.replace(path, backup)
+    except OSError:
+        log.exception("meter catalog: could not preserve %s", path)
+        return
+    log.error(
+        "meter catalog: %s is not readable; previous contents preserved at %s",
+        path,
+        backup,
+    )
+
+
 def _write_override(
     kind: str,
     new_specs: Sequence[MeterSpec],
@@ -766,16 +790,27 @@ def _write_override(
         existing = _read_json(path)
         if isinstance(existing, dict):
             document = existing
-        meters = document.get("meters")
-        if not isinstance(meters, list):
-            meters = []
-        document["meters"] = [item for item in meters if isinstance(item, dict)]
+            meters = document.get("meters")
+            document["meters"] = (
+                [item for item in meters if isinstance(item, dict)]
+                if isinstance(meters, list)
+                else []
+            )
+        else:
+            _quarantine_override(path)
     document.setdefault("version", 1)
     document.setdefault("kind", kind)
     document["meters"].extend(_spec_to_raw(spec) for spec in new_specs)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+        # Same write discipline as the secrets file: a reader sees the old
+        # document or the new one, never half of either, and the file carries
+        # page-derived labels and an account id so it is owner-only.
+        _atomic_write(
+            path,
+            (json.dumps(document, indent=2) + "\n").encode("utf-8"),
+            mode=0o600,
+        )
     except OSError:
         log.exception("meter catalog: cannot write %s", path)
         return False
