@@ -107,10 +107,12 @@ _NON_METER_MARKERS = (
     "account",
     "profile",
     "notification",
-    "workspace",
     "resets",
     "reset in",
 )
+# Not on that list, deliberately: "workspace". Codex renders "Workspace monthly
+# credit limit", which is a real meter - the blocklist has to reject furniture
+# without rejecting a limit that happens to be named after where it applies.
 
 # Window inference for adopted meters. Only the wordings the existing meters
 # already use; anything else gets no window, which is safe (window only gates

@@ -822,3 +822,19 @@ def test_the_provider_records_the_account_a_meter_was_discovered_on(fake_runner)
     spec = load_catalog("claude").spec_for_label("Cowork sessions")
     assert spec.account_id == "claude-work"
     assert spec.evidence == "Cowork sessions 7% used resets 3 days"
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        # Codex's own shared-limit wording. The blocklist has to reject page
+        # furniture without rejecting a limit named after where it applies.
+        "Workspace monthly credit limit",
+        "Cowork sessions",
+        "Opus 4 only",
+        "Daily included routine runs",
+        "5 hour usage limit",
+    ],
+)
+def test_a_plausible_meter_name_is_not_mistaken_for_page_furniture(label):
+    assert is_adoptable_label(label) is True
