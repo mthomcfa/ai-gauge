@@ -82,7 +82,7 @@ instead of a code change.
 
 ### Testing
 
-- 610 → 720 tests. Catalog loading, override merge and alias matching; the
+- 610 → 725 tests. Catalog loading, override merge and alias matching; the
   seven-day gate including the clock-change case; adoption, its idempotence,
   its cap and every junk rule; provenance including the email redaction and the
   preservation of unknown fields; the catalog scan and the discovery scan
