@@ -29,8 +29,12 @@ from aigauge.providers.catalog import (
     BREAKDOWN_TAG,
     CATALOG_SCAN_INTERVAL,
     MAX_ADOPTED_METERS,
+    MAX_EVIDENCE_CHARS,
+    SOURCE_DISCOVERY,
+    STATUS_ACTIVE,
     MeterCatalog,
     MeterSpec,
+    _spec_to_raw,
     adopt_rows,
     bundled_catalog,
     clear_scans,
@@ -41,6 +45,7 @@ from aigauge.providers.catalog import (
     metric_for_spec,
     override_path,
     record_scan,
+    row_evidence,
     scan_due,
     unreadable_reason,
 )
@@ -656,3 +661,164 @@ def test_a_scrape_that_never_ran_discovery_does_not_record_a_scan(fake_runner):
     )
 
     assert scan_due(config, "claude") is True
+
+
+# --- provenance ------------------------------------------------------------
+#
+# A discovered meter is structurally identical to a bundled one, so without
+# provenance nobody can tell which meters the app invented for itself, when,
+# from which account, or on what evidence. A review step is going to need
+# exactly that, and it has to be recorded at adoption time - the page has
+# moved on by the time anyone looks.
+
+
+def _adopted(tmp_path, row=None, **kwargs):
+    rows = [row or _row("Cowork sessions")]
+    return adopt_rows("claude", rows, base_dir=tmp_path, **kwargs)[0]
+
+
+def test_an_adopted_meter_records_where_it_came_from(tmp_path):
+    now = datetime(2026, 9, 9, 14, 30, 5)
+
+    spec = _adopted(tmp_path, account_id="claude-work", now=now)
+
+    assert spec.source == SOURCE_DISCOVERY
+    assert spec.first_seen == "2026-09-09T14:30:05"
+    assert spec.account_id == "claude-work"
+    assert spec.evidence == "Cowork sessions 7% used resets 3 days"
+    assert spec.status == STATUS_ACTIVE
+
+
+def test_provenance_survives_the_round_trip_through_the_override_file(tmp_path):
+    now = datetime(2026, 9, 9, 14, 30, 5)
+    _adopted(tmp_path, account_id="claude-work", now=now)
+
+    reloaded = load_catalog("claude", base_dir=tmp_path).spec_for_label(
+        "Cowork sessions"
+    )
+
+    assert (reloaded.source, reloaded.account_id, reloaded.first_seen) == (
+        SOURCE_DISCOVERY,
+        "claude-work",
+        "2026-09-09T14:30:05",
+    )
+    assert reloaded.evidence == "Cowork sessions 7% used resets 3 days"
+
+
+def test_every_bundled_meter_declares_itself_bundled():
+    for kind in ("claude", "codex"):
+        for spec in bundled_catalog(kind).specs:
+            assert spec.source == "bundled", f"{kind}:{spec.key}"
+            assert spec.adopted is False
+            assert spec.first_seen is None and spec.evidence is None
+
+
+def test_an_adopted_meter_is_otherwise_shaped_like_a_bundled_one(tmp_path):
+    _adopted(tmp_path)
+    entry = json.loads((tmp_path / "claude.json").read_text(encoding="utf-8"))["meters"][0]
+    bundled = json.loads(
+        (REPO_ROOT / "src/aigauge/providers/meter_catalog/claude.json").read_text(
+            encoding="utf-8"
+        )
+    )["meters"][0]
+
+    assert set(bundled) <= set(entry), "an adopted entry is missing a structural field"
+    assert entry["primary"] is False
+
+
+def test_evidence_is_composed_from_the_row_not_copied_out_of_it(tmp_path):
+    """The raw row text can carry an account email; this file is one users open."""
+    row = _row(
+        "Cowork sessions",
+        raw="Signed in as someone@example.com Cowork sessions 7% used",
+        reset_text="3 days",
+    )
+
+    spec = _adopted(tmp_path, row=row)
+
+    assert "@example.com" not in (spec.evidence or "")
+    assert "someone" not in (spec.evidence or "")
+
+
+def test_an_email_in_the_label_itself_is_redacted(tmp_path):
+    assert "@" not in (row_evidence(_row("Plan for someone@example.com")) or "")
+    assert "[redacted-email]" in row_evidence(_row("Plan for someone@example.com"))
+
+
+def test_evidence_is_capped(tmp_path):
+    evidence = row_evidence(_row("A" * 400, reset_text="B" * 400))
+
+    assert len(evidence) <= MAX_EVIDENCE_CHARS
+
+
+def test_an_unknown_field_on_an_entry_is_preserved_not_eaten(tmp_path):
+    """A later release will add review state; an older loader must not drop it."""
+    _write_override(
+        tmp_path,
+        "claude",
+        [
+            {
+                "key": "cloud_runs",
+                "label": "Cloud runs",
+                "aliases": ["Cloud runs"],
+                "reviewed_by": "someone",
+                "review_note": {"decision": "keep"},
+            }
+        ],
+    )
+
+    spec = load_catalog("claude", base_dir=tmp_path).spec_for_key("cloud_runs")
+
+    assert spec.extra == {"reviewed_by": "someone", "review_note": {"decision": "keep"}}
+    assert _spec_to_raw(spec)["reviewed_by"] == "someone"
+
+
+def test_an_entry_awaiting_review_is_loaded_but_not_read(tmp_path):
+    """The hook the review step needs: `status` gates without deleting.
+
+    Nothing writes anything but "active" yet, so this changes no behaviour
+    today - it means a later release can park an entry without an older or a
+    newer loader disagreeing about what the file says.
+    """
+    _write_override(
+        tmp_path,
+        "claude",
+        [
+            {
+                "key": "cloud_runs",
+                "label": "Cloud runs",
+                "aliases": ["Cloud runs"],
+                "status": "pending",
+            }
+        ],
+    )
+
+    catalog = load_catalog("claude", base_dir=tmp_path)
+
+    assert catalog.spec_for_key("cloud_runs").status == "pending"
+    assert catalog.spec_for_label("Cloud runs") is None
+    assert "Cloud runs" not in catalog.aliases()
+
+
+def test_the_provider_records_the_account_a_meter_was_discovered_on(fake_runner):
+    from aigauge.providers.claude import ClaudeProvider
+
+    ClaudeProvider(account_id="claude-work", config=Config()).refresh(lambda s: None)
+    fake_runner.last["build"](
+        {
+            "logged_out": False,
+            "session": {"percent": 5, "kind": "used", "reset_text": "6 min"},
+            "weekly_all": {"percent": 26, "kind": "used", "reset_text": "Thu 9:59 AM"},
+            "title": "Claude",
+            "url": "https://claude.ai/settings/usage",
+            "body_text": "Plan usage Current session 5% used Weekly 26% used",
+            "discovered": [
+                {"label": "Cowork sessions", "percent": 7.0, "kind": "used",
+                 "reset_text": "3 days", "in_container": True},
+            ],
+        }
+    )
+
+    spec = load_catalog("claude").spec_for_label("Cowork sessions")
+    assert spec.account_id == "claude-work"
+    assert spec.evidence == "Cowork sessions 7% used resets 3 days"

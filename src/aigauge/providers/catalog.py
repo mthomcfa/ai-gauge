@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from importlib import resources
 from pathlib import Path
@@ -50,6 +50,17 @@ CATALOG_SCAN_INTERVAL = timedelta(days=7)
 # page furniture and every refresh grows another junk gauge.
 MAX_LABEL_CHARS = 40
 MAX_ADOPTED_METERS = 24
+MAX_EVIDENCE_CHARS = 200
+
+SOURCE_BUNDLED = "bundled"
+SOURCE_DISCOVERY = "discovery"
+# Reserved for a review step: an entry whose status is not "active" is loaded
+# and preserved but not read. Nothing writes anything else yet.
+STATUS_ACTIVE = "active"
+
+# Evidence is page text, and a usage page can carry an account email. Same
+# pattern as error_dialog's diagnostics redaction, for the same reason.
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 
 _KEY_RE = re.compile(r"[a-z0-9_]{1,64}")
 _KIND_RE = re.compile(r"[a-z0-9_]{1,32}")
@@ -128,6 +139,9 @@ class MeterSpec:
 
     ``key`` addresses the row in the extractor payload, ``label`` is what the
     user (and ``history``) sees, ``aliases`` are the labels the page may render.
+    A discovered meter is structurally identical to a bundled one; what marks
+    it is its provenance (``source`` and the three fields below it), which is
+    what a reviewer needs to judge whether it should have been adopted.
     """
 
     key: str
@@ -142,8 +156,20 @@ class MeterSpec:
     # percentage. Unset everywhere by default: guessing polarity is how a quota
     # monitor reports 42% left as 42% consumed.
     polarity: str | None = None
-    adopted: bool = False
     enabled: bool = True
+    # --- provenance ---
+    source: str = SOURCE_BUNDLED
+    status: str = STATUS_ACTIVE
+    first_seen: str | None = None
+    account_id: str | None = None
+    evidence: str | None = None
+    # Fields this build does not know about, carried through untouched so a
+    # later release can add one without an older loader eating it.
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def adopted(self) -> bool:
+        return self.source == SOURCE_DISCOVERY
 
     def matches(self, label: Any) -> bool:
         normalized = normalize_label(label)
@@ -169,7 +195,9 @@ class MeterCatalog:
 
     @property
     def enabled_specs(self) -> tuple[MeterSpec, ...]:
-        return tuple(spec for spec in self.specs if spec.enabled)
+        return tuple(
+            spec for spec in self.specs if spec.enabled and spec.status == STATUS_ACTIVE
+        )
 
     def aliases(self) -> tuple[str, ...]:
         """Every enabled alias, de-duplicated, in catalog order."""
@@ -227,6 +255,13 @@ def _coerce_polarity(value: Any) -> str | None:
     return text if text in ("used", "remaining") else None
 
 
+def _coerce_optional_str(value: Any, *, limit: int = 200) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text[:limit] if text else None
+
+
 def _spec_from_raw(raw: Any) -> MeterSpec | None:
     if not isinstance(raw, dict):
         return None
@@ -239,6 +274,9 @@ def _spec_from_raw(raw: Any) -> MeterSpec | None:
     if not label or not aliases:
         log.warning("meter catalog: dropping entry %s without a label/aliases", key)
         return None
+    source = str(raw.get("source") or "").strip().lower()
+    if not source:
+        source = SOURCE_DISCOVERY if raw.get("adopted") else SOURCE_BUNDLED
     return MeterSpec(
         key=key,
         label=label,
@@ -247,9 +285,44 @@ def _spec_from_raw(raw: Any) -> MeterSpec | None:
         primary=bool(raw.get("primary")),
         boundaries=_coerce_str_tuple(raw.get("boundaries")),
         polarity=_coerce_polarity(raw.get("polarity")),
-        adopted=bool(raw.get("adopted")),
         enabled=raw.get("enabled") is not False,
+        source=source,
+        status=str(raw.get("status") or STATUS_ACTIVE).strip().lower(),
+        first_seen=_coerce_optional_str(raw.get("first_seen")),
+        account_id=_coerce_optional_str(raw.get("account_id")),
+        evidence=_coerce_optional_str(raw.get("evidence"), limit=MAX_EVIDENCE_CHARS),
+        extra=_unknown_fields(raw),
     )
+
+
+# Everything ``_spec_to_raw`` writes back. Anything else in an entry belongs to
+# a newer build than this one and is carried through untouched.
+_KNOWN_FIELDS = frozenset(
+    {
+        "key",
+        "label",
+        "aliases",
+        "window_seconds",
+        "primary",
+        "boundaries",
+        "polarity",
+        "enabled",
+        "source",
+        "status",
+        "first_seen",
+        "account_id",
+        "evidence",
+        "adopted",
+    }
+)
+
+
+def _unknown_fields(raw: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in raw.items()
+        if isinstance(key, str) and key not in _KNOWN_FIELDS
+    }
 
 
 def _meters_from_document(data: Any) -> list[dict[str, Any]]:
@@ -324,6 +397,15 @@ def _apply_override(spec: MeterSpec, raw: dict[str, Any]) -> MeterSpec:
         changes["polarity"] = _coerce_polarity(raw.get("polarity"))
     if "enabled" in raw:
         changes["enabled"] = raw.get("enabled") is not False
+    if "status" in raw:
+        changes["status"] = str(raw.get("status") or STATUS_ACTIVE).strip().lower()
+    for name, limit in (("first_seen", 200), ("account_id", 200),
+                        ("evidence", MAX_EVIDENCE_CHARS)):
+        if name in raw:
+            changes[name] = _coerce_optional_str(raw.get(name), limit=limit)
+    unknown = _unknown_fields(raw)
+    if unknown:
+        changes["extra"] = {**spec.extra, **unknown}
     return replace(spec, **changes) if changes else spec
 
 
@@ -496,13 +578,21 @@ def _spec_to_raw(spec: MeterSpec) -> dict[str, Any]:
         ),
         "primary": spec.primary,
         "enabled": spec.enabled,
+        # Provenance. A discovered entry is structurally identical to a bundled
+        # one, so without these a reader cannot tell which meters the app
+        # invented for itself, when, from which account, or on what evidence.
+        "source": spec.source,
+        "status": spec.status,
     }
     if spec.boundaries:
         raw["boundaries"] = list(spec.boundaries)
     if spec.polarity:
         raw["polarity"] = spec.polarity
-    if spec.adopted:
-        raw["adopted"] = True
+    for name in ("first_seen", "account_id", "evidence"):
+        value = getattr(spec, name)
+        if value:
+            raw[name] = value
+    raw.update(spec.extra)
     return raw
 
 
@@ -510,17 +600,22 @@ def adopt_rows(
     kind: str,
     rows: Any,
     *,
+    account_id: str | None = None,
     base_dir: Path | None = None,
+    now: datetime | None = None,
 ) -> list[MeterSpec]:
     """Add unrecognized discovered rows to the override file.
 
     Adopted meters are always informational (``primary`` false): a page row the
-    app has never seen must not be able to take over the tray colour. Returns
-    the specs written, which is empty in the normal case where the page shows
-    nothing new.
+    app has never seen must not be able to take over the tray colour. Each one
+    records where it came from — ``source``, ``first_seen``, the account it was
+    seen on, and the row text that justified it — because a meter the app
+    invented for itself has to be reviewable afterwards. Returns the specs
+    written, which is empty in the normal case where the page shows nothing new.
     """
     if not isinstance(rows, list) or not rows:
         return []
+    first_seen = (now or datetime.now()).replace(microsecond=0).isoformat()
     catalog = load_catalog(kind, base_dir=base_dir)
     existing_adopted = sum(1 for spec in catalog.specs if spec.adopted)
     taken_keys = {spec.key for spec in catalog.specs}
@@ -548,7 +643,11 @@ def adopt_rows(
                 aliases=(label,),
                 window=infer_window(label),
                 primary=False,
-                adopted=True,
+                source=SOURCE_DISCOVERY,
+                status=STATUS_ACTIVE,
+                first_seen=first_seen,
+                account_id=account_id,
+                evidence=row_evidence(row),
             )
         )
 
@@ -558,13 +657,42 @@ def adopt_rows(
         return []
     for spec in adopted:
         log.info(
-            "meter catalog: adopted %s meter key=%s label=%r window=%s",
+            "meter catalog: adopted %s meter key=%s label=%r window=%s account=%s "
+            "evidence=%r",
             kind,
             spec.key,
             spec.label,
             spec.window,
+            spec.account_id,
+            spec.evidence,
         )
     return adopted
+
+
+def row_evidence(row: Any) -> str | None:
+    """What the page showed that justified adopting this row.
+
+    Composed from the fields the decision actually used rather than copied out
+    of ``raw``: a rendered row can carry an account email, and this string is
+    written to a file the user is told to open. Emails are redacted the way the
+    diagnostics blob redacts them, and the whole thing is capped.
+    """
+    if not isinstance(row, dict):
+        return None
+    percent = row.get("percent")
+    parts = [clean_label(row.get("label"))]
+    if isinstance(percent, (int, float)) and not isinstance(percent, bool):
+        parts.append(f"{percent:g}%")
+    kind = str(row.get("kind") or "").strip().lower()
+    if kind in ("used", "remaining"):
+        parts.append(kind)
+    reset_text = clean_label(row.get("reset_text"))
+    if reset_text:
+        parts.append(f"resets {reset_text}")
+    text = " ".join(part for part in parts if part).strip()
+    if not text:
+        return None
+    return _EMAIL_RE.sub("[redacted-email]", text)[:MAX_EVIDENCE_CHARS]
 
 
 def _write_override(

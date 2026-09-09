@@ -592,7 +592,11 @@ class ClaudeProvider(Provider):
         def _build(payload: dict[str, Any]) -> UsageSnapshot:
             snapshot_catalog = catalog
             if discover and isinstance(payload.get("discovered"), list):
-                if adopt_rows("claude", payload["discovered"]):
+                if adopt_rows(
+                    "claude",
+                    payload["discovered"],
+                    account_id=self._account_id,
+                ):
                     snapshot_catalog = load_catalog("claude")
                 record_scan(self._config, "claude")
             return _build_snapshot(

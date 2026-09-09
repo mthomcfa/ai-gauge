@@ -7,49 +7,56 @@
       "label": "Session",
       "aliases": ["Current session"],
       "window_seconds": 18000,
-      "primary": true
+      "primary": true,
+      "source": "bundled"
     },
     {
       "key": "weekly_all",
       "label": "Weekly",
       "aliases": ["All models", "Weekly"],
       "window_seconds": 604800,
-      "primary": true
+      "primary": true,
+      "source": "bundled"
     },
     {
       "key": "opus_only",
       "label": "Opus only",
       "aliases": ["Opus only"],
       "window_seconds": 604800,
-      "primary": false
+      "primary": false,
+      "source": "bundled"
     },
     {
       "key": "sonnet_only",
       "label": "Sonnet only",
       "aliases": ["Sonnet only"],
       "window_seconds": 604800,
-      "primary": false
+      "primary": false,
+      "source": "bundled"
     },
     {
       "key": "cowork_only",
       "label": "Cowork only",
       "aliases": ["Cowork only"],
       "window_seconds": null,
-      "primary": false
+      "primary": false,
+      "source": "bundled"
     },
     {
       "key": "claude_design",
       "label": "Claude Design",
       "aliases": ["Claude Design"],
       "window_seconds": null,
-      "primary": false
+      "primary": false,
+      "source": "bundled"
     },
     {
       "key": "daily_routine_runs",
       "label": "Daily routine runs",
       "aliases": ["Daily included routine runs"],
       "window_seconds": 86400,
-      "primary": false
+      "primary": false,
+      "source": "bundled"
     }
   ]
 }

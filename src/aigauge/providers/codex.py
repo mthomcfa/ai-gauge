@@ -785,7 +785,11 @@ class CodexProvider(Provider):
         def _build(payload: dict[str, Any]) -> UsageSnapshot:
             snapshot_catalog = catalog
             if discover and isinstance(payload.get("discovered"), list):
-                if adopt_rows("codex", payload["discovered"]):
+                if adopt_rows(
+                    "codex",
+                    payload["discovered"],
+                    account_id=self._account_id,
+                ):
                     snapshot_catalog = load_catalog("codex")
                 record_scan(self._config, "codex")
             return _build_snapshot(
