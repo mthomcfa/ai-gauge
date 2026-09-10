@@ -108,6 +108,10 @@ MAX_QUERY_ROWS = 50_000
 # Currency codes are three letters and service names are a phrase. Both come
 # off the wire and both reach a Qt label and current.json.
 CURRENCY_MAX_LEN = 8
+# The same ceiling AzureConfig puts on a typed allowance. A budget above it is
+# not a denominator - 1e308 is finite, passes _to_float, and renders every
+# possible spend as 0%.
+MAX_ALLOWANCE = 100_000_000.0
 SERVICE_NAME_MAX_LEN = 120
 
 _PERMISSION_HINT = (
@@ -1247,6 +1251,12 @@ def fetch_budget(
         # float("inf") > 0 is True - an infinite denominator reads as 0%.
         value = _to_float(properties.get("amount"))
         if value <= 0:
+            continue
+        if value > MAX_ALLOWANCE:
+            note = (
+                "An Azure Budget exists but its amount is implausibly large; "
+                "using the allowance from Settings."
+            )
             continue
         if not _budget_scope_matches(properties, resource_group):
             note = (

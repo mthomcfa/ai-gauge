@@ -1847,3 +1847,13 @@ def test_foundry_resource_count_counts_resources_that_actually_spent(
     assert snapshot.raw["foundry_resource_count"] == 1
     foundry = next(m for m in snapshot.metrics if m.label == az.FOUNDRY_BUCKET)
     assert "1 Foundry resource." in (foundry.note or "")
+
+
+@responses.activate
+def test_an_absurdly_large_budget_is_refused_rather_than_pinning_the_gauge_at_zero():
+    """1e308 is finite, so _to_float passes it - and total/1e308*100 rounds to
+    zero. AzureConfig caps a typed allowance at the same ceiling."""
+    _budgets(_budget(1e308))
+    got, _grain, note = az.fetch_budget("tok", SUB, currency="CAD")
+    assert got is None
+    assert note
