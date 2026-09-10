@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import threading
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -625,9 +626,15 @@ def retry_after_seconds(headers: Any) -> int:
             and lowered.endswith("-retry-after")
         ):
             try:
-                values.append(int(float(str(value).strip())))
-            except (TypeError, ValueError):
+                number = float(str(value).strip())
+            except (TypeError, ValueError, OverflowError):
                 continue
+            # int(float("inf")) raises OverflowError, and this call sits inside
+            # the `raise AzureThrottled(...)` expression: letting it escape
+            # discarded the server's own back-off along with the 429 handling.
+            if not math.isfinite(number):
+                continue
+            values.append(int(number))
     positive = [v for v in values if v > 0]
     if not positive:
         return int(MIN_FETCH_INTERVAL.total_seconds())
@@ -959,7 +966,8 @@ def fetch_foundry_resource_ids(token: str, subscription_id: str) -> set[str]:
         payload = _json(response)
         if not isinstance(payload, dict):
             break
-        for item in payload.get("value") or []:
+        items = payload.get("value")
+        for item in items if isinstance(items, list) else []:
             if not isinstance(item, dict):
                 continue
             if str(item.get("kind") or "").strip().lower() != FOUNDRY_ACCOUNT_KIND:
@@ -967,7 +975,10 @@ def fetch_foundry_resource_ids(token: str, subscription_id: str) -> set[str]:
             resource_id = item.get("id")
             if isinstance(resource_id, str) and resource_id:
                 found.add(resource_id.lower())
-        url = payload.get("nextLink") or ""
+        # nextLink is server-supplied and is not guaranteed to be a string:
+        # a non-string one used to raise AttributeError out of the whole fetch.
+        next_link = payload.get("nextLink")
+        url = next_link if isinstance(next_link, str) else ""
         if url and not url.startswith(f"{MANAGEMENT_HOST}/"):
             # nextLink is server-supplied; only follow it back to ARM.
             break
@@ -987,8 +998,13 @@ class _State:
     # registration would otherwise keep serving the old tenant's numbers - and,
     # worse, a user who has just fixed a wrong client secret would keep seeing
     # the auth error for the rest of the backoff window. See _identity().
-    identity: tuple[str, str, str] | None = None
+    identity: tuple | None = None
     last_fetch_at: datetime | None = None
+    # Set before a work item is dispatched and cleared when it finishes. Two
+    # refreshes arriving before the first completes would otherwise both pass
+    # the gate, because the gate only short-circuits on state that a *finished*
+    # fetch leaves behind.
+    in_flight: bool = False
     blocked_until: datetime | None = None
     consecutive_errors: int = 0
     aggregate: AzureAggregate | None = None
@@ -1045,7 +1061,10 @@ def next_allowed_at(state: _State) -> datetime | None:
 
 
 def _error_backoff(consecutive_errors: int) -> timedelta:
-    seconds = MIN_FETCH_INTERVAL.total_seconds() * (2 ** max(0, consecutive_errors - 1))
+    # The exponent is capped: 2 ** 1029 overflows the float multiply, and
+    # anything past the 6 h ceiling is the same wait either way.
+    exponent = min(max(0, consecutive_errors - 1), 32)
+    seconds = MIN_FETCH_INTERVAL.total_seconds() * (2 ** exponent)
     return timedelta(seconds=min(seconds, MAX_ERROR_BACKOFF.total_seconds()))
 
 
@@ -1098,6 +1117,19 @@ class AzureProvider(Provider):
         state = state_for(subscription_id)
         now = datetime.now()
 
+        # A clock that jumped forward (bad RTC, an NTP correction, a DST
+        # fall-back) leaves stamps in the future that no elapsed time can ever
+        # reach, which would park the tile on its cached number forever. A
+        # last_fetch_at later than now is impossible; a blocked_until further
+        # out than the largest back-off we can produce is too.
+        if state.last_fetch_at is not None and state.last_fetch_at > now:
+            state.last_fetch_at = None
+        if (
+            state.blocked_until is not None
+            and state.blocked_until > now + MAX_ERROR_BACKOFF
+        ):
+            state.blocked_until = None
+
         identity = _identity(tenant_id, client_id, secret)
         if state.identity is not None and state.identity != identity:
             # Re-pointed at a different app registration: everything cached
@@ -1115,6 +1147,20 @@ class AzureProvider(Provider):
         # fire every five minutes when the user is active, and every minute
         # while any provider is erroring; this is the only thing standing
         # between that loop and a tenant-wide rate limit.
+        def serve_cache() -> None:
+            on_done(
+                build_snapshot(state.aggregate, azure_cfg, fetched_at=state.fetched_at)
+            )
+
+        if state.in_flight:
+            # A fetch is out. Dispatching a second one would double the request
+            # count for a number that is about to arrive anyway.
+            if state.aggregate is not None:
+                serve_cache()
+            else:
+                on_done(_error("An Azure fetch is already in progress."))
+            return
+
         allowed_at = next_allowed_at(state)
         if allowed_at is not None and now < allowed_at:
             if state.aggregate is not None:
@@ -1123,27 +1169,58 @@ class AzureProvider(Provider):
                     "classification=throttled_serving_cache next_fetch_in_s=%s",
                     int((allowed_at - now).total_seconds()),
                 )
-                on_done(
-                    build_snapshot(
-                        state.aggregate, azure_cfg, fetched_at=state.fetched_at
-                    )
-                )
+                serve_cache()
                 return
             if state.last_error is not None:
                 on_done(state.last_error)
                 return
+            # Nothing cached and nothing remembered, but the window is still
+            # shut. Falling through to a live fetch here is what let a single
+            # unexpected exception - which leaves the state blank - turn the
+            # hourly floor into a fetch on every refresh cycle. The gate fails
+            # closed instead: no state to serve is not permission to fetch.
+            minutes = max(1, int((allowed_at - now).total_seconds() // 60))
+            log.info(
+                "provider api diagnosis provider=azure "
+                "classification=throttled_no_cache next_fetch_in_s=%s",
+                int((allowed_at - now).total_seconds()),
+            )
+            on_done(
+                _error(
+                    f"Waiting for the next Azure fetch window ({minutes} min)."
+                )
+            )
+            return
 
         state.last_fetch_at = now
+        state.in_flight = True
 
         def work() -> UsageSnapshot:
-            return self._fetch(
-                state,
-                azure_cfg,
-                tenant_id=tenant_id,
-                client_id=client_id,
-                client_secret=secret,
-                subscription_id=subscription_id,
-            )
+            try:
+                return self._fetch(
+                    state,
+                    azure_cfg,
+                    tenant_id=tenant_id,
+                    client_id=client_id,
+                    client_secret=secret,
+                    subscription_id=subscription_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Anything _fetch does not name still has to be *recorded*:
+                # an exception that leaves _State blank is an exception that
+                # switches the throttle off. The type name only - a message
+                # can carry the request URL, and with it the subscription id.
+                log.exception(
+                    "provider api diagnosis provider=azure "
+                    "classification=unexpected_exception type=%s",
+                    type(exc).__name__,
+                )
+                return self._remember_error(
+                    state,
+                    _error(f"Azure refresh failed ({type(exc).__name__})."),
+                )
+            finally:
+                state.in_flight = False
 
         self._run_async(work, on_done)
 
@@ -1322,7 +1399,8 @@ class AzureProvider(Provider):
         except AzurePermissionError:
             notes.append("Offer type unknown (Reader role missing).")
             return None
-        except (requests.HTTPError, requests.RequestException):
+        except Exception:  # noqa: BLE001 - this layer is tolerant by design:
+            # discovery failure is a note, never the reason the tile breaks.
             return None
 
     def _safe_foundry_ids(
@@ -1336,7 +1414,7 @@ class AzureProvider(Provider):
                 "resource ids under Settings → Microsoft → Foundry."
             )
             return set()
-        except (requests.HTTPError, requests.RequestException):
+        except Exception:  # noqa: BLE001 - tolerant by design; see above.
             return set()
 
     def _safe_budget(
@@ -1395,13 +1473,14 @@ class AzureProvider(Provider):
             def run(self_inner) -> None:  # noqa: N805
                 try:
                     snapshot = work()
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:  # noqa: BLE001 - work() already
+                    # records its own failures; this only covers the dispatch.
                     log.exception(
                         "provider api diagnosis provider=azure "
                         "classification=unexpected_exception type=%s",
                         type(exc).__name__,
                     )
-                    snapshot = _error(str(exc))
+                    snapshot = _error(f"Azure refresh failed ({type(exc).__name__}).")
                 on_done(snapshot)
 
         pool = self._pool or QThreadPool.globalInstance()

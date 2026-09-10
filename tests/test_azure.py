@@ -899,3 +899,156 @@ def test_egress_stays_on_the_two_declared_hosts(monkeypatch, config):
     _run(az.AzureProvider(config), monkeypatch)
     hosts = {requests.utils.urlparse(c.request.url).hostname for c in responses.calls}
     assert hosts <= {"login.microsoftonline.com", "management.azure.com"}
+
+
+# --- the throttle must never fail open -------------------------------------
+#
+# The hourly floor is the module's single safety property: Cost Management
+# quotas are tenant-wide, and the refresh loop above this fires every minute
+# while any provider is erroring. Every test here is about what happens when a
+# response is not the shape the code expected.
+
+
+class _InlinePool:
+    """A QThreadPool double that runs the runnable on this thread.
+
+    ``_run`` monkeypatches ``_run_async`` away, so the real ``_Worker.run`` -
+    including its blanket handler - is otherwise never executed by the suite.
+    """
+
+    def __init__(self):
+        self.started = 0
+
+    def start(self, runnable):
+        self.started += 1
+        runnable.run()
+
+
+def _run_through_pool(provider):
+    captured: list = []
+    provider.refresh(captured.append)
+    return captured[0]
+
+
+@pytest.mark.parametrize(
+    "raw", ["inf", "Infinity", "1e400", "9" * 400, "nan", "-inf", "-Infinity"]
+)
+def test_retry_after_ignores_non_finite_headers(raw):
+    """int(float("inf")) raises OverflowError, which used to escape the 429
+    handler entirely and take the whole back-off with it."""
+    assert az.retry_after_seconds({"Retry-After": raw}) == int(
+        az.MIN_FETCH_INTERVAL.total_seconds()
+    )
+
+
+@responses.activate
+def test_a_429_with_a_hostile_retry_after_still_records_a_backoff(monkeypatch, config):
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    responses.replace(
+        responses.POST,
+        QUERY_URL,
+        json={},
+        status=429,
+        headers={"x-ms-ratelimit-microsoft.costmanagement-qpu-retry-after": "inf"},
+    )
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+    assert snapshot.status == SnapshotStatus.ERROR
+    state = az.state_for(SUB)
+    assert state.blocked_until is not None, "the 429 back-off was thrown away"
+    assert state.last_error is not None
+
+
+@responses.activate
+def test_an_unexpected_exception_is_recorded_and_holds_the_hourly_floor(
+    monkeypatch, config
+):
+    """A non-string nextLink used to raise past _fetch, leaving _State blank -
+    and the gate only engages when the state is *not* blank."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    responses.replace(
+        responses.GET,
+        ACCOUNTS_URL,
+        json={"value": [], "nextLink": {"href": "x"}},
+        status=200,
+    )
+    pool = _InlinePool()
+    provider = az.AzureProvider(config, pool=pool)
+
+    _run_through_pool(provider)
+    calls = len(responses.calls)
+    state = az.state_for(SUB)
+    assert state.aggregate is not None or state.last_error is not None
+
+    second = _run_through_pool(provider)
+    assert len(responses.calls) == calls, "second refresh went back to the network"
+    assert second is not None
+    assert pool.started == 1, "a second work item was dispatched inside the window"
+
+
+@responses.activate
+def test_a_fetch_already_in_flight_dispatches_nothing_more(monkeypatch, config):
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+
+    dispatched: list = []
+
+    class _HoldingPool:
+        def start(self, runnable):
+            dispatched.append(runnable)
+
+    provider = az.AzureProvider(config, pool=_HoldingPool())
+    provider.refresh(lambda snap: None)
+    provider.refresh(lambda snap: None)
+    assert len(dispatched) == 1, "two live fetches were dispatched at once"
+
+
+@responses.activate
+def test_a_last_fetch_at_in_the_future_does_not_freeze_the_tile(monkeypatch, config):
+    """A bad RTC or an NTP correction must not park the tile for ten years."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    state = az.state_for(SUB)
+    state.last_fetch_at = datetime.now() + timedelta(days=3650)
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+    assert snapshot.status == SnapshotStatus.OK
+    assert az.state_for(SUB).last_fetch_at < datetime.now() + timedelta(minutes=1)
+
+
+@responses.activate
+def test_the_throttle_gate_fails_closed_with_nothing_to_serve(monkeypatch, config):
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    state = az.state_for(SUB)
+    state.blocked_until = datetime.now() + timedelta(minutes=42)
+
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+    assert snapshot.status == SnapshotStatus.ERROR
+    assert "window" in (snapshot.error or "")
+    assert not responses.calls, "the gate fell through to a live fetch"
+
+
+@pytest.mark.parametrize("bad", [{"a": 1}, 12345, True, ["x"]])
+@responses.activate
+def test_a_non_string_nextlink_is_not_followed_and_does_not_raise(bad):
+    responses.add(
+        responses.GET,
+        ACCOUNTS_URL,
+        json={"value": [{"id": FOUNDRY_ID, "kind": "AIServices"}], "nextLink": bad},
+        status=200,
+    )
+    assert az.fetch_foundry_resource_ids("tok", SUB) == {FOUNDRY_ID.lower()}
+    assert len(responses.calls) == 1
+
+
+@pytest.mark.parametrize("bad", [12345, "abc", {"a": 1}, None])
+@responses.activate
+def test_a_non_list_value_in_discovery_does_not_raise(bad):
+    responses.add(responses.GET, ACCOUNTS_URL, json={"value": bad}, status=200)
+    assert az.fetch_foundry_resource_ids("tok", SUB) == set()
+
+
+def test_the_error_backoff_exponent_is_capped():
+    """~1030 consecutive errors used to raise OverflowError out of the backoff."""
+    assert az._error_backoff(5000) == az.MAX_ERROR_BACKOFF
