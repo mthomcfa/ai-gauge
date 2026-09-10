@@ -108,11 +108,11 @@ MAX_QUERY_ROWS = 50_000
 # Currency codes are three letters and service names are a phrase. Both come
 # off the wire and both reach a Qt label and current.json.
 CURRENCY_MAX_LEN = 8
+SERVICE_NAME_MAX_LEN = 120
 # The same ceiling AzureConfig puts on a typed allowance. A budget above it is
 # not a denominator - 1e308 is finite, passes _to_float, and renders every
 # possible spend as 0%.
 MAX_ALLOWANCE = 100_000_000.0
-SERVICE_NAME_MAX_LEN = 120
 
 _PERMISSION_HINT = (
     "Grant the app registration Cost Management Reader (for cost queries, "
@@ -461,10 +461,9 @@ def bucket_costs(
 
     ranked = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
     # Foundry is never folded into "Other": it is the row the tile exists to
-    # show, and a quiet month would otherwise hide it.
-    # Pinned on the bucket name alone: a Foundry row that spent 0.00 this
-    # month is still the row the tile exists to show, and folding it into
-    # "Other" is exactly the quiet month the pin is for.
+    # show, and a quiet month would otherwise hide it. Pinned on the bucket
+    # name alone - a Foundry row that spent 0.00 is still that row, and a
+    # quiet month is exactly what the pin is for.
     pinned = [pair for pair in ranked if pair[0] == FOUNDRY_BUCKET]
     rest = [pair for pair in ranked if pair not in pinned]
     top_rows = max(1, min(MAX_BREAKDOWN_ROWS, top_rows))
@@ -474,9 +473,10 @@ def bucket_costs(
         other_total = sum(cost for _, cost in remainder)
         # "services" only when they all are: the Marketplace row is a bucket,
         # not a service, and counting it as one mis-states what the row holds.
+        non_services = (FOUNDRY_BUCKET, MARKETPLACE_BUCKET)
         noun = (
             "buckets"
-            if any(name in (FOUNDRY_BUCKET, MARKETPLACE_BUCKET) for name, _ in remainder)
+            if any(name in non_services for name, _ in remainder)
             else "services"
         )
         keep.append((f"Other ({len(remainder)} {noun})", other_total))
@@ -870,7 +870,8 @@ def _scope(subscription_id: str) -> str:
     # settings dialog validates before assigning, but neither is in this call
     # path, and this is the last place that can still refuse. Same shape as
     # opencode_go.usage_url(), which re-runs its validator at the point of use.
-    return f"{MANAGEMENT_HOST}/subscriptions/{validate_azure_guid(subscription_id, 'subscription id')}"
+    checked = validate_azure_guid(subscription_id, "subscription id")
+    return f"{MANAGEMENT_HOST}/subscriptions/{checked}"
 
 
 def _charge_type_filter() -> dict:

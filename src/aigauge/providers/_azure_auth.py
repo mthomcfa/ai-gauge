@@ -80,7 +80,8 @@ def token_endpoint(tenant_id: str) -> str:
     # was stored; the ValueError surfaces as "Azure is not configured".
     from ..config import validate_azure_guid
 
-    return f"{LOGIN_HOST}/{validate_azure_guid(tenant_id, 'tenant id')}/oauth2/v2.0/token"
+    checked = validate_azure_guid(tenant_id, "tenant id")
+    return f"{LOGIN_HOST}/{checked}/oauth2/v2.0/token"
 
 
 def clear_cache() -> None:
