@@ -48,9 +48,11 @@ Copilot is unchanged and simply moves under it. Azure is new.
   produce one (omitted, not errored, when it does not), and a "Marketplace
   models" row behind a settings toggle, which costs a second query.
 
-- **Allowance from a real Azure Budget when one exists.** A monthly cost Budget
-  on the subscription is used in preference to the number typed into Settings,
-  so the figure does not have to be kept in two places.
+- **Allowance from a real Azure Budget when one exists.** Leave the Settings
+  allowance at 0 and a monthly cost Budget on the subscription is used
+  instead, so the figure does not have to be kept in two places. A typed
+  allowance always wins; a qualifying budget is then reported in the tile's
+  note rather than silently replacing it.
 
 ### Changed
 

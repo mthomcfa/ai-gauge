@@ -357,13 +357,28 @@ def test_no_allowance_means_no_gauge_but_still_a_number():
     assert "Set a monthly allowance" in (summary.note or "")
 
 
-def test_an_azure_budget_beats_the_settings_allowance():
+def test_a_typed_allowance_is_always_the_denominator():
+    """"Smallest qualifying budget wins" is the right rule between budgets. It
+    is the wrong rule against a number the user typed by hand: a 1.00 alert
+    canary or a per-team budget they may not even own would take the tile
+    over, and the tray dot with it."""
     snapshot = az.build_snapshot(
         _aggregate(budget_amount=200.0, budget_time_grain="Monthly"),
         AzureConfig(monthly_allowance=150.0),
     )
+    assert snapshot.metrics[0].percent_used == pytest.approx(24.07, abs=0.01)
+    note = snapshot.metrics[0].note or ""
+    assert "Azure Budget of CAD 200.00" in note
+    assert "Settings" in note
+
+
+def test_a_budget_is_the_denominator_when_nothing_is_typed():
+    snapshot = az.build_snapshot(
+        _aggregate(budget_amount=200.0, budget_time_grain="Monthly"),
+        AzureConfig(monthly_allowance=0.0),
+    )
     assert snapshot.metrics[0].percent_used == pytest.approx(18.05, abs=0.01)
-    assert "Azure Budget" in (snapshot.metrics[0].note or "")
+    assert "Allowance read from an Azure Budget" in (snapshot.metrics[0].note or "")
 
 
 def test_settings_allowance_is_used_when_there_is_no_budget():
@@ -1700,6 +1715,52 @@ def test_a_scoped_budget_is_not_the_subscriptions_allowance():
     )
     got, _grain, _note = az.fetch_budget("tok", SUB, currency="CAD")
     assert got is None
+
+
+@responses.activate
+def test_an_unfiltered_budget_is_refused_for_a_resource_group_filtered_tile():
+    """The scope check was one-directional: it refused a budget narrower than
+    the tile and accepted one wider. A subscription-wide budget used as the
+    denominator for one resource group under-reports by the ratio between
+    them - the same error, in the other direction."""
+    _budgets(_budget(9000.0))
+    got, _grain, note = az.fetch_budget(
+        "tok", SUB, currency="CAD", resource_group="rg-ai"
+    )
+    assert got is None
+    assert "whole subscription" in (note or "")
+
+
+@responses.activate
+def test_an_unfiltered_budget_is_accepted_when_the_tile_is_not_filtered():
+    _budgets(_budget(9000.0))
+    got, _grain, note = az.fetch_budget("tok", SUB, currency="CAD")
+    assert got == pytest.approx(9000.0)
+    assert note is None
+
+
+@responses.activate
+def test_a_typed_allowance_survives_an_alert_canary_budget(monkeypatch, config):
+    """End to end: a 1.00 canary and the real 5000.00 both qualify, the
+    smallest of them wins between themselves, and neither displaces the
+    number in Settings."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    config.azure.monthly_allowance = 5000.0
+    _stub_everything()
+    responses.replace(
+        responses.GET,
+        BUDGETS_URL,
+        json={"value": [_budget(1.0), _budget(5000.0)]},
+        status=200,
+    )
+
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+
+    summary = snapshot.metrics[0]
+    assert "of 5,000.00" in (summary.reset_label or "")
+    assert "of 1.00" not in (summary.reset_label or "")
+    assert summary.percent_used == pytest.approx(28.55 / 50, abs=0.05)
+    assert "Azure Budget of CAD 1.00" in (summary.note or "")
 
 
 @responses.activate

@@ -202,12 +202,15 @@ the month's spend must not turn the tray red.
 - The allowance is **a number you state**, in your subscription's own billing
   currency. The tile shows whichever currency the API reports and never assumes
   dollars.
-- If the subscription already has a **monthly cost Budget** in Azure, that
-  amount is used instead, so the figure does not live in two places — but only
-  when it measures the same money: a budget in another currency, one scoped to
-  a different resource group, or one read against an anniversary reset day is
-  refused, and the tile says so and uses your allowance instead. An Azure
-  Budget is always a calendar month.
+- **Leave the allowance at 0 to use a monthly cost Budget** from Azure
+  instead, if the subscription has one, so the figure does not have to live in
+  two places. An allowance you type always wins: a budget is then only
+  mentioned in the tile's note, because a 1.00 alert canary or a per-team
+  budget is not the number you meant. A budget is used only when it measures
+  the same money — one in another currency, one scoped to a different resource
+  group, one covering the whole subscription while the tile is filtered to a
+  resource group, or one read against an anniversary reset day is refused, and
+  the tile says so. An Azure Budget is always a calendar month.
 - **Reset day** defaults to 1 (calendar month). Set it to the day your credit
   actually renews — a Visual Studio credit resets on its own anniversary, not
   on the 1st, and querying the calendar month would measure the wrong window.

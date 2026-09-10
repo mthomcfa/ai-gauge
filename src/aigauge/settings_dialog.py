@@ -850,8 +850,10 @@ class SettingsDialog(QDialog):
             _hint_label(
                 "In your subscription's own billing currency — the tile shows "
                 "whichever currency the API reports and never assumes dollars. "
-                "An Azure <b>Budget</b> on the subscription is used instead if "
-                "one exists. Cost Management reports spend <b>gross of "
+                "Leave at 0 to use a monthly cost <b>Budget</b> on the "
+                "subscription instead, if one exists; a number set here always "
+                "wins, and a budget is then only mentioned in the tile's note. "
+                "Cost Management reports spend <b>gross of "
                 "credits</b>: it excludes free and prepaid credit, so this "
                 "gauge measures consumption against the number you set here, "
                 "not a live credit balance."

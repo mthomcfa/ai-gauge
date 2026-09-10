@@ -541,12 +541,20 @@ def _truncate(label: str) -> str:
 
 
 def _allowance(aggregate: AzureAggregate, azure_cfg) -> tuple[float | None, str]:
-    """Resolve the denominator: a real Azure Budget wins over the setting."""
-    if aggregate.budget_amount and aggregate.budget_amount > 0:
-        return aggregate.budget_amount, "budget"
+    """Resolve the denominator. A number the user typed always wins.
+
+    A budget is only the denominator when nothing has been typed. "Smallest
+    qualifying budget wins" is the right rule *between* budgets - it is the
+    one that alerts first - but it is the wrong rule against a hand-typed
+    number: a 1.00 alert canary or a per-team budget the user may not even own
+    would take the tile over, and the tray dot with it. A qualifying budget is
+    still reported, in the note, so the two numbers can be reconciled.
+    """
     allowance = getattr(azure_cfg, "monthly_allowance", None)
     if allowance and allowance > 0:
         return float(allowance), "setting"
+    if aggregate.budget_amount and aggregate.budget_amount > 0:
+        return aggregate.budget_amount, "budget"
     return None, "none"
 
 
@@ -695,6 +703,11 @@ def build_snapshot(
         )
     if allowance_source == "budget":
         note_parts.append("Allowance read from an Azure Budget on this subscription.")
+    elif allowance_source == "setting" and aggregate.budget_amount:
+        note_parts.append(
+            f"An Azure Budget of {_money(aggregate.budget_amount, currency)} also "
+            "exists on this subscription; the allowance from Settings is used."
+        )
     elif allowance_source == "none":
         note_parts.append("Set a monthly allowance in Settings to show a gauge.")
     if aggregate.period_start and aggregate.period_end:
@@ -1347,7 +1360,12 @@ def _budget_scope_matches(properties: dict, resource_group: str | None) -> bool:
     """
     budget_filter = properties.get("filter")
     if not budget_filter:
-        return True
+        # An unfiltered budget covers the whole subscription. When the tile is
+        # filtered to one resource group it is measuring a strict subset of
+        # that, so using it as the denominator under-reports by the ratio
+        # between the two - the same error a *narrower* budget makes, in the
+        # other direction.
+        return not resource_group
     if not resource_group or not isinstance(budget_filter, dict):
         return False
     dimensions = budget_filter.get("dimensions")
@@ -1370,10 +1388,10 @@ def fetch_budget(
 ) -> tuple[float | None, str | None, str | None]:
     """A real monthly cost Budget on the subscription, if one applies.
 
-    Preferred over the settings allowance: if the owner already told Azure what
-    the monthly number is, restating it in this app is a second copy to keep in
-    sync. But it is only the right denominator when it measures the same money:
-    a budget in another currency, or scoped to some other resource group, is
+    Used as the denominator only when nothing has been typed in Settings (see
+    _allowance), and even then only when it measures the same money: a budget
+    in another currency, one scoped to some other resource group, or an
+    unfiltered one on a tile that *is* filtered to a resource group, is
     refused rather than silently divided into a CAD total. Where several
     qualify the smallest wins - it is the one that alerts first, and the
     conservative choice. Not paged on purpose: a subscription with more monthly
@@ -1424,8 +1442,12 @@ def fetch_budget(
             continue
         if not _budget_scope_matches(properties, resource_group):
             note = (
-                "An Azure Budget exists but is scoped to something other than "
-                "this subscription view; using the allowance from Settings."
+                "An Azure Budget exists but covers the whole subscription "
+                "while this tile is filtered to one resource group; using the "
+                "allowance from Settings."
+                if not properties.get("filter")
+                else "An Azure Budget exists but is scoped to something other "
+                "than this subscription view; using the allowance from Settings."
             )
             continue
         budget_currency = _budget_currency(properties)

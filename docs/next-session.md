@@ -519,11 +519,19 @@ the calls that were made, and why:
   caption — a ticking countdown, or Azure's spend to the cent — and either one
   counted as "this provider changed", which reset the adaptive backoff and
   pushed the whole app back into active-cadence polling.
-- **A budget is a calendar-month figure.** It is preferred over the Settings
-  allowance only when `reset_day == 1`, only when its currency matches the
-  cost data, only when it is unscoped (or scoped to exactly the configured
-  resource group), and the smallest qualifying one wins. Budget pagination is
-  deliberately not followed.
+- **A typed allowance is always the denominator.** Round 1 preferred a
+  budget unconditionally and round 2 reversed it: "smallest qualifying budget
+  wins" is the right rule between budgets, and the wrong rule against a number
+  a person typed, since a 1.00 alert canary or a per-team budget would take
+  the tile and the tray dot over. A qualifying budget is reported in the note
+  instead. It becomes the denominator only when nothing is typed.
+- **A budget is a calendar-month figure.** Even then it qualifies only when
+  `reset_day == 1`, only when its currency matches the cost data, and only
+  when it measures the same scope: unfiltered when the tile is unfiltered, or
+  filtered to exactly the configured resource group when it is. An unfiltered
+  budget on a resource-group-filtered tile is refused too — it under-reports
+  by the ratio between them. The smallest qualifying one wins. Budget
+  pagination is deliberately not followed.
 - **The period boundary is a UTC date**, because that is how Cost Management
   dates usage; `resets_at` converts it to local time for display. Copilot does
   the same, so the two Microsoft tiles agree about the 1st of the month.
