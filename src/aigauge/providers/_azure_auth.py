@@ -12,6 +12,7 @@ early (``_EXPIRY_SKEW``) so a token can't expire mid-request.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -26,6 +27,12 @@ REQUEST_TIMEOUT = 15
 # Drop a token this long before it actually expires, so a request that starts
 # just under the wire cannot be rejected mid-flight.
 _EXPIRY_SKEW = timedelta(minutes=5)
+# The AAD error code is documentation's "short code", e.g. invalid_client - but
+# nothing upstream guarantees that shape, and the value lands verbatim in
+# ai-gauge.log (a newline in it forges whole log lines), in snapshot.error, and
+# in a RichText dialog header. Reduce it to the alphabet a code can have.
+_CODE_RE = re.compile(r"[^A-Za-z0-9_.\-]")
+_CODE_MAX_LEN = 64
 
 
 class AzureAuthError(Exception):
@@ -103,7 +110,9 @@ def get_token(
         try:
             payload = response.json()
             if isinstance(payload, dict):
-                code = str(payload.get("error") or "")
+                code = _CODE_RE.sub("", str(payload.get("error") or ""))[
+                    :_CODE_MAX_LEN
+                ]
         except ValueError:
             pass
         log.warning(

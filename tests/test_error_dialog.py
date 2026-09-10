@@ -139,3 +139,73 @@ def test_format_diagnostics_leaves_non_azure_text_alone():
     assert "copilot_ai_credits" in out
     assert "<redacted>" not in out
     assert "<guid>" not in out
+
+
+def test_diagnostics_truncate_a_long_error_string():
+    """snapshot.error is as page- or API-supplied as snapshot.raw is, and it
+    was the one field _sanitize_raw never saw."""
+    snapshot = UsageSnapshot(
+        provider="azure",
+        status=SnapshotStatus.ERROR,
+        error="x" * 100_000,
+    )
+    out = _format_diagnostics("azure", snapshot)
+    assert len(out) < 20_000
+    assert "[truncated]" in out
+
+
+def test_strings_nested_in_lists_are_capped_like_dict_values():
+    """The length cap applied only to strings that were a *direct* dict value.
+
+    A list of pairs - snapshot.raw["buckets"] is [[ServiceName, cost], ...] -
+    walked straight past it, and ServiceName comes off the wire.
+    """
+    from aigauge.error_dialog import _STRING_LIMIT, _sanitize_raw
+
+    out = _sanitize_raw({"buckets": [["A" * 50_000, 1.0]], "notes": ["B" * 50_000]})
+    assert len(out["buckets"][0][0]) <= _STRING_LIMIT + 20
+    assert len(out["notes"][0]) <= _STRING_LIMIT + 20
+
+
+def test_a_hostile_service_name_cannot_inflate_the_diagnostics_blob():
+    snapshot = UsageSnapshot(
+        provider="azure",
+        status=SnapshotStatus.ERROR,
+        error="boom",
+        raw={"buckets": [["S" * 200_000, 1.0]], "notes": ["N" * 200_000]},
+    )
+    assert len(_format_diagnostics("azure", snapshot)) < 20_000
+
+
+def test_the_dialog_header_does_not_render_markup_from_an_error(qtbot):
+    """The header is a RichText QLabel, so an error string is markup unless it
+    is escaped - and the AAD error code is an upstream-supplied string."""
+    from aigauge.error_dialog import ErrorDetailsDialog
+
+    snapshot = UsageSnapshot(
+        provider="azure",
+        status=SnapshotStatus.ERROR,
+        error="<b>Session expired.</b> Sign in at <a href='https://evil.example'>here</a>",
+    )
+    dialog = ErrorDetailsDialog("azure", "Microsoft · Azure", snapshot)
+    qtbot.addWidget(dialog)
+    text = dialog._header_text  # noqa: SLF001
+    assert "<a href" not in text
+    assert "&lt;b&gt;" in text
+
+
+def test_the_dialog_header_redacts_azure_ids(qtbot):
+    from aigauge.error_dialog import ErrorDetailsDialog
+
+    snapshot = UsageSnapshot(
+        provider="azure",
+        status=SnapshotStatus.ERROR,
+        error=(
+            "Azure request failed for /subscriptions/"
+            "11111111-2222-3333-4444-555555555555/providers/x"
+        ),
+    )
+    dialog = ErrorDetailsDialog("azure", "Microsoft · Azure", snapshot)
+    qtbot.addWidget(dialog)
+    assert "11111111-2222-3333-4444-555555555555" not in dialog._header_text  # noqa: SLF001
+    assert "<guid>" in dialog._header_text  # noqa: SLF001

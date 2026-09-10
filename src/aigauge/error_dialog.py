@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -100,22 +101,29 @@ def _redact_azure_ids(text: str) -> str:
     return _GUID_RE.sub("<guid>", text)
 
 
-def _sanitize_raw(raw: Any) -> Any:
+def _sanitize_raw(raw: Any, *, limit: int = _STRING_LIMIT) -> Any:
+    """Cap every string in the payload, wherever it sits.
+
+    The cap used to apply only to a string that was a *direct* value of a dict,
+    so anything inside a list walked past it - and page- and API-supplied
+    strings sit in lists (``raw["buckets"]`` is [[ServiceName, cost], …],
+    ``raw["notes"]`` is a list of strings). The recursion handles the string
+    case itself now, which is the only place that covers every position.
+    """
+    if isinstance(raw, str):
+        return raw[:limit] + "…[truncated]" if len(raw) > limit else raw
     if isinstance(raw, dict):
         sanitized: dict[str, Any] = {}
         if len(raw) > _MAX_KEYS:
             sanitized["…[truncated]"] = f"{len(raw) - _MAX_KEYS} more keys"
         for key, value in list(raw.items())[:_MAX_KEYS]:
-            if isinstance(value, str):
-                limit = _BODY_TEXT_LIMIT if key == "body_text" else _STRING_LIMIT
-                if len(value) > limit:
-                    value = value[:limit] + "…[truncated]"
-            elif isinstance(value, (dict, list)):
-                value = _sanitize_raw(value)
-            sanitized[key] = value
+            sanitized[key] = _sanitize_raw(
+                value,
+                limit=_BODY_TEXT_LIMIT if key == "body_text" else _STRING_LIMIT,
+            )
         return sanitized
     if isinstance(raw, list):
-        capped = [_sanitize_raw(item) for item in raw[:_MAX_ITEMS]]
+        capped = [_sanitize_raw(item, limit=limit) for item in raw[:_MAX_ITEMS]]
         if len(raw) > _MAX_ITEMS:
             capped.append(f"…[truncated] {len(raw) - _MAX_ITEMS} more items")
         return capped
@@ -130,7 +138,10 @@ def _format_diagnostics(provider: str, snapshot: UsageSnapshot) -> str:
         "provider": provider,
         "status": snapshot.status.value,
         "fetched_at": snapshot.fetched_at.isoformat(timespec="seconds"),
-        "error": snapshot.error,
+        # snapshot.error is as API-supplied as raw is: an AAD error code and a
+        # requests exception message both land here, and _redact_emails is
+        # quadratic on a long non-matching string.
+        "error": _sanitize_raw(snapshot.error),
         "raw": _sanitize_raw(snapshot.raw),
     }
     return _redact_azure_ids(
@@ -169,11 +180,18 @@ class ErrorDetailsDialog(QDialog):
         self.resize(560, 460)
         self.setStyleSheet(_DARK_STYLESHEET)
 
-        header = QLabel(
-            f"<b>{display_name}</b> last refresh failed at "
-            f"{snapshot.fetched_at.strftime('%Y-%m-%d %H:%M:%S')}.<br/>"
-            f"<span style='color:#ef4444;'>{(snapshot.error or 'unknown error')}</span>"
+        # The header is RichText, so the error string is markup unless it is
+        # escaped, and it is not redacted anywhere else on this path: the
+        # clipboard blob below is, ai-gauge.log is, this label was not.
+        error_text = _redact_azure_ids(
+            html.escape(_sanitize_raw(snapshot.error) or "unknown error")
         )
+        self._header_text = (
+            f"<b>{html.escape(display_name)}</b> last refresh failed at "
+            f"{snapshot.fetched_at.strftime('%Y-%m-%d %H:%M:%S')}.<br/>"
+            f"<span style='color:#ef4444;'>{error_text}</span>"
+        )
+        header = QLabel(self._header_text)
         header.setWordWrap(True)
         header.setTextFormat(Qt.TextFormat.RichText)
 

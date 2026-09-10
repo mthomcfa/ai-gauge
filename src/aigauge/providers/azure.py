@@ -1176,6 +1176,21 @@ def _error(message: str) -> UsageSnapshot:
     return UsageSnapshot(provider="azure", status=SnapshotStatus.ERROR, error=message)
 
 
+def _exception_summary(exc: BaseException) -> str:
+    """Name a failure without quoting it.
+
+    ``str(exc)`` on a requests transport exception embeds the whole request
+    URL, and every ARM URL in this module contains ``/subscriptions/<guid>/``
+    or ``/<tenant guid>/oauth2``. That string reaches ai-gauge.log, the tile
+    tooltip and the error-dialog header, none of which redact. The type name -
+    plus the status when there is one - is what a bug report actually needs.
+    """
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status:
+        return f"{type(exc).__name__}, HTTP {status}"
+    return type(exc).__name__
+
+
 class AzureProvider(Provider):
     name = "azure"
     display_name = "Microsoft · Azure"
@@ -1335,7 +1350,8 @@ class AzureProvider(Provider):
             return self._remember_error(state, _auth_required(str(exc)))
         except requests.RequestException as exc:
             return self._remember_error(
-                state, _error(f"Could not reach Entra ID: {exc}")
+                state,
+                _error(f"Could not reach Entra ID ({_exception_summary(exc)})."),
             )
 
         notes: list[str] = []
@@ -1438,7 +1454,9 @@ class AzureProvider(Provider):
         except requests.HTTPError as exc:
             return self._remember_error(state, _error(str(exc)))
         except requests.RequestException as exc:
-            return self._remember_error(state, _error(f"Azure request failed: {exc}"))
+            return self._remember_error(
+                state, _error(f"Azure request failed ({_exception_summary(exc)}).")
+            )
 
         aggregate = AzureAggregate(
             total=parsed.total,
@@ -1608,7 +1626,8 @@ def _probe() -> int:
     try:
         token = get_token(azure_cfg.tenant_id, azure_cfg.client_id, secret)
     except (AzureAuthError, requests.RequestException) as exc:
-        print(f"azure: token request failed: {exc}")
+        # Never {exc}: a transport error carries the tenant id in its URL.
+        print(f"azure: token request failed ({_exception_summary(exc)})")
         return 1
     print("token: ok")
 
@@ -1639,7 +1658,7 @@ def _probe() -> int:
             resource_group=azure_cfg.resource_group,
         )
     except Exception as exc:  # noqa: BLE001
-        print(f"cost query: failed ({type(exc).__name__}: {exc})")
+        print(f"cost query: failed ({_exception_summary(exc)})")
         return 1
     print(f"cost metric accepted: {metric}")
     print(f"currency reported: {parsed.currency or '(none)'}")

@@ -1103,3 +1103,115 @@ def test_the_query_page_loop_is_capped():
     parsed, _metric = az.fetch_query("tok", SUB, date(2026, 9, 1), date(2026, 10, 1))
     assert len(responses.calls) == az.MAX_QUERY_PAGES
     assert parsed.truncated is True
+
+
+# --- identifiers must not ride out on an error string -----------------------
+#
+# A requests transport exception stringifies with the full request URL, and
+# that URL carries /subscriptions/<GUID>/ or /<TENANT GUID>/oauth2. The
+# diagnostics blob is redacted; ai-gauge.log, the tile tooltip, the error
+# dialog header and --probe stdout are not. So the id must never get into
+# snapshot.error in the first place.
+
+
+@responses.activate
+def test_a_transport_failure_does_not_carry_the_subscription_id(
+    monkeypatch, config, caplog
+):
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    responses.add(
+        responses.POST, TOKEN_URL, json={"access_token": "tok", "expires_in": 3600}
+    )
+    responses.add(
+        responses.GET,
+        SUBSCRIPTION_URL,
+        json={"subscriptionPolicies": {"quotaId": "MSDN_2014-09-01"}},
+        status=200,
+    )
+    responses.add(responses.GET, ACCOUNTS_URL, json={"value": []}, status=200)
+    responses.add(
+        responses.POST,
+        QUERY_URL,
+        body=requests.ConnectionError(
+            "HTTPSConnectionPool(host='management.azure.com', port=443): Max "
+            f"retries exceeded with url: /subscriptions/{SUB}/providers/"
+            "Microsoft.CostManagement/query?api-version=2025-03-01"
+        ),
+    )
+    with caplog.at_level("WARNING"):
+        snapshot = _run(az.AzureProvider(config), monkeypatch)
+
+    assert snapshot.status == SnapshotStatus.ERROR
+    assert SUB not in (snapshot.error or "")
+    assert "ConnectionError" in (snapshot.error or "")
+    assert SUB not in caplog.text
+
+
+@responses.activate
+def test_an_entra_transport_failure_does_not_carry_the_tenant_id(monkeypatch, config):
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    responses.add(
+        responses.POST,
+        TOKEN_URL,
+        body=requests.ConnectionError(
+            "HTTPSConnectionPool(host='login.microsoftonline.com', port=443): "
+            f"Max retries exceeded with url: /{TENANT}/oauth2/v2.0/token"
+        ),
+    )
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+    assert snapshot.status == SnapshotStatus.ERROR
+    assert TENANT not in (snapshot.error or "")
+
+
+def test_the_probe_never_prints_an_id(monkeypatch, capsys, config):
+    """--probe output is what an operator pastes into a bug report."""
+    monkeypatch.setattr(az.Config, "load", classmethod(lambda cls: config))
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    monkeypatch.setattr(az, "get_token", lambda *a, **k: "tok")
+
+    boom = requests.ConnectionError(
+        "HTTPSConnectionPool(host='management.azure.com', port=443): Max retries "
+        f"exceeded with url: /subscriptions/{SUB}/providers/"
+        "Microsoft.CostManagement/query"
+    )
+
+    def _raise(*args, **kwargs):
+        raise boom
+
+    for name in (
+        "fetch_quota_id",
+        "fetch_foundry_resource_ids",
+        "fetch_query",
+        "fetch_budget",
+        "fetch_forecast",
+    ):
+        monkeypatch.setattr(az, name, _raise)
+
+    az._probe()
+    out = capsys.readouterr().out
+    assert SUB not in out
+    assert TENANT not in out
+    assert "ConnectionError" in out
+
+
+@responses.activate
+def test_the_aad_error_code_is_reduced_to_a_code():
+    """The AAD body is only as trustworthy as the TLS path to Entra ID, and
+    the code lands in the log, the tile, and a RichText dialog header."""
+    responses.add(
+        responses.POST,
+        TOKEN_URL,
+        json={
+            "error": "invalid_client\nWARNING forged log line <b>markup</b>"
+            + "z" * 5000
+        },
+        status=401,
+    )
+    with pytest.raises(AzureAuthError) as exc:
+        get_token(TENANT, CLIENT, "bad", now=datetime(2026, 9, 9))
+    code = exc.value.code
+    assert code.startswith("invalid_client")
+    assert len(code) <= 64
+    assert "\n" not in code and "<b>" not in code and " " not in code
+    message = str(exc.value)
+    assert "\n" not in message and "<b>" not in message

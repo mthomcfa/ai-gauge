@@ -29,7 +29,7 @@ from .config import (
     qt_scale_factor_env,
 )
 from .cookie_dialog import CookieDialog
-from .error_dialog import ErrorDetailsDialog
+from .error_dialog import ErrorDetailsDialog, _redact_azure_ids
 from .history import HistoryStore
 from .logging_setup import setup_logging
 from .gauge import highest_indicator
@@ -688,7 +688,7 @@ class App(QObject):
             log.warning(
                 "snapshot error provider=%s error=%s raw_keys=%s raw_summary=%s",
                 snapshot.provider,
-                snapshot.error,
+                _redact_azure_ids(snapshot.error or ""),
                 sorted(snapshot.raw.keys()) if snapshot.raw else [],
                 _raw_summary(snapshot.raw) if snapshot.raw else "{}",
             )
@@ -696,7 +696,7 @@ class App(QObject):
             log.info(
                 "snapshot auth_required provider=%s error=%s raw_keys=%s raw_summary=%s",
                 snapshot.provider,
-                snapshot.error,
+                _redact_azure_ids(snapshot.error or ""),
                 sorted(snapshot.raw.keys()) if snapshot.raw else [],
                 _raw_summary(snapshot.raw) if snapshot.raw else "{}",
             )

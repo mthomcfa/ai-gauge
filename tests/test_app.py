@@ -664,3 +664,56 @@ def test_the_app_can_actually_be_constructed(qapp, tmp_path, monkeypatch):
     app._schedule_next_refresh()  # noqa: SLF001
 
     assert app._consecutive_error_cycles == 0  # noqa: SLF001
+
+
+class _SnapshotWidget:
+    """Just enough widget for _on_snapshot."""
+
+    def __init__(self):
+        self.snapshots = []
+
+    def update_snapshot(self, snapshot, display_name):
+        self.snapshots.append((snapshot, display_name))
+
+    def set_ratio(self, *args, **kwargs):
+        pass
+
+
+def test_the_snapshot_error_log_line_redacts_azure_identifiers(qapp, caplog):
+    """ai-gauge.log is the file the error dialog's own "Open log folder"
+    button points at, and Copy diagnostics is the only exit that was redacted.
+    A requests transport error stringifies with the whole request URL."""
+    import logging
+
+    app = App.__new__(App)
+    app._snapshots = {}  # noqa: SLF001
+    app._cycle_signatures = {}  # noqa: SLF001
+    app._inflight = set()  # noqa: SLF001
+    app._config = Config()  # noqa: SLF001
+    app._widget = _SnapshotWidget()  # noqa: SLF001
+    app._history = SimpleNamespace(record_snapshot=lambda snap: None)  # noqa: SLF001
+    app._ratio = SimpleNamespace(  # noqa: SLF001
+        record_snapshot=lambda snap: None,
+        display_estimate=lambda provider: None,
+        current_estimate=lambda provider: None,
+    )
+    app._ratio_recent = lambda provider: []  # noqa: SLF001
+    app._refresh_queue = ["claude"]  # noqa: SLF001
+    app._start_next_refresh = lambda: None  # noqa: SLF001
+
+    sub = "11111111-2222-3333-4444-555555555555"
+    snapshot = UsageSnapshot(
+        provider="azure",
+        status=SnapshotStatus.ERROR,
+        error=(
+            "Azure request failed: HTTPSConnectionPool(host='management.azure.com'"
+            f", port=443): Max retries exceeded with url: /subscriptions/{sub}"
+            "/providers/Microsoft.CostManagement/query"
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        app._on_snapshot(snapshot)  # noqa: SLF001
+
+    assert sub not in caplog.text
+    assert "<guid>" in caplog.text
