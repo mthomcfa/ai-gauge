@@ -1165,6 +1165,56 @@ def test_a_429_on_any_sub_fetch_still_records_the_servers_backoff(
         )
 
 
+# The note each tolerant sub-fetch owes the reader when it comes back empty
+# for a reason that is not an answer.
+_SERVER_ERROR_NOTE = {
+    "subscription": "The subscription's offer type could not be read.",
+    "accounts": "Foundry resources could not be listed this refresh.",
+    "budgets": "Azure Budgets were unavailable this refresh.",
+    "forecast": "The forecast was unavailable this refresh.",
+    "marketplace": "Marketplace breakdown unavailable this refresh.",
+}
+
+
+def _server_error(endpoint):
+    """Turn one ARM endpoint into a 500 with a body that is not JSON."""
+    body = "<html>502 Bad Gateway</html>"
+    if endpoint == "subscription":
+        responses.replace(responses.GET, SUBSCRIPTION_URL, body=body, status=500)
+    elif endpoint == "accounts":
+        responses.replace(responses.GET, ACCOUNTS_URL, body=body, status=500)
+    elif endpoint == "budgets":
+        responses.replace(responses.GET, BUDGETS_URL, body=body, status=500)
+    elif endpoint == "forecast":
+        responses.replace(responses.POST, FORECAST_URL, body=body, status=500)
+    elif endpoint == "marketplace":
+        # The marketplace query is the second POST to the query URL, so this
+        # is added rather than replaced: responses serves them in order.
+        responses.add(responses.POST, QUERY_URL, body=body, status=500)
+    else:  # pragma: no cover - guard against a typo in the parametrisation
+        raise AssertionError(endpoint)
+
+
+@pytest.mark.parametrize("endpoint", sorted(_SERVER_ERROR_NOTE))
+@responses.activate
+def test_a_500_on_any_tolerant_sub_fetch_says_so(endpoint, monkeypatch, config):
+    """`_check` raises for 429, 401 and 403 only, so every other non-200 used
+    to return the same "nothing here" a legitimately empty answer returns: an
+    entirely healthy-looking tile with a row silently missing, for the failure
+    that happens most often. A 5xx is the server saying "ask again", which is
+    not an answer, and the note the tolerant branches already carry is the one
+    the reader needs."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    config.azure.include_marketplace = True
+    _stub_everything()
+    _server_error(endpoint)
+
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+
+    assert snapshot.status == SnapshotStatus.OK, "a sub-fetch took the tile down"
+    assert _SERVER_ERROR_NOTE[endpoint] in (snapshot.metrics[0].note or "")
+
+
 @responses.activate
 def test_a_403_on_the_marketplace_query_does_not_take_the_tile_down(
     monkeypatch, config

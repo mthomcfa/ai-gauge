@@ -953,6 +953,25 @@ def _check(response: requests.Response, what: str) -> None:
         )
 
 
+def _server_error(response: requests.Response, what: str) -> None:
+    """Turn a 5xx into an exception the tolerant sub-fetches can see.
+
+    _check raises for 429, 401 and 403 - the answers that are about the whole
+    tenant or about a role. Everything else reaches a ``status_code != 200``
+    branch that returns the same "nothing here" a legitimately empty answer
+    returns, and the caller's tolerant handler never runs: a 500 on the
+    budgets list, the forecast, the offer read or discovery produced an
+    entirely healthy-looking tile with a row silently missing. A 5xx is the
+    server asking to be asked again, which is not an answer, so it is raised
+    and noted. A 4xx still is one - a forecast a new subscription has no
+    history for is a 400, and saying so on every refresh would be noise.
+    """
+    if response.status_code >= 500:
+        raise requests.HTTPError(
+            f"Azure returned HTTP {response.status_code} for the {what} request"
+        )
+
+
 def _json(response: requests.Response) -> Any:
     try:
         return response.json()
@@ -1342,6 +1361,7 @@ def fetch_forecast(
     )
     response = arm_post(token, url, body, "forecast")
     if response.status_code != 200:
+        _server_error(response, "forecast")
         log.info(
             "provider api diagnosis provider=azure classification=forecast_unavailable "
             "status=%s",
@@ -1425,6 +1445,7 @@ def fetch_budget(
     )
     response = arm_get(token, url, "budgets")
     if response.status_code != 200:
+        _server_error(response, "budgets")
         log.info(
             "provider api diagnosis provider=azure classification=budgets_unavailable "
             "status=%s",
@@ -1494,6 +1515,7 @@ def fetch_quota_id(token: str, subscription_id: str) -> str | None:
     url = f"{_scope(subscription_id)}?api-version={SUBSCRIPTIONS_API_VERSION}"
     response = arm_get(token, url, "subscription")
     if response.status_code != 200:
+        _server_error(response, "subscription")
         return None
     payload = _json(response)
     if not isinstance(payload, dict):
@@ -1554,6 +1576,10 @@ def fetch_foundry_resource_ids(
             break
         response = arm_get(token, url, "Cognitive Services accounts")
         if response.status_code != 200:
+            # Raised even mid-loop, and so past whatever page 1 found: half a
+            # discovery is a Foundry resource whose spend appears under its
+            # own service name with nothing saying the roll-up is incomplete.
+            _server_error(response, "Cognitive Services accounts")
             log.info(
                 "provider api diagnosis provider=azure "
                 "classification=foundry_discovery_unavailable status=%s",
