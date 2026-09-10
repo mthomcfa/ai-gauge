@@ -1505,8 +1505,9 @@ def test_a_blocked_until_past_the_backoff_ceiling_is_cleared(monkeypatch, config
 @responses.activate
 def test_ten_settings_saves_inside_the_hour_buy_one_live_fetch(monkeypatch, config):
     """A settings save is a one-click human action and it is easy to loop.
-    Changing what the query asks for invalidates the cached answer; it does
-    not reopen the fetch window, which is what README and SECURITY.md promise."""
+    Changing what the query asks for invalidates the gauge on the cached
+    answer; it does not reopen the fetch window, which is what README and
+    SECURITY.md promise."""
     monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
     _stub_everything()
     for press in range(10):
