@@ -431,3 +431,36 @@ def test_azure_secret_save_is_read_back_before_it_is_believed(qtbot, monkeypatch
     dialog.azure_secret_edit.setText("s3cret")
     assert dialog._save_azure_secret() is False  # noqa: SLF001
     assert warned
+
+
+def test_a_large_allowance_survives_a_settings_round_trip(qtbot, monkeypatch):
+    """QDoubleSpinBox clamps to its range and _apply_azure writes the clamped
+    value straight back, so a narrower widget silently rewrites the config.
+    An allowance above a million is ordinary in JPY, KRW, INR and CLP."""
+    monkeypatch.setattr(settings_dialog, "set_start_at_login", lambda enabled: None)
+    config = Config()
+    config.azure.monthly_allowance = 2_500_000.0
+    dialog = SettingsDialog(config)
+    qtbot.addWidget(dialog)
+
+    dialog.apply_to(config)
+    assert config.azure.monthly_allowance == 2_500_000.0
+
+
+def test_a_foundry_project_child_id_can_be_pinned(qtbot, monkeypatch):
+    """docs/next-session.md §8.1 parks "cost rows may carry a project child id"
+    as an open risk whose mitigation is pinning ids by hand - which the field
+    could not express."""
+    monkeypatch.setattr(settings_dialog, "set_start_at_login", lambda enabled: None)
+    monkeypatch.setattr(settings_dialog.QMessageBox, "warning", lambda *a, **k: None)
+    config = Config()
+    dialog = SettingsDialog(config)
+    qtbot.addWidget(dialog)
+
+    child = (
+        f"/subscriptions/{SUB}/resourceGroups/rg-ai/providers/"
+        "Microsoft.CognitiveServices/accounts/my-foundry/projects/proj1"
+    )
+    dialog.azure_foundry_ids.setPlainText(child)
+    dialog.apply_to(config)
+    assert config.azure.foundry_resource_ids == [child]

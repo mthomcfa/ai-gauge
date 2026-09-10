@@ -1652,3 +1652,83 @@ def test_changing_the_app_registration_also_drops_the_token(monkeypatch, config)
     )
     _run(provider, monkeypatch)
     assert not any(key[0] == TENANT for key in _azure_auth._CACHE)
+
+
+# --- settings reach the request ---------------------------------------------
+
+
+@responses.activate
+def test_changing_the_reset_day_refetches_instead_of_replaying_the_old_period(
+    monkeypatch, config
+):
+    """_identity detected credential changes only, so every setting that
+    shapes the *request* was replayed from the cached aggregate for an hour -
+    and a manual Refresh went through the same gate, so it could not force it."""
+    import json as _json
+
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    _run(az.AzureProvider(config), monkeypatch)
+
+    config.azure.reset_day = 15
+    responses.reset()
+    _stub_everything()
+    _run(az.AzureProvider(config), monkeypatch)
+
+    queries = [c for c in responses.calls if "CostManagement/query" in c.request.url]
+    assert queries, "the new reset day did not reach a request"
+    body = _json.loads(queries[-1].request.body)
+    expected_start, _end = az.period_bounds(
+        datetime.now(timezone.utc).date(), 15
+    )
+    assert body["timePeriod"]["from"].startswith(expected_start.isoformat())
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("resource_group", "rg-ai"),
+        ("include_marketplace", True),
+        ("top_rows", 2),
+        ("foundry_resource_ids", [OPENAI_ID]),
+    ],
+)
+@responses.activate
+def test_every_query_shaping_setting_invalidates_the_cache(
+    monkeypatch, config, field, value
+):
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    responses.add(responses.POST, QUERY_URL, json=query_payload([]), status=200)
+    _run(az.AzureProvider(config), monkeypatch)
+    calls = len(responses.calls)
+
+    setattr(config.azure, field, value)
+    _run(az.AzureProvider(config), monkeypatch)
+    assert len(responses.calls) > calls, f"{field} was replayed from the cache"
+
+
+@pytest.mark.parametrize("bad", ["evil.example/x", "x/../../y", "", "a?b=c"])
+@responses.activate
+def test_a_non_guid_id_can_never_reach_a_request_url(monkeypatch, config, bad):
+    """Defence in depth: AzureConfig coerces these to None at load, and
+    SettingsDialog validates before assigning - but the URL builders trusted
+    whatever reached them."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    config.azure.subscription_id = bad
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+    assert snapshot.status == SnapshotStatus.AUTH_REQUIRED
+    assert not responses.calls
+
+
+def test_the_scope_builder_refuses_a_non_guid_subscription():
+    with pytest.raises(ValueError):
+        az._scope("evil.example/x")
+
+
+def test_the_token_endpoint_refuses_a_non_guid_tenant():
+    from aigauge.providers import _azure_auth
+
+    with pytest.raises(ValueError):
+        _azure_auth.token_endpoint("evil.example/x")

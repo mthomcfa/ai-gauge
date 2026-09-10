@@ -400,7 +400,15 @@ _ARM_RESOURCE_ID_RE = re.compile(
     r"/resourceGroups/(?P<rg>[A-Za-z0-9._()\-]{1,90})"
     r"/providers/(?P<ns>[A-Za-z0-9.]{1,64})"
     r"/(?P<type>[A-Za-z0-9]{1,64})"
-    r"/(?P<name>[A-Za-z0-9._\-]{1,128})$",
+    r"/(?P<name>[A-Za-z0-9._\-]{1,128})"
+    # One optional child segment, so a Foundry *project*
+    # (accounts/<acct>/projects/<proj>) can be pinned. Cost rows are documented
+    # to carry the parent account id, but §8.1 parks the opposite as an open
+    # risk whose only mitigation is pinning by hand - which this field could
+    # not express. The value is lower-cased and compared against ids ARM
+    # returned; it is never interpolated into a URL, so the extra segment adds
+    # no injection surface.
+    r"(?:/[A-Za-z0-9]{1,64}/[A-Za-z0-9._\-]{1,128})?$",
     re.IGNORECASE,
 )
 # Azure resource group names; also the shape accepted for the optional
@@ -430,7 +438,8 @@ def validate_azure_resource_id(value: str) -> str:
     if match is None:
         raise ValueError(
             "Azure resource id must look like /subscriptions/<guid>/resourceGroups/"
-            "<name>/providers/<namespace>/<type>/<name>"
+            "<name>/providers/<namespace>/<type>/<name>, optionally followed by "
+            "one child /<type>/<name>"
         )
     validate_azure_guid(match.group("sub"), "subscription id")
     return text

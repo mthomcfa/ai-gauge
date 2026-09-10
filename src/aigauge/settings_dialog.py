@@ -835,7 +835,10 @@ class SettingsDialog(QDialog):
         azure_form.addRow("Subscription ID:", self.azure_subscription)
 
         self.azure_allowance = QDoubleSpinBox()
-        self.azure_allowance.setRange(0.0, 1_000_000.0)
+        # Matches AzureConfig's own bound. A narrower widget would clamp on
+        # open and _apply_azure would write the clamped value back, silently
+        # rewriting an allowance that is ordinary in JPY, KRW, INR or CLP.
+        self.azure_allowance.setRange(0.0, 100_000_000.0)
         self.azure_allowance.setDecimals(2)
         self.azure_allowance.setSingleStep(10.0)
         self.azure_allowance.setSpecialValueText("(no gauge)")

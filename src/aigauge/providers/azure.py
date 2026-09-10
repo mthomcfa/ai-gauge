@@ -44,7 +44,7 @@ from typing import Any, Callable
 
 import requests
 
-from ..config import Config, get_azure_client_secret
+from ..config import Config, get_azure_client_secret, validate_azure_guid
 from ..models import SnapshotStatus, UsageMetric, UsageSnapshot
 from ._azure_auth import AzureAuthError, clear_cache, get_token, invalidate
 from .base import Provider
@@ -819,7 +819,12 @@ def arm_get(token: str, url: str, what: str) -> requests.Response:
 
 
 def _scope(subscription_id: str) -> str:
-    return f"{MANAGEMENT_HOST}/subscriptions/{subscription_id}"
+    # Re-validated here, at the point the id becomes a URL, and not only where
+    # it was stored: AzureConfig coerces a bad id to None at load and the
+    # settings dialog validates before assigning, but neither is in this call
+    # path, and this is the last place that can still refuse. Same shape as
+    # opencode_go.usage_url(), which re-runs its validator at the point of use.
+    return f"{MANAGEMENT_HOST}/subscriptions/{validate_azure_guid(subscription_id, 'subscription id')}"
 
 
 def _charge_type_filter() -> dict:
@@ -1337,8 +1342,10 @@ _STATES: dict[str, _State] = {}
 _STATES_LOCK = threading.Lock()
 
 
-def _identity(tenant_id: str, client_id: str, client_secret: str) -> tuple[str, str, str]:
-    """A change detector for the credential set, not a place to keep a secret.
+def _identity(
+    tenant_id: str, client_id: str, client_secret: str, azure_cfg
+) -> tuple:
+    """A change detector for everything the cached aggregate depends on.
 
     The secret is reduced to a truncated digest purely so that *rotating* it
     invalidates the cached backoff: without this, a user who fixed a wrong
@@ -1346,9 +1353,25 @@ def _identity(tenant_id: str, client_id: str, client_secret: str) -> tuple[str, 
     which is exactly when they are looking at the tile to see whether the fix
     worked. An unchanged wrong secret still backs off, so a bad credential is
     not retried every five minutes against Entra ID.
+
+    The query-shaping settings are here for the same reason. They are consumed
+    inside _fetch - which period, which scope, which queries, which buckets -
+    so a cached aggregate built before the change answers a different question
+    than the one the settings now ask, and the throttle would replay it for an
+    hour with a manual Refresh unable to force it. Only monthly_allowance is
+    absent, because build_snapshot re-reads it on every render.
     """
     digest = hashlib.sha256(client_secret.encode("utf-8", "replace")).hexdigest()
-    return (tenant_id, client_id, digest[:16])
+    return (
+        tenant_id,
+        client_id,
+        digest[:16],
+        getattr(azure_cfg, "reset_day", 1),
+        getattr(azure_cfg, "resource_group", None) or "",
+        bool(getattr(azure_cfg, "include_marketplace", False)),
+        getattr(azure_cfg, "top_rows", MAX_BREAKDOWN_ROWS),
+        tuple(sorted(getattr(azure_cfg, "foundry_resource_ids", []) or [])),
+    )
 
 
 def state_for(subscription_id: str) -> _State:
@@ -1459,7 +1482,7 @@ class AzureProvider(Provider):
         ):
             state.blocked_until = None
 
-        identity = _identity(tenant_id, client_id, secret)
+        identity = _identity(tenant_id, client_id, secret, azure_cfg)
         if state.identity is not None and state.identity != identity:
             # Re-pointed at a different app registration: everything cached
             # here describes the old one, including the throttle window.
@@ -1567,6 +1590,28 @@ class AzureProvider(Provider):
         client_secret: str,
         subscription_id: str,
     ) -> UsageSnapshot:
+        try:
+            for field, value in (
+                ("tenant id", tenant_id),
+                ("client id", client_id),
+                ("subscription id", subscription_id),
+            ):
+                validate_azure_guid(value, field)
+        except ValueError:
+            # Something bypassed the config validators. Nothing has been sent
+            # yet and nothing will be: the URL builders refuse these too.
+            log.warning(
+                "provider api diagnosis provider=azure "
+                "classification=invalid_id_refused"
+            )
+            return self._remember_error(
+                state,
+                _auth_required(
+                    "Azure is not configured. Add the tenant, client, and "
+                    "subscription ids in Settings → Microsoft → Azure."
+                ),
+            )
+
         try:
             token = get_token(tenant_id, client_id, client_secret)
         except AzureAuthError as exc:
