@@ -1107,11 +1107,14 @@ def test_a_429_with_a_hostile_retry_after_still_records_a_backoff(monkeypatch, c
 
 
 @responses.activate
-def test_an_unexpected_exception_is_recorded_and_holds_the_hourly_floor(
+def test_a_malformed_nextlink_still_leaves_a_recorded_fetch_behind(
     monkeypatch, config
 ):
     """A non-string nextLink used to raise past _fetch, leaving _State blank -
-    and the gate only engages when the state is *not* blank."""
+    and the gate only engages when the state is *not* blank. It is handled
+    where it is read now, so what this pins is the outcome: a fetch that was
+    recorded, the hourly floor holding, and one dispatch. (The exception that
+    no one anticipates has its own test, through the real worker.)"""
     monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
     _stub_everything()
     responses.replace(
@@ -1126,7 +1129,7 @@ def test_an_unexpected_exception_is_recorded_and_holds_the_hourly_floor(
     _run_through_pool(provider)
     calls = len(responses.calls)
     state = az.state_for(SUB)
-    assert state.aggregate is not None or state.last_error is not None
+    assert state.aggregate is not None, "the malformed link cost the whole fetch"
 
     second = _run_through_pool(provider)
     assert len(responses.calls) == calls, "second refresh went back to the network"
@@ -1173,6 +1176,9 @@ def test_the_throttle_gate_fails_closed_with_nothing_to_serve(monkeypatch, confi
     snapshot = _run(az.AzureProvider(config), monkeypatch)
     assert snapshot.status == SnapshotStatus.ERROR
     assert "window" in (snapshot.error or "")
+    # Rounded up, so a wait of 41 min 59 s does not read as 41 - and the wait
+    # printed one microsecond after a 42-minute block is still 42.
+    assert "(42 min)" in (snapshot.error or "")
     assert not responses.calls, "the gate fell through to a live fetch"
 
 

@@ -130,6 +130,10 @@ MAX_QUERY_PAGES = 20
 # pages plus 10 discovery pages at REQUEST_TIMEOUT each is ~13 min on one
 # QThreadPool thread that every other provider is queued behind.
 REFRESH_DEADLINE_SECONDS = 90.0
+# What the *page loops* may spend. The fixed handful around them (token,
+# subscription, first cost page, the metric retry, first marketplace page,
+# budgets, forecast) is outside the budget by design, so this is a floor on a
+# refresh's real ceiling - measured at 46 - rather than the ceiling itself.
 MAX_ARM_REQUESTS_PER_REFRESH = 40
 # A ceiling on what one response can cost us in memory and time. A period with
 # 50 000 daily ResourceId x ServiceName rows is already outside this tile's
@@ -2028,7 +2032,10 @@ class AzureProvider(Provider):
             # unexpected exception - which leaves the state blank - turn the
             # hourly floor into a fetch on every refresh cycle. The gate fails
             # closed instead: no state to serve is not permission to fetch.
-            minutes = max(1, int((allowed_at - now).total_seconds() // 60))
+            # Rounded up: flooring printed "(59 min)" one second into a
+            # 60-minute wait, and "(0 min)" is not a wait at all.
+            seconds = (allowed_at - now).total_seconds()
+            minutes = max(1, int(-(-seconds // 60)))
             log.info(
                 "provider api diagnosis provider=azure "
                 "classification=throttled_no_cache next_fetch_in_s=%s",
