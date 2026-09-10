@@ -54,13 +54,19 @@ _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 # than the only guard - but an error string, a request URL echoed by requests,
 # or a future provider can all still carry one, and a subscription or tenant
 # GUID is an account identifier the way an email address is.
+# \b is not usable as the left edge here: an encoded separator ends in a hex
+# digit ("%2F"), so there is no word boundary between it and the id that
+# follows - the resource names in an encoded path were redacted while the
+# subscription id in the same string was not.
+_ID_START = r"(?:(?<=%2F)|(?<=%2f)|(?<![0-9A-Za-z]))"
+_ID_END = r"(?![0-9A-Za-z])"
 _GUID_RE = re.compile(
-    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+    _ID_START + r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}" + _ID_END
 )
 # The same id written without its hyphens. Azure accepts and emits both forms,
 # and the dashed pattern does not match this one at all.
-_GUID_COMPACT_RE = re.compile(r"\b[0-9a-fA-F]{32}\b")
+_GUID_COMPACT_RE = re.compile(_ID_START + r"[0-9a-fA-F]{32}" + _ID_END)
 # A path separator, as written or as requests echoes it back out of an encoded
 # URL. A name may not contain either.
 _SEP = r"(?:/|%2[Ff])"

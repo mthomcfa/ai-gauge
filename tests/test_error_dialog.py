@@ -256,3 +256,17 @@ def test_a_guid_without_hyphens_is_redacted():
     out = _redact_azure_ids("tenant 11111111222233334444555555555555 failed")
     assert "11111111222233334444555555555555" not in out
     assert "<guid>" in out
+
+
+def test_a_guid_after_an_encoded_separator_is_redacted():
+    """%2F ends in a hex digit, so \\b never fired between it and the GUID -
+    the resource names in an encoded path were redacted while the
+    subscription id in the same string was not."""
+    from aigauge.error_dialog import _redact_azure_ids
+
+    out = _redact_azure_ids(
+        "https://management.azure.com/subscriptions%2F"
+        "11111111-1111-1111-1111-111111111111%2FresourceGroups%2Frg-secret"
+    )
+    assert "11111111-1111-1111-1111-111111111111" not in out
+    assert "rg-secret" not in out
