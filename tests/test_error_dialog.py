@@ -363,6 +363,19 @@ def test_sanitize_raw_caps_strings_inside_tuples():
     assert all(len(item) < 3000 for item in out["pair"])
 
 
+def test_sanitize_raw_caps_strings_inside_sets():
+    """A set was the last container the walk stepped over, and
+    ``json.dumps(default=str)`` then rendered it verbatim - after the cap had
+    already run, so the cap had nothing to do with the size of the blob."""
+    from aigauge.error_dialog import _sanitize_raw
+
+    out = _sanitize_raw({"ids": {"S" * 5000}, "frozen": frozenset({"T" * 5000})})
+    assert all(len(item) < 3000 for item in out["ids"])
+    assert all(len(item) < 3000 for item in out["frozen"])
+    # A list, so the blob is still JSON rather than a Python repr.
+    assert json.dumps(out)
+
+
 def test_sanitize_raw_does_not_recurse_off_the_stack():
     """json.loads accepts a payload deeper than this walk could handle, and
     ErrorDetailsDialog.__init__ does not catch RecursionError - so the one

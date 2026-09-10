@@ -188,10 +188,15 @@ def _sanitize_raw(raw: Any, *, limit: int = _STRING_LIMIT, depth: int = 0) -> An
                 depth=depth + 1,
             )
         return sanitized
-    if isinstance(raw, (list, tuple)):
+    if isinstance(raw, (list, tuple, set, frozenset)):
+        # A set is walked like a list rather than stepped over: json.dumps'
+        # default=str would otherwise render it verbatim, after the cap has
+        # already run. Sorted so the blob is stable between two copies of the
+        # same payload.
+        items = sorted(raw, key=str) if isinstance(raw, (set, frozenset)) else raw
         capped = [
             _sanitize_raw(item, limit=limit, depth=depth + 1)
-            for item in raw[:_MAX_ITEMS]
+            for item in items[:_MAX_ITEMS]
         ]
         if len(raw) > _MAX_ITEMS:
             capped.append(f"…[truncated] {len(raw) - _MAX_ITEMS} more items")
