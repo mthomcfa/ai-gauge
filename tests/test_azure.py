@@ -1806,3 +1806,44 @@ def test_the_row_still_reads_without_an_allowance():
     summary = snapshot.metrics[0]
     assert summary.percent_used is None
     assert summary.reset_label.startswith("CAD 36.10")
+
+
+# --- wording and counts -----------------------------------------------------
+
+
+def test_the_other_row_counts_buckets_when_marketplace_is_folded_into_it():
+    """The Marketplace row is not a service, so counting it as one mis-states
+    what the row holds."""
+    rows = [
+        [float(10 - i), 20260901, f"{STORAGE_ID}-{i}", f"Service {i}", "CAD"]
+        for i in range(8)
+    ]
+    rows.append([0.5, 20260901, MARKET_ID, "Global resources", "CAD"])
+    parsed = az.parse_query_response(query_payload(rows))
+    buckets, _f, _m, _s = az.bucket_costs(
+        parsed, set(), {(MARKET_ID.lower(), "Global resources"): 0.5}, top_rows=6
+    )
+    assert buckets[-1][0] == "Other (3 buckets)"
+
+
+@responses.activate
+def test_foundry_resource_count_counts_resources_that_actually_spent(
+    monkeypatch, config
+):
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    responses.replace(
+        responses.GET,
+        ACCOUNTS_URL,
+        json={
+            "value": [
+                {"id": FOUNDRY_ID, "kind": "AIServices"},
+                {"id": f"{FOUNDRY_ID}-quiet", "kind": "AIServices"},
+            ]
+        },
+        status=200,
+    )
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+    assert snapshot.raw["foundry_resource_count"] == 1
+    foundry = next(m for m in snapshot.metrics if m.label == az.FOUNDRY_BUCKET)
+    assert "1 Foundry resource." in (foundry.note or "")

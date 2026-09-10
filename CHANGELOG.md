@@ -33,7 +33,8 @@ Copilot is unchanged and simply moves under it. Azure is new.
   already inside the Azure total. A second tile would show the same money
   twice with nothing in the layout saying so; a row inside the Azure tile
   makes the double-count structurally impossible, because every cost row lands
-  in exactly one bucket and the buckets sum to the query total exactly.
+  in exactly one bucket and the buckets sum to the query total (to within float
+  rounding).
 
   Foundry resources are identified by resource **kind** (`AIServices`), never
   by resource type: Azure OpenAI, Speech, Vision, Language and Foundry all
@@ -83,6 +84,74 @@ Copilot is unchanged and simply moves under it. Azure is new.
   detect. Detected from `subscriptionPolicies.quotaId`.
 - **The tile never assumes a currency.** Amounts are shown in whatever the
   API's `Currency` column reports, with the code printed alongside.
+
+### Hardening from review
+
+Three reviews — security, correctness and adversarial — went over the Azure
+work before it merged. What they found, and what changed:
+
+- **The hourly throttle now fails closed.** It is the property the whole module
+  is shaped around, because Cost Management quotas are shared tenant-wide. An
+  exception outside `_fetch`'s except list left the state object blank, and the
+  gate only engaged on state a *finished* fetch leaves behind — so with nothing
+  cached and nothing remembered it fell through and fetched live on every
+  refresh cycle. One malformed field was enough to reach it: a non-string
+  `nextLink`, or a `Retry-After` of `inf`, which threw the 429 handling away
+  along with the server's own back-off. The gate now returns a "waiting for the
+  next fetch window" snapshot rather than falling through, every outcome is
+  recorded, a fetch already in flight dispatches nothing more, and a clock that
+  jumped forward no longer parks the tile forever.
+- **The cost query follows `nextLink`.** The Query API pages at ~1000 rows,
+  which Daily granularity grouped on ResourceId and ServiceName reaches at
+  roughly 33 resources — so page 1's subtotal was being shown as the month's
+  spend on exactly the busiest subscriptions. Pages are followed back to ARM
+  only, capped at 20, and a truncated result carries a note and no gauge.
+- **Identifiers no longer ride out on an error string.** A transport failure
+  stringifies with the request URL, and every ARM URL carries the subscription
+  or tenant GUID; Copy diagnostics redacted it but `ai-gauge.log`, the tile
+  tooltip, the error dialog and `--probe` did not. Errors now name the
+  exception type instead of quoting it, the log line and the dialog header are
+  redacted, the header is escaped (it is rich text), and the redaction pass
+  itself covers child resource names, `%2F`-encoded paths and un-hyphenated
+  GUIDs.
+- **The Marketplace row moves a charge, not a resource.** It was keyed on
+  resource id, so a resource with 900.00 of ordinary usage and 1.00 of
+  Marketplace charge reported all 901.00 as Marketplace spend.
+- **An Azure Budget is only used when it measures the same money.** A budget in
+  another currency, one scoped to a different resource group, a non-finite
+  amount, or any budget at all when the reset day is not the 1st (a Budget's
+  monthly grain is the calendar month) is refused, with a note saying so and
+  the Settings allowance used instead. Where several apply, the smallest wins.
+- **Several more ways to print a confident wrong number are closed.** An
+  unreadable cost column or an ARM error body returned as 200 is an error
+  rather than a month with no spend; the cost column is never guessed from
+  position; zero spend with the offer type unreadable carries no gauge, because
+  that is what an unsupported Sponsorship subscription looks like; rows in
+  several currencies are not added together; a forecast below the spend already
+  recorded is dropped; breakdown shares are clamped for display; a usage date
+  in the future is not "data as of"; and row counts, currency codes and service
+  names are bounded at parse time.
+- **The cached bearer token behaves like the credential it is.** It is keyed on
+  the secret's digest, dropped when the secret is saved or cleared, dropped on
+  an ARM 401, and dropped when the app registration changes — a rotated secret
+  used to keep producing a working tile for the rest of the token's lifetime.
+- **Settings reach the next request.** The reset day, resource group,
+  marketplace toggle, row count and pinned Foundry ids are part of the cache
+  key now, so changing one refetches instead of replaying the old answer for an
+  hour. The allowance spin box matches the config bound rather than silently
+  rewriting a large allowance, a Foundry *project* id can be pinned, and the
+  ids are re-validated where they become URLs.
+- **The allowance period is a UTC window**, matching how Cost Management dates
+  its usage, with the boundary shown in local time. The summary row's label is
+  stable ("Spend this month"), with the amounts alongside the bar, so history
+  keys one period instead of one per fetch.
+
+### Testing
+
+- 907 → 1002 tests. Every finding above has a regression test that fails on the
+  code as reviewed, including one that drives the real worker rather than the
+  inline stand-in the suite had been using — which is why the throttle hole was
+  invisible to it.
 
 ## 1.1.0+cfa.3 - 2026-09-09
 

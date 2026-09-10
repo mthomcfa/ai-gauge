@@ -152,9 +152,12 @@ through a service operated by this project.
 The last two are new in 1.2.0+cfa.4. Both are contacted only when the Azure
 tile is enabled *and* a tenant, client, and subscription ID are configured; an
 unconfigured tile makes no request at all. The Azure provider limits itself to
-one live fetch per hour, which is also a courtesy to the rest of the tenant:
-Azure Cost Management rate limits are shared tenant-wide rather than per
-application.
+one live fetch per hour per app run, which is also a courtesy to the rest of
+the tenant: Azure Cost Management rate limits are shared tenant-wide rather
+than per application. The floor is held in memory and deliberately not written
+to disk — keeping it off disk is the right trade for the secrets story — so
+restarting the app permits one more immediate fetch. Restarting is a human
+action, not a loop.
 
 The embedded browser's navigation allowlist is separate from and stricter than
 this table; see [Embedded Browser](#embedded-browser). No Azure traffic goes

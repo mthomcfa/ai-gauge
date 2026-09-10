@@ -875,7 +875,12 @@ class SettingsDialog(QDialog):
         self.azure_top_rows = QSpinBox()
         self.azure_top_rows.setRange(1, 6)
         self.azure_top_rows.setValue(config.azure.top_rows)
-        azure_form.addRow("Breakdown rows:", self.azure_top_rows)
+        self.azure_top_rows.setToolTip(
+            "How many component rows to name individually. Whatever is left "
+            "over is collapsed into one extra \u201cOther\u201d row, so the "
+            "tile can show one row more than this."
+        )
+        azure_form.addRow("Top rows shown:", self.azure_top_rows)
 
         self.azure_marketplace_cb = QCheckBox(
             "Show Marketplace models as their own row"

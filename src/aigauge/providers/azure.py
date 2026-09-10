@@ -468,7 +468,14 @@ def bucket_costs(
     remainder = [pair for pair in rest if pair not in keep]
     if remainder:
         other_total = sum(cost for _, cost in remainder)
-        keep.append((f"Other ({len(remainder)} services)", other_total))
+        # "services" only when they all are: the Marketplace row is a bucket,
+        # not a service, and counting it as one mis-states what the row holds.
+        noun = (
+            "buckets"
+            if any(name in (FOUNDRY_BUCKET, MARKETPLACE_BUCKET) for name, _ in remainder)
+            else "services"
+        )
+        keep.append((f"Other ({len(remainder)} {noun})", other_total))
     return keep, foundry_cost, marketplace_cost, len(services)
 
 
@@ -1801,7 +1808,12 @@ class AzureProvider(Provider):
             data_as_of=parsed.latest_usage_date,
             buckets=buckets,
             foundry_cost=foundry_cost,
-            foundry_resource_count=len(foundry_ids),
+            # Resources that actually spent, not resources discovered: "across
+            # 5 Foundry resources" reading over a total that four of them
+            # contributed nothing to is a count of the wrong thing.
+            foundry_resource_count=sum(
+                1 for rid in foundry_ids if parsed.by_resource.get(rid)
+            ),
             marketplace_cost=(
                 bucket_marketplace if bucket_marketplace is not None else marketplace_cost
             ),

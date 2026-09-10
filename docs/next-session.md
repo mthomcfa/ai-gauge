@@ -417,11 +417,11 @@ python -m aigauge.providers.azure --probe
 
 | What | Why it might differ | What the code does |
 | --- | --- | --- |
-| Cost metric name — `Cost` vs `PreTaxCost` | MCA and EA/pay-as-you-go disagree, and every example in the REST spec uses `PreTaxCost` while the automation docs use `Cost`. | Tries `Cost`, retries once on a 400 with `PreTaxCost`, then remembers which worked. The response column is found by name-candidate list, then by "first numeric non-date column". |
+| Cost metric name — `Cost` vs `PreTaxCost` | MCA and EA/pay-as-you-go disagree, and every example in the REST spec uses `PreTaxCost` while the automation docs use `Cost`. | Tries `Cost`, retries once on a 400 with `PreTaxCost`, then remembers which worked. The response column is found by name-candidate list, then by a numeric column whose *name* contains "cost" — never by position. A response with no cost column is an error, not a month with no spend. |
 | `ClientType: ai-gauge` request header | Documented in Q&A and SDK behaviour (it maps to the SDK's ApplicationID), not in the REST reference. If it is ignored we share the anonymous rate-limit bucket — a throughput question, not a correctness one. | Sent on every ARM request. |
 | `ResourceGroupName` as the filter dimension | The optional resource-group filter uses this name; the docs show `ResourceGroup` in some places. | Only used when the user sets the filter; leaving it blank avoids the question. |
 | Whether Marketplace model charges really carry a distinct `ResourceId` | The design assumes they do, and buckets them by id like Foundry. If they share a resource id with something else the row would absorb it. | Off by default; the toggle is the opt-in. |
-| Whether a Foundry resource's cost rows carry the *account* id rather than a project child id | Projects are `accounts/projects` children and are documented as billing to the parent. If cost rows name the child, the roll-up under-reports. | The probe prints the resource ids found and the bucket totals, so a mismatch shows up as a Foundry row that is smaller than expected. |
+| Whether a Foundry resource's cost rows carry the *account* id rather than a project child id | Projects are `accounts/projects` children and are documented as billing to the parent. If cost rows name the child, the roll-up under-reports. | The probe prints the resource ids found and the bucket totals, so a mismatch shows up as a Foundry row that is smaller than expected. The Settings field accepts one child `type/name` segment, so a project id can be pinned by hand if the probe shows that shape. |
 
 `api-version`s were all confirmed present in the spec repo: Cost Management
 `2025-03-01`, Consumption budgets `2024-08-01`, Cognitive Services `2024-10-01`,
@@ -462,11 +462,57 @@ unnecessary source of behaviour change.
   whole point. It also means it is process-global: two `AzureProvider` instances
   for the same subscription share one budget (correct), and the state is not
   written to disk, so a restart is a fresh hour (acceptable — a restart is a
-  human action, not a loop).
+  human action, not a loop; SECURITY.md now says "per app run" rather than
+  implying the floor survives a restart).
 - **`data as of` is derived, not reported.** Cost Management does not return a
   freshness timestamp, so the tile uses the latest `UsageDate` that carries
-  non-zero cost. A genuinely zero-cost day inside the period reads as "no data
-  yet" for that day. There is no better signal available.
+  non-zero cost, ignoring any date later than tomorrow. A genuinely zero-cost
+  day inside the period reads as "no data yet" for that day. There is no better
+  signal available.
 - **The forecast row trusts Cost Management's own projection** rather than
-  extrapolating locally. When it is unavailable the row is simply absent, which
-  is honest but means the row silently comes and goes early in a period.
+  extrapolating locally. When it is unavailable — or when it comes back at or
+  below the spend already recorded, which is not a projection — the row is
+  simply absent, which is honest but means it silently comes and goes early in
+  a period.
+- **History still keys on the display label.** The Azure summary label is
+  stable now, so Azure closes periods correctly, but `history._state_key` is
+  still `provider::label` and OpenRouter's `Today ($x/$y)` and Copilot's
+  `Credits (12.5/1500)` have the original shape. A stable `key` field on
+  `UsageMetric`, used by `history` and `ratio`, is the repo-wide fix and was
+  out of scope here.
+
+### 8.4 Decisions taken in review, so they are not relitigated
+
+Three reviews went over this feature before it merged (see the
+"Hardening from review" block in `CHANGELOG.md` for the findings). These are
+the calls that were made, and why:
+
+- **The throttle fails closed.** Inside the fetch window with nothing cached
+  and nothing remembered, `refresh()` returns an error snapshot naming the
+  wait. It never falls through to a live fetch. Every fetch outcome — including
+  an exception no one anticipated — is recorded in `_State`, because a blank
+  state is what switched the throttle off. If a future change needs a "fetch
+  now" escape hatch, it must clear `last_fetch_at` explicitly rather than rely
+  on the gate letting anything through.
+- **A cost column is found by name, never by position**, and its absence is an
+  error routed through `_remember_error`. `row_count == 0` *with* a column is
+  still a legitimate empty month, since the data lags 8–72 h.
+- **A zero total with an unreadable offer type shows no gauge.** Cost
+  Management Reader without Reader is the likely role split, and an Azure
+  Sponsorship subscription reports exactly zero. A *positive* total rules that
+  out and keeps its gauge.
+- **A budget is a calendar-month figure.** It is preferred over the Settings
+  allowance only when `reset_day == 1`, only when its currency matches the
+  cost data, only when it is unscoped (or scoped to exactly the configured
+  resource group), and the smallest qualifying one wins. Budget pagination is
+  deliberately not followed.
+- **The period boundary is a UTC date**, because that is how Cost Management
+  dates usage; `resets_at` converts it to local time for display. Copilot does
+  the same, so the two Microsoft tiles agree about the 1st of the month.
+- **The summary metric's label is a key, not a caption.** It must stay
+  "Spend this month"; the money lives in `reset_label`, which the row renders
+  inline. Changing the label back would restart the history-key churn.
+- **Error strings name an exception type, never quote one.** `str(exc)` on a
+  requests exception carries the request URL and with it the subscription id.
+  The redaction in `error_dialog` is the second line of defence, not the
+  first.
