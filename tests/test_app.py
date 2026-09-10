@@ -9,6 +9,7 @@ from aigauge.app import (
     _preserve_error_metrics,
     _refresh_provider_order,
     _raw_summary,
+    _snapshot_signature,
 )
 from aigauge.config import BrowserAccount, Config
 from aigauge.models import SnapshotStatus, UsageMetric, UsageSnapshot
@@ -533,6 +534,35 @@ def test_a_clean_cycle_uses_the_normal_cadence():
     app._schedule_next_refresh()  # noqa: SLF001
 
     assert app._timer.started_ms > 65_000, "healthy providers must not be hammered"  # noqa: SLF001
+
+
+def _snapshot_with(*metrics: UsageMetric) -> UsageSnapshot:
+    return UsageSnapshot(
+        provider="claude", status=SnapshotStatus.OK, metrics=list(metrics)
+    )
+
+
+def test_the_cadence_signature_ignores_informational_meters():
+    """Otherwise every breakdown row can reset the adaptive backoff.
+
+    A provider that renders a dozen tagged meters offers a dozen numbers that
+    twitch on their own; the cadence should follow the meters the tile is
+    about.
+    """
+    primary = UsageMetric(label="Session", percent_used=64.0)
+    quiet = _snapshot_with(primary, UsageMetric(label="Opus only", percent_used=91.0,
+                                                tag="meter_breakdown"))
+    moved = _snapshot_with(primary, UsageMetric(label="Opus only", percent_used=92.0,
+                                                tag="meter_breakdown"))
+
+    assert _snapshot_signature(quiet) == _snapshot_signature(moved)
+
+
+def test_the_cadence_signature_still_follows_the_primary_meters():
+    before = _snapshot_with(UsageMetric(label="Session", percent_used=64.0))
+    after = _snapshot_with(UsageMetric(label="Session", percent_used=65.0))
+
+    assert _snapshot_signature(before) != _snapshot_signature(after)
 
 
 def test_auth_required_is_not_retried_quickly():

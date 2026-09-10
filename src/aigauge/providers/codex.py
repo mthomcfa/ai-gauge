@@ -7,16 +7,28 @@ from typing import Any, Callable
 
 from PyQt6.QtCore import QObject
 
+from ..config import Config
 from ..models import SnapshotStatus, UsageMetric, UsageSnapshot
 from ._common import (
     has_usage_page_signal,
     is_security_verification_page,
-    normalize_percent,
 )
 from ._scrape_runner import ScrapeRunner
 from .base import Provider
+from .catalog import (
+    MeterCatalog,
+    MeterSpec,
+    adopt_rows,
+    bundled_catalog,
+    extractor_source,
+    load_catalog,
+    metric_for_spec,
+    record_no_container_scan,
+    record_scan,
+    scan_due,
+    unreadable_reason,
+)
 from .diagnostics import log_page_diagnosis
-from .idle import idle_reset_state
 
 CODEX_ANALYTICS_URL = "https://chatgpt.com/codex/cloud/settings/analytics"
 CODEX_USAGE_URL = f"{CODEX_ANALYTICS_URL}#personal-usage"
@@ -28,8 +40,16 @@ log = logging.getLogger("aigauge.providers.codex")
 # card is always required; the five-hour card is optional because Codex may
 # temporarily expose only the shared weekly agentic limit. Returns raw text
 # fragments so Python can do the unit-aware normalization.
-EXTRACTOR_JS = r"""
+EXTRACTOR_TEMPLATE = r"""
 (() => {
+  // [{key, label, aliases, boundaries, primary}] from the meter catalog
+  // (providers/meter_catalog/codex.json plus the app-data override). Each
+  // entry becomes its own field on the snapshot.
+  const CATALOG = __AG_CATALOG__;
+  // Weekly self-scan: also return every candidate card the usage container
+  // renders, so Python can adopt cards this build has never heard of.
+  const DISCOVER = __AG_DISCOVER__;
+
   function visibleText(el) {
     return ((el && (el.innerText || el.textContent)) || '').replace(/\s+/g, ' ').trim();
   }
@@ -72,12 +92,20 @@ EXTRACTOR_JS = r"""
     return 'selected personal usage tab';
   }
 
+  // One DOM walk per extractor run, not one per label. The catalog turned a
+  // two-card read into as many cards as the page renders, and querySelectorAll
+  // + innerText over every element is the expensive part of this extractor.
+  let cardCandidateCache = null;
+  function cardCandidates() {
+    if (cardCandidateCache) return cardCandidateCache;
+    cardCandidateCache = Array.from(
+      document.querySelectorAll('article,section,[role="group"],div,li')
+    ).map(el => ({ el, text: visibleText(el) }));
+    return cardCandidateCache;
+  }
+
   function findCardByLabel(label) {
-    const candidates = Array.from(document.querySelectorAll('article,section,[role="group"],div,li'))
-      .map(el => {
-        const text = visibleText(el);
-        return { el, text };
-      })
+    const candidates = cardCandidates()
       .filter(({ text }) => {
         const lower = text.toLowerCase();
         return lower.includes(label.toLowerCase()) && /%/.test(text) && text.length < 1600;
@@ -106,20 +134,281 @@ EXTRACTOR_JS = r"""
     return null;
   }
 
-  function readCard(label, nextLabels) {
-    const card = findCardByLabel(label);
-    const text = card ? visibleText(card) : windowTextAfterLabel(label, nextLabels);
+  // POLARITY. The same rule as Claude's readRow, and for the same reason:
+  // normalize_percent resolves an unknown kind to *used*, so a card meaning
+  // "42% left" was reported as 42% consumed - a plausible number pointing the
+  // wrong way. Testing the whole card for "used"/"remaining" did exactly that
+  // with a bare percentage, and the text-window fallback could take the
+  // wording out of the NEXT card. The wording has to sit against the
+  // percentage, and the forward scan stops at a digit, a time unit or a
+  // reset/renew word so a countdown's "left" ("2 hr left") is never read as a
+  // quota direction. No wording beside the number means no polarity, and no
+  // polarity means no metric (see _build_snapshot).
+  function polarityFor(text, pctMatch) {
+    if (!pctMatch) return 'unknown';
+    const start = pctMatch.index;
+    const end = start + pctMatch[0].length;
+    const tail = text.slice(end, end + 60);
+    const stop = tail.search(
+      /\d|\b(?:reset|renew|sec|second|min|minute|hr|hour|day|week|month)s?\b/i);
+    const forward = stop === -1 ? tail : tail.slice(0, stop);
+    const word = /\b(remaining|left|used|consumed)\b/i.exec(forward)
+      || /\b(used|consumed)\W*$/i.exec(text.slice(Math.max(0, start - 16), start));
+    if (!word) return 'unknown';
+    return /^(remaining|left)$/i.test(word[1]) ? 'remaining' : 'used';
+  }
+
+  function readCardText(text) {
     if (!text) return null;
+    // The FIRST percentage, unlike Claude's readRow: a Codex card renders its
+    // own number before any neighbouring text can intrude.
     const pctMatch = text.match(/(\d+(?:\.\d+)?)\s*%/);
-    const remaining = /remaining/i.test(text);
-    const used = /used/i.test(text);
     const resetMatch = text.match(/Resets?\s+(?:(?:at|on|in)\s+)?(.+?)(?=\s*$|\s+(?:Daily|Weekly|All|Current|Personal|Team|5 hour)\b|\s+\d+(?:\.\d+)?\s*%)/i);
     return {
       raw: text.slice(0, 400),
       percent: pctMatch ? parseFloat(pctMatch[1]) : null,
-      kind: remaining ? 'remaining' : (used ? 'used' : 'unknown'),
+      kind: polarityFor(text, pctMatch),
       reset_text: resetMatch ? resetMatch[1].trim() : null,
     };
+  }
+
+  function readCard(label, nextLabels) {
+    const card = findCardByLabel(label);
+    return readCardText(
+      card ? visibleText(card) : windowTextAfterLabel(label, nextLabels));
+  }
+
+  // One field per catalog meter. `seed` carries the two primary cards already
+  // read above; the rest are resolved by trying each catalog alias in order,
+  // which is also how a primary card survives being relabelled - adding the
+  // new wording to the override file is enough.
+  function readCatalogCards(seed) {
+    // Object.create(null), not {}: a plain object inherits constructor,
+    // toString and hasOwnProperty, all truthy, so a catalog key of
+    // "constructor" read as already-filled and its meter was never read.
+    const out = Object.create(null);
+    for (const key of Object.keys(seed || {})) {
+      if (seed[key]) out[key] = seed[key];
+    }
+    for (const entry of CATALOG) {
+      if (out[entry.key]) continue;
+      for (const alias of entry.aliases) {
+        const card = readCard(alias, entry.boundaries || []);
+        if (card) { out[entry.key] = card; break; }
+      }
+    }
+    return out;
+  }
+
+  function pctCount(text) {
+    return (text.match(/\d+(?:\.\d+)?\s*%/g) || []).length;
+  }
+
+  // Wording that names the usage panel. "usage limit" alone was both too
+  // narrow and too broad: the analytics page carries prose about usage limits
+  // above the cards, while the workspace-credit layout never says "usage
+  // limit" at all. Plus every primary alias the catalog carries, so teaching
+  // the app a relabelled card also teaches it where the panel is.
+  const PANEL_MARKER = /usage limit|credit limit/i;
+  function marksUsagePanel(text) {
+    if (PANEL_MARKER.test(text)) return true;
+    const lower = text.toLowerCase();
+    for (const entry of CATALOG) {
+      if (!entry.primary) continue;
+      for (const alias of entry.aliases) {
+        if (alias && lower.includes(alias.toLowerCase())) return true;
+      }
+    }
+    return false;
+  }
+
+  // The cards themselves, as opposed to the wrappers around them: an element
+  // carrying one percentage and no percentage-bearing descendant of its own.
+  // Every wrapper between a card and the panel reports that card's percentage
+  // too, so counting all of them multiplied the cards total by the nesting
+  // depth - and six layers of wrapper was enough to let an element holding
+  // the whole page pass the ratio below.
+  let leafCardCache = null;
+  function leafCards() {
+    if (leafCardCache) return leafCardCache;
+    const bearing = cardCandidates().filter(c => pctCount(c.text) >= 1);
+    leafCardCache = bearing.filter(
+      c => pctCount(c.text) === 1 &&
+        !bearing.some(other => other !== c && c.el.contains(other.el)));
+    return leafCardCache;
+  }
+
+  // A container that reached past the panel is worse than no container at all:
+  // `in_container` is the whole difference between a meter and page furniture,
+  // and every percentage on the page sits inside one of these. A panel is
+  // mostly its cards; an element several times longer than the cards it holds
+  // swallowed the page around them.
+  function swallowedThePage(el, text) {
+    let rowsLen = 0;
+    for (const card of leafCards()) {
+      if (card.el === el || !el.contains(card.el)) continue;
+      rowsLen += card.text.length;
+    }
+    return rowsLen > 0 && text.length > rowsLen * 4;
+  }
+
+  // How much of a usage panel a candidate holds: the catalog meters whose
+  // wording it renders, plus the cards whose percentage carries
+  // used/remaining wording. Size was the whole tiebreak, and page furniture
+  // is always smaller than the panel - a rail reading "Usage limits 20% off
+  // Pro" beside "Storage 88% used" won on length, "Storage" was adopted, and
+  // the real panel was never scanned. A task rail whose titles quote the
+  // limits ("Weekly usage limit refactor 40% done") does it with the marker
+  // wording alone. Richness answers what a panel IS rather than how long it
+  // is; length only settles ties.
+  function richness(el, text) {
+    const lower = text.toLowerCase();
+    let score = 0;
+    for (const entry of CATALOG) {
+      // Once per meter, not once per alias: a meter counted twice is not two.
+      for (const alias of entry.aliases) {
+        if (alias && lower.includes(alias.toLowerCase())) { score++; break; }
+      }
+    }
+    for (const card of leafCards()) {
+      if (card.el !== el && !el.contains(card.el)) continue;
+      // The reader's own polarity verdict, so what is counted here is what
+      // could be adopted.
+      const pctMatch = card.text.match(/(\d+(?:\.\d+)?)\s*%/);
+      if (polarityFor(card.text, pctMatch) !== 'unknown') score++;
+    }
+    return score;
+  }
+
+  // The element holding the usage panel, found by walking UP from the wording
+  // that names it. Discovery is confined to it: a percentage in the task rail
+  // is not a meter, and where it sits is the only way to tell.
+  //
+  // Taking the smallest element holding the marker and two percentages picked
+  // <body> whenever the marker also appeared outside the panel, which is the
+  // ordinary case - and inside <body>, a task's "90% done" is a meter.
+  // Anchoring on the innermost elements that carry the marker and climbing to
+  // the first ancestor holding two percentages keeps the answer inside the
+  // panel. <body> is refused outright.
+  function usageContainer() {
+    const marked = cardCandidates().filter(c => marksUsagePanel(c.text));
+    // Innermost first, then: an anchor has to carry a percentage of its own.
+    // A bare mention of the marker is a nav item, a heading or prose about
+    // limits, not a panel, and climbing from one let a settings nav holding
+    // "Plan usage" beside "Storage 88%" become the container - a SMALLER
+    // element than the panel, so it won, and the real panel was never
+    // scanned.
+    const anchors = marked.filter(
+      c => !marked.some(other => other !== c && c.el.contains(other.el)) &&
+        pctCount(c.text) >= 1);
+    // Those bare markers again, this time as evidence of overreach: one of
+    // them inside a candidate container but not on the path up from the
+    // anchor means the climb left the panel and took a slice of the page
+    // with it. That is how a panel rendering fewer than two percentages
+    // reached the SPA's root wrapper, where every piece of page furniture
+    // counts as `in_container`.
+    //
+    // Only once the climb has passed the panel, though: the panel's own
+    // heading, a tab strip ("Usage limits | Analytics") or a footnote about
+    // limits is a bare marker sitting INSIDE the panel and on no path up from
+    // a row, so counting it refused the real panel outright - leaving
+    // discovery permanently inert on that layout and saying so once a day as
+    // `discovery_no_container`.
+    const bare = marked.filter(c => pctCount(c.text) === 0);
+    let best = null;
+    let bestLen = Infinity;
+    let bestScore = -1;
+    for (const anchor of anchors) {
+      let el = anchor.el;
+      // Panel-shaped: an ancestor above the anchor holding a percentage and
+      // no stray marker. A stray above THAT one is the climb leaving the
+      // panel; a stray at or below it is the panel's own furniture.
+      let passedPanel = false;
+      for (let depth = 0; depth < 12 && el; depth++) {
+        if (el === document.body || el === document.documentElement) break;
+        const text = visibleText(el);
+        const holdsStray = bare.some(
+          c => el.contains(c.el) && !c.el.contains(anchor.el));
+        if (pctCount(text) >= 2) {
+          const stray = passedPanel && holdsStray;
+          if (!stray && !swallowedThePage(el, text)) {
+            const score = richness(el, text);
+            if (score > bestScore ||
+                (score === bestScore && text.length < bestLen)) {
+              best = el;
+              bestLen = text.length;
+              bestScore = score;
+            }
+          }
+          break;
+        }
+        if (depth > 0 && !holdsStray && pctCount(text) >= 1) passedPanel = true;
+        el = el.parentElement;
+      }
+    }
+    return best;
+  }
+
+  // Every card inside the usage container shaped like "<label> ... N% ...".
+  // Deliberately permissive about wording and strict about shape; Python
+  // applies the label rules before anything is adopted.
+  function discoverCards() {
+    const container = usageContainer();
+    // null, not []: "the panel showed nothing new" is a completed scan and
+    // "there was no panel to look in" is not one. Python cannot tell those
+    // apart from an empty list, and it stamps the weekly scan on the answer.
+    if (!container || !container.contains) return null;
+    const out = [];
+    // Object.create(null) for the same reason as readCatalogCards's map: with a
+    // plain object, seen["constructor"] is truthy before anything is seen, so
+    // a row labelled "Constructor" was dropped from every scan.
+    const seen = Object.create(null);
+    for (const candidate of cardCandidates()) {
+      if (out.length >= 40) break;
+      const text = candidate.text;
+      if (!text || text.length > 200) continue;
+      if (candidate.el !== container && !container.contains(candidate.el)) continue;
+      const percentages = text.match(/\d+(?:\.\d+)?\s*%/g) || [];
+      // Exactly one percentage: two means this element wraps several cards,
+      // and each of those is a candidate in its own right.
+      if (percentages.length !== 1) continue;
+      // Stop at the percentage or at reset wording, whichever comes first.
+      // Stopping at any digit would empty the label of a card whose name
+      // starts with one ("5 hour usage limit").
+      const labelMatch = /^(.*?)(?=\s*(?:Resets?\b|\d+(?:\.\d+)?\s*%))/i.exec(text);
+      if (!labelMatch) continue;
+      const label = labelMatch[1].trim();
+      if (!label || label.length > 60) continue;
+      const key = label.toLowerCase();
+      if (seen[key]) continue;
+      seen[key] = true;
+      const card = readCardText(text);
+      if (!card || card.percent === null) continue;
+      card.label = label;
+      card.in_container = true;
+      out.push(card);
+    }
+    // Nested wrappers: a parent that puts a heading in front of one card
+    // renders that card's number under a longer label, and both are
+    // candidates. Same percentage, same reset text, and one label ending in
+    // the other means one card described twice - keep the child.
+    const deduped = [];
+    for (const row of out) {
+      const lower = row.label.toLowerCase();
+      let merged = false;
+      for (let i = 0; i < deduped.length; i++) {
+        const other = deduped[i];
+        const otherLower = other.label.toLowerCase();
+        if (other.percent !== row.percent) continue;
+        if ((other.reset_text || '') !== (row.reset_text || '')) continue;
+        if (!lower.endsWith(otherLower) && !otherLower.endsWith(lower)) continue;
+        if (row.label.length < other.label.length) deduped[i] = row;
+        merged = true;
+        break;
+      }
+      if (!merged) deduped.push(row);
+    }
+    return deduped;
   }
 
   const bodyText = visibleText(document.body);
@@ -144,10 +433,16 @@ EXTRACTOR_JS = r"""
     location.pathname === '/login' ||
     document.title.toLowerCase().includes('login') ||
     (/log in|sign in/.test(lowerText) && !/usage limit/i.test(bodyText));
+  const session = readCard('5 hour usage limit', ['Weekly usage limit']);
+  const weekly = readCard('Weekly usage limit', ['Personal usage', 'Team usage']);
   return {
     logged_out: isLoggedOut,
-    session: readCard('5 hour usage limit', ['Weekly usage limit']),
-    weekly: readCard('Weekly usage limit', ['Personal usage', 'Team usage']),
+    session: session,
+    weekly: weekly,
+    // The two cards above stay the primary path, unchanged. Everything else
+    // the catalog knows about is read alongside them.
+    rows: readCatalogCards({ session: session, weekly: weekly }),
+    discovered: DISCOVER ? discoverCards() : null,
     url: location.href,
     title: document.title,
     has_percent_text: /%/.test(bodyText),
@@ -170,6 +465,13 @@ EXTRACTOR_JS = r"""
   };
 })();
 """
+
+# The module-level constant is the catalog as shipped, with discovery off. The
+# provider rebuilds it per refresh so an override file (and a due scan) take
+# effect without a restart.
+EXTRACTOR_JS = extractor_source(
+    EXTRACTOR_TEMPLATE, bundled_catalog("codex"), discover=False
+)
 
 
 _WEEKDAYS = {
@@ -267,6 +569,37 @@ def _payload_has_usage_signal(payload: dict[str, Any]) -> bool:
     return "%" in page_text or "usage limit" in page_text or "usage" in page_text
 
 
+_POLARITY_STOP_RE = re.compile(
+    r"\d|\b(?:reset|renew|sec|second|min|minute|hr|hour|day|week|month)s?\b",
+    re.IGNORECASE,
+)
+
+
+def _polarity_near_percent(text: str, match: re.Match[str]) -> str:
+    """Used/remaining wording sitting against the percentage.
+
+    The Python twin of ``polarityFor`` in the extractor, kept in step with it
+    for the same reason: this fallback reads a *text window* that can run into
+    the next card, so testing the whole window for "used"/"remaining" resolved
+    a bare percentage - and sometimes a neighbour's wording - to *used*.
+    """
+    tail = text[match.end() : match.end() + 60]
+    stop = _POLARITY_STOP_RE.search(tail)
+    forward = tail[: stop.start()] if stop else tail
+    word = re.search(r"\b(remaining|left|used|consumed)\b", forward, re.IGNORECASE)
+    if word is None:
+        # Leading wording takes consumption words only: a countdown reads
+        # "2 hr left", so accepting that before a number would invert the gauge.
+        word = re.search(
+            r"\b(used|consumed)\W*$",
+            text[max(0, match.start() - 16) : match.start()],
+            re.IGNORECASE,
+        )
+    if word is None:
+        return "unknown"
+    return "remaining" if word.group(1).lower() in ("remaining", "left") else "used"
+
+
 def _parse_body_card(
     body_text: str,
     label: str,
@@ -293,14 +626,28 @@ def _parse_body_card(
         window,
         re.IGNORECASE,
     )
-    remaining = re.search(r"\bremaining\b", window, re.IGNORECASE)
-    used = re.search(r"\bused\b", window, re.IGNORECASE)
     return {
         "raw": window[:400],
         "percent": float(pct_match.group(1)),
-        "kind": "remaining" if remaining else ("used" if used else "unknown"),
+        "kind": _polarity_near_percent(window, pct_match),
         "reset_text": reset_match.group(1).strip() if reset_match else None,
     }
+
+
+def _body_card_for_spec(
+    spec: MeterSpec,
+    body_text: str,
+    catalog: MeterCatalog,
+) -> dict[str, Any] | None:
+    """Plain-text fallback for one catalog meter, tried alias by alias."""
+    boundaries = spec.boundaries or tuple(
+        alias for alias in catalog.aliases() if not spec.matches(alias)
+    )
+    for alias in spec.aliases:
+        card = _parse_body_card(body_text, alias, boundaries)
+        if card:
+            return card
+    return None
 
 
 def _looks_like_empty_signed_in_usage(payload: dict[str, Any]) -> bool:
@@ -374,10 +721,29 @@ def _is_logged_out_payload(payload: dict[str, Any]) -> bool:
     return False
 
 
+def _payload_rows(payload: dict[str, Any]) -> dict[str, Any]:
+    """Per-meter cards from the payload, keyed by catalog key.
+
+    ``rows`` is what the catalog-aware extractor returns. The two top-level
+    keys are the primary path and also the shape of every payload recorded
+    before the catalog existed (cached snapshots, hand-built test payloads),
+    so they are still honoured.
+    """
+    rows = payload.get("rows")
+    merged: dict[str, Any] = dict(rows) if isinstance(rows, dict) else {}
+    for key in _EXPECTED_ROWS:
+        card = payload.get(key)
+        if isinstance(card, dict) and not merged.get(key):
+            merged[key] = card
+    return {key: card for key, card in merged.items() if isinstance(card, dict)}
+
+
 def _build_snapshot(
     payload: dict[str, Any],
     *,
     account_id: str = "codex",
+    catalog: MeterCatalog | None = None,
+    log_skipped: bool = True,
 ) -> UsageSnapshot:
     if _is_logged_out_payload(payload):
         log_page_diagnosis(
@@ -409,39 +775,72 @@ def _build_snapshot(
         )
 
     metrics: list[UsageMetric] = []
+    unreadable: list[str] = []
+    skipped: list[str] = []
     body_text = str(payload.get("body_text") or "")
-    for key, label, source_label, next_labels in (
-        ("session", "Session", "5 hour usage limit", ("Weekly usage limit",)),
-        ("weekly", "Weekly", "Weekly usage limit", ("Personal usage", "Team usage")),
-    ):
-        card = payload.get(key) or _parse_body_card(
-            body_text,
-            source_label,
-            next_labels,
-        )
+    catalog = catalog or load_catalog("codex")
+    rows = _payload_rows(payload)
+    for spec in catalog.enabled_specs:
+        card = rows.get(spec.key) or _body_card_for_spec(spec, body_text, catalog)
         if not card:
             continue
-        percent = normalize_percent(card.get("percent"), card.get("kind", ""))
-        resets_at = _parse_reset_text(card.get("reset_text"))
-        reset_window = timedelta(hours=5) if key == "session" else timedelta(days=7)
-        resets_at, reset_label, idle_note = idle_reset_state(
-            percent=percent,
-            resets_at=resets_at,
-            window=reset_window,
+        reason = unreadable_reason(card, spec)
+        if reason:
+            # Only a primary card's unreadability is worth failing the whole
+            # snapshot for; a breakdown card the page renders oddly must not
+            # take Session and Weekly down with it.
+            if spec.primary:
+                unreadable.append(f"{spec.label} ({reason})")
+            else:
+                skipped.append(f"{spec.label} ({reason})")
+            continue
+        metric = metric_for_spec(
+            spec, card, resets_at=_parse_reset_text(card.get("reset_text"))
         )
-        note = idle_note or card.get("reset_text")
-        metrics.append(
-            UsageMetric(
-                label=label,
-                percent_used=percent,
-                resets_at=resets_at,
-                reset_label=reset_label,
-                note=note,
-                window=reset_window,
-            )
+        if metric is not None:
+            metrics.append(metric)
+
+    # An informational card is dropped rather than failing the snapshot, but a
+    # silent drop is invisible: the tile just shows one gauge fewer than the
+    # page does, and nothing says which meter went or why.
+    if skipped and log_skipped:
+        log.info(
+            "provider skipped unreadable rows provider=%s rows=%s",
+            account_id,
+            "; ".join(skipped),
         )
 
-    labels = {metric.label.lower(): metric for metric in metrics}
+    # A card we could not read is reported, never quietly dropped: a bare
+    # percentage has no polarity, and normalize_percent would resolve it to
+    # *used*. The payload rides along so one error report carries the card text
+    # needed to teach the extractor the new wording.
+    if unreadable:
+        log_page_diagnosis(
+            log,
+            provider=account_id,
+            classification="unreadable_usage_row",
+            payload=payload,
+            expected_rows=_EXPECTED_ROWS,
+            level=logging.WARNING,
+        )
+        return UsageSnapshot(
+            provider=account_id,
+            status=SnapshotStatus.ERROR,
+            error=(
+                "Codex's usage layout changed: could not read "
+                + ", ".join(unreadable)
+                + ". Use Copy diagnostics to report it."
+            ),
+            raw=payload,
+        )
+
+    # Primary cards only. Breakdown metrics are informational, so a page that
+    # renders an extra meter must not read as a partial render of the two that
+    # matter.
+    labels = {metric.label.lower(): metric for metric in metrics if metric.tag is None}
+    expected_primary = {
+        spec.label.lower() for spec in catalog.enabled_specs if spec.primary
+    }
     # Accept a lone Weekly card only when the surrounding page identifies the
     # new shared-agentic layout. This preserves transient-error retries for a
     # genuinely partial render of the older Session + Weekly layout.
@@ -458,7 +857,7 @@ def _build_snapshot(
         # guard unconditionally made a genuinely idle account error forever.
         if (weekly_metric.percent_used or 0) <= 0 and weekly_metric.reset_label == "idle":
             weekly_only_layout = False
-    if metrics and set(labels) != {"session", "weekly"} and not weekly_only_layout:
+    if metrics and set(labels) != expected_primary and not weekly_only_layout:
         log_page_diagnosis(
             log,
             provider=account_id,
@@ -540,20 +939,83 @@ class CodexProvider(Provider):
     name = "codex"
     display_name = "Codex"
 
-    def __init__(self, parent: QObject | None = None, account_id: str = "codex"):
+    def __init__(
+        self,
+        parent: QObject | None = None,
+        account_id: str = "codex",
+        config: Config | None = None,
+    ):
         self._parent = parent
         self._account_id = account_id
+        self._config = config
         self._runner: ScrapeRunner | None = None  # held to prevent GC
 
     def refresh(self, on_done: Callable[[UsageSnapshot], None]) -> None:
+        catalog = load_catalog("codex")
+        # The scan is per provider *kind*, not per account: the cards are a
+        # property of Codex's page, so the first account to refresh after the
+        # interval does the scan and the others read the result.
+        discover = scan_due(self._config, "codex")
+
+        # ScrapeRunner rebuilds the snapshot after a transient error, so this
+        # closure runs more than once per refresh. A scan is a once-per-refresh
+        # event: without the flag the second attempt adopts again and saves the
+        # config again.
+        scanned = False
+
         def _build(payload: dict[str, Any]) -> UsageSnapshot:
-            return _build_snapshot(payload, account_id=self._account_id)
+            nonlocal scanned
+            # Classify first. A logged-out, challenged or half-rendered page
+            # still carries cards, and adopting from one writes page furniture
+            # into the catalog permanently while burning the weekly scan (and
+            # the "Re-scan meters now" button) on a page we could not read.
+            snapshot = _build_snapshot(
+                payload, account_id=self._account_id, catalog=catalog
+            )
+            if not discover or scanned or snapshot.status != SnapshotStatus.OK:
+                return snapshot
+            discovered = payload.get("discovered")
+            if not isinstance(discovered, list):
+                # The usage panel was never located, so the scan did not look.
+                # Distinguishable in the log from a scan that found nothing.
+                log_page_diagnosis(
+                    log,
+                    provider=self._account_id,
+                    classification="discovery_no_container",
+                    payload=payload,
+                    expected_rows=_EXPECTED_ROWS,
+                )
+                if "discovered" in payload:
+                    # The extractor ran the scan and answered null: there is
+                    # no panel it can find. Re-attempt daily rather than on
+                    # every refresh. A payload with no "discovered" key at all
+                    # is an extractor that never got that far, and that must
+                    # not spend the scan.
+                    scanned = True
+                    record_no_container_scan(self._config, "codex")
+                return snapshot
+            scanned = True
+            if adopt_rows("codex", discovered, account_id=self._account_id):
+                snapshot = _build_snapshot(
+                    payload,
+                    account_id=self._account_id,
+                    catalog=load_catalog("codex"),
+                    # The cards this refresh could not read were named in the
+                    # log by the build above, off the same payload. Adoption
+                    # adds meters, never makes one unreadable, so repeating
+                    # the line here only doubled it.
+                    log_skipped=False,
+                )
+            record_scan(self._config, "codex")
+            return snapshot
 
         cache_buster = int(datetime.now().timestamp())
         self._runner = ScrapeRunner(
             account_id=self._account_id,
             url=f"{CODEX_ANALYTICS_URL}?aigauge_ts={cache_buster}#personal-usage",
-            extractor_js=EXTRACTOR_JS,
+            extractor_js=extractor_source(
+                EXTRACTOR_TEMPLATE, catalog, discover=discover
+            ),
             build=_build,
             log=log,
             wait_ms=7000,

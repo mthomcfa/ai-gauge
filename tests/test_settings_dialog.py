@@ -2,6 +2,7 @@ from PyQt6.QtWidgets import QPushButton
 
 from aigauge import settings_dialog
 from aigauge.config import Config
+from aigauge.providers.catalog import record_scan, scan_due
 from aigauge.settings_dialog import SettingsDialog
 
 
@@ -258,6 +259,22 @@ def test_account_and_provider_colors_persist_through_apply(qtbot, monkeypatch):
 
     assert config.browser_accounts[0].colors.green_color == "#111111"
     assert config.copilot.colors.red_color == "#222222"
+
+
+def test_rescan_meters_button_arms_the_scan_and_asks_for_a_refresh(qtbot, monkeypatch):
+    monkeypatch.setattr(settings_dialog.QMessageBox, "information", lambda *a, **k: None)
+    config = Config()
+    record_scan(config, "claude", save=False)
+    record_scan(config, "codex", save=False)
+    dialog = SettingsDialog(config)
+    qtbot.addWidget(dialog)
+
+    with qtbot.waitSignal(dialog.rescan_meters_clicked):
+        _button(dialog, "rescan_meters_btn").click()
+
+    assert scan_due(config, "claude") and scan_due(config, "codex")
+    # Saved immediately: the refresh it triggers happens before OK is pressed.
+    assert scan_due(Config.load(), "claude")
 
 
 # --- Microsoft section -----------------------------------------------------

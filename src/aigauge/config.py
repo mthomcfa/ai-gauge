@@ -649,7 +649,22 @@ class Config(BaseModel):
     azure: AzureConfig = Field(default_factory=AzureConfig)
     expanded_tiles: list[str] = Field(default_factory=list)
     collapsed_tiles: list[str] = Field(default_factory=list)
+    # When each provider kind last asked its page for every meter it renders,
+    # ISO-8601 per kind. Empty (or missing) means the next refresh re-scans -
+    # which is also how the Settings "Re-scan meters now" button works.
+    meter_catalog_last_scan: dict[str, str] = Field(default_factory=dict)
     window: WindowState = Field(default_factory=WindowState)
+
+    @field_validator("meter_catalog_last_scan", mode="before")
+    @classmethod
+    def _coerce_scan_stamps(cls, value: object) -> dict[str, str]:
+        if not isinstance(value, dict):
+            return {}
+        return {
+            str(key): item
+            for key, item in value.items()
+            if isinstance(key, str) and isinstance(item, str)
+        }
 
     @field_validator(
         "active_refresh_interval_minutes", "refresh_interval_minutes", mode="before"

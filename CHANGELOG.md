@@ -6,7 +6,7 @@
 > earlier `0.6.4` entry predates that convention and **is not** upstream's
 > `v0.6.4`, which is different code.
 
-## 1.2.0+cfa.4 - 2026-09-09
+## 1.2.0+cfa.4 - 2026-09-10
 
 Adds a **Microsoft** section: Azure, Foundry, and Copilot under one heading.
 Copilot is unchanged and simply moves under it. Azure is new.
@@ -83,6 +83,224 @@ Copilot is unchanged and simply moves under it. Azure is new.
   detect. Detected from `subscriptionPolicies.quotaId`.
 - **The tile never assumes a currency.** Amounts are shown in whatever the
   API's `Currency` column reports, with the code printed alongside.
+
+## 1.1.0+cfa.3 - 2026-09-09
+
+Claude and Codex tiles read **every meter their pages show**, not two, and the
+label definitions moved out of the extractor source into a catalog the app can
+extend by itself. Claude changed its usage surface three times in one week
+before this release; a renamed row is now a one-line edit to a JSON file
+instead of a code change.
+
+### Added
+
+- **One field per meter.** Claude reports Session, Weekly, Opus only, Sonnet
+  only, Cowork only, Claude Design and Daily routine runs; Codex reports its
+  5-hour and weekly cards plus any other usage card the page renders. Session
+  and Weekly stay untagged and still drive the tray / menu-bar colour on their
+  own; every other meter is informational, shown when the tile is expanded.
+  Opus at 91% of a sub-limit is not the account being at 91% of its quota.
+- **A meter catalog, in data.** `src/aigauge/providers/meter_catalog/{claude,codex}.json`
+  ships with the app and is overlaid by `<app data>/meter_catalog/<kind>.json`.
+  Each entry carries a canonical key, a stable display label, the page wordings
+  (`aliases`), its window and whether it is primary. The bundled catalog
+  reproduces exactly the labels the extractors carried before it. Format
+  documented in README.md.
+- **A weekly self-scan.** On the first refresh after seven days — or right away
+  via **Settings → General → Re-scan meters now** — each provider is asked for
+  every labelled row its usage container renders, and rows the catalog does not
+  recognise are adopted as informational meters. They appear as fields on the
+  next refresh, and `"enabled": false` in the override file switches one off
+  **and keeps it off**: a disabled or parked entry is still a label the catalog
+  knows, so the next scan does not adopt it again under a new key.
+  Adoption requires a percentage, used/remaining wording beside it (a row the
+  reader can never read is not a meter), a short alphabetic label that matches
+  no page furniture, and either reset wording or a position inside the usage
+  container. A label that is a meter the catalog already has is refused: the
+  same wording, a whole-word *fragment* of a known label ("Current" inside
+  "Current session"), or a known label with a count glued on and no new word of
+  its own ("Daily included routine runs 3 of 10"). A candidate that adds a word
+  of its own is a new meter — "Weekly Opus" and "Cowork session" are the shapes
+  Claude actually ships — and the collision that corrupts something, a row
+  carrying an existing meter's *display* label and therefore its history key,
+  is refused outright. The 200-meter read cap does not narrow what adoption
+  knows: an entry past it is still in the file, so it cannot be adopted a
+  second time.
+  An adopted meter is given no window for the same reason it is given no
+  polarity: a period guessed from the wording can make an active meter read
+  "idle". Adoption is capped at 24 meters per provider and never sets
+  `primary`. The scan is local — it reads what the embedded browser already
+  rendered, downloads nothing, and there is no remote catalog.
+- **The scan only counts when the page could actually be read.** Adoption and
+  the weekly stamp happen after the snapshot is classified, only on an OK
+  snapshot, only when the extractor found a usage container, and once per
+  refresh. A logged-out, challenged or half-rendered page would otherwise adopt
+  whatever it happened to render — permanently — and spend the week's scan on a
+  page nobody could read. The extractor distinguishes "the panel showed nothing
+  new" from "there was no panel to look in"; the second leaves the scan due and
+  says so in the log.
+- **Provenance on every adopted meter.** An adopted entry is structurally
+  identical to a bundled one, so each records `source`, `first_seen`, the
+  `account_id` its page belonged to, and the `evidence` that justified it (the
+  row's label, percentage and reset wording, capped at 200 characters with any
+  email redacted — the same treatment the diagnostics blob gets). Bundled
+  entries declare `source: "bundled"`; an entry added by hand with no `source`
+  becomes `"user"`, because only the packaged file is bundled. Unrecognised
+  fields in an override file are preserved rather than dropped, and an entry
+  can carry a `status` other than `"active"` to park it — the hook a later
+  review step needs. A discovered meter whose wording a later bundled meter
+  covers is dropped at load with one `superseded` line, rather than reporting
+  the same number twice for ever.
+
+### Fixed
+
+- **Codex read a bare percentage as "used".** `readCard` tested the whole card
+  for "used"/"remaining", so a card rendering only "42%" resolved to 42%
+  consumed — and if it meant 42% *left*, the gauge pointed the wrong way. Worse,
+  the plain-text fallback reads a window that can run into the next card, so one
+  card's wording could set another's polarity. Polarity is now read beside the
+  percentage exactly as Claude's `readRow` does, stopping before any countdown
+  so "2 hr left" cannot invert the gauge, and a card with no wording beside its
+  number is refused rather than guessed. `_parse_body_card` carried the same
+  defect and got the same rule. This was the first entry in
+  `docs/next-session.md`'s known-defect list.
+
+- **A collapsed container gives Session no number rather than the wrong one.**
+  `readRowText` takes the last percentage in the element it picked unless a
+  rival label is in there too, so with adopted meters left out of the rival set
+  an adopted row sharing one container with Session made Session report *that*
+  meter's percentage — as an OK snapshot, on every refresh. The rival set is
+  every meter the page can render: bundled, discovered and hand-added, enabled
+  or not. Fragments like "Current" and "Opus" are refused at adoption instead.
+- **A usage panel the app cannot find is diagnosed daily, not every refresh.**
+  A page rendering fewer than two percentages never completes a scan, and the
+  scan was left due — so `discovery_no_container` was logged every time the
+  tile refreshed, for as long as the page kept that shape. The scan is stamped
+  to come due again in a day. A payload that never reached the scan at all
+  still leaves it due.
+- **Switching both primary meters off is a setting, not an error.** Claude's
+  new "a primary must have been read" guard fired on a catalog with Session and
+  Weekly disabled, so the tile reported a layout change about the user's own
+  override file, permanently. Codex already tolerated it.
+- **An unreadable informational row is named once per refresh.** Adoption
+  rebuilds the snapshot, and the rebuild logged the same line again — two lines
+  read as two meters gone rather than one.
+- **A row labelled "Constructor" is no longer dropped.** Both extractors kept
+  their per-key maps in plain objects, so every name on `Object.prototype` was
+  already present: that row vanished from every scan and a catalog key of
+  `constructor` was never read.
+
+### Changed
+
+- **A Codex card with no readable percentage is no longer shown as a blank
+  gauge.** It counts as absent, which makes the page a partial render and earns
+  a retry, then a plain error. This matches Claude's rule for the same case.
+- **The extractors walk the DOM once per run**, not once per label. The catalog
+  turned a two-label read into a dozen, and `querySelectorAll` plus `innerText`
+  over every element is the expensive part of both extractors.
+- `meter_catalog_last_scan` is a new config key (per provider kind). Missing
+  counts as due, so the first refresh after upgrading scans, and so does a
+  stamp that cannot be read. A stamp in the *future* — a DST rollback, a
+  corrected system clock — is clamped to now rather than treated as due, which
+  had meant scanning on every refresh until the clock caught up. A
+  timezone-aware stamp is converted to local time instead of raising
+  `TypeError` out of `refresh()` and erroring the tile permanently.
+- **The adaptive refresh cadence follows the primary meters only.** Its
+  signature hashed every metric, so with a dozen informational rows per
+  provider any one of them twitching reset the backoff that exists to stop
+  polling a provider that is not moving.
+- **Claude requires that a primary meter was actually read.** A payload of
+  informational rows only used to build an OK snapshot with no gauge on the
+  tile and nothing to retry. Codex has refused that since its partial-render
+  bug.
+
+### Security
+
+- **The override file is written atomically** (temp file plus `os.replace`),
+  and `0600` where POSIX modes exist. It carries page-derived labels, capped
+  evidence and the account id a meter was seen on. On Windows there is no
+  POSIX mode: it relies on the user-scoped `%APPDATA%` location like
+  `config.json` beside it, which SECURITY.md now says rather than claiming
+  owner-only everywhere.
+- **Nothing is written over a file the app could not read or could not move
+  aside.** A file that does not *parse* is moved to `<kind>.json.corrupt`
+  before the write — one trailing comma in a hand edit used to cost every other
+  edit in the file — and if that move fails, the write is abandoned rather than
+  destroying what the move was meant to keep. A file that could not be *read*
+  (a Windows sharing violation, a permission change) is left exactly where it
+  is: a failed read says nothing about the contents, and treating it as
+  unparsable had a valid file quarantined and replaced. A second corruption
+  keeps the first quarantine and discards the newer copy, loudly.
+- **The usage container cannot leave the usage panel.** Discovery is confined
+  to the element holding the panel, and that element was chosen as the smallest
+  one carrying a marker phrase and two percentages — which is `<body>` whenever
+  the phrase also appears outside the panel, as it does in Claude's settings
+  nav and in Codex's prose above the cards. Page furniture ("Storage 88%",
+  "Save 20%") was then inside the usage container. The panel is found by
+  walking up from a marker that carries a percentage of its own — a bare
+  mention is a nav item, not a panel — and among the candidates that survive,
+  the *richest* wins: the one holding the most of the catalog's meters and the
+  most rows whose percentage says used or remaining. Size was the old
+  tiebreak, and furniture that carries the marker and a number of its own
+  ("Plan usage 12% off Max" beside "Storage 88% used", a sidebar of chat
+  titles) is always shorter than the panel, so it won and the panel was never
+  scanned. A candidate holding a bare marker off the path from its anchor is
+  refused as well, once the climb has passed something panel-shaped: that is
+  how a panel with a single meter promoted the SPA's root wrapper, which is
+  not `<body>` and so escaped the outright refusal — while a panel's own
+  heading, tab strip or footnote is a bare marker *inside* the panel, and
+  refusing on those refused the panel itself. `<body>` itself is still
+  refused, and so is a container several times longer than the rows it holds —
+  counting the rows themselves, since counting every wrapper around them
+  multiplied the total by the nesting depth and let a page-swallowing element
+  through. Only one container is returned, so a page rendering two usage
+  panels has the richer one scanned and the other one's meters left
+  undiscovered.
+- **The extractor's injection markers are filled in one pass.** Three chained
+  replaces rescanned inserted text, so a label reading `__AG_CATALOG__` spliced
+  JSON into a string literal and the whole extractor stopped parsing.
+- **A meter past the read cap is still a rival.** The 200-meter cap is a budget
+  for DOM walks, and naming a meter in the extractor's rival set costs no walk:
+  built from the capped catalog, an entry past the cap was a meter the page
+  still renders and the extractor no longer knew about, so one sharing a
+  collapsed container with Session could hand Session its percentage. The rival
+  set is built from the whole file, the way adoption already reads it.
+- **`kind` is validated inside both path builders** — shape, and the Windows
+  device names (`con`, `nul`, `com1`…) `config` already refuses for profile ids,
+  because `nul.json` is a device and not a file. A catalog is capped at 200
+  meters for reading. `secret_storage._atomic_write` now applies a requested
+  mode without `os.fchmod` where there is none, so a Windows caller asking for
+  one gets a file rather than an `AttributeError`.
+
+### Packaging
+
+- The catalog is data next to the code, so both packaging paths name it
+  explicitly: `artifacts` in the hatch wheel config and `--add-data` in
+  `build.sh` / `build.ps1`. A frozen build that silently dropped it would read
+  no meters at all, and only on a user's machine.
+
+### Testing
+
+- 610 → 827 tests. Catalog loading, override merge, load order and alias
+  matching; the seven-day gate including the clock-change, future-stamp and
+  timezone cases; adoption, its idempotence, its cap and every junk rule,
+  including that a disabled meter is not adopted again and that a display-label
+  collision cannot fabricate a history rollover; provenance including the email
+  redaction and the preservation of unknown fields; the catalog scan and the
+  discovery scan executed in node against a stub DOM whose containers derive
+  their text from their children, covering the settings-nav layout, the
+  workspace-credit layout and nested wrappers; `node --check` on an extractor
+  built from a catalog whose label looks like an injection marker; Codex
+  polarity for used, remaining and a bare percentage; and that a page relabel
+  keeps one history key rather than forking it. Plus, for each way out of the
+  usage panel, a stub DOM that takes it: a nav carrying the marker and its own
+  percentages, a nav carrying the marker and a percentage too, an SPA root
+  wrapper reached from a single-meter panel, and rows buried six wrappers deep
+  inside a page-swallowing element. Plus the panel's own heading, tab strip and
+  footnote, which name the meters without measuring them and used to refuse the
+  panel that renders them. And the collapsed
+  container in both orders, which is where a rival label is the difference
+  between Session refusing and Session reporting another meter's number.
 
 ## 1.0.0+cfa.2 - 2026-08-10
 
