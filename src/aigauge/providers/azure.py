@@ -40,7 +40,7 @@ import math
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from typing import Any, Callable
 
 import requests
@@ -205,15 +205,19 @@ def _utc_today() -> date:
     return datetime.now(timezone.utc).date()
 
 
-def _boundary_local(day: date) -> datetime:
+def _boundary_local(day: date, *, tz: tzinfo | None = None) -> datetime:
     """A period boundary (a UTC date) as a local wall-clock time.
 
     The boundary is a UTC instant; the countdown next to the bar is read in
-    local time, so it is converted rather than reinterpreted.
+    local time, so it is converted rather than reinterpreted. ``tz`` is the
+    zone to render in and defaults to the system's; the tests pass a fixed
+    offset instead of changing the process's TZ, because ``setenv`` racing
+    ``getenv`` on the Chromium threads that earlier tests leave running is a
+    segmentation fault, not a test failure.
     """
     return (
         datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
-        .astimezone()
+        .astimezone(tz)
         .replace(tzinfo=None)
     )
 
@@ -657,6 +661,7 @@ def build_snapshot(
     *,
     fetched_at: datetime | None = None,
     stale_note: str | None = None,
+    local_tz: tzinfo | None = None,
 ) -> UsageSnapshot:
     """Render an aggregate as tile rows.
 
@@ -673,7 +678,9 @@ def build_snapshot(
     currency = aggregate.currency
     allowance, allowance_source = _allowance(aggregate, azure_cfg)
     resets_at = (
-        _boundary_local(aggregate.period_end) if aggregate.period_end else None
+        _boundary_local(aggregate.period_end, tz=local_tz)
+        if aggregate.period_end
+        else None
     )
     window = (
         timedelta(days=(aggregate.period_end - aggregate.period_start).days)
@@ -781,7 +788,7 @@ def build_snapshot(
         # was built from the UTC date and the countdown from its local
         # rendering, so west of UTC the tile printed 1 Oct and counted down to
         # 30 Sep.
-        end = _boundary_local(aggregate.period_end).date()
+        end = _boundary_local(aggregate.period_end, tz=local_tz).date()
         reset_label = f"{money_text} · resets {end.day} {end.strftime('%b')}"
     else:
         reset_label = money_text
