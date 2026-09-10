@@ -34,7 +34,7 @@ _EXPIRY_SKEW = timedelta(minutes=5)
 # ai-gauge.log (a newline in it forges whole log lines), in snapshot.error, and
 # in a RichText dialog header. Reduce it to the alphabet a code can have.
 _CODE_RE = re.compile(r"[^A-Za-z0-9_.\-]")
-_CODE_MAX_LEN = 64
+_CODE_MAX_LEN = 32
 # Bounds on the lifetime Entra ID claims for a token. An hour is the norm; the
 # bounds are here so a hostile or broken value cannot produce a cache entry
 # that is either useless or effectively immortal.
@@ -148,7 +148,12 @@ def get_token(
         try:
             payload = response.json()
             if isinstance(payload, dict):
-                code = _CODE_RE.sub("", str(payload.get("error") or ""))[
+                # First whitespace-delimited token *before* the character
+                # filter: every character of "AADSTS7000215: tenant <guid>
+                # app x" is in the allowlist, so filtering alone let a whole
+                # description - GUIDs included - through as a "code".
+                raw_code = str(payload.get("error") or "").strip().split(maxsplit=1)
+                code = _CODE_RE.sub("", raw_code[0] if raw_code else "")[
                     :_CODE_MAX_LEN
                 ]
         except ValueError:

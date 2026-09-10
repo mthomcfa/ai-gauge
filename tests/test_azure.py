@@ -1584,11 +1584,49 @@ def test_the_aad_error_code_is_reduced_to_a_code():
     with pytest.raises(AzureAuthError) as exc:
         get_token(TENANT, CLIENT, "bad", now=datetime(2026, 9, 9))
     code = exc.value.code
-    assert code.startswith("invalid_client")
-    assert len(code) <= 64
+    assert code == "invalid_client"
+    assert len(code) <= 32
     assert "\n" not in code and "<b>" not in code and " " not in code
     message = str(exc.value)
     assert "\n" not in message and "<b>" not in message
+
+
+@responses.activate
+def test_a_description_shaped_aad_error_cannot_smuggle_an_id_through():
+    """Every character of "AADSTS7000215: tenant <guid> app x" is in the
+    allowlist, so the filter alone passed the whole sentence - GUIDs included -
+    into the log, the tile and an unredacted tray tooltip. A code is one
+    token."""
+    responses.add(
+        responses.POST,
+        TOKEN_URL,
+        json={"error": f"AADSTS7000215: tenant {TENANT} app {CLIENT}"},
+        status=401,
+    )
+    with pytest.raises(AzureAuthError) as exc:
+        get_token(TENANT, CLIENT, "bad", now=datetime(2026, 9, 9))
+
+    code = exc.value.code
+    assert code == "AADSTS7000215", "the description rode out as a code"
+    assert TENANT not in str(exc.value) and CLIENT not in str(exc.value)
+
+
+def test_a_keyring_failure_still_forgets_the_cached_token(monkeypatch):
+    """clear_cache ran only after keyring.set_password, so a keyring that
+    raised left the bearer minted from the *old* secret live in memory."""
+    from aigauge import config as config_module
+    from aigauge.providers import _azure_auth
+
+    def _boom(service, account, value):
+        raise RuntimeError("keyring is locked")
+
+    monkeypatch.setattr(config_module.keyring, "set_password", _boom)
+    _azure_auth._CACHE[(TENANT, CLIENT, "digest")] = _azure_auth._CachedToken(
+        token="live", expires_at=datetime.now() + timedelta(hours=1)
+    )
+    with pytest.raises(RuntimeError):
+        config_module.set_azure_client_secret("new-secret")
+    assert not _azure_auth._CACHE
 
 
 @responses.activate

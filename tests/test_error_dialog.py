@@ -1,3 +1,6 @@
+import json
+import time
+
 from aigauge.error_dialog import _format_diagnostics
 from aigauge.models import SnapshotStatus, UsageSnapshot
 
@@ -218,7 +221,10 @@ def test_the_dialog_header_redacts_azure_ids(qtbot):
     dialog = ErrorDetailsDialog("azure", "Microsoft · Azure", snapshot)
     qtbot.addWidget(dialog)
     assert "11111111-2222-3333-4444-555555555555" not in dialog._header_text  # noqa: SLF001
-    assert "<guid>" in dialog._header_text  # noqa: SLF001
+    # Redacted first and escaped last, so the marker is escaped markup in the
+    # source and renders as the literal "<guid>" - see
+    # test_the_header_shows_the_redaction_marker_to_the_reader.
+    assert "&lt;guid&gt;" in dialog._header_text  # noqa: SLF001
 
 
 def test_child_resource_names_are_redacted_too():
@@ -251,9 +257,15 @@ def test_url_encoded_resource_paths_are_redacted():
 
 
 def test_a_guid_without_hyphens_is_redacted():
+    """Azure accepts and emits both forms, and the dashed pattern does not
+    match this one at all. Anchored to an Azure context so an md5 elsewhere in
+    the blob is not swept up with it."""
     from aigauge.error_dialog import _redact_azure_ids
 
-    out = _redact_azure_ids("tenant 11111111222233334444555555555555 failed")
+    out = _redact_azure_ids(
+        "https://login.microsoftonline.com/tenants/"
+        "11111111222233334444555555555555/oauth2/v2.0/token"
+    )
     assert "11111111222233334444555555555555" not in out
     assert "<guid>" in out
 
@@ -270,3 +282,154 @@ def test_a_guid_after_an_encoded_separator_is_redacted():
     )
     assert "11111111-1111-1111-1111-111111111111" not in out
     assert "rg-secret" not in out
+
+
+# --- the redaction pass is a scalpel, not a broom ---------------------------
+
+
+def test_a_hash_that_is_not_an_azure_id_survives_the_blob():
+    """Any 32 hex digits became <guid>, so an md5, a Chromium request id or a
+    32-char session id in a Claude or Codex payload was removed from the blob
+    the user is told to paste into a bug report."""
+    snapshot = UsageSnapshot(
+        provider="claude",
+        status=SnapshotStatus.ERROR,
+        error="etag mismatch",
+        raw={"etag": "d41d8cd98f00b204e9800998ecf8427e"},
+    )
+    out = _format_diagnostics("claude", snapshot)
+    assert "d41d8cd98f00b204e9800998ecf8427e" in out
+
+
+def test_a_non_azure_providers_path_is_left_alone():
+    """/providers/ is not an Azure-only word: a model name on an OpenRouter
+    URL was being redacted out of another provider's diagnostics."""
+    from aigauge.error_dialog import _redact_azure_ids
+
+    text = "https://api.example.com/v1/providers/openrouter/models/gpt-4o"
+    assert _redact_azure_ids(text) == text
+
+
+def test_an_arm_path_is_still_redacted_end_to_end():
+    from aigauge.error_dialog import _redact_azure_ids
+
+    out = _redact_azure_ids(
+        "/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups"
+        "/rg-client/providers/Microsoft.Web/sites/client-portal"
+    )
+    assert "rg-client" not in out and "client-portal" not in out
+    assert "<guid>" in out and "Microsoft.Web/sites/<redacted>" in out
+
+
+def test_a_name_containing_an_apostrophe_is_redacted_whole():
+    """The segment pattern stopped at a quote, so the customer-identifying
+    tail of the name survived into the clipboard blob."""
+    from aigauge.error_dialog import _redact_azure_ids
+
+    out = _redact_azure_ids(
+        "/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups"
+        "/rg-o'brien-secret/providers/Microsoft.Web/sites/x"
+    )
+    assert "brien-secret" not in out
+
+
+def test_json_structure_survives_the_segment_pattern():
+    """A double quote still ends a segment: the blob is JSON, and eating the
+    closing quote would make it unreadable."""
+    from aigauge.error_dialog import _redact_azure_ids
+
+    out = _redact_azure_ids(
+        '{"url": "/subscriptions/11111111-2222-3333-4444-555555555555'
+        '/resourceGroups/rg-x", "status": 403}'
+    )
+    assert out.endswith('", "status": 403}')
+
+
+def test_sanitize_raw_caps_dict_keys_like_values():
+    """The cap exists because the email pass is quadratic on a long
+    non-matching string; a key is as good a place to put one as a value."""
+    from aigauge.error_dialog import _STRING_LIMIT, _sanitize_raw
+
+    out = _sanitize_raw({"k" * 5000: 1})
+    assert all(len(key) <= _STRING_LIMIT + 20 for key in out)
+
+
+def test_sanitize_raw_caps_strings_inside_tuples():
+    from aigauge.error_dialog import _sanitize_raw
+
+    out = _sanitize_raw({"pair": ("t" * 5000, "u" * 5000)})
+    assert all(len(item) < 3000 for item in out["pair"])
+
+
+def test_sanitize_raw_does_not_recurse_off_the_stack():
+    """json.loads accepts a payload deeper than this walk could handle, and
+    ErrorDetailsDialog.__init__ does not catch RecursionError - so the one
+    dialog a user opens when something is already wrong would not open."""
+    from aigauge.error_dialog import _sanitize_raw
+
+    deep = current = {}
+    for _ in range(600):
+        current["next"] = {}
+        current = current["next"]
+    out = _sanitize_raw(deep)
+    assert "too deep" in json.dumps(out)
+
+
+def test_the_email_pass_is_linear_in_a_long_non_matching_string():
+    """The unbounded quantifiers backtracked quadratically: 80 KB took 7.5 s
+    and 200 KB was still running after 25 s, on the GUI thread. The string cap
+    keeps today's payloads short enough to hide it, so this pins the pattern
+    itself."""
+    from aigauge.error_dialog import _redact_emails
+
+    blob = "a" * 200_000
+    started = time.perf_counter()
+    assert _redact_emails(blob) == blob
+    assert time.perf_counter() - started < 0.1
+
+
+def test_the_diagnostics_blob_is_bounded_for_a_huge_error_string():
+    snapshot = UsageSnapshot(
+        provider="claude",
+        status=SnapshotStatus.ERROR,
+        error="x" * 200_000,
+        raw={"body_text": "y" * 200_000},
+    )
+    started = time.perf_counter()
+    _format_diagnostics("claude", snapshot)
+    assert time.perf_counter() - started < 0.1
+
+
+def test_email_addresses_are_still_redacted_by_the_linear_pattern():
+    from aigauge.error_dialog import _redact_emails
+
+    assert _redact_emails("mail person.name+tag@sub.example.co.uk here") == (
+        "mail [redacted-email] here"
+    )
+
+
+def test_the_header_shows_the_redaction_marker_to_the_reader(qtbot):
+    """The markers were inserted after html.escape, so Qt parsed <redacted>
+    as an unknown tag and dropped it - the reader saw /subscriptions// and
+    could not tell whether an id had been removed or was never there."""
+    from PyQt6.QtGui import QTextDocument
+
+    from aigauge.error_dialog import ErrorDetailsDialog
+
+    snapshot = UsageSnapshot(
+        provider="azure",
+        status=SnapshotStatus.ERROR,
+        error=(
+            "Azure request failed at /subscriptions/"
+            "11111111-2222-3333-4444-555555555555/resourceGroups/rg-x"
+            "/providers/Microsoft.Web/sites/portal"
+        ),
+    )
+    dialog = ErrorDetailsDialog("azure", "Microsoft · Azure", snapshot)
+    qtbot.addWidget(dialog)
+
+    document = QTextDocument()
+    document.setHtml(dialog._header_text)  # noqa: SLF001
+    rendered = document.toPlainText()
+    assert "<redacted>" in rendered
+    assert "<guid>" in rendered

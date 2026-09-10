@@ -1034,6 +1034,11 @@ def set_azure_client_secret(secret: str | None) -> None:
     # this module free of provider imports.
     from .providers._azure_auth import clear_cache
 
+    # Before as well as after: a keyring that raises (locked, unavailable,
+    # a policy refusal) would otherwise leave the bearer minted from the *old*
+    # secret live in memory, which is the one outcome this call exists to
+    # prevent.
+    clear_cache()
     if secret:
         keyring.set_password(KEYRING_SERVICE, KEYRING_AZURE_CLIENT_SECRET, secret)
     else:
