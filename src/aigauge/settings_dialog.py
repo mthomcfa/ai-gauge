@@ -778,7 +778,10 @@ class SettingsDialog(QDialog):
                 "<b>Entra ID app registration</b> (client credentials). Grant it "
                 "<b>Cost Management Reader</b> for cost queries, forecasts, and "
                 "budgets, plus <b>Reader</b> so it can list resources and read "
-                "the subscription's offer."
+                "the subscription's offer. Both are needed for a gauge: "
+                "without <b>Reader</b> the tile shows the spend but no "
+                "percentage, because an Azure Sponsorship offer - which Cost "
+                "Management reports as zero - cannot be ruled out."
             ),
         )
 

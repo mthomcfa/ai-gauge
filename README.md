@@ -178,8 +178,9 @@ are shares of spend, not usage against a limit, so a single service at 96% of
 the month's spend must not turn the tray red. Every percentage on the tile —
 the top row, the shares and the forecast — appears together or not at all: if
 the total cannot honestly carry a gauge (a truncated read, more than one
-billing currency, an unreadable offer type) then none of the rows below it
-carries one either, and the amounts are still shown.
+billing currency, an unreadable offer type, a Sponsorship offer, or settings
+changed since the figures were read) then none of the rows below it carries
+one either, and the amounts are still shown.
 
 #### Setting it up
 
@@ -196,9 +197,15 @@ carries one either, and the amounts are still shown.
    - **Reader** — listing resources (to find Foundry resources by kind) and
      reading the subscription's offer type.
 
-   Reader is optional in the narrow sense that the spend gauge still works
-   without it, but you then lose the Foundry roll-up and the sponsorship
-   warning, and you have to pin Foundry resource IDs by hand.
+   **Both are needed for a gauge.** With Cost Management Reader alone the tile
+   still shows the month's spend, but no percentage anywhere: reading the
+   subscription's offer type is what rules out an Azure Sponsorship offer,
+   which Cost Management reports as zero cost while the sponsored credit
+   drains — and a small positive total does not rule it out either, because a
+   sponsored subscription still bills Marketplace and other non-sponsored
+   charges normally. Without that check no gauge is honest, so none is shown.
+   You also lose the Foundry roll-up and have to pin Foundry resource IDs by
+   hand.
 4. **Fill in Settings → Microsoft → Azure.** Directory (tenant) ID,
    Application (client) ID, the client secret, and the Subscription ID — all
    three IDs are GUIDs, and anything else is refused. Set a monthly allowance
