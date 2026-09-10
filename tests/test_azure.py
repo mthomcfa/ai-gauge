@@ -1182,6 +1182,35 @@ def test_a_403_on_the_marketplace_query_does_not_take_the_tile_down(
 
 
 @responses.activate
+def test_a_truncated_marketplace_query_drops_the_split_it_could_not_finish(
+    monkeypatch, config
+):
+    """A marketplace read that stopped early moves *part* of a resource's
+    charge into the Marketplace row and leaves the rest under its own service.
+    The month's total is unaffected - the rows are only re-labelled - so the
+    split goes rather than the tile, and the note says why."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    config.azure.include_marketplace = True
+    market_row = [3.0, 20260907, MARKET_ID, "Global resources", "CAD"]
+    _stub_everything(rows=DEFAULT_ROWS + [market_row])
+    page_one = query_payload([[1.0, 20260907, MARKET_ID, "Global resources", "CAD"]])
+    page_one["properties"]["nextLink"] = f"{QUERY_URL}?$skiptoken=page2"
+    responses.add(responses.POST, QUERY_URL, json=page_one, status=200)
+    responses.add(responses.POST, QUERY_URL, json={}, status=500)
+
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+
+    assert snapshot.status == SnapshotStatus.OK
+    note = snapshot.metrics[0].note or ""
+    assert "Marketplace breakdown unavailable this refresh (results truncated)." in note
+    assert az.MARKETPLACE_BUCKET not in [m.label for m in snapshot.metrics]
+    assert snapshot.raw["marketplace_cost"] is None
+    # The whole charge stays where the main query put it.
+    resource_row = [m for m in snapshot.metrics if m.label == "Global resources"]
+    assert resource_row and "CAD 3.00" in (resource_row[0].note or "")
+
+
+@responses.activate
 def test_a_failed_dispatch_does_not_park_the_tile(monkeypatch, config):
     """in_flight is set by the caller and cleared by the callee, so the one
     path where the callee never runs used to leak it for the whole process."""

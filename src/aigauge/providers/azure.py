@@ -2020,14 +2020,27 @@ class AzureProvider(Provider):
                         marketplace_only=True,
                         budget=budget,
                     )
-                    for rid, service, cost in mp_parsed.rows:
-                        if not rid:
-                            continue
-                        key = (rid, service)
-                        marketplace_costs[key] = (
-                            marketplace_costs.get(key, 0.0) + cost
+                    if mp_parsed.truncated:
+                        # A marketplace read that stopped early re-labels
+                        # *part* of a resource's charge and leaves the rest
+                        # under its own service - a wrong split, shown at OK
+                        # with nothing saying so. The month's total does not
+                        # depend on it (these rows are only moved between
+                        # buckets), so the split is discarded rather than the
+                        # tile, and the note says what is missing.
+                        notes.append(
+                            "Marketplace breakdown unavailable this refresh "
+                            "(results truncated)."
                         )
-                    marketplace_cost = mp_parsed.total
+                    else:
+                        for rid, service, cost in mp_parsed.rows:
+                            if not rid:
+                                continue
+                            key = (rid, service)
+                            marketplace_costs[key] = (
+                                marketplace_costs.get(key, 0.0) + cost
+                            )
+                        marketplace_cost = mp_parsed.total
                 except AzureThrottled:
                     raise
                 except AzurePermissionError:
