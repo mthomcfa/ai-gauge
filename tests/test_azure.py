@@ -296,6 +296,31 @@ def test_top_rows_setting_narrows_the_breakdown():
     assert [name for name, _c in buckets] == ["Service 0", "Service 1", "Other (3 services)"]
 
 
+def test_the_kept_buckets_are_capped_and_still_sum_to_the_total():
+    """The aggregate keeps every distinct bucket so the row count can be
+    re-sliced from it, which makes that list something a response can grow.
+    The cap is on distinct services rather than rows, and whatever is past it
+    is folded rather than dropped, so the rows still add up."""
+    ranked = [(f"Service {i}", float(300 - i)) for i in range(300)]
+    total = sum(cost for _, cost in ranked)
+
+    kept = az.fold_buckets(ranked, az.MAX_KEPT_BUCKETS, cap=az.MAX_KEPT_BUCKETS)
+    assert len(kept) == az.MAX_KEPT_BUCKETS + 1
+    assert sum(cost for _, cost in kept) == pytest.approx(total)
+
+    shown = az.fold_buckets(kept, 3)
+    assert len(shown) == 4
+    assert sum(cost for _, cost in shown) == pytest.approx(total)
+
+
+def test_a_folded_row_is_counted_as_a_bucket_when_it_folds_again():
+    """The fetch-time fold can leave an Other row in the list the render-time
+    fold re-slices. It is an aggregation, not a service, so the noun says so
+    rather than counting a hundred services as one."""
+    folded = az.fold_buckets([("Other (9 services)", 1.0), ("A", 5.0), ("B", 4.0)], 1)
+    assert folded == [("A", 5.0), ("Other (2 buckets)", 5.0)]
+
+
 # --- snapshot --------------------------------------------------------------
 
 
@@ -762,6 +787,40 @@ def test_second_refresh_within_the_hour_serves_the_cache(monkeypatch, config):
     assert second.status == SnapshotStatus.OK
     # Served from cache means the ORIGINAL fetch time, not "now".
     assert second.fetched_at == first.fetched_at
+
+
+@responses.activate
+def test_changing_the_row_count_re_renders_from_the_cache(monkeypatch, config):
+    """"Top rows shown" changes nothing about the question asked, only how
+    many of the answer's rows are named. Treating it like the rest of the
+    query shape discarded a correct cached aggregate and left the tile reading
+    `error - stale` until the hourly window opened, for a display edit."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    rows = [
+        [float(10 - i), 20260901, f"{STORAGE_ID}-{i}", f"Service {i}", "CAD"]
+        for i in range(6)
+    ]
+    _stub_everything(rows=rows, forecast=False)
+    first = _run(az.AzureProvider(config), monkeypatch)
+    calls = len(responses.calls)
+    assert [m.label for m in first.metrics if m.tag == az.BREAKDOWN_TAG] == [
+        f"Service {i}" for i in range(6)
+    ]
+
+    config.azure.top_rows = 3
+    second = _run(az.AzureProvider(config), monkeypatch)
+
+    assert len(responses.calls) == calls, "a display setting cost a live fetch"
+    assert second.status == SnapshotStatus.OK
+    assert [m.label for m in second.metrics if m.tag == az.BREAKDOWN_TAG] == [
+        "Service 0",
+        "Service 1",
+        "Service 2",
+        "Other (3 services)",
+    ]
+    assert second.metrics[0].percent_used is not None
+    # The folded rows still add up: 7.00 + 6.00 + 5.00.
+    assert second.metrics[-1].note and "CAD 18.00" in second.metrics[-1].note
 
 
 @responses.activate
@@ -1390,14 +1449,14 @@ def test_a_blocked_until_past_the_backoff_ceiling_is_cleared(monkeypatch, config
 
 
 @responses.activate
-def test_toggling_a_display_setting_does_not_buy_a_live_fetch(monkeypatch, config):
+def test_ten_settings_saves_inside_the_hour_buy_one_live_fetch(monkeypatch, config):
     """A settings save is a one-click human action and it is easy to loop.
     Changing what the query asks for invalidates the cached answer; it does
     not reopen the fetch window, which is what README and SECURITY.md promise."""
     monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
     _stub_everything()
     for press in range(10):
-        config.azure.top_rows = 5 if press % 2 else 6
+        config.azure.reset_day = 15 if press % 2 else 16
         snapshot = _run(az.AzureProvider(config), monkeypatch)
 
     queries = [c for c in responses.calls if "CostManagement/query" in c.request.url]
@@ -2629,7 +2688,6 @@ def test_changing_the_reset_day_refetches_instead_of_replaying_the_old_period(
     [
         ("resource_group", "rg-ai"),
         ("include_marketplace", True),
-        ("top_rows", 2),
         ("foundry_resource_ids", [OPENAI_ID]),
     ],
 )

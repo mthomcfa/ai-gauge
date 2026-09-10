@@ -86,6 +86,13 @@ IN_FLIGHT_STALE_AFTER = timedelta(minutes=15)
 # driving the tray colour. Asserted in tests/test_azure.py.
 BREAKDOWN_TAG = "model_breakdown"
 MAX_BREAKDOWN_ROWS = 6
+# How many distinct buckets the cached aggregate keeps, so the row-count
+# setting can be re-sliced from it without another live fetch. A ceiling on
+# *distinct services*, not on rows: Azure has a couple of hundred service
+# names in total, so this is a memory bound that is never reached in practice
+# rather than a display one. Whatever is past it is already folded into Other,
+# so the rows still sum to the total.
+MAX_KEPT_BUCKETS = 200
 LABEL_MAX_LEN = 20
 
 FOUNDRY_BUCKET = "Foundry"
@@ -416,6 +423,10 @@ class AzureAggregate:
     period_start: date | None = None
     period_end: date | None = None
     data_as_of: date | None = None
+    # Every distinct bucket this period, largest first, capped at
+    # MAX_KEPT_BUCKETS with the tail already folded into an Other row. The
+    # rows the tile names are sliced from this on every render, so the
+    # row-count setting costs no API call.
     buckets: list[tuple[str, float]] = field(default_factory=list)
     foundry_cost: float | None = None
     foundry_resource_count: int = 0
@@ -451,7 +462,19 @@ def bucket_costs(
     *,
     top_rows: int = MAX_BREAKDOWN_ROWS,
 ) -> tuple[list[tuple[str, float]], float | None, float | None, int]:
-    """Partition rows into display buckets that sum to the total.
+    """``rank_buckets`` and ``fold_buckets`` in one step, for one row count."""
+    ranked, foundry_cost, marketplace_cost, service_count = rank_buckets(
+        parsed, foundry_ids, marketplace_costs
+    )
+    return fold_buckets(ranked, top_rows), foundry_cost, marketplace_cost, service_count
+
+
+def rank_buckets(
+    parsed: QueryRows,
+    foundry_ids: set[str],
+    marketplace_costs: dict[tuple[str, str], float] | None = None,
+) -> tuple[list[tuple[str, float]], float | None, float | None, int]:
+    """Partition rows into buckets that sum to the total, largest first.
 
     Each cost row lands in exactly one bucket - Foundry, Marketplace, or its
     ServiceName - so the rows can never double-count. That is the whole reason
@@ -503,27 +526,56 @@ def bucket_costs(
         totals[bucket] = totals.get(bucket, 0.0) + cost
 
     ranked = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
+    return ranked, foundry_cost, marketplace_cost, len(services)
+
+
+# A folded row is a bucket, not a service, and the render-time fold has to be
+# able to tell one it made earlier from a real service name.
+_OTHER_PREFIX = "Other ("
+
+
+def fold_buckets(
+    ranked: list[tuple[str, float]],
+    top_rows: int,
+    *,
+    cap: int = MAX_BREAKDOWN_ROWS,
+) -> list[tuple[str, float]]:
+    """Name the largest ``top_rows`` buckets and collapse the rest into Other.
+
+    Run twice on the way to the tile: once at fetch time against
+    ``MAX_KEPT_BUCKETS``, which is a memory bound rather than a display one,
+    and again on every render against the row count from Settings. That second
+    pass is what makes "Top rows shown" a display setting again - changing it
+    re-slices the cached aggregate instead of discarding a correct answer and
+    leaving the tile in error until the hourly window opens.
+    """
+    ranked = sorted(ranked, key=lambda kv: kv[1], reverse=True)
     # Foundry is never folded into "Other": it is the row the tile exists to
     # show, and a quiet month would otherwise hide it. Pinned on the bucket
     # name alone - a Foundry row that spent 0.00 is still that row, and a
     # quiet month is exactly what the pin is for.
     pinned = [pair for pair in ranked if pair[0] == FOUNDRY_BUCKET]
     rest = [pair for pair in ranked if pair not in pinned]
-    top_rows = max(1, min(MAX_BREAKDOWN_ROWS, top_rows))
+    top_rows = max(1, min(cap, top_rows))
     keep = pinned + rest[: max(0, top_rows - len(pinned))]
     remainder = [pair for pair in rest if pair not in keep]
     if remainder:
         other_total = sum(cost for _, cost in remainder)
         # "services" only when they all are: the Marketplace row is a bucket,
         # not a service, and counting it as one mis-states what the row holds.
+        # So is an Other row the fetch-time fold already made, which is the
+        # only way one arrives here.
         non_services = (FOUNDRY_BUCKET, MARKETPLACE_BUCKET)
         noun = (
             "buckets"
-            if any(name in non_services for name, _ in remainder)
+            if any(
+                name in non_services or name.startswith(_OTHER_PREFIX)
+                for name, _ in remainder
+            )
             else "services"
         )
         keep.append((f"Other ({len(remainder)} {noun})", other_total))
-    return keep, foundry_cost, marketplace_cost, len(services)
+    return keep
 
 
 # --------------------------------------------------------------------------
@@ -771,7 +823,12 @@ def build_snapshot(
     )
 
     total = aggregate.total
-    for name, cost in aggregate.buckets:
+    # Sliced here rather than at fetch time, so "Top rows shown" is a display
+    # setting: changing it re-renders the cached aggregate with no API call.
+    shown_buckets = fold_buckets(
+        aggregate.buckets, getattr(azure_cfg, "top_rows", MAX_BREAKDOWN_ROWS)
+    )
+    for name, cost in shown_buckets:
         # Clamped for display only: a refund row makes a share negative and
         # pushes another over 100, and the row label prints the percentage
         # verbatim. The money stays exact in the note. A share of a total the
@@ -848,17 +905,22 @@ def build_snapshot(
         status=SnapshotStatus.OK,
         metrics=metrics,
         fetched_at=fetched_at or datetime.now(),
-        raw=_diagnostic_raw(aggregate),
+        raw=_diagnostic_raw(aggregate, shown_buckets),
     )
 
 
-def _diagnostic_raw(aggregate: AzureAggregate) -> dict[str, Any]:
+def _diagnostic_raw(
+    aggregate: AzureAggregate, buckets: list[tuple[str, float]]
+) -> dict[str, Any]:
     """What Copy-diagnostics may see.
 
     Built as an allowlist rather than a redaction pass: no resource id,
     resource-group name, subscription id, or tenant id is put in here at all,
     so error_dialog's redaction is a second line of defence rather than the
     only one.
+
+    ``buckets`` is the rendered slice rather than everything the aggregate
+    kept, so a pasted blob describes the tile the reporter is looking at.
     """
     return {
         "currency": aggregate.currency,
@@ -872,7 +934,7 @@ def _diagnostic_raw(aggregate: AzureAggregate) -> dict[str, Any]:
         "data_as_of": aggregate.data_as_of.isoformat()
         if aggregate.data_as_of
         else None,
-        "buckets": [[name, round(cost, 6)] for name, cost in aggregate.buckets],
+        "buckets": [[name, round(cost, 6)] for name, cost in buckets],
         "foundry_cost": aggregate.foundry_cost,
         "foundry_resource_count": aggregate.foundry_resource_count,
         "marketplace_cost": aggregate.marketplace_cost,
@@ -1707,18 +1769,17 @@ def _query_identity(azure_cfg) -> tuple:
     to loop. So the next render is the fail-closed "waiting for the next Azure
     fetch window" snapshot rather than a fresh query.
 
-    ``top_rows`` is only a display setting, but re-bucketing it without a
-    refetch would mean keeping every parsed row alongside the aggregate (up to
-    MAX_QUERY_ROWS of them) for the life of the process, so it is treated like
-    the rest: the answer is dropped and re-read at the next window.
-    ``monthly_allowance`` is absent because build_snapshot re-reads it on every
-    render, so editing it re-colours the gauge with no API call at all.
+    ``top_rows`` is absent: it changes how many of the answer's rows are
+    named, not what was asked, and the aggregate keeps every distinct bucket
+    (see MAX_KEPT_BUCKETS) so build_snapshot can re-slice it on the spot.
+    ``monthly_allowance`` is absent for the same reason - build_snapshot
+    re-reads it on every render, so editing it re-colours the gauge with no
+    API call at all.
     """
     return (
         getattr(azure_cfg, "reset_day", 1),
         getattr(azure_cfg, "resource_group", None) or "",
         bool(getattr(azure_cfg, "include_marketplace", False)),
-        getattr(azure_cfg, "top_rows", MAX_BREAKDOWN_ROWS),
         tuple(sorted(getattr(azure_cfg, "foundry_resource_ids", []) or [])),
     )
 
@@ -2105,11 +2166,15 @@ class AzureProvider(Provider):
                 except Exception:  # noqa: BLE001 - tolerant by design.
                     notes.append("Marketplace breakdown unavailable this refresh.")
 
-            buckets, foundry_cost, bucket_marketplace, service_count = bucket_costs(
-                parsed,
-                foundry_ids,
-                marketplace_costs,
-                top_rows=azure_cfg.top_rows,
+            # Every distinct bucket, not only the rows the row-count setting
+            # asks for today: the tile slices this on every render, so
+            # changing that setting re-renders from here rather than
+            # discarding a correct answer and waiting out the hour.
+            ranked, foundry_cost, bucket_marketplace, service_count = rank_buckets(
+                parsed, foundry_ids, marketplace_costs
+            )
+            buckets = fold_buckets(
+                ranked, MAX_KEPT_BUCKETS, cap=MAX_KEPT_BUCKETS
             )
 
             budget_amount, budget_grain = self._safe_budget(
