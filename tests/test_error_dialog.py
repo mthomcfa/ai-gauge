@@ -1,6 +1,8 @@
 import json
 import time
 
+import pytest
+
 from aigauge.error_dialog import _format_diagnostics
 from aigauge.models import SnapshotStatus, UsageSnapshot
 
@@ -405,6 +407,28 @@ def test_email_addresses_are_still_redacted_by_the_linear_pattern():
 
     assert _redact_emails("mail person.name+tag@sub.example.co.uk here") == (
         "mail [redacted-email] here"
+    )
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "a" * 70 + "@example.com",
+        "sk-" + "A" * 70 + ".alice@example.com",
+        "a@" + "d" * 300 + ".com",
+    ],
+)
+def test_a_long_address_is_still_an_address(address):
+    """The lookbehind that makes the pass linear allows exactly one start
+    position per run of local-part characters, so the bound has to cover the
+    *whole* run: at {1,64} an identifier joined to an address by a dot - which
+    is what a leaked token followed by a name looks like - pushed the run past
+    the bound, no start position was viable, and the address was emitted
+    whole. The bounds are what keep the pass linear; their size is not."""
+    from aigauge.error_dialog import _redact_emails
+
+    assert _redact_emails(f"contact {address} please") == (
+        "contact [redacted-email] please"
     )
 
 

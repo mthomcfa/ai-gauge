@@ -52,8 +52,14 @@ QPushButton:default { background:#2563eb; border-color:#1d4ed8; }
 # each start position costs a bounded amount of work: the unbounded ``+`` runs
 # backtracked quadratically on a long non-matching string, and this pass runs
 # over the whole diagnostics blob on the GUI thread.
+# The lookbehind is what buys the linearity, not the size of the bounds - it
+# allows exactly one start position per run of local-part characters. That
+# also means each bound has to cover the *whole* run: at {1,64} an identifier
+# joined to an address by a dot (all local-part characters) pushed the run
+# past the bound, left no viable start position at all, and the address was
+# emitted whole. The bounds are therefore generous rather than RFC-tight.
 _EMAIL_RE = re.compile(
-    r"(?<![A-Za-z0-9._%+\-])[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9.\-]{1,255}"
+    r"(?<![A-Za-z0-9._%+\-])[A-Za-z0-9._%+\-]{1,256}@[A-Za-z0-9.\-]{1,512}"
     r"\.[A-Za-z]{2,24}"
 )
 # Azure identifiers. The Azure provider already builds its snapshot.raw as an
