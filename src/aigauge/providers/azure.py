@@ -1049,7 +1049,9 @@ def _merge_query_rows(into: QueryRows, page: QueryRows) -> None:
         or page.latest_usage_date > into.latest_usage_date
     ):
         into.latest_usage_date = page.latest_usage_date
-    into.truncated = into.truncated or page.truncated
+    # Belt and braces: _follow_query_pages refuses an unreadable page before
+    # it gets here, and any future caller gets the same answer.
+    into.truncated = into.truncated or page.truncated or not page.cost_column_found
     if into.row_count > MAX_QUERY_ROWS:
         into.truncated = True
 
@@ -1070,6 +1072,7 @@ def _follow_query_pages(
     truncated, because the alternative is a subtotal shown as a total.
     """
     pages = 1
+    followed: set[str] = set()
     while True:
         url, refused = _next_query_link(payload)
         if refused:
@@ -1080,6 +1083,16 @@ def _follow_query_pages(
         if pages >= MAX_QUERY_PAGES:
             parsed.truncated = True
             return
+        if url in followed:
+            # A link back to a page already read double-counts every row on it.
+            log.warning(
+                "provider api diagnosis provider=azure "
+                "classification=query_nextlink_repeated pages=%s",
+                pages,
+            )
+            parsed.truncated = True
+            return
+        followed.add(url)
         if budget is not None and not budget.spend():
             log.warning(
                 "provider api diagnosis provider=azure "
@@ -1094,6 +1107,17 @@ def _follow_query_pages(
             return
         payload = _json(response)
         page = parse_query_response(payload)
+        if not page.cost_column_found:
+            # The same rule fetch_query applies to page 1: a 200 whose body is
+            # an ARM error document, or a schema this parser cannot read, is a
+            # page that was not read - not a page that held nothing.
+            log.warning(
+                "provider api diagnosis provider=azure "
+                "classification=query_page_unreadable page=%s",
+                pages + 1,
+            )
+            parsed.truncated = True
+            return
         _merge_query_rows(parsed, page)
         pages += 1
 

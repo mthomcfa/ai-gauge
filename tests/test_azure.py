@@ -7,6 +7,7 @@ column map. A fixture written as a convenient dict would test nothing.
 """
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -1379,13 +1380,88 @@ def test_a_foreign_nextlink_on_the_cost_query_is_never_requested(monkeypatch, co
 
 @responses.activate
 def test_the_query_page_loop_is_capped():
-    payload = query_payload([[1.0, 20260901, STORAGE_ID, "Storage", "CAD"]])
-    payload["properties"]["nextLink"] = f"{QUERY_URL}?$skiptoken=forever"
-    responses.add(responses.POST, QUERY_URL, json=payload, status=200)
+    """Each page hands back a *different* link, so the cap is what stops it
+    rather than the repeated-link guard."""
+    def _page(request):
+        token = len(responses.calls)
+        payload = query_payload([[1.0, 20260901, STORAGE_ID, "Storage", "CAD"]])
+        payload["properties"]["nextLink"] = f"{QUERY_URL}?$skiptoken={token}"
+        return 200, {}, json.dumps(payload)
+
+    responses.add_callback(responses.POST, QUERY_URL, callback=_page)
 
     parsed, _metric = az.fetch_query("tok", SUB, date(2026, 9, 1), date(2026, 10, 1))
     assert len(responses.calls) == az.MAX_QUERY_PAGES
     assert parsed.truncated is True
+
+
+@responses.activate
+def test_a_repeated_nextlink_stops_the_loop_instead_of_multiplying_the_total(
+    monkeypatch, config
+):
+    """A page that points back at itself counted its own rows once per page:
+    twenty POSTs, and a total twenty times the truth on the row."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    payload = query_payload([[5.0, 20260901, STORAGE_ID, "Storage", "CAD"]])
+    payload["properties"]["nextLink"] = f"{QUERY_URL}?$skiptoken=forever"
+    responses.replace(responses.POST, QUERY_URL, json=payload, status=200)
+
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+
+    posts = [c for c in responses.calls if "CostManagement/query" in c.request.url]
+    assert len(posts) <= 2, "the loop followed a link it had already read"
+    summary = snapshot.metrics[0]
+    assert summary.percent_used is None
+    assert "truncated" in (summary.note or "").lower()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [None, {}, {"error": {"code": "GatewayTimeout"}}, "quantity-only"],
+    ids=["non-json", "empty", "arm-error-doc", "schema-drift"],
+)
+@responses.activate
+def test_an_unreadable_continuation_page_is_not_an_empty_page(
+    monkeypatch, config, body
+):
+    """fetch_query refuses a *first* page with no cost column - "a 200 whose
+    body is an ARM error document is not an empty month". Page 7 of 12 got no
+    such check: it merged as zero and the subtotal was gauged at OK."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    page1 = query_payload([[5.0, 20260901, STORAGE_ID, "Storage", "CAD"]])
+    page1["properties"]["nextLink"] = f"{QUERY_URL}?$skiptoken=abc"
+    responses.replace(responses.POST, QUERY_URL, json=page1, status=200)
+    if body == "quantity-only":
+        responses.add(
+            responses.POST,
+            QUERY_URL,
+            json={
+                "properties": {
+                    "columns": [{"name": "Quantity", "type": "Number"}],
+                    "rows": [[999.0]],
+                }
+            },
+            status=200,
+        )
+    elif body is None:
+        responses.add(responses.POST, QUERY_URL, body="not json at all", status=200)
+    else:
+        responses.add(responses.POST, QUERY_URL, json=body, status=200)
+
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+
+    summary = snapshot.metrics[0]
+    assert summary.percent_used is None, "a subtotal was shown as a gauge"
+    assert "truncated" in (summary.note or "").lower()
+
+
+def test_merging_a_page_with_no_cost_column_marks_the_total_a_subtotal():
+    """Belt and braces for any future caller of the merge helper."""
+    into = az.QueryRows(total=10.0, cost_column_found=True)
+    az._merge_query_rows(into, az.QueryRows())
+    assert into.truncated is True
 
 
 # --- identifiers must not ride out on an error string -----------------------
