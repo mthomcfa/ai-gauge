@@ -94,6 +94,35 @@ def test_reenabled_provider_returns_to_canonical_order(qtbot):
     assert _tile_order(widget) == ["claude", "codex", "copilot"]
 
 
+def test_microsoft_tiles_render_as_a_pair(qtbot):
+    """Copilot and Azure are the two halves of the Microsoft section, so they
+    must sit next to each other however the tiles happen to be created."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+
+    widget.ensure_tile("openrouter", "OpenRouter")
+    widget.ensure_tile("azure", "Microsoft · Azure")
+    widget.ensure_tile("claude", "Claude")
+    widget.ensure_tile("copilot", "Copilot")
+
+    order = _tile_order(widget)
+    assert order == ["claude", "copilot", "azure", "openrouter"]
+
+
+def test_azure_summary_chip_uses_the_short_name(qtbot):
+    """The tile header has room for "Microsoft · Azure"; a chip does not, and a
+    chip that wraps costs a whole row in the collapsed panel."""
+    from aigauge.widget import UsageWidget as _UsageWidget
+
+    widget = _UsageWidget(Config())
+    qtbot.addWidget(widget)
+    chip = widget._summary_chip("azure")  # noqa: SLF001
+    qtbot.addWidget(chip)
+
+    assert chip._text.startswith("Azure")  # noqa: SLF001
+    assert "Microsoft" not in chip._text  # noqa: SLF001
+
+
 def test_browser_account_tiles_group_by_provider_kind(qtbot):
     config = Config()
     config.browser_accounts.append(
@@ -944,3 +973,66 @@ def test_summary_chip_receives_account_colors(qtbot):
 
     expected = QColor("#654321").darker(135)
     assert chip._fill_color.name() == expected.name()  # noqa: SLF001
+
+
+def test_metric_row_sizes_a_long_reset_label_to_fit(qtbot):
+    """A reset_label is normally a countdown, but Azure puts the money there
+    so the amounts stay on the row when the tile is collapsed. The 58 px
+    countdown column would clip it."""
+    row = _MetricRow()
+    qtbot.addWidget(row)
+
+    row.set_metric(
+        "Spend this month",
+        24.0,
+        datetime.now() + timedelta(days=20),
+        "CAD 36.10 of 150.00 · resets 1 Oct",
+        note="…",
+        window=timedelta(days=30),
+    )
+
+    # Whether the whole string fits depends on the platform's font metrics -
+    # Windows draws this wider than Linux and elides it - so the contract is
+    # what holds everywhere: the column widened past the countdown width, what
+    # is drawn fits inside it and starts with the amounts, and the full text
+    # is reachable from the tooltip.
+    label = "CAD 36.10 of 150.00 · resets 1 Oct"
+    drawn = row.reset.text()
+    assert not row.reset.isHidden()
+    assert row.reset.width() > 58
+    assert row.reset.fontMetrics().horizontalAdvance(drawn) <= row.reset.width()
+    assert drawn == label or (drawn.startswith("CAD 36.10 of 150.00") and drawn != label)
+    assert label in row.reset.toolTip()
+
+
+def test_a_long_reset_label_is_elided_and_kept_in_the_tooltip(qtbot):
+    """A currency with no two-digit magnitude, or an allowance above ~1e6,
+    ran past the column and was clipped mid-string with the amounts nowhere
+    else in the UI."""
+    row = _MetricRow()
+    qtbot.addWidget(row)
+    label = "JPY 12,345,678.00 of 50,000,000.00 · resets 28 Feb"
+
+    row.set_metric(
+        "Spend this month",
+        24.0,
+        datetime.now() + timedelta(days=20),
+        label,
+        note="Data as of 2026-09-08.",
+        window=timedelta(days=30),
+    )
+
+    drawn = row.reset.text()
+    assert row.reset.fontMetrics().horizontalAdvance(drawn) <= row.reset.width()
+    assert drawn != label, "the label fitted, so this test proves nothing"
+    assert drawn.startswith("JPY 12,345,678.00"), "elided from the wrong end"
+    tooltip = row.reset.toolTip()
+    assert label in tooltip
+    assert "Data as of 2026-09-08." in tooltip
+
+
+def test_metric_row_keeps_the_narrow_countdown_column_for_a_countdown(qtbot):
+    row = _MetricRow()
+    qtbot.addWidget(row)
+    row.set_metric("Weekly", 20.0, datetime.now() + timedelta(days=2), "idle")
+    assert row.reset.width() == 58

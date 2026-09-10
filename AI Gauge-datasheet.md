@@ -1,18 +1,18 @@
 # Product Data Sheet: AI Gauge (security-hardened fork)
 
 > Describes [mthomcfa/ai-gauge](https://github.com/mthomcfa/ai-gauge) at
-> **1.1.0+cfa.3**, a security-hardening fork of
+> **1.2.0+cfa.4**, a security-hardening fork of
 > [jpajak/ai-gauge](https://github.com/jpajak/ai-gauge). Fork version numbers
 > are its own and do not correspond to upstream releases of the same number.
 
 ## Product Summary
 
-AI Gauge is a local desktop utility for monitoring AI service usage across Claude.ai, ChatGPT Codex, GitHub Copilot, OpenRouter, and OpenCode. The implemented app runs as a PyQt6 desktop application with a floating widget on Windows/Linux and a menu-bar item on macOS. It shows provider usage percentages, reset timing, account balance/spend details where available, and refresh status without using a hosted backend or telemetry service.
+AI Gauge is a local desktop utility for monitoring AI service usage across Claude.ai, ChatGPT Codex, Microsoft (Azure spend and GitHub Copilot), OpenRouter, and OpenCode. The implemented app runs as a PyQt6 desktop application with a floating widget on Windows/Linux and a menu-bar item on macOS. It shows provider usage percentages, reset timing, account balance/spend details where available, and refresh status without using a hosted backend or telemetry service.
 
 ## Primary Users
 
 - Individual AI power users who pay for multiple subscriptions and want a compact local view of quota/balance status.
-- Developers or technical users using Claude, Codex, Copilot, and OpenRouter enough to care about session, weekly, monthly, or spend limits.
+- Developers or technical users using Claude, Codex, Copilot, Azure, and OpenRouter enough to care about session, weekly, monthly, or spend limits.
 - Users comfortable configuring API keys, GitHub personal access tokens, browser sign-in sessions, pasted cookies, and local diagnostics.
 
 ## Core Workflows
@@ -22,15 +22,16 @@ AI Gauge is a local desktop utility for monitoring AI service usage across Claud
 - Sign in to Claude or ChatGPT Codex through embedded Chromium, paste cookies as a fallback, and manage multiple named Claude/Codex accounts.
 - Configure GitHub Copilot with a fine-grained PAT, optional username/billing organization, and a monthly AI credit allowance.
 - Configure OpenRouter with an inference key, optional management key, and optional daily budget.
+- Configure Microsoft Azure with an Entra ID app registration (tenant, client, subscription IDs plus a client secret), a monthly allowance, and the day of month it resets.
 - Refresh usage manually or through adaptive auto-refresh, then inspect tiles, compact chips, error details, and local logs.
 
 ## Implemented Capabilities
 
 - Cross-platform desktop app for Windows, macOS, and Linux, packaged with PyInstaller and runnable from source via `ai-gauge`.
 - Floating widget on Windows/Linux, compact pill mode, tray/menu actions, no-tray Linux fallback, and native macOS menu-bar popover.
-- Provider tiles for Claude, Codex, GitHub Copilot, OpenRouter, and OpenCode.
+- Provider tiles for Claude, Codex, Microsoft Azure, GitHub Copilot, OpenRouter, and OpenCode.
 - OpenCode usage scraping from a user-configured workspace URL, pinned to `https` on `opencode.ai`, with Rolling, Weekly, and Monthly meters and a cookie-paste setup path for accounts that cannot complete Google sign-in in an embedded browser.
-- Per-account configurable gauge colors: each Claude/Codex/OpenCode account, plus Copilot and OpenRouter, can set three severity cutoffs and four band colors, applied consistently to bars, compact chips, the Windows/Linux tray dot, and the macOS menu-bar dots.
+- Per-account configurable gauge colors: each Claude/Codex/OpenCode account, plus Copilot, Azure and OpenRouter, can set three severity cutoffs and four band colors, applied consistently to bars, compact chips, the Windows/Linux tray dot, and the macOS menu-bar dots.
 - Claude usage scraping from `https://claude.ai/settings/usage`, reporting every meter the page shows: Session (5 h) and Weekly (7 d) as the primary gauges, plus Opus only, Sonnet only, Cowork only, Claude Design and Daily routine runs as informational rows. A reading that cannot be attributed to a single meter, or that carries no used/remaining wording, is reported as an error rather than displayed.
 - Local diagnostic capture of the *shape* of JSON responses the Claude page fetches (field names, numbers, timestamps; all other strings reduced to a length marker). Never leaves the machine.
 - Codex usage scraping from `https://chatgpt.com/codex/cloud/settings/analytics#personal-usage`, reporting the 5-hour and weekly cards as primary gauges plus any additional usage card the page renders.
@@ -38,6 +39,7 @@ AI Gauge is a local desktop utility for monitoring AI service usage across Claud
 - Weekly self-scan of each provider's usage page — and a "Re-scan meters now" action in Settings — that reads every labelled row the usage container renders and adopts unrecognised ones as new informational meters, recording where each came from (source, timestamp, account, and the redacted row text that justified it). The scan is local: it reads what the embedded browser already rendered and fetches nothing.
 - GitHub Copilot AI credit usage via GitHub REST billing summary endpoints for user or organization billing scopes, with a legacy premium-request fallback.
 - OpenRouter account/key data via `/credits`, `/key`, and `/activity`, including balance, UTC day/month spend, optional daily budget gauge, and top model activity.
+- Azure month-to-date spend via Cost Management, decomposed into per-service component rows with a Microsoft Foundry roll-up, an optional forecast row, an optional Marketplace-models row, allowance taken from an Azure Budget when one exists, and an explicit warning for Azure Sponsorship offers, which Cost Management does not support. Foundry is a row inside this tile rather than a tile of its own, because it bills per token to the same subscription; that makes double-counting structurally impossible.
 - Adaptive refresh cadence with active and idle intervals, manual refresh, and refresh pull-forward shortly after known reset times.
 - Per-period peak history persisted locally in `current.json` and `history.jsonl`; there is still no history UI, so the data is available only on disk.
 - Local diagnostic logging for auth, layout, API, and refresh lifecycle issues. Copyable diagnostics redact email addresses, truncate scraped page text, and carry the full `app_version`.
@@ -49,7 +51,8 @@ AI Gauge is a local desktop utility for monitoring AI service usage across Claud
 - Claude and Codex sessions from embedded Chromium profiles or pasted `Cookie:` headers, with separate storage per named account.
 - GitHub Copilot fine-grained PAT stored in the OS credential store; optional username, billing organization, and AI credit allowance values.
 - OpenRouter inference key and optional management key stored in the OS credential store; optional daily budget entered by the user.
-- External integrations are direct local requests from the app to Claude.ai, ChatGPT, GitHub API, and OpenRouter API. No server-side app backend, public API routes, or web app routes were found in the codebase.
+- Azure Entra ID client secret stored in the OS credential store with no plaintext fallback; tenant, client, and subscription IDs validated as GUIDs in the config file; optional pinned Foundry resource IDs and resource-group filter validated as ARM paths and names.
+- External integrations are direct local requests from the app to Claude.ai, ChatGPT, GitHub API, OpenRouter API, and the Microsoft Entra ID (login.microsoftonline.com) and Azure Resource Manager (management.azure.com) endpoints. No server-side app backend, public API routes, or web app routes were found in the codebase.
 - Secrets use Windows Credential Manager/DPAPI, macOS Keychain, or Linux Secret Service depending on platform. This fork additionally refuses a planted plaintext secrets file unless explicitly opted in, writes `0600` atomically, quarantines rather than overwrites an undecryptable store, passes `CRYPTPROTECT_UI_FORBIDDEN` so DPAPI cannot hang the tray, and applies an owner-only Windows DACL.
 
 ## Outputs and Artifacts
@@ -65,7 +68,7 @@ AI Gauge is a local desktop utility for monitoring AI service usage across Claud
 
 - Local-only operation with no telemetry or backend — confirmed by audit rather than hypothesised, which may matter to privacy/security-conscious users.
 - Hypothesis: an audited, hardened build with signed build provenance may distinguish this fork from both upstream and comparable utilities.
-- Hypothesis: combining Claude, Codex, Copilot, and OpenRouter usage in one compact desktop surface may distinguish it from provider-specific dashboards.
+- Hypothesis: combining Claude, Codex, Copilot, Azure spend, and OpenRouter usage in one compact desktop surface may distinguish it from provider-specific dashboards.
 - Hypothesis: multiple Claude/Codex account support is useful for users juggling personal/work subscriptions.
 - Hypothesis: reset-aware refresh scheduling, pace indicators, and OpenRouter model breakdowns add context beyond raw percentages.
 
@@ -78,6 +81,10 @@ AI Gauge is a local desktop utility for monitoring AI service usage across Claud
 - Copilot usage can lag GitHub's upstream reporting by hours and is described as a trailing indicator, not real time.
 - Copilot's current usage-based model is tracked as AI credits rather than premium request counts; annual/request-based accounts may still rely on GitHub's legacy premium-request API fallback.
 - OpenRouter activity uses the last 30 completed UTC days and excludes the current UTC day; balance and model activity require a management key.
+- Azure Cost Management reports spend gross of credits and excludes free and prepaid credit, so the Azure gauge measures consumption against a user-stated allowance rather than a live credit balance; it must not be described as a credit-balance monitor.
+- Azure cost data lags 8-24 hours (up to 72 on pay-as-you-go) and refreshes roughly six times a day, so the tile is throttled to one fetch per hour and reports the date of the data it is showing.
+- Azure Sponsorship subscriptions are unsupported by Cost Management and report zero spend; the app surfaces a warning rather than a gauge.
+- Azure support covers a single subscription per install; multi-subscription roll-up is not implemented.
 - Same-user local processes can generally decrypt/access stored session tokens or keys through the OS credential model; do not imply process-level isolation.
 - No implemented collaboration, alerting, cloud sync, mobile app, browser extension, team dashboard, or export workflow was found.
 
@@ -85,7 +92,7 @@ AI Gauge is a local desktop utility for monitoring AI service usage across Claud
 
 - Local desktop monitor for AI subscription usage across several providers.
 - Compact quota and spend visibility for users with multiple AI accounts.
-- Technical utility for tracking Claude/Codex/OpenCode reset windows, Copilot monthly AI credits, and OpenRouter spend.
+- Technical utility for tracking Claude/Codex/OpenCode reset windows, Copilot monthly AI credits, Azure month-to-date spend, and OpenRouter spend.
 - Audited-and-hardened alternative to the upstream project for users who want the source reviewed and the build attested.
 - Privacy-conscious angle based on local storage and direct provider requests, with caveats about credential-store threat models.
 - Maintenance/support angle around diagnostics for provider layout and API changes.

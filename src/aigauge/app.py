@@ -29,7 +29,7 @@ from .config import (
     qt_scale_factor_env,
 )
 from .cookie_dialog import CookieDialog
-from .error_dialog import ErrorDetailsDialog
+from .error_dialog import ErrorDetailsDialog, _redact_azure_ids
 from .history import HistoryStore
 from .logging_setup import setup_logging
 from .gauge import highest_indicator
@@ -39,6 +39,7 @@ from .platforms import autostart_command, get_platform
 from .providers.base import Provider, ProviderSignals
 from .providers.claude import ClaudeProvider
 from .providers.codex import CodexProvider
+from .providers.azure import AzureProvider
 from .providers.copilot import CopilotProvider
 from .providers.openrouter import OpenRouterProvider
 from .providers.opencode_go import OpenCodeGoProvider, usage_url as opencode_go_usage_url
@@ -98,6 +99,8 @@ def _enabled_providers(config: Config) -> tuple[str, ...]:
             out.append("codex")
     if config.providers.copilot:
         out.append("copilot")
+    if getattr(config.providers, "azure", False):
+        out.append("azure")
     if config.providers.openrouter:
         out.append("openrouter")
     if getattr(config.providers, "opencode_go", False):
@@ -105,13 +108,24 @@ def _enabled_providers(config: Config) -> tuple[str, ...]:
     return tuple(out)
 
 
+# Cheap REST providers, refreshed before the browser-driven ones so their tiles
+# fill while a Claude/Codex scrape is still loading a page. Azure is cheap in
+# the same sense - a handful of JSON calls - and it self-throttles to one live
+# fetch per hour internally, so putting it early costs the API nothing even
+# when the cycle-wide error fast-retry is running every minute.
+_REFRESH_FIRST = ("openrouter", "azure")
+
+
 def _refresh_provider_order(providers: dict[str, Provider]) -> list[str]:
     names = list(providers)
     positions = {name: index for index, name in enumerate(names)}
-    return sorted(
-        names,
-        key=lambda name: (0 if name == "openrouter" else 1, positions[name]),
-    )
+
+    def rank(name: str) -> tuple[int, int]:
+        if name in _REFRESH_FIRST:
+            return (0, _REFRESH_FIRST.index(name))
+        return (1, positions[name])
+
+    return sorted(names, key=rank)
 
 
 def _adaptive_refresh_minutes(
@@ -136,6 +150,13 @@ def _snapshot_signature(snapshot: UsageSnapshot) -> tuple:
     dozen of them offers a dozen numbers that can twitch, each one resetting
     the backoff. The cadence should follow the meters the tile is actually
     about.
+
+    ``reset_label`` is deliberately absent for every provider. It is a
+    caption, not a meter: a countdown that ticks, or Azure's spend to the
+    cent. Either one counted as "this provider changed", which reset
+    ``_unchanged_cycles`` and pushed the whole app back into active-cadence
+    polling — for one cent, or for the clock. The label and the rounded
+    percentage are what the cadence is about.
     """
     return (
         snapshot.status.value,
@@ -148,7 +169,6 @@ def _snapshot_signature(snapshot: UsageSnapshot) -> tuple:
                     if metric.percent_used is not None
                     else None
                 ),
-                metric.reset_label,
             )
             for metric in snapshot.metrics
             if metric.tag is None
@@ -457,6 +477,10 @@ class App(QObject):
             self._providers["copilot"] = CopilotProvider(self._config)
             desired_tiles.add("copilot")
             self._widget.ensure_tile("copilot", "Copilot")
+        if getattr(self._config.providers, "azure", False):
+            self._providers["azure"] = AzureProvider(self._config)
+            desired_tiles.add("azure")
+            self._widget.ensure_tile("azure", "Microsoft · Azure")
         if self._config.providers.openrouter:
             self._providers["openrouter"] = OpenRouterProvider(self._config)
             desired_tiles.add("openrouter")
@@ -610,6 +634,7 @@ class App(QObject):
                     name: {
                         "copilot": "Copilot",
                         "openrouter": "OpenRouter",
+                        "azure": "Microsoft · Azure",
                     }.get(name, display_name_for_account(self._config, name))
                     for name in self._refresh_queue
                 }
@@ -653,7 +678,10 @@ class App(QObject):
                 UsageSnapshot(
                     provider=name,
                     status=SnapshotStatus.ERROR,
-                    error=str(exc),
+                    # str(exc) on a transport failure carries the request URL,
+                    # and this string reaches the tile, the tray tooltip and
+                    # the error dialog. Same redaction the log line below uses.
+                    error=_redact_azure_ids(str(exc)),
                 )
             )
 
@@ -669,7 +697,7 @@ class App(QObject):
             log.warning(
                 "snapshot error provider=%s error=%s raw_keys=%s raw_summary=%s",
                 snapshot.provider,
-                snapshot.error,
+                _redact_azure_ids(snapshot.error or ""),
                 sorted(snapshot.raw.keys()) if snapshot.raw else [],
                 _raw_summary(snapshot.raw) if snapshot.raw else "{}",
             )
@@ -677,7 +705,7 @@ class App(QObject):
             log.info(
                 "snapshot auth_required provider=%s error=%s raw_keys=%s raw_summary=%s",
                 snapshot.provider,
-                snapshot.error,
+                _redact_azure_ids(snapshot.error or ""),
                 sorted(snapshot.raw.keys()) if snapshot.raw else [],
                 _raw_summary(snapshot.raw) if snapshot.raw else "{}",
             )

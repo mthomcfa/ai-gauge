@@ -197,6 +197,40 @@ def test_refresh_order_prioritizes_openrouter_without_reordering_tiles():
     ]
 
 
+def test_refresh_order_puts_both_cheap_rest_providers_first():
+    """Azure is a handful of JSON calls and self-throttles to one live fetch
+    per hour, so it costs nothing to refresh early - and an early tile fills
+    while a Claude/Codex scrape is still loading a page."""
+    providers = {
+        "claude": object(),
+        "copilot": object(),
+        "azure": object(),
+        "openrouter": object(),
+    }
+
+    assert _refresh_provider_order(providers) == [
+        "openrouter",
+        "azure",
+        "claude",
+        "copilot",
+    ]
+
+
+def test_enabled_providers_places_azure_next_to_copilot():
+    config = Config()
+    config.providers.azure = True
+
+    enabled = _enabled_providers(config)
+    assert "azure" in enabled
+    assert abs(enabled.index("azure") - enabled.index("copilot")) == 1
+
+
+def test_enabled_providers_omits_azure_by_default():
+    # Azure needs an app registration before it can report anything; an
+    # on-by-default tile would show every user an auth error they never asked for.
+    assert "azure" not in _enabled_providers(Config())
+
+
 def test_enabled_providers_includes_enabled_browser_accounts():
     config = Config()
     config.browser_accounts.append(
@@ -524,6 +558,22 @@ def test_the_cadence_signature_ignores_informational_meters():
     assert _snapshot_signature(quiet) == _snapshot_signature(moved)
 
 
+def test_a_caption_change_alone_is_not_a_cadence_change():
+    """reset_label is a caption - a ticking countdown, or Azure's spend to the
+    cent. Either one reset the adaptive backoff for *every* provider and
+    pushed the whole app back into active-cadence polling."""
+    before = _snapshot_with(
+        UsageMetric(label="Spend this month", percent_used=24.0,
+                    reset_label="CAD 36.10 of 150.00 · resets 1 Oct")
+    )
+    after = _snapshot_with(
+        UsageMetric(label="Spend this month", percent_used=24.0,
+                    reset_label="CAD 36.42 of 150.00 · resets 1 Oct")
+    )
+
+    assert _snapshot_signature(before) == _snapshot_signature(after)
+
+
 def test_the_cadence_signature_still_follows_the_primary_meters():
     before = _snapshot_with(UsageMetric(label="Session", percent_used=64.0))
     after = _snapshot_with(UsageMetric(label="Session", percent_used=65.0))
@@ -630,3 +680,86 @@ def test_the_app_can_actually_be_constructed(qapp, tmp_path, monkeypatch):
     app._schedule_next_refresh()  # noqa: SLF001
 
     assert app._consecutive_error_cycles == 0  # noqa: SLF001
+
+
+class _SnapshotWidget:
+    """Just enough widget for _on_snapshot."""
+
+    def __init__(self):
+        self.snapshots = []
+
+    def update_snapshot(self, snapshot, display_name):
+        self.snapshots.append((snapshot, display_name))
+
+    def set_ratio(self, *args, **kwargs):
+        pass
+
+
+def test_the_snapshot_error_log_line_redacts_azure_identifiers(qapp, caplog):
+    """ai-gauge.log is the file the error dialog's own "Open log folder"
+    button points at, and Copy diagnostics is the only exit that was redacted.
+    A requests transport error stringifies with the whole request URL."""
+    import logging
+
+    app = App.__new__(App)
+    app._snapshots = {}  # noqa: SLF001
+    app._cycle_signatures = {}  # noqa: SLF001
+    app._inflight = set()  # noqa: SLF001
+    app._config = Config()  # noqa: SLF001
+    app._widget = _SnapshotWidget()  # noqa: SLF001
+    app._history = SimpleNamespace(record_snapshot=lambda snap: None)  # noqa: SLF001
+    app._ratio = SimpleNamespace(  # noqa: SLF001
+        record_snapshot=lambda snap: None,
+        display_estimate=lambda provider: None,
+        current_estimate=lambda provider: None,
+    )
+    app._ratio_recent = lambda provider: []  # noqa: SLF001
+    app._refresh_queue = ["claude"]  # noqa: SLF001
+    app._start_next_refresh = lambda: None  # noqa: SLF001
+
+    sub = "11111111-2222-3333-4444-555555555555"
+    snapshot = UsageSnapshot(
+        provider="azure",
+        status=SnapshotStatus.ERROR,
+        error=(
+            "Azure request failed: HTTPSConnectionPool(host='management.azure.com'"
+            f", port=443): Max retries exceeded with url: /subscriptions/{sub}"
+            "/providers/Microsoft.CostManagement/query"
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        app._on_snapshot(snapshot)  # noqa: SLF001
+
+    assert sub not in caplog.text
+    assert "<guid>" in caplog.text
+
+
+def test_a_provider_that_raises_out_of_refresh_is_redacted_too(qapp):
+    """refresh() raising is turned into an ERROR snapshot here, and that
+    string reaches the tile, the tray tooltip and the dialog header - none of
+    which redact. The other exit from this method already redacts."""
+    from types import SimpleNamespace as _NS
+
+    app = App.__new__(App)
+    app._inflight = set()  # noqa: SLF001
+    sub = "11111111-2222-3333-4444-555555555555"
+    captured: list = []
+    app._signals = _NS(  # noqa: SLF001
+        snapshot_ready=_NS(emit=captured.append)
+    )
+
+    def _raise(_on_done):
+        raise RuntimeError(
+            "Max retries exceeded with url: /subscriptions/"
+            f"{sub}/providers/Microsoft.CostManagement/query"
+        )
+
+    app._providers = {"azure": _NS(refresh=_raise)}  # noqa: SLF001
+    app._refresh_queue = ["azure"]  # noqa: SLF001
+
+    app._start_next_refresh()  # noqa: SLF001
+
+    assert captured, "the exception was not turned into a snapshot"
+    assert sub not in (captured[0].error or "")
+    assert "<guid>" in (captured[0].error or "")

@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QSizePolicy,
     QSlider,
@@ -42,14 +43,19 @@ from .config import (
     account_display_name,
     app_data_dir,
     browser_accounts,
+    get_azure_client_secret,
     get_github_pat,
     get_openrouter_key,
     get_openrouter_mgmt_key,
     provider_base_name,
+    set_azure_client_secret,
     set_github_pat,
     set_openrouter_key,
     set_openrouter_mgmt_key,
     set_provider_cookie,
+    validate_azure_guid,
+    validate_azure_resource_group,
+    validate_azure_resource_id,
     validate_opencode_usage_url,
 )
 from .error_dialog import reveal_path
@@ -542,6 +548,7 @@ class SettingsDialog(QDialog):
         # Working copies so Cancel discards colour edits like every other field.
         self._provider_colors = {
             "copilot": config.copilot.colors.model_copy(deep=True),
+            "azure": config.azure.colors.model_copy(deep=True),
             "openrouter": config.openrouter.colors.model_copy(deep=True),
             "opencode_go": config.opencode_go.colors.model_copy(deep=True),
         }
@@ -689,6 +696,13 @@ class SettingsDialog(QDialog):
         self.copilot_cb.setChecked(config.providers.copilot)
         providers_layout.addWidget(self.copilot_cb)
 
+        self.azure_cb = QCheckBox("Microsoft Azure")
+        self.azure_cb.setToolTip(
+            "Show the Azure month-to-date spend tile in the panel."
+        )
+        self.azure_cb.setChecked(getattr(config.providers, "azure", False))
+        providers_layout.addWidget(self.azure_cb)
+
         self.openrouter_cb = QCheckBox("OpenRouter")
         self.openrouter_cb.setToolTip("Show the OpenRouter usage tile in the panel.")
         self.openrouter_cb.setChecked(config.providers.openrouter)
@@ -747,8 +761,206 @@ class SettingsDialog(QDialog):
         codex_accounts_layout.addLayout(self._codex_accounts_layout)
         self._rebuild_browser_account_rows()
 
-        # ----- Copilot details -----
-        copilot = QGroupBox("GitHub Copilot")
+        # ----- Microsoft → Azure -----
+        azure = QGroupBox("Azure")
+        azure_form = QFormLayout(azure)
+        azure_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        azure_form.setHorizontalSpacing(12)
+        azure_form.setVerticalSpacing(8)
+        azure_form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
+        )
+
+        azure_form.addRow(
+            "",
+            _hint_label(
+                "Reads month-to-date spend from Azure Cost Management with an "
+                "<b>Entra ID app registration</b> (client credentials). Grant it "
+                "<b>Cost Management Reader</b> for cost queries, forecasts, and "
+                "budgets, plus <b>Reader</b> so it can list resources and read "
+                "the subscription's offer. Both are needed for a gauge: "
+                "without <b>Reader</b> the tile shows the spend but no "
+                "percentage, because an Azure Sponsorship offer - which Cost "
+                "Management reports as zero - cannot be ruled out."
+            ),
+        )
+
+        self.azure_tenant = QLineEdit()
+        self.azure_tenant.setPlaceholderText("00000000-0000-0000-0000-000000000000")
+        if config.azure.tenant_id:
+            self.azure_tenant.setText(config.azure.tenant_id)
+        azure_form.addRow("Directory (tenant) ID:", self.azure_tenant)
+
+        self.azure_client = QLineEdit()
+        self.azure_client.setPlaceholderText("00000000-0000-0000-0000-000000000000")
+        if config.azure.client_id:
+            self.azure_client.setText(config.azure.client_id)
+        azure_form.addRow("Application (client) ID:", self.azure_client)
+
+        self.azure_secret_edit = QLineEdit()
+        self.azure_secret_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        existing_azure_secret = get_azure_client_secret()
+        self._had_existing_azure_secret = bool(existing_azure_secret)
+        if existing_azure_secret:
+            self.azure_secret_edit.setPlaceholderText(
+                "•••••••••• (saved — leave blank to keep)"
+            )
+        else:
+            self.azure_secret_edit.setPlaceholderText("client secret value")
+        azure_form.addRow("Client secret:", self.azure_secret_edit)
+
+        self.clear_azure_secret_cb = QCheckBox("Clear saved client secret")
+        self.clear_azure_secret_cb.setToolTip(
+            "Remove the client secret from the system keychain."
+        )
+        self.clear_azure_secret_cb.setVisible(self._had_existing_azure_secret)
+        if self._had_existing_azure_secret:
+            azure_form.addRow("", self.clear_azure_secret_cb)
+
+        azure_form.addRow(
+            "",
+            _hint_label(
+                "The secret is stored in your OS credential store, never in a "
+                "file. Copy the secret <b>value</b> (not the secret ID) from "
+                "<a style='color:#60a5fa;' href='https://portal.azure.com/#view/"
+                "Microsoft_AAD_RegisteredApps/ApplicationsListBlade'>App "
+                "registrations → Certificates &amp; secrets</a>; it is only "
+                "shown once."
+            ),
+        )
+
+        self.azure_subscription = QLineEdit()
+        self.azure_subscription.setPlaceholderText(
+            "00000000-0000-0000-0000-000000000000"
+        )
+        if config.azure.subscription_id:
+            self.azure_subscription.setText(config.azure.subscription_id)
+        azure_form.addRow("Subscription ID:", self.azure_subscription)
+
+        self.azure_allowance = QDoubleSpinBox()
+        # Matches AzureConfig's own bound. A narrower widget would clamp on
+        # open and _apply_azure would write the clamped value back, silently
+        # rewriting an allowance that is ordinary in JPY, KRW, INR or CLP.
+        self.azure_allowance.setRange(0.0, 100_000_000.0)
+        self.azure_allowance.setDecimals(2)
+        self.azure_allowance.setSingleStep(10.0)
+        self.azure_allowance.setSpecialValueText("(no gauge)")
+        self.azure_allowance.setValue(float(config.azure.monthly_allowance or 0.0))
+        azure_form.addRow("Monthly allowance:", self.azure_allowance)
+
+        azure_form.addRow(
+            "",
+            _hint_label(
+                "In your subscription's own billing currency — the tile shows "
+                "whichever currency the API reports and never assumes dollars. "
+                "Leave at 0 to use a monthly cost <b>Budget</b> on the "
+                "subscription instead, if one exists; a number set here always "
+                "wins, and a budget is then only mentioned in the tile's note. "
+                "Cost Management reports spend <b>gross of "
+                "credits</b>: it excludes free and prepaid credit, so this "
+                "gauge measures consumption against the number you set here, "
+                "not a live credit balance."
+            ),
+        )
+
+        self.azure_reset_day = QSpinBox()
+        self.azure_reset_day.setRange(1, 28)
+        self.azure_reset_day.setValue(config.azure.reset_day)
+        azure_form.addRow("Resets on day:", self.azure_reset_day)
+
+        azure_form.addRow(
+            "",
+            _hint_label(
+                "Day of the month the allowance resets. Use 1 for a calendar "
+                "month; a Visual Studio credit resets on its own anniversary. "
+                "Capped at 28 so the date exists in February."
+            ),
+        )
+
+        self.azure_top_rows = QSpinBox()
+        self.azure_top_rows.setRange(1, 6)
+        self.azure_top_rows.setValue(config.azure.top_rows)
+        self.azure_top_rows.setToolTip(
+            "How many component rows to name individually. Whatever is left "
+            "over is collapsed into one extra \u201cOther\u201d row, so the "
+            "tile can show one row more than this."
+        )
+        azure_form.addRow("Top rows shown:", self.azure_top_rows)
+
+        self.azure_marketplace_cb = QCheckBox(
+            "Show Marketplace models as their own row"
+        )
+        self.azure_marketplace_cb.setToolTip(
+            "Runs a second cost query so Marketplace model charges are shown "
+            "separately instead of under their Azure service name."
+        )
+        self.azure_marketplace_cb.setChecked(config.azure.include_marketplace)
+        azure_form.addRow("", self.azure_marketplace_cb)
+
+        self.azure_resource_group = QLineEdit()
+        self.azure_resource_group.setPlaceholderText("(blank for the whole subscription)")
+        if config.azure.resource_group:
+            self.azure_resource_group.setText(config.azure.resource_group)
+        azure_form.addRow("Resource group:", self.azure_resource_group)
+
+        azure_form.addRow("", self._gauge_colors_button("azure", "Azure"))
+
+        azure_form.addRow(
+            "",
+            _hint_label(
+                "Cost Management data lags <b>8–24 hours</b> (up to 72 on "
+                "pay-as-you-go) and refreshes about six times a day, so the "
+                "tile fetches at most once an hour and shows the date the "
+                "numbers are actually from."
+            ),
+        )
+
+        # ----- Microsoft → Foundry -----
+        foundry = QGroupBox("Foundry")
+        foundry_form = QFormLayout(foundry)
+        foundry_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        foundry_form.setHorizontalSpacing(12)
+        foundry_form.setVerticalSpacing(8)
+        foundry_form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
+        )
+
+        foundry_form.addRow(
+            "",
+            _hint_label(
+                "Microsoft Foundry has <b>no separate tile and no credit of its "
+                "own</b>: it bills per token to the Azure subscription above, so "
+                "its spend is already part of the Azure total. It appears as a "
+                "roll-up row inside the Azure tile, which is what stops it being "
+                "counted twice."
+            ),
+        )
+
+        self.azure_foundry_ids = QPlainTextEdit()
+        self.azure_foundry_ids.setPlaceholderText(
+            "/subscriptions/…/resourceGroups/…/providers/"
+            "Microsoft.CognitiveServices/accounts/…"
+        )
+        self.azure_foundry_ids.setPlainText(
+            "\n".join(config.azure.foundry_resource_ids)
+        )
+        self.azure_foundry_ids.setFixedHeight(70)
+        foundry_form.addRow("Pinned resource IDs:", self.azure_foundry_ids)
+
+        foundry_form.addRow(
+            "",
+            _hint_label(
+                "Normally left blank — Foundry resources are found "
+                "automatically by resource <i>kind</i>, which is the only thing "
+                "that separates them from Azure OpenAI, Speech, Vision and "
+                "Language (they all share the same resource type). Pin one id "
+                "per line if the app registration lacks the <b>Reader</b> role "
+                "and cannot list them."
+            ),
+        )
+
+        # ----- Microsoft → Copilot -----
+        copilot = QGroupBox("Copilot")
         copilot_form = QFormLayout(copilot)
         copilot_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         copilot_form.setHorizontalSpacing(12)
@@ -991,12 +1203,18 @@ class SettingsDialog(QDialog):
         codex_tab_layout.addWidget(codex_accounts)
         codex_tab_layout.addStretch(1)
 
-        copilot_tab = QWidget()
-        copilot_tab_layout = QVBoxLayout(copilot_tab)
-        copilot_tab_layout.setContentsMargins(10, 10, 10, 10)
-        copilot_tab_layout.setSpacing(10)
-        copilot_tab_layout.addWidget(copilot)
-        copilot_tab_layout.addStretch(1)
+        # One Microsoft tab holding the three sub-headings. Azure and Copilot
+        # are separate providers with separate credentials, but they are one
+        # vendor relationship to the person configuring them, and Foundry only
+        # makes sense next to the Azure block it configures.
+        microsoft_tab = QWidget()
+        microsoft_tab_layout = QVBoxLayout(microsoft_tab)
+        microsoft_tab_layout.setContentsMargins(10, 10, 10, 10)
+        microsoft_tab_layout.setSpacing(10)
+        microsoft_tab_layout.addWidget(azure)
+        microsoft_tab_layout.addWidget(foundry)
+        microsoft_tab_layout.addWidget(copilot)
+        microsoft_tab_layout.addStretch(1)
 
         openrouter_tab = QWidget()
         openrouter_tab_layout = QVBoxLayout(openrouter_tab)
@@ -1017,7 +1235,7 @@ class SettingsDialog(QDialog):
         tabs.addTab(claude_tab, "Claude")
         tabs.addTab(codex_tab, "Codex")
         tabs.addTab(opencode_go_tab, "OpenCode")
-        tabs.addTab(copilot_tab, "GitHub Copilot")
+        tabs.addTab(microsoft_tab, "Microsoft")
         tabs.addTab(openrouter_tab, "OpenRouter")
         tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
@@ -1333,7 +1551,61 @@ class SettingsDialog(QDialog):
                 return
             log.info("Saved OpenRouter management key to system keychain.")
 
+        if not self._save_azure_secret():
+            return
+
         self.accept()
+
+    def _save_azure_secret(self) -> bool:
+        """Persist (or clear) the Entra ID client secret. False aborts the save.
+
+        Same shape as the PAT and OpenRouter keys: a write is read back before
+        it is believed, because a keychain that silently refuses a write would
+        otherwise leave the user with a tile that keeps asking for a secret
+        they think they saved.
+        """
+        new_secret = self.azure_secret_edit.text().strip()
+        if self.clear_azure_secret_cb.isChecked() and not new_secret:
+            try:
+                set_azure_client_secret(None)
+            except Exception as exc:  # noqa: BLE001
+                QMessageBox.warning(
+                    self,
+                    "Azure client secret was not cleared",
+                    f"The saved secret could not be cleared:\n{exc}",
+                )
+                return False
+            if get_azure_client_secret():
+                QMessageBox.warning(
+                    self,
+                    "Azure client secret was not cleared",
+                    "The secret still appears to be available after clearing. "
+                    "Remove the 'ai-gauge' / 'azure-client-secret' credential "
+                    "from your system keychain.",
+                )
+                return False
+            return True
+        if new_secret:
+            try:
+                set_azure_client_secret(new_secret)
+            except Exception as exc:  # noqa: BLE001
+                QMessageBox.warning(
+                    self,
+                    "Azure client secret was not saved",
+                    f"The system keychain rejected the secret:\n{exc}",
+                )
+                return False
+            if get_azure_client_secret() != new_secret:
+                QMessageBox.warning(
+                    self,
+                    "Azure client secret was not saved",
+                    "The secret could not be read back from the system "
+                    "keychain. Try running the app normally rather than as a "
+                    "different user/elevated account.",
+                )
+                return False
+            log.info("Saved Azure client secret to system keychain.")
+        return True
 
     def _set_quota_selection(self, quota: int) -> None:
         for i in range(self.gh_plan.count()):
@@ -1344,6 +1616,77 @@ class SettingsDialog(QDialog):
         self.gh_plan.setCurrentIndex(self.gh_plan.count() - 1)
         self.gh_quota.setValue(quota)
         self._sync_custom_quota_enabled()
+
+    def _apply_azure(self, config: Config) -> None:
+        """Write the Azure block, refusing anything that is not a valid id.
+
+        A rejected field keeps its previous value and the user is told which
+        ones, rather than the whole save being blocked or - worse - a malformed
+        id being interpolated into a request URL. Blank clears the field, which
+        is how you turn the provider off without deleting the rest.
+        """
+        rejected: list[str] = []
+
+        def _guid(widget, field: str, current: str | None) -> str | None:
+            text = widget.text().strip()
+            if not text:
+                return None
+            try:
+                return validate_azure_guid(text, field)
+            except ValueError:
+                rejected.append(field)
+                widget.setText(current or "")
+                return current
+
+        config.azure.tenant_id = _guid(
+            self.azure_tenant, "tenant ID", config.azure.tenant_id
+        )
+        config.azure.client_id = _guid(
+            self.azure_client, "client ID", config.azure.client_id
+        )
+        config.azure.subscription_id = _guid(
+            self.azure_subscription, "subscription ID", config.azure.subscription_id
+        )
+
+        allowance = self.azure_allowance.value()
+        config.azure.monthly_allowance = allowance if allowance > 0 else None
+        config.azure.reset_day = self.azure_reset_day.value()
+        config.azure.top_rows = self.azure_top_rows.value()
+        config.azure.include_marketplace = self.azure_marketplace_cb.isChecked()
+
+        group = self.azure_resource_group.text().strip()
+        if not group:
+            config.azure.resource_group = None
+        else:
+            try:
+                config.azure.resource_group = validate_azure_resource_group(group)
+            except ValueError:
+                rejected.append("resource group")
+                self.azure_resource_group.setText(config.azure.resource_group or "")
+
+        pinned: list[str] = []
+        for line in self.azure_foundry_ids.toPlainText().splitlines():
+            candidate = line.strip()
+            if not candidate:
+                continue
+            try:
+                pinned.append(validate_azure_resource_id(candidate))
+            except ValueError:
+                rejected.append("Foundry resource ID")
+        config.azure.foundry_resource_ids = pinned
+        self.azure_foundry_ids.setPlainText("\n".join(pinned))
+
+        if rejected:
+            QMessageBox.warning(
+                self,
+                "Invalid Azure settings",
+                "These Azure fields were not saved because they are not in the "
+                "expected format:\n\n  • "
+                + "\n  • ".join(sorted(set(rejected)))
+                + "\n\nTenant, client, and subscription IDs must be GUIDs "
+                "(8-4-4-4-12 hex digits). Foundry resource IDs must be full "
+                "ARM paths.",
+            )
 
     def _sync_custom_quota_enabled(self) -> None:
         is_custom = self.gh_plan.currentData() is None
@@ -1368,6 +1711,7 @@ class SettingsDialog(QDialog):
         config.providers.claude = self.claude_cb.isChecked()
         config.providers.codex = self.codex_cb.isChecked()
         config.providers.copilot = self.copilot_cb.isChecked()
+        config.providers.azure = self.azure_cb.isChecked()
         config.providers.openrouter = self.openrouter_cb.isChecked()
         config.providers.opencode_go = self.opencode_go_cb.isChecked()
         for account_id in self._removed_browser_account_ids:
@@ -1384,6 +1728,8 @@ class SettingsDialog(QDialog):
         config.opencode_go.colors = self._provider_colors["opencode_go"].model_copy(
             deep=True
         )
+        config.azure.colors = self._provider_colors["azure"].model_copy(deep=True)
+        self._apply_azure(config)
         username = self.gh_username.text().strip()
         config.copilot.username = username or None
         billing_org = self.gh_billing_org.text().strip()

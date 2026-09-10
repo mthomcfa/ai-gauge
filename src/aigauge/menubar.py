@@ -30,6 +30,7 @@ PROVIDER_LABELS = {
     "codex": "Cx",
     "opencode_go": "Go",
     "copilot": "Cp",
+    "azure": "Az",
     "openrouter": "OR",
 }
 
