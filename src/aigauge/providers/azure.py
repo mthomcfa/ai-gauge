@@ -652,12 +652,18 @@ def build_snapshot(
     azure_cfg,
     *,
     fetched_at: datetime | None = None,
+    stale_note: str | None = None,
 ) -> UsageSnapshot:
     """Render an aggregate as tile rows.
 
     Pure: called both after a live fetch and when serving the cached aggregate
     inside the throttle window, so an allowance edited in Settings takes effect
     on the next render rather than on the next API call.
+
+    ``stale_note`` says this aggregate answers a question the settings no
+    longer ask. It is a reason not to gauge, exactly like a truncated read:
+    the amounts are still the last real reading of this subscription and are
+    still shown, but no percentage of them is claimed.
     """
     metrics: list[UsageMetric] = []
     currency = aggregate.currency
@@ -710,6 +716,10 @@ def build_snapshot(
             "while the sponsored credit drains - cannot be ruled out, and a "
             "non-zero total does not rule it out either. Grant the app "
             "registration the Reader role for that check. No gauge is shown."
+        )
+    if stale_note:
+        ungauged_note = (
+            f"{ungauged_note} {stale_note}" if ungauged_note else stale_note
         )
     spend_text = _money(aggregate.total, currency)
     # One flag, so the tile cannot disown a number on one row and print a
@@ -1727,6 +1737,11 @@ class _State:
     foundry_ids: set[str] = field(default_factory=set)
     quota_id: str | None = None
     cost_metric: str = COST_METRIC_PRIMARY
+    # The cached aggregate answers a question the settings no longer ask. It
+    # is still served - it is the last real reading of this subscription - but
+    # without a gauge, and it says so. Cleared only by a fetch that succeeds
+    # under the new settings.
+    stale_settings: bool = False
 
 
 # Module-level, keyed by subscription id: App rebuilds every provider on each
@@ -1780,7 +1795,18 @@ def _query_identity(azure_cfg) -> tuple:
         getattr(azure_cfg, "reset_day", 1),
         getattr(azure_cfg, "resource_group", None) or "",
         bool(getattr(azure_cfg, "include_marketplace", False)),
-        tuple(sorted(getattr(azure_cfg, "foundry_resource_ids", []) or [])),
+        # Lower-cased and de-duplicated, because _fetch does both before it
+        # uses them: re-typing a pinned id in a different case asks the same
+        # question, and should not cost the tile its gauge until the next
+        # window.
+        tuple(
+            sorted(
+                {
+                    str(rid).strip().lower()
+                    for rid in getattr(azure_cfg, "foundry_resource_ids", []) or []
+                }
+            )
+        ),
     )
 
 
@@ -1805,6 +1831,20 @@ def next_allowed_at(state: _State) -> datetime | None:
         if stamp is not None
     ]
     return max(candidates) if candidates else None
+
+
+def _stale_settings_note(state: _State) -> str:
+    """Why the tile is showing figures it will not gauge.
+
+    The hourly floor is a promise to the tenant, not to this tile, so a
+    settings save cannot buy a fetch. Naming the time the next one is due is
+    what turns "no gauge" from a fault into a wait.
+    """
+    when = next_allowed_at(state)
+    return (
+        "Settings changed; these figures are from the previous settings."
+        + (f" Next fetch at {when:%H:%M}." if when is not None else "")
+    )
 
 
 def _error_backoff(consecutive_errors: int) -> timedelta:
@@ -1918,8 +1958,13 @@ class AzureProvider(Provider):
                 "provider api diagnosis provider=azure "
                 "classification=query_settings_changed cache_dropped=1"
             )
-            state.aggregate = None
-            state.fetched_at = None
+            # The answer is kept and the gauge is not: a cached aggregate
+            # built from the old settings is still the last real reading of
+            # this subscription's spend, and dropping it left the tile in
+            # error for up to an hour with nothing saying why. It is served
+            # ungauged, with a note, until a fetch under the new settings
+            # replaces it. The throttle stamps are untouched.
+            state.stale_settings = True
             state.last_error = None
         state.identity = identity
         state.query_identity = shape
@@ -1944,7 +1989,16 @@ class AzureProvider(Provider):
         # between that loop and a tenant-wide rate limit.
         def serve_cache() -> None:
             on_done(
-                build_snapshot(state.aggregate, azure_cfg, fetched_at=state.fetched_at)
+                build_snapshot(
+                    state.aggregate,
+                    azure_cfg,
+                    fetched_at=state.fetched_at,
+                    stale_note=(
+                        _stale_settings_note(state)
+                        if state.stale_settings
+                        else None
+                    ),
+                )
             )
 
         if state.in_flight:
@@ -2212,7 +2266,14 @@ class AzureProvider(Provider):
             )
             if state.aggregate is not None:
                 return build_snapshot(
-                    state.aggregate, azure_cfg, fetched_at=state.fetched_at
+                    state.aggregate,
+                    azure_cfg,
+                    fetched_at=state.fetched_at,
+                    stale_note=(
+                        _stale_settings_note(state)
+                        if state.stale_settings
+                        else None
+                    ),
                 )
             return self._remember_error(
                 state,
@@ -2270,6 +2331,8 @@ class AzureProvider(Provider):
         fetched_at = datetime.now()
         state.aggregate = aggregate
         state.fetched_at = fetched_at
+        # This answer was read under the settings as they now stand.
+        state.stale_settings = False
         state.consecutive_errors = 0
         state.blocked_until = None
         state.last_error = None

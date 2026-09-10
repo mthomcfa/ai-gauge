@@ -823,6 +823,54 @@ def test_changing_the_row_count_re_renders_from_the_cache(monkeypatch, config):
     assert second.metrics[-1].note and "CAD 18.00" in second.metrics[-1].note
 
 
+def test_re_typing_a_pinned_id_in_another_case_is_the_same_question():
+    """`_fetch` lower-cases pinned ids and holds them in a set before it uses
+    them, so case and duplicates change nothing about the request. Counting
+    them as a new question cost the tile its gauge until the next window for
+    an edit that changed nothing."""
+    one = AzureConfig(foundry_resource_ids=[FOUNDRY_ID])
+    other = AzureConfig(foundry_resource_ids=[FOUNDRY_ID.upper(), FOUNDRY_ID])
+    assert az._query_identity(one) == az._query_identity(other)
+
+
+@responses.activate
+def test_a_query_shape_change_keeps_the_figures_and_drops_the_gauge(
+    monkeypatch, config
+):
+    """The cached answer was built from a different question, so it cannot
+    carry a percentage - but it is still the last real reading of this
+    subscription's spend, and the hourly floor is a promise to the tenant that
+    a settings save does not get to reopen. Showing an error for up to an hour
+    threw away a number the user could still use and said nothing about why."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    first = _run(az.AzureProvider(config), monkeypatch)
+    calls = len(responses.calls)
+    assert first.metrics[0].percent_used is not None
+
+    config.azure.reset_day = 15
+    second = _run(az.AzureProvider(config), monkeypatch)
+
+    assert len(responses.calls) == calls, "a settings save reopened the window"
+    assert second.status == SnapshotStatus.OK
+    assert all(m.percent_used is None for m in second.metrics)
+    note = second.metrics[0].note or ""
+    assert "Settings changed" in note
+    assert "Next fetch at" in note
+    assert "CAD 28.55" in (second.metrics[0].reset_label or "")
+
+    # The window is untouched, and the next fetch asks the new question.
+    az.state_for(SUB).last_fetch_at -= az.MIN_FETCH_INTERVAL
+    third = _run(az.AzureProvider(config), monkeypatch)
+    assert len(responses.calls) > calls
+    assert third.metrics[0].percent_used is not None
+    assert "Settings changed" not in (third.metrics[0].note or "")
+    queries = [c for c in responses.calls if "CostManagement/query" in c.request.url]
+    body = json.loads(queries[-1].request.body)
+    expected_start, _end = az.period_bounds(datetime.now(timezone.utc).date(), 15)
+    assert body["timePeriod"]["from"].startswith(expected_start.isoformat())
+
+
 @responses.activate
 def test_throttle_survives_the_provider_rebuild_on_a_settings_save(monkeypatch, config):
     monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
@@ -1463,9 +1511,12 @@ def test_ten_settings_saves_inside_the_hour_buy_one_live_fetch(monkeypatch, conf
     tokens = [c for c in responses.calls if c.request.url.startswith(TOKEN_URL)]
     assert len(queries) == 1, "a settings toggle reopened the hourly window"
     assert len(tokens) == 1
-    # And the stale answer is not replayed either: the tile says it is waiting.
-    assert snapshot.status == SnapshotStatus.ERROR
-    assert "window" in (snapshot.error or "")
+    # And the answer to the old question is not gauged as if it answered the
+    # new one: the amounts stand, the percentage does not, and the tile says
+    # when the next fetch is due.
+    assert snapshot.status == SnapshotStatus.OK
+    assert snapshot.metrics[0].percent_used is None
+    assert "Settings changed" in (snapshot.metrics[0].note or "")
 
 
 @responses.activate
@@ -2658,8 +2709,8 @@ def test_changing_the_reset_day_refetches_instead_of_replaying_the_old_period(
     shapes the *request* was replayed from the cached aggregate for an hour -
     and a manual Refresh went through the same gate, so it could not force it.
 
-    The cached answer is dropped at once; the *window* is not reopened, so the
-    new question is asked at the next one."""
+    The cached answer stops being gauged at once; the *window* is not
+    reopened, so the new question is asked at the next one."""
     import json as _json
 
     monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
@@ -2670,7 +2721,8 @@ def test_changing_the_reset_day_refetches_instead_of_replaying_the_old_period(
     responses.reset()
     _stub_everything()
     stale = _run(az.AzureProvider(config), monkeypatch)
-    assert stale.status == SnapshotStatus.ERROR, "the old period was replayed"
+    assert stale.metrics[0].percent_used is None, "the old period was gauged"
+    assert "Settings changed" in (stale.metrics[0].note or "")
     az.state_for(SUB).last_fetch_at -= az.MIN_FETCH_INTERVAL
     _run(az.AzureProvider(config), monkeypatch)
 
@@ -2692,11 +2744,12 @@ def test_changing_the_reset_day_refetches_instead_of_replaying_the_old_period(
     ],
 )
 @responses.activate
-def test_every_query_shaping_setting_invalidates_the_cache(
+def test_every_query_shaping_setting_stops_gauging_the_cached_answer(
     monkeypatch, config, field, value
 ):
-    """Invalidates the answer, not the fetch window: the stale aggregate is
-    never served again, and the new question is asked at the next window."""
+    """Invalidates the gauge, not the fetch window: the old amounts are still
+    shown because they are still the last real reading, no percentage is
+    claimed for them, and the new question is asked at the next window."""
     monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
     _stub_everything()
     responses.add(responses.POST, QUERY_URL, json=query_payload([]), status=200)
@@ -2705,7 +2758,8 @@ def test_every_query_shaping_setting_invalidates_the_cache(
 
     setattr(config.azure, field, value)
     stale = _run(az.AzureProvider(config), monkeypatch)
-    assert stale.status == SnapshotStatus.ERROR, f"{field} was replayed from the cache"
+    assert stale.metrics[0].percent_used is None, f"{field} was gauged from the cache"
+    assert "Settings changed" in (stale.metrics[0].note or "")
     assert len(responses.calls) == calls, f"{field} reopened the fetch window"
 
     az.state_for(SUB).last_fetch_at -= az.MIN_FETCH_INTERVAL
