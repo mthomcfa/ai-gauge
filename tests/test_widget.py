@@ -991,9 +991,18 @@ def test_metric_row_sizes_a_long_reset_label_to_fit(qtbot):
         window=timedelta(days=30),
     )
 
-    assert row.reset.text() == "CAD 36.10 of 150.00 · resets 1 Oct"
+    # Whether the whole string fits depends on the platform's font metrics -
+    # Windows draws this wider than Linux and elides it - so the contract is
+    # what holds everywhere: the column widened past the countdown width, what
+    # is drawn fits inside it and starts with the amounts, and the full text
+    # is reachable from the tooltip.
+    label = "CAD 36.10 of 150.00 · resets 1 Oct"
+    drawn = row.reset.text()
     assert not row.reset.isHidden()
     assert row.reset.width() > 58
+    assert row.reset.fontMetrics().horizontalAdvance(drawn) <= row.reset.width()
+    assert drawn == label or (drawn.startswith("CAD 36.10 of 150.00") and drawn != label)
+    assert label in row.reset.toolTip()
 
 
 def test_a_long_reset_label_is_elided_and_kept_in_the_tooltip(qtbot):
