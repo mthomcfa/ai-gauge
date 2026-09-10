@@ -1774,19 +1774,21 @@ def _identity(tenant_id: str, client_id: str, client_secret: str) -> tuple:
 
 
 def _query_identity(azure_cfg) -> tuple:
-    """*What* the request asks for. A change here drops only the answer.
+    """*What* the request asks for. A change here drops only the gauge.
 
     These settings are consumed inside _fetch - which period, which scope,
-    which queries, which buckets - so a cached aggregate built before the
-    change answers a different question than the one the settings now ask, and
-    the throttle would otherwise replay it for an hour.
+    which queries - so a cached aggregate built before the change answers a
+    different question than the one the settings now ask, and the throttle
+    would otherwise replay it as though it did not.
 
-    What it deliberately does **not** drop is ``last_fetch_at``,
+    What it deliberately does **not** touch is ``last_fetch_at``,
     ``blocked_until`` and ``consecutive_errors``. Those are promises made to
     the *tenant*, not to this tile: README and SECURITY.md say at most one live
     fetch an hour, and a settings save is a one-click human action that is easy
-    to loop. So the next render is the fail-closed "waiting for the next Azure
-    fetch window" snapshot rather than a fresh query.
+    to loop. So no fetch follows the save. The aggregate is kept and marked
+    ``stale_settings``: until the window opens the tile shows those amounts
+    with no percentage on any row and a note saying so, because they are still
+    the last real reading of this subscription's spend.
 
     ``top_rows`` is absent: it changes how many of the answer's rows are
     named, not what was asked, and the aggregate keeps every distinct bucket
@@ -1960,7 +1962,7 @@ class AzureProvider(Provider):
             # promise about how often this tile may ask.
             log.info(
                 "provider api diagnosis provider=azure "
-                "classification=query_settings_changed cache_dropped=1"
+                "classification=query_settings_changed cache_ungauged=1"
             )
             # The answer is kept and the gauge is not: a cached aggregate
             # built from the old settings is still the last real reading of
