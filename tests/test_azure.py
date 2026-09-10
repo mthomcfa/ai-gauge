@@ -8,8 +8,6 @@ column map. A fixture written as a convenient dict would test nothing.
 from __future__ import annotations
 
 import json
-import os
-import time
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -2854,33 +2852,16 @@ def test_the_token_endpoint_refuses_a_non_guid_tenant():
 # --- the period is a UTC window --------------------------------------------
 
 
-_NO_TZSET = not hasattr(time, "tzset")
+# These tests inject the zone rather than setting TZ and re-reading it: the
+# suite leaves QtWebEngine's Chromium threads running, and a setenv() on this
+# thread racing their getenv() is a segmentation fault - it took one of six CI
+# jobs down at random. A fixed offset proves the same thing without touching
+# the process.
+_UTC_PLUS_14 = timezone(timedelta(hours=14))   # Pacific/Kiritimati
+_UTC_MINUS_12 = timezone(timedelta(hours=-12))  # Etc/GMT+12
 
 
-@pytest.fixture
-def _tz(request):
-    """Run one test in a named zone, then put the process back.
-
-    The suite runs at TZ=UTC, where every one of these assertions is a
-    tautology: the local date *is* the UTC date and the local rendering of a
-    UTC midnight *is* that midnight, so the tests passed with the fix reverted.
-    """
-    previous = os.environ.get("TZ")
-    os.environ["TZ"] = request.param
-    time.tzset()
-    try:
-        yield request.param
-    finally:
-        if previous is None:
-            os.environ.pop("TZ", None)
-        else:
-            os.environ["TZ"] = previous
-        time.tzset()
-
-
-@pytest.mark.skipif(_NO_TZSET, reason="tzset is POSIX-only; CI also runs Windows")
-@pytest.mark.parametrize("_tz", ["Pacific/Kiritimati"], indirect=True)
-def test_utc_today_is_the_utc_date_not_the_local_one(_tz, monkeypatch):
+def test_utc_today_is_the_utc_date_not_the_local_one(monkeypatch):
     """At UTC+14 the local calendar date runs ahead of the UTC one for ten
     hours a day, and Cost Management dates its usage in UTC."""
     fixed = datetime(2026, 9, 30, 22, 0, tzinfo=timezone.utc)
@@ -2888,9 +2869,10 @@ def test_utc_today_is_the_utc_date_not_the_local_one(_tz, monkeypatch):
     class _Frozen(datetime):
         @classmethod
         def now(cls, tz=None):  # noqa: N805
-            return fixed.astimezone(tz) if tz else fixed.astimezone().replace(
-                tzinfo=None
-            )
+            if tz is not None:
+                return fixed.astimezone(tz)
+            # A naive local clock at UTC+14, without changing the process TZ.
+            return fixed.astimezone(_UTC_PLUS_14).replace(tzinfo=None)
 
     monkeypatch.setattr(az, "datetime", _Frozen)
     assert _Frozen.now().date() == date(2026, 10, 1), "the fixture proves nothing"
@@ -2918,23 +2900,23 @@ def test_the_query_window_follows_the_utc_date(monkeypatch, config):
     assert body["timePeriod"]["to"].startswith("2026-09-30")
 
 
-@pytest.mark.skipif(_NO_TZSET, reason="tzset is POSIX-only; CI also runs Windows")
-@pytest.mark.parametrize("_tz", ["Pacific/Kiritimati"], indirect=True)
-def test_resets_at_is_the_utc_boundary_rendered_locally(_tz):
+def test_resets_at_is_the_utc_boundary_rendered_locally():
     """The boundary is a UTC instant; the countdown shows it in local time,
     which is also what Copilot does with the same 1st-of-the-month."""
-    snapshot = az.build_snapshot(_aggregate(), AzureConfig(monthly_allowance=150.0))
+    snapshot = az.build_snapshot(
+        _aggregate(), AzureConfig(monthly_allowance=150.0), local_tz=_UTC_PLUS_14
+    )
     assert snapshot.metrics[0].resets_at == datetime(2026, 10, 1, 14, 0)
     assert snapshot.metrics[0].window == timedelta(days=30)
 
 
-@pytest.mark.skipif(_NO_TZSET, reason="tzset is POSIX-only; CI also runs Windows")
-@pytest.mark.parametrize("_tz", ["Etc/GMT+12"], indirect=True)
-def test_the_printed_reset_day_agrees_with_the_countdown_west_of_utc(_tz):
+def test_the_printed_reset_day_agrees_with_the_countdown_west_of_utc():
     """The label was built from the UTC date and the countdown from its local
     rendering, so at UTC-12 the row said "resets 1 Oct" and counted down to
     30 September."""
-    snapshot = az.build_snapshot(_aggregate(), AzureConfig(monthly_allowance=150.0))
+    snapshot = az.build_snapshot(
+        _aggregate(), AzureConfig(monthly_allowance=150.0), local_tz=_UTC_MINUS_12
+    )
     summary = snapshot.metrics[0]
     assert summary.resets_at == datetime(2026, 9, 30, 12, 0)
     assert "resets 30 Sep" in (summary.reset_label or "")
