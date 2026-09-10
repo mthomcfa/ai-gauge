@@ -687,9 +687,19 @@ def build_snapshot(
             )
         )
 
-    if aggregate.forecast_total is not None:
+    forecast_total = aggregate.forecast_total
+    if forecast_total is not None and (
+        forecast_total <= 0 or forecast_total < aggregate.total
+    ):
+        # A full-period projection at or below what has already been spent is
+        # not a projection - it contradicts the row above it. The row is built
+        # to come and go silently when Cost Management cannot produce one, so
+        # omitting it is the honest outcome. (The number stays in the
+        # diagnostics payload, which is where a bug report needs it.)
+        forecast_total = None
+    if forecast_total is not None:
         forecast_share = (
-            max(0.0, min(100.0, aggregate.forecast_total / allowance * 100.0))
+            max(0.0, min(100.0, forecast_total / allowance * 100.0))
             if allowance
             else None
         )
@@ -698,7 +708,7 @@ def build_snapshot(
                 label="Forecast end of month",
                 percent_used=forecast_share,
                 note=(
-                    f"~{_money(aggregate.forecast_total, currency)} projected by "
+                    f"~{_money(forecast_total, currency)} projected by "
                     "Cost Management for the full period"
                     + (f" ({forecast_share:.0f}% of allowance)." if forecast_share is not None else ".")
                 ),
@@ -1769,18 +1779,6 @@ class AzureProvider(Provider):
                 cost_metric=cost_metric,
                 resource_group=azure_cfg.resource_group,
             )
-            if forecast_total is not None and (
-                forecast_total <= 0 or forecast_total < parsed.total
-            ):
-                # A full-period projection below what has already been spent
-                # is not a projection. Omitting the row is honest; the tile is
-                # built to lose it silently when Cost Management cannot
-                # produce one.
-                log.info(
-                    "provider api diagnosis provider=azure "
-                    "classification=forecast_implausible"
-                )
-                forecast_total = None
         except AzureThrottled as exc:
             state.blocked_until = datetime.now() + timedelta(seconds=exc.retry_after)
             log.warning(

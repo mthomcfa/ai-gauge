@@ -1857,3 +1857,25 @@ def test_an_absurdly_large_budget_is_refused_rather_than_pinning_the_gauge_at_ze
     got, _grain, note = az.fetch_budget("tok", SUB, currency="CAD")
     assert got is None
     assert note
+
+
+def test_a_forecast_below_the_spend_already_recorded_is_not_a_forecast():
+    """build_snapshot is re-run over the cached aggregate on every render, so
+    the rule has to live there rather than only at fetch time."""
+    for forecast in (0.0, -5.0, 10.0):
+        snapshot = az.build_snapshot(
+            _aggregate(total=36.10, forecast_total=forecast),
+            AzureConfig(monthly_allowance=150.0),
+        )
+        assert not any(
+            m.label == "Forecast end of month" for m in snapshot.metrics
+        ), forecast
+
+
+def test_a_forecast_equal_to_the_spend_so_far_is_still_shown():
+    """Legitimate at the end of a period, or when nothing more is projected."""
+    snapshot = az.build_snapshot(
+        _aggregate(total=36.10, forecast_total=36.10),
+        AzureConfig(monthly_allowance=150.0),
+    )
+    assert snapshot.metrics[-1].label == "Forecast end of month"
