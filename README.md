@@ -158,7 +158,7 @@ into component rows by Azure service:
 
 ```
 Microsoft · Azure
-Spend this month (CAD 36.10 of 150.00)      resets Oct 1
+Spend this month         CAD 36.10 of 150.00 · resets 1 Oct
 [■■■■■■■░░░░░░░░░░░░░░░░░░░░░░]
   Foundry                    12.40   34%
   Azure OpenAI                8.05   22%
@@ -169,9 +169,17 @@ Spend this month (CAD 36.10 of 150.00)      resets Oct 1
   Forecast end of month      ~71.00  47%
 ```
 
+The label is fixed and the amounts sit in the right-hand column: history keys
+an in-flight period on the label, so a label that moved with the money would
+open a new period on every fetch.
+
 Only the top row counts toward the tray/menu-bar colour. The component rows
 are shares of spend, not usage against a limit, so a single service at 96% of
-the month's spend must not turn the tray red.
+the month's spend must not turn the tray red. Every percentage on the tile —
+the top row, the shares and the forecast — appears together or not at all: if
+the total cannot honestly carry a gauge (a truncated read, more than one
+billing currency, an unreadable offer type) then none of the rows below it
+carries one either, and the amounts are still shown.
 
 #### Setting it up
 

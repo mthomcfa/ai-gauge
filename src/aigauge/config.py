@@ -434,6 +434,11 @@ def validate_azure_resource_id(value: str) -> str:
     text = (value or "").strip()
     if any(ord(ch) < 0x20 or ch in "\\ " for ch in text):
         raise ValueError("Azure resource id contains illegal characters")
+    if any(segment in (".", "..") for segment in text.split("/")):
+        # "." and ".." are path operators, not resource names. The value is
+        # only ever compared against ids ARM returned today, but this is the
+        # validator anything that changed that would lean on.
+        raise ValueError("Azure resource id contains a path traversal segment")
     match = _ARM_RESOURCE_ID_RE.fullmatch(text)
     if match is None:
         raise ValueError(

@@ -8,6 +8,8 @@ column map. A fixture written as a convenient dict would test nothing.
 from __future__ import annotations
 
 import json
+import os
+import time
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -209,7 +211,7 @@ def test_cost_column_falls_back_to_a_column_that_names_itself_a_cost():
     to survive a rename, so it matches on the name and never on position."""
     columns = [
         {"name": "UsageDate", "type": "Number"},
-        {"name": "SomeFutureCostName", "type": "Number"},
+        {"name": "SomeFutureBilledCost", "type": "Number"},
     ]
     assert az._cost_column(columns, az._column_index(columns)) == 1
 
@@ -1878,7 +1880,7 @@ def test_the_cost_column_is_never_guessed_from_position():
     be summed and formatted as money."""
     columns = [
         {"name": "UsageQuantity", "type": "Number"},
-        {"name": "SomeFutureCostName", "type": "Number"},
+        {"name": "SomeFutureBilledCost", "type": "Number"},
     ]
     assert az._cost_column(columns, az._column_index(columns)) == 1
 
@@ -2140,6 +2142,143 @@ def test_the_printed_reset_day_is_the_one_the_countdown_counts_to():
     assert f"resets {printed}" in (summary.reset_label or "")
 
 
+# --- the remaining low-severity edges ---------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name", ["CostCenter", "CostCentre", "CostCategory", "CostAllocationRuleId"]
+)
+def test_a_column_that_merely_contains_cost_is_not_money(name):
+    """The fallback dropped the positional guess because summing a quantity
+    into a money label is a wrong number rather than a visible failure. A
+    cost-centre id is the same mistake by a different route: 4815162342 read
+    as dollars."""
+    payload = {
+        "properties": {
+            "columns": [
+                {"name": name, "type": "Number"},
+                {"name": "ServiceName", "type": "String"},
+            ],
+            "rows": [[4815162342, "Storage"]],
+        }
+    }
+    parsed = az.parse_query_response(payload)
+    assert parsed.cost_column_found is False
+    assert parsed.total == 0.0
+
+
+@pytest.mark.parametrize("name", ["Cost", "PreTaxCost", "cost", "CostInBillingCurrency"])
+def test_the_documented_cost_column_names_all_resolve(name):
+    parsed = az.parse_query_response(query_payload([[12.5, 20260901, "", "S", "CAD"]],
+                                                   cost_name=name))
+    assert parsed.cost_column_found is True
+    assert parsed.total == pytest.approx(12.5)
+
+
+def test_a_renamed_cost_column_is_still_found_by_the_fallback():
+    payload = {
+        "properties": {
+            "columns": [
+                {"name": "BilledPreTaxCost", "type": "Number"},
+                {"name": "ServiceName", "type": "String"},
+            ],
+            "rows": [[12.5, "Storage"]],
+        }
+    }
+    parsed = az.parse_query_response(payload)
+    assert parsed.cost_column_found is True
+    assert parsed.total == pytest.approx(12.5)
+
+
+@pytest.mark.parametrize(
+    "quota_id,expected",
+    [
+        ("Sponsored_2016-01-01", True),
+        ("MS-AZR-0136P", True),
+        ("ms-azr-0136p", True),
+        ("EnterpriseAgreement_2014-09-01", False),
+    ],
+)
+def test_sponsorship_covers_the_offer_ids_the_docstring_names(quota_id, expected):
+    """EA Azure Sponsorship is listed as unsupported under an offer id with no
+    "sponsor" in it, which the substring test the docstring claimed to cover
+    did not match."""
+    assert az.is_sponsorship(quota_id) is expected
+
+
+@pytest.mark.parametrize("child", [".", ".."])
+def test_a_dot_child_segment_is_not_a_resource_name(child):
+    """The value is only ever a set member today, never a URL - but "." and
+    ".." are path operators, not names, and this is the validator that would
+    be relied on if that ever changed."""
+    from aigauge.config import validate_azure_resource_id
+
+    with pytest.raises(ValueError):
+        validate_azure_resource_id(
+            f"/subscriptions/{SUB}/resourceGroups/rg-ai/providers/"
+            f"Microsoft.CognitiveServices/accounts/acct/projects/{child}"
+        )
+
+
+@responses.activate
+def test_marketplace_charges_are_summed_per_pair_across_days(monkeypatch, config):
+    """Daily granularity returns one row per (resource, service, day), so
+    keeping the last day's amount instead of the sum moved only a fraction of
+    the Marketplace spend out of the service row."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    config.azure.include_marketplace = True
+    _stub_everything(
+        rows=[
+            [10.0, 20260906, MARKET_ID, "Global resources", "CAD"],
+            [10.0, 20260907, MARKET_ID, "Global resources", "CAD"],
+            [10.0, 20260908, MARKET_ID, "Global resources", "CAD"],
+        ]
+    )
+    responses.add(
+        responses.POST,
+        QUERY_URL,
+        json=query_payload(
+            [
+                [4.0, 20260906, MARKET_ID, "Global resources", "CAD"],
+                [4.0, 20260907, MARKET_ID, "Global resources", "CAD"],
+                [4.0, 20260908, MARKET_ID, "Global resources", "CAD"],
+            ]
+        ),
+        status=200,
+    )
+
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+
+    buckets = dict(snapshot.raw["buckets"])
+    assert buckets[az.MARKETPLACE_BUCKET] == pytest.approx(12.0)
+    assert buckets["Global resources"] == pytest.approx(18.0)
+
+
+@responses.activate
+def test_discovery_is_cached_for_a_day_and_re_read_after_it(monkeypatch, config):
+    """The offer type and the Foundry resource list describe things that
+    change on the order of months. Two calls an hour for them would double the
+    tile's request count for nothing."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    _run(az.AzureProvider(config), monkeypatch)
+    discovery = [c for c in responses.calls if "CognitiveServices/accounts" in c.request.url]
+    assert len(discovery) == 1
+
+    state = az.state_for(SUB)
+    state.last_fetch_at -= az.MIN_FETCH_INTERVAL
+    _run(az.AzureProvider(config), monkeypatch)
+    discovery = [c for c in responses.calls if "CognitiveServices/accounts" in c.request.url]
+    assert len(discovery) == 1, "discovery ran again inside its TTL"
+
+    state = az.state_for(SUB)
+    state.last_fetch_at -= az.MIN_FETCH_INTERVAL
+    state.discovery_at -= az.DISCOVERY_TTL + timedelta(minutes=1)
+    _run(az.AzureProvider(config), monkeypatch)
+    discovery = [c for c in responses.calls if "CognitiveServices/accounts" in c.request.url]
+    assert len(discovery) == 2, "discovery was never re-read"
+
+
 # --- the token cache is a credential, and behaves like one -----------------
 
 
@@ -2341,8 +2480,47 @@ def test_the_token_endpoint_refuses_a_non_guid_tenant():
 # --- the period is a UTC window --------------------------------------------
 
 
-def test_utc_today_is_the_utc_date_not_the_local_one():
-    assert az._utc_today() == datetime.now(timezone.utc).date()
+_NO_TZSET = not hasattr(time, "tzset")
+
+
+@pytest.fixture
+def _tz(request):
+    """Run one test in a named zone, then put the process back.
+
+    The suite runs at TZ=UTC, where every one of these assertions is a
+    tautology: the local date *is* the UTC date and the local rendering of a
+    UTC midnight *is* that midnight, so the tests passed with the fix reverted.
+    """
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = request.param
+    time.tzset()
+    try:
+        yield request.param
+    finally:
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()
+
+
+@pytest.mark.skipif(_NO_TZSET, reason="tzset is POSIX-only; CI also runs Windows")
+@pytest.mark.parametrize("_tz", ["Pacific/Kiritimati"], indirect=True)
+def test_utc_today_is_the_utc_date_not_the_local_one(_tz, monkeypatch):
+    """At UTC+14 the local calendar date runs ahead of the UTC one for ten
+    hours a day, and Cost Management dates its usage in UTC."""
+    fixed = datetime(2026, 9, 30, 22, 0, tzinfo=timezone.utc)
+
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):  # noqa: N805
+            return fixed.astimezone(tz) if tz else fixed.astimezone().replace(
+                tzinfo=None
+            )
+
+    monkeypatch.setattr(az, "datetime", _Frozen)
+    assert _Frozen.now().date() == date(2026, 10, 1), "the fixture proves nothing"
+    assert az._utc_today() == date(2026, 9, 30)
 
 
 @responses.activate
@@ -2366,15 +2544,26 @@ def test_the_query_window_follows_the_utc_date(monkeypatch, config):
     assert body["timePeriod"]["to"].startswith("2026-09-30")
 
 
-def test_resets_at_is_the_utc_boundary_rendered_locally():
+@pytest.mark.skipif(_NO_TZSET, reason="tzset is POSIX-only; CI also runs Windows")
+@pytest.mark.parametrize("_tz", ["Pacific/Kiritimati"], indirect=True)
+def test_resets_at_is_the_utc_boundary_rendered_locally(_tz):
     """The boundary is a UTC instant; the countdown shows it in local time,
     which is also what Copilot does with the same 1st-of-the-month."""
     snapshot = az.build_snapshot(_aggregate(), AzureConfig(monthly_allowance=150.0))
-    expected = (
-        datetime(2026, 10, 1, tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
-    )
-    assert snapshot.metrics[0].resets_at == expected
+    assert snapshot.metrics[0].resets_at == datetime(2026, 10, 1, 14, 0)
     assert snapshot.metrics[0].window == timedelta(days=30)
+
+
+@pytest.mark.skipif(_NO_TZSET, reason="tzset is POSIX-only; CI also runs Windows")
+@pytest.mark.parametrize("_tz", ["Etc/GMT+12"], indirect=True)
+def test_the_printed_reset_day_agrees_with_the_countdown_west_of_utc(_tz):
+    """The label was built from the UTC date and the countdown from its local
+    rendering, so at UTC-12 the row said "resets 1 Oct" and counted down to
+    30 September."""
+    snapshot = az.build_snapshot(_aggregate(), AzureConfig(monthly_allowance=150.0))
+    summary = snapshot.metrics[0]
+    assert summary.resets_at == datetime(2026, 9, 30, 12, 0)
+    assert "resets 30 Sep" in (summary.reset_label or "")
 
 
 # --- the summary label is a key, so it has to be stable ---------------------

@@ -474,6 +474,33 @@ unnecessary source of behaviour change.
   below the spend already recorded, which is not a projection — the row is
   simply absent, which is honest but means it silently comes and goes early in
   a period.
+- **A refresh has a request budget, and it only guards the loops.** A
+  wall-clock deadline (`REFRESH_DEADLINE_SECONDS`) and a request ceiling
+  (`MAX_ARM_REQUESTS_PER_REFRESH`) cover the cost-query `nextLink` chain and
+  the discovery page loop, because those are what multiply. The fixed handful
+  around them — token, subscription, budgets, forecast — is outside it: they
+  cannot repeat, and counting them would make the ceiling harder to reason
+  about.
+- **A subscription that exceeds the page cap every hour stays ungauged.** A
+  truncated aggregate is cached like a good one, so the hour that follows is
+  "no gauge, with a note" rather than an hour of error backoff — the right
+  trade, but permanent for such a subscription. A monthly-granularity retry
+  (losing only `data_as_of`) would produce a complete total and was not built.
+- **An unmatched Marketplace pair contributes nothing and is not noted.** If
+  the marketplace query returns a (resource, service) pair the main query does
+  not, its cost does not appear anywhere and no note says so. The alternative —
+  adding it — would break the invariant that the buckets sum to the total.
+- **The App-level in-flight scheduler has no watchdog.** `app.py` clears
+  `_inflight` only when a snapshot arrives, and `_schedule_next_refresh`,
+  `refresh_now` and `refresh_provider` all return early while it is non-empty.
+  The Azure provider bounds its own worst case now, but a provider that never
+  calls back still stalls the cycle. `AzureProvider`'s own `in_flight` flag
+  does have one (`IN_FLIGHT_STALE_AFTER`).
+- **The tile and tray tooltips rely on `snapshot.error` being clean at
+  source.** `_exception_summary` is what keeps a request URL out of it;
+  `widget.py` renders the string as-is, and only `app.py`'s log lines and the
+  error dialog redact. A future provider that puts an id in `snapshot.error`
+  would put it in a tooltip.
 - **History still keys on the display label.** The Azure summary label is
   stable now, so Azure closes periods correctly, but `history._state_key` is
   still `provider::label` and OpenRouter's `Today ($x/$y)` and Copilot's
@@ -494,6 +521,25 @@ the calls that were made, and why:
   state is what switched the throttle off. If a future change needs a "fetch
   now" escape hatch, it must clear `last_fetch_at` explicitly rather than rely
   on the gate letting anything through.
+- **The identity check is two checks.** `_identity` is the credential triple
+  (tenant, client, secret digest); changing it resets the whole `_State` and
+  the token cache, because everything cached describes a different app
+  registration. `_query_identity` is what the request asks for (reset day,
+  resource group, marketplace toggle, row count, pinned Foundry ids);
+  changing it drops only `aggregate`, `fetched_at` and `last_error` and keeps
+  `last_fetch_at`, `blocked_until` and `consecutive_errors`. A settings save is
+  a one-click human action that is easy to loop, and "at most one live fetch an
+  hour" is a promise made to the tenant, not to this tile — so the next render
+  is the fail-closed "waiting for the next Azure fetch window" snapshot. That
+  includes `top_rows`, which is only a display setting: re-bucketing it without
+  a refetch would mean holding every parsed row (up to `MAX_QUERY_ROWS` of
+  them) for the life of the process.
+- **A tolerant sub-fetch re-raises `AzureThrottled`.** The five of them
+  (`_safe_quota_id`, `_safe_foundry_ids`, `_safe_budget`, `_safe_forecast`, the
+  marketplace query) share one shape: re-raise the 429, note a permission
+  error, note anything else. A 429 is an answer about the whole tenant, not a
+  detail of one sub-fetch, and `_fetch`'s handler is the only place it is
+  recorded.
 - **A cost column is found by name, never by position**, and its absence is an
   error routed through `_remember_error`. `row_count == 0` *with* a column is
   still a legitimate empty month, since the data lags 8–72 h.

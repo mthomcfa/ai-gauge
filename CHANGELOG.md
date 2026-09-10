@@ -148,12 +148,58 @@ work before it merged. What they found, and what changed:
   stable ("Spend this month"), with the amounts alongside the bar, so history
   keys one period instead of one per fetch.
 
+A second round of the same three reviews went over the fixes. What it found
+was of one kind: places where a rule was enforced at one point and not at its
+twin.
+
+- **The throttle class, not the trigger.** The tolerant sub-fetches had been
+  widened to `except Exception`, which swallowed the 429 they were never meant
+  to catch — so the tenant-wide back-off Azure asked for was dropped and the
+  refresh carried on issuing requests inside it. All five now re-raise it, note
+  a permission error and note anything else; a 403 on the marketplace query no
+  longer discards a cost query that already succeeded. A dispatch that fails
+  before the worker runs no longer leaks the in-flight flag and parks the tile
+  until restart, and the flag expires. The identity check is split, so changing
+  what the request asks for drops the cached answer without reopening the fetch
+  window: ten OK presses in Settings were ten live fetches. Two log lines no
+  longer write a traceback whose message is the request URL. A refresh has a
+  wall-clock deadline and a request ceiling for its page loops.
+- **The pagination class.** The cost-column rule now runs on every page, not
+  only the first: an ARM error document returned as 200 on page 7 of 12 merged
+  as zero and the under-reported total was shown as a clean gauge. A `nextLink`
+  that points back at a page already read stops the loop instead of counting
+  its rows again.
+- **The tile never prints a number it has just disowned.** One flag governs the
+  summary percent, the breakdown shares and whether there is a forecast row at
+  all. More than one billing currency shows per-currency subtotals rather than
+  their meaningless sum; a truncated read reads "incomplete" and moves the
+  subtotal into the note. An unreadable offer type now refuses the gauge
+  whatever the total — a Sponsorship subscription still bills Marketplace and
+  other non-sponsored charges, so a positive total does not rule it out. The
+  printed reset day comes from the same instant the countdown counts to.
+- **A typed allowance is always the denominator**, with a qualifying budget
+  reported in the note instead of replacing it; and an unfiltered budget is
+  refused for a tile filtered to one resource group, which it over-counts.
+- **Redaction is a scalpel again.** The compact-GUID rule is anchored to Azure
+  contexts and the resource-name rule needs a dotted namespace, so an md5 or
+  another provider's `/providers/` URL survives the blob. Names containing an
+  apostrophe redact whole. The dialog header redacts first and escapes last, so
+  the markers are visible rather than eaten as unknown tags. `_sanitize_raw`
+  caps dict keys and tuples and has a depth cap, the email pattern is bounded
+  at both ends, the AAD error code is one token, and the token cache is cleared
+  before as well as after the keyring write.
+- **Refresh cadence ignores `reset_label`, for every provider.** It is a
+  caption — a ticking countdown, or spend to the cent — and either one counted
+  as activity and pushed the whole app back into active-cadence polling.
+
 ### Testing
 
-- 907 → 1002 tests. Every finding above has a regression test that fails on the
-  code as reviewed, including one that drives the real worker rather than the
-  inline stand-in the suite had been using — which is why the throttle hole was
-  invisible to it.
+- 907 → 1074 tests. Every finding in both rounds now has a regression test that
+  fails on the code as reviewed — round 1 shipped five that did not, which a
+  mutation run over the fixes is what found. Several drive the real worker
+  rather than the inline stand-in the suite had been using (which is why the
+  throttle hole was invisible to it), and the UTC-period tests run under a
+  non-UTC zone, where they had been tautologies.
 
 ## 1.1.0+cfa.3 - 2026-09-09
 

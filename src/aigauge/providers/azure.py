@@ -101,7 +101,18 @@ FOUNDRY_ACCOUNT_KIND = "aiservices"
 # a 400, so we try the first and fall back once, then remember which worked.
 COST_METRIC_PRIMARY = "Cost"
 COST_METRIC_FALLBACK = "PreTaxCost"
-_COST_COLUMN_CANDIDATES = ("Cost", "PreTaxCost", "CostUSD", "PreTaxCostUSD", "totalCost")
+_COST_COLUMN_CANDIDATES = (
+    "Cost",
+    "PreTaxCost",
+    "CostUSD",
+    "PreTaxCostUSD",
+    "totalCost",
+    "CostInBillingCurrency",
+)
+# Words that make a column an identifier or a classification rather than an
+# amount, however much of "cost" is in the name: a CostCenter is a number, and
+# summing 4815162342 of it reads as money.
+_NOT_A_COST_WORD = ("center", "centre", "category", "rule", "id")
 # The Query API pages at ~1000 rows, and Daily granularity grouped on ResourceId
 # *and* ServiceName reaches that at roughly 33 resources over a month. Following
 # nextLink is therefore the normal case on a busy subscription, not an edge one.
@@ -227,12 +238,16 @@ def _cost_column(columns: list[Any], index: dict[str, int]) -> int | None:
     # list already covers every documented name, so this only has to survive a
     # rename. It deliberately no longer falls back on position: the first
     # numeric non-date column can be a quantity, and summing a quantity into a
-    # money label is a wrong number rather than a visible failure.
+    # money label is a wrong number rather than a visible failure. The name has
+    # to *end* in "cost" and carry none of the words that make it an id, for
+    # the same reason - CostCenter merely contains it.
     for position, column in enumerate(columns or []):
         if not isinstance(column, dict):
             continue
         name = str(column.get("name") or "").strip().lower()
-        if name in ("usagedate", "billingmonth") or "cost" not in name:
+        if not name.endswith("cost") or any(
+            word in name for word in _NOT_A_COST_WORD
+        ):
             continue
         if str(column.get("type") or "").strip().lower() == "number":
             return position
@@ -1485,15 +1500,23 @@ def fetch_quota_id(token: str, subscription_id: str) -> str | None:
     return str(quota_id) if quota_id else None
 
 
+# Offer ids for sponsorship offers whose *name* carries no "sponsor" at all,
+# so the substring test below cannot see them. Kept beside the substring rule
+# rather than replacing it: the substring is what covers a future sibling.
+SPONSORSHIP_OFFER_IDS = ("ms-azr-0136p",)
+
+
 def is_sponsorship(quota_id: str | None) -> bool:
     """Match on the family, not one literal.
 
     ``Sponsored_2016-01-01`` is the documented pay-as-you-go sponsorship quota
-    id, and EA Azure Sponsorship (MS-AZR-0136P) is listed as unsupported with
-    no quota id published at all. A substring test covers both and any future
-    sibling, and a false positive costs a warning row rather than a wrong gauge.
+    id, and EA Azure Sponsorship (MS-AZR-0136P) is listed as unsupported under
+    an offer id with no "sponsor" in it - so the substring test the docstring
+    used to claim "covers both" did not match it. Both rules run now, and a
+    false positive costs a warning row rather than a wrong gauge.
     """
-    return "sponsor" in (quota_id or "").lower()
+    lowered = (quota_id or "").strip().lower()
+    return "sponsor" in lowered or lowered in SPONSORSHIP_OFFER_IDS
 
 
 def fetch_foundry_resource_ids(
