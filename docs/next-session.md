@@ -517,6 +517,23 @@ unnecessary source of behaviour change.
   `UsageMetric`, used by `history` and `ratio`, is the repo-wide fix and was
   out of scope here.
 
+- **One CI job segfaulted in a native thread, once, and the cause is not
+  pinned.** Run 67 on `aab1de9` died with `Fatal Python error: Segmentation
+  fault` in the Ubuntu 22.04 / 3.11 job while the other five jobs and every
+  local run passed. faulthandler showed the main thread parked in a
+  `responses`-mocked request inside `test_the_query_page_loop_is_capped` -
+  pure Python - and labelled it `Thread`, not `Current thread`, so the fault
+  was in a thread with no Python state: a Qt or Chromium thread left running
+  by earlier files (`test_app.py` constructs a real `App()`), or the
+  `Release of profile requested but WebEnginePage still not deleted` hazard
+  the suite prints at exit. Commits `13f7aec` and `2c2b0e2` removed the one
+  thing this PR had added of that class - three tests setting `TZ` and
+  calling `time.tzset()` under those threads - and their messages name it as
+  the cause. That was overstated: those tests sit at the end of the Azure
+  file and had not run when the crash landed. The removal stands as hygiene;
+  the segfault is a suite-level soft spot that predates this PR's code and
+  belongs with the WebEngine teardown warning, not with Azure.
+
 ### 8.4 Decisions taken in review, so they are not relitigated
 
 Three reviews went over this feature before it merged (see the
