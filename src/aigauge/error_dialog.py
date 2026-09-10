@@ -58,13 +58,24 @@ _GUID_RE = re.compile(
     r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
 )
+# The same id written without its hyphens. Azure accepts and emits both forms,
+# and the dashed pattern does not match this one at all.
+_GUID_COMPACT_RE = re.compile(r"\b[0-9a-fA-F]{32}\b")
+# A path separator, as written or as requests echoes it back out of an encoded
+# URL. A name may not contain either.
+_SEP = r"(?:/|%2[Ff])"
+_SEGMENT = r"(?:(?!%2[Ff])[^/\s\"'])+"
 # Resource-group and resource names are chosen by the account holder and often
 # name a client, a project, or a person. The shape is kept so a reader can still
 # tell what kind of resource was involved.
-_RESOURCE_GROUP_RE = re.compile(r"(?i)(/resourceGroups/)[^/\s\"']+")
+_RESOURCE_GROUP_RE = re.compile(rf"(?i)({_SEP}resourceGroups{_SEP}){_SEGMENT}")
+# Every type/name pair below /providers/<namespace>, not just the first: a
+# Foundry project (accounts/<acct>/projects/<proj>) is a child resource, and a
+# project name is exactly the customer-identifying string this pass removes.
 _RESOURCE_NAME_RE = re.compile(
-    r"(?i)(/providers/[A-Za-z0-9.]+/[A-Za-z0-9]+/)[^/\s\"']+"
+    rf"(?i)({_SEP}providers{_SEP}[A-Za-z0-9.]+)((?:{_SEP}[A-Za-z0-9]+{_SEP}{_SEGMENT})+)"
 )
+_RESOURCE_PAIR_RE = re.compile(rf"(?i)({_SEP}[A-Za-z0-9]+{_SEP}){_SEGMENT}")
 _BODY_TEXT_LIMIT = 500
 # Every other string in the payload is capped too, not just the key that
 # happens to be named body_text. Snapshots now carry page- and Chromium-
@@ -92,13 +103,18 @@ def _redact_azure_ids(text: str) -> str:
     which provider and resource type was involved, which is the part that helps
     with a bug report, without naming the subscription or the resource.
 
-    Order matters: the resource-name pass runs before the resource-group pass
-    would otherwise have consumed it, and the GUID pass runs last so it also
-    catches ids that are not part of an ARM path.
+    Order matters only in one direction: the GUID passes run last, so a name
+    that happens to look like a GUID is already gone and the subscription id -
+    which is not part of any name - is still there to match.
     """
-    text = _RESOURCE_NAME_RE.sub(r"\1<redacted>", text)
+    text = _RESOURCE_NAME_RE.sub(
+        lambda match: match.group(1)
+        + _RESOURCE_PAIR_RE.sub(r"\1<redacted>", match.group(2)),
+        text,
+    )
     text = _RESOURCE_GROUP_RE.sub(r"\1<redacted>", text)
-    return _GUID_RE.sub("<guid>", text)
+    text = _GUID_RE.sub("<guid>", text)
+    return _GUID_COMPACT_RE.sub("<guid>", text)
 
 
 def _sanitize_raw(raw: Any, *, limit: int = _STRING_LIMIT) -> Any:

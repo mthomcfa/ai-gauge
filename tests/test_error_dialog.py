@@ -128,17 +128,27 @@ def test_format_diagnostics_redacts_azure_identifiers():
     assert "Microsoft.CognitiveServices/accounts/<redacted>" in out
 
 
-def test_format_diagnostics_leaves_non_azure_text_alone():
+def test_guids_are_redacted_for_every_provider_but_ordinary_text_is_kept():
+    """The redaction runs over the whole blob, for every provider, and that is
+    deliberate: a GUID identifies an account whoever issued it. What must
+    survive is ordinary text - the previous version of this test asserted the
+    opposite intent using a fixture with no GUID in it, so it could not fail
+    for the reason its name implied."""
     snapshot = UsageSnapshot(
         provider="copilot",
         status=SnapshotStatus.ERROR,
         error="GitHub API 403",
-        raw={"usageItems": [], "sku": "copilot_ai_credits"},
+        raw={
+            "usageItems": [],
+            "sku": "copilot_ai_credits",
+            "conversation_uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        },
     )
     out = _format_diagnostics("copilot", snapshot)
     assert "copilot_ai_credits" in out
     assert "<redacted>" not in out
-    assert "<guid>" not in out
+    assert "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" not in out
+    assert "<guid>" in out
 
 
 def test_diagnostics_truncate_a_long_error_string():
@@ -209,3 +219,40 @@ def test_the_dialog_header_redacts_azure_ids(qtbot):
     qtbot.addWidget(dialog)
     assert "11111111-2222-3333-4444-555555555555" not in dialog._header_text  # noqa: SLF001
     assert "<guid>" in dialog._header_text  # noqa: SLF001
+
+
+def test_child_resource_names_are_redacted_too():
+    """A Foundry project name is exactly the customer-identifying string this
+    pass exists to remove, and it sits one segment below the account."""
+    from aigauge.error_dialog import _redact_azure_ids
+
+    out = _redact_azure_ids(
+        "/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-x"
+        "/providers/Microsoft.CognitiveServices/accounts/acme-foundry"
+        "/projects/CLIENT-ALPHA"
+    )
+    assert "CLIENT-ALPHA" not in out
+    assert "acme-foundry" not in out
+    # The shape still says what kind of resource was involved.
+    assert "Microsoft.CognitiveServices/accounts/<redacted>/projects/<redacted>" in out
+
+
+def test_url_encoded_resource_paths_are_redacted():
+    """requests echoes an encoded path back in its exception message."""
+    from aigauge.error_dialog import _redact_azure_ids
+
+    out = _redact_azure_ids(
+        "/subscriptions/11111111-2222-3333-4444-555555555555%2FresourceGroups"
+        "%2Frg-secret%2Fproviders%2FMicrosoft.CognitiveServices%2Faccounts"
+        "%2Fclient-name"
+    )
+    assert "rg-secret" not in out
+    assert "client-name" not in out
+
+
+def test_a_guid_without_hyphens_is_redacted():
+    from aigauge.error_dialog import _redact_azure_ids
+
+    out = _redact_azure_ids("tenant 11111111222233334444555555555555 failed")
+    assert "11111111222233334444555555555555" not in out
+    assert "<guid>" in out
