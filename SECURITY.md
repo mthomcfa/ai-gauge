@@ -48,6 +48,29 @@ Embedded browser profiles live under `<app-data>/profiles/{account-id}/` on
 every OS. The default Claude and Codex account IDs are `claude` and `codex`;
 additional Claude/Codex accounts get their own generated IDs and profiles.
 
+### Other persisted data
+
+Not secrets, but written from provider pages and worth knowing about:
+
+| Path | Contents |
+| ---- | -------- |
+| `<app-data>/meter_catalog/<kind>.json` | The meter catalog override: which labelled rows of a provider's usage page the app reads. Rows the weekly self-scan adopts are written here with their provenance — the label as the page rendered it, when it was first seen, which account id it was seen on, and up to 200 characters of evidence (the row's label, percentage and reset wording, with any email address redacted the way the diagnostics blob redacts them). |
+| `<app-data>/meter_catalog/<kind>.json.corrupt` | The previous contents of that file when it could not be parsed, kept rather than overwritten. Same suffix convention as the config file. |
+
+Both are written atomically — a temp file in the same directory plus
+`os.replace` — so a reader sees the old document or the new one, never half of
+either. On macOS and Linux the file is created `0600`, owner-only, before any
+bytes are written. **On Windows there is no POSIX mode**: the override file
+relies on the user-scoped `%APPDATA%` location, exactly like `config.json` and
+the browser profiles beside it, and it is not DPAPI-encrypted or given an
+explicit DACL the way `secrets.dat` is. It holds no credentials — page labels,
+an account id and redacted evidence — but another account with administrative
+rights on the machine can read it.
+
+The catalog is built entirely from what the embedded browser already rendered:
+nothing is downloaded, there is no remote catalog, and none of it is sent
+anywhere.
+
 ### Why the split on Windows?
 
 Windows Credential Manager caps each blob at ~2.5 KB, which is fine for a

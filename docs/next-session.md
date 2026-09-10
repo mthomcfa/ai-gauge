@@ -3,6 +3,10 @@
 State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#16,
 610 tests passing, all five providers reading.
 
+> **Updated for `1.1.0+cfa.3`.** The Claude/Codex label definitions moved out of
+> the extractors into a meter catalog (§7), and the Codex polarity defect that
+> headed §4 is fixed. Everything else below stands as written.
+
 `1.0.0+cfa.1` does not start — it raises `AttributeError` during `App.__init__`.
 Fixed in `+cfa.2`; the two carry different version strings on purpose, because
 `app_version` in a diagnostics blob has to identify which build produced it.
@@ -165,7 +169,6 @@ speculative.
 
 | Where | What | Why it was left |
 | --- | --- | --- |
-| `providers/codex.py` → `readCard` | Scans the whole card for used/remaining, so a bare percentage resolves to *used*. Same bug class as Claude's polarity defect. | Codex works today, its structure differs (it takes the *first* percentage and has a text-window fallback that can pull wording from adjacent cards), and its live page is not observable from the dev environment. Changing a working provider on a guess is what caused the previous breakage. |
 | `webview/verify.py` → Claude check | A `/login` anchor is a hard veto, while `providers/claude.py`'s `isLoggedOut` ANDs it with absent usage text. Verify is stricter than the extractor, in the direction of the reported sign-in loop. | Loosening sign-in semantics without evidence risks the opposite failure: a bad session verifying, then erroring forever. |
 | `menubar.py` → `_provider_max_percent` | Short-circuits on a metric labelled `session`, while `gauge.provider_max_percent` takes the worst metric. The two can disagree for the same provider. | Pre-existing and documented in the module. The tag-filter half was fixed in PR #6; this divergence predates it. |
 | `webview/scraper.py` → timeout | Wall-clock, so it does not account for system sleep. A laptop resumed after two days reported `elapsed_s: 228477` and fired a stale scrape per provider. | Cosmetic in effect — the resumed cycle fails and recovers — but it produces one spurious failure per provider on every resume, and nonsense elapsed values in the log. |
@@ -228,3 +231,169 @@ open the app, which is the cheapest win of the four.
   fallback.** It is known not to open the dialog, and while the settings page
   was still loading it fired and navigated away from the page that was about to
   succeed. Being on the right route and unhydrated is a reason to wait.
+
+---
+
+## 7. The meter catalog — what `1.1.0+cfa.3` changed, and what it does not
+
+**The problem it addresses.** Both extractors matched hardcoded English labels,
+so a relabel broke the read and a new meter never appeared at all. Claude
+changed that surface three times in one week (§1.1). The labels now live in
+`src/aigauge/providers/meter_catalog/{claude,codex}.json`, overlaid by
+`app_data_dir()/meter_catalog/<kind>.json`, and every catalog meter becomes its
+own field. Only Session and Weekly stay untagged, so the tray colour is
+unchanged. Format documented in README.md.
+
+**What it is not.** It does not retire the polarity and attribution heuristics
+— §3's API mapper is still the durable fix, and the DOM path is still what the
+gauge reads. What the catalog changes is the *cost* of a relabel: an alias
+added to a JSON file instead of a code change and a release.
+
+**Design decisions worth not relitigating:**
+
+- **The primary path is untouched.** `readRow('Current session')` and
+  `readRow('All models') || readRow('Weekly')` still run first and still seed
+  the catalog scan.
+- **An adopted row can cost Session/Weekly their number, and must never give
+  them the wrong one.** `ROW_LABELS` is the *rival* set — `readRowText` takes
+  the LAST percentage in the container it picked unless a rival label is in
+  there too — and this went round twice. Built from every alias, an adopted
+  fragment like "Current" or "Opus" made the primary Session row `ambiguous`
+  on every refresh; narrowed to bundled specs, an adopted "Cowork sessions"
+  sharing a collapsed container with Session made Session report *7% used* as
+  an OK snapshot. The second is worse: a refusal is visible and recoverable, a
+  plausible number pointing at the wrong meter is neither. So the rival set is
+  every spec's aliases again — bundled, discovered and hand-added, enabled or
+  not, because the page renders them all — and the fragments are refused at
+  *adoption* instead, by `_collides_with_known`, which is the one place that
+  can decide it before the entry exists. Display labels stay out of the rival
+  set: "Session" is a fragment of "Current session".
+- **The usage container is found from a marker that has a number beside it,
+  and the richest candidate wins.** A bare mention of the marker phrase is a
+  nav item, a heading or prose about limits, and climbing from one let a
+  settings nav that also renders "Storage 88%" win on size — it is smaller
+  than the panel. Size was the wrong tiebreak in general: furniture that
+  carries the marker *and* a percentage ("Plan usage 12% off Max" beside
+  "Storage 88% used", a sidebar of chat titles quoting the meter names) is a
+  legitimate anchor and still shorter than the panel, so it won and the panel
+  was never scanned. Candidates are scored by how much of a usage panel they
+  hold — the catalog meters whose wording they render plus the leaf rows whose
+  percentage says used or remaining — and length only settles ties. A
+  candidate is still refused when it holds a bare marker off the path from its
+  anchor, but only once the climb has passed something panel-shaped (an
+  ancestor above the anchor with a percentage and no stray of its own): that
+  is the evidence the climb left the panel, and it is what stops a panel with
+  a single meter promoting the SPA root wrapper (which is not `<body>`, so the
+  outright refusal never saw it). Without that qualification the rule refused
+  the panel's own heading, period tab strip and footnote — marker wording
+  inside the panel, on no path up from a row — so `usageContainer()` answered
+  null and discovery was inert on that layout, once a day, forever. The
+  "swallowed the page" ratio counts leaf rows only; counting every wrapper
+  around a row counted the row once per nesting level.
+- **The overlap rule refuses fragments, not vocabulary.** Claude names its
+  meters out of a handful of words, so refusing any candidate containing a
+  known label refused "Weekly Opus" and "Cowork session" too. Refused now: the
+  same wording, a whole-word fragment of a known label, and a known label with
+  a count glued on. The accepted cost is that a *relabel* ("Session limit") is
+  adopted as an informational meter beside the unreadable primary rather than
+  refused; it gets its own history key, and adding the wording to the primary's
+  aliases is still the fix.
+- **A file we could not read is not a file we may replace.** A failed read
+  (`OSError`) and a failed parse (`ValueError`) are different answers, and only
+  the second says the contents are worthless — collapsing them had a Windows
+  sharing violation quarantine a valid override and replace it. A quarantine
+  that fails aborts the write, and a second corruption keeps the *first*
+  `.corrupt`: that copy holds the user's own edits, and everything written
+  after it was written by the app.
+- **A scan that found no panel is stamped short, not left due.** The diagnosis
+  is right and the cadence was not: the same line every refresh, forever. It
+  re-attempts daily (`CATALOG_NO_CONTAINER_RETRY`). A payload that never
+  reached the scan still leaves it due, so a page that failed to render cannot
+  spend a scan the user armed by hand.
+- **A meter is adopted with no window.** Same reasoning as `polarity` below:
+  inferring a period from the wording is a guess, and a wrong window makes an
+  active meter read "idle" instead of showing its number. `infer_window` is
+  gone rather than unused.
+- **A scan is stamped only from a page that produced an OK snapshot and that
+  actually had a usage container**, once per refresh. Stamping on any payload
+  carrying a `discovered` list meant a logged-out or half-rendered page adopted
+  its furniture permanently and burned the week's scan — including a scan the
+  user had just armed with "Re-scan meters now" — and stamped twice per
+  refresh, because `ScrapeRunner` rebuilds the snapshot after a transient
+  error. The extractor returns `discovered: null` when it never found a
+  container, so "found nothing" and "could not look" are distinguishable in
+  Python and in the log (`classification=discovery_no_container`).
+- **Discovery is local and adopts nothing that could matter.** It reads rows
+  the page already rendered, adopts only inside the recognised usage container,
+  and never sets `primary` — a row this build has never seen cannot take over
+  the tray colour. No remote catalog was considered; a downloaded catalog is a
+  new egress channel and a new trust boundary in an app whose whole claim is
+  that it has neither.
+- **`label` is deliberately not the page's wording**, because it is the history
+  key. A relabel must not fork `provider::label`.
+- **`polarity` exists but ships unset.** Without wording beside the number the
+  reading is refused, and the hint is an escape hatch for a user who knows what
+  their page renders — not a default.
+- **`status` is parsed and honoured but nothing writes anything but `active`.**
+  It is the hook for routing discovered rows through a review dialog before they
+  take effect; unknown fields on an override entry are preserved for the same
+  reason.
+
+**Open, and deliberately not done here:**
+
+- **Adoption is unreviewed.** A row that passes the junk rules becomes a field
+  on the next refresh with no user confirmation. The provenance fields
+  (`source`, `first_seen`, `account_id`, `evidence`) exist so a review step can
+  be added without re-scanning; that step is a separate change.
+- **Codex discovery needs two percentages in one element** to identify the
+  usage panel, so a page rendering a single card discovers nothing. Harmless
+  today (one card means nothing new to find) but it is the reason a first
+  extra card can take an extra scan to appear.
+- **Only one usage panel is scanned.** `usageContainer()` answers with a single
+  element, so a page rendering two panels — a personal one and a team one,
+  each with its own meters — has the richer one scanned and the other's meters
+  outside the container, where nothing is adopted from them. Pinned as a
+  known-limitation test (`test_only_one_of_two_usage_panels_is_scanned`),
+  because the failure is a meter that never appears rather than a team
+  percentage under a personal label. Scanning both means returning a list of
+  containers and merging the scans, which is a change to every caller of the
+  discovery payload.
+- **The "passed the panel" test is a percentage, not a second anchor.**
+  `passedPanel` is set by the first ancestor above the anchor that holds a
+  percentage and no bare marker, and a card's own wrapper qualifies. So a panel
+  whose cards each sit in a wrapper of their own *and* whose heading is a
+  `div`/`section`/`li` reading "Plan usage" is refused as though the climb had
+  left it, and discovery is inert on that layout (`discovery_no_container`
+  once a day). The mirror case: a single-meter panel whose heading is that bare
+  marker never sets `passedPanel`, so the SPA root above it is scored instead
+  of refused, and only the page-swallowing ratio stands between its furniture
+  and `in_container`. Both are pre-existing shapes of the stray rule narrowed,
+  not widened, by the `passedPanel` qualification; neither touches the primary
+  reads; and both want a live page before choosing the rule — an ancestor
+  bearing a second *anchor* would separate a wrapper from a panel, at the cost
+  of never recognising a single-meter panel at all.
+- **Nothing has been observed against a live page.** The catalog reproduces the
+  labels the extractors already carried, and the discovery scan is exercised
+  against reconstructed DOMs in node — the same evidence basis, and the same
+  limitation, as §1.1 describes for the row readers.
+- **Nothing retires an adopted meter.** A row the page stops rendering keeps
+  its entry, and the 24-meter cap is a ratchet: once it is reached, a genuinely
+  new meter can never be adopted, because nothing below it is ever released.
+  Retiring an entry not seen in N consecutive scans would fix both, and it
+  belongs with the review dialog — a meter the user has approved must not be
+  retired behind their back.
+- **The junk blocklist is a substring list.** `_NON_METER_MARKERS` matches
+  anywhere in the normalized label, so a real meter named after one of those
+  words is refused ("Account credits" dies on "account"), while furniture
+  worded differently gets through. And `_LABEL_RE` is ASCII-only, so a
+  localised page adopts nothing at all. Both want the review dialog before
+  they want loosening: a refusal is invisible today, and that is what makes
+  either one hard to judge.
+- **A future bundled key could collide with an adopted one.** Adopted keys are
+  derived from the page label (`daily_agent_runs`), and nothing reserves them.
+  If a later release ships a bundled meter under a key some user's file already
+  holds, `load_catalog` merges the override *onto* the bundled entry and the
+  adopted label wins. `_drop_superseded` handles the common shape of this (an
+  adopted meter whose aliases the bundled catalog has since learned is dropped
+  at load), but not a key collision with different wording. Namespacing
+  adopted keys is the fix, and it is a file-format change.

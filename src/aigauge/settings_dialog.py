@@ -55,6 +55,7 @@ from .config import (
 from .error_dialog import reveal_path
 from .logging_setup import log_path
 from .webview.profile import purge_profile
+from .providers.catalog import clear_scans
 from .providers.claude import CLAUDE_USAGE_URL
 from .providers.codex import CODEX_USAGE_URL
 from .providers.opencode_go import OPENCODE_GO_USAGE_URL, usage_url as opencode_go_usage_url
@@ -518,6 +519,7 @@ class _BrowserAccountRow(QWidget):
 class SettingsDialog(QDialog):
     sign_in_clicked = pyqtSignal(str)  # provider name
     paste_cookie_clicked = pyqtSignal(str)  # provider name
+    rescan_meters_clicked = pyqtSignal()
 
     def __init__(self, config: Config, parent=None):
         # Don't pass parent — avoids any cascading stylesheet issues.
@@ -643,6 +645,17 @@ class SettingsDialog(QDialog):
         self.clear_browser_data_btn.clicked.connect(self._clear_all_browser_data)
         general_grid.addWidget(
             self.clear_browser_data_btn, 5, 0, 1, 2, Qt.AlignmentFlag.AlignLeft
+        )
+
+        self.rescan_meters_btn = QPushButton("Re-scan meters now")
+        self.rescan_meters_btn.setObjectName("rescan_meters_btn")
+        self.rescan_meters_btn.setToolTip(
+            "Ask Claude and Codex for every usage meter their pages show, and "
+            "add any new ones as extra rows. Happens automatically once a week."
+        )
+        self.rescan_meters_btn.clicked.connect(self._rescan_meters)
+        general_grid.addWidget(
+            self.rescan_meters_btn, 5, 2, 1, 2, Qt.AlignmentFlag.AlignLeft
         )
 
         # ----- Providers -----
@@ -1092,6 +1105,28 @@ class SettingsDialog(QDialog):
             "Browser data cleared",
             "Saved cookies and browser profiles were deleted. Sign in again to "
             "resume monitoring.",
+        )
+
+    def _rescan_meters(self) -> None:
+        """Arm the meter scan that otherwise runs once a week.
+
+        Clearing the timestamps is the whole mechanism: the next refresh of
+        each provider asks its page for every row it renders and adopts the
+        ones the catalog does not know. Saved immediately rather than on OK,
+        because the refresh it triggers is immediate too.
+        """
+        clear_scans(self._config)
+        try:
+            self._config.save()
+        except OSError:
+            log.exception("failed to persist the meter re-scan request")
+        self.rescan_meters_clicked.emit()
+        QMessageBox.information(
+            self,
+            "Re-scan meters",
+            "The next refresh of each provider will read every usage meter its "
+            "page shows. New meters appear as extra rows on the refresh after "
+            "that.",
         )
 
     def _new_account_id(self, kind: str) -> str:

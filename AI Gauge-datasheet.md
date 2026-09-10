@@ -1,7 +1,7 @@
 # Product Data Sheet: AI Gauge (security-hardened fork)
 
 > Describes [mthomcfa/ai-gauge](https://github.com/mthomcfa/ai-gauge) at
-> **1.0.0+cfa.2**, a security-hardening fork of
+> **1.1.0+cfa.3**, a security-hardening fork of
 > [jpajak/ai-gauge](https://github.com/jpajak/ai-gauge). Fork version numbers
 > are its own and do not correspond to upstream releases of the same number.
 
@@ -31,9 +31,11 @@ AI Gauge is a local desktop utility for monitoring AI service usage across Claud
 - Provider tiles for Claude, Codex, GitHub Copilot, OpenRouter, and OpenCode.
 - OpenCode usage scraping from a user-configured workspace URL, pinned to `https` on `opencode.ai`, with Rolling, Weekly, and Monthly meters and a cookie-paste setup path for accounts that cannot complete Google sign-in in an embedded browser.
 - Per-account configurable gauge colors: each Claude/Codex/OpenCode account, plus Copilot and OpenRouter, can set three severity cutoffs and four band colors, applied consistently to bars, compact chips, the Windows/Linux tray dot, and the macOS menu-bar dots.
-- Claude usage scraping from `https://claude.ai/settings/usage`, including session and weekly limits. A reading that cannot be attributed to a single meter, or that carries no used/remaining wording, is reported as an error rather than displayed.
+- Claude usage scraping from `https://claude.ai/settings/usage`, reporting every meter the page shows: Session (5 h) and Weekly (7 d) as the primary gauges, plus Opus only, Sonnet only, Cowork only, Claude Design and Daily routine runs as informational rows. A reading that cannot be attributed to a single meter, or that carries no used/remaining wording, is reported as an error rather than displayed.
 - Local diagnostic capture of the *shape* of JSON responses the Claude page fetches (field names, numbers, timestamps; all other strings reduced to a length marker). Never leaves the machine.
-- Codex usage scraping from `https://chatgpt.com/codex/cloud/settings/analytics#personal-usage`, including session and weekly limits.
+- Codex usage scraping from `https://chatgpt.com/codex/cloud/settings/analytics#personal-usage`, reporting the 5-hour and weekly cards as primary gauges plus any additional usage card the page renders.
+- A meter catalog held as data rather than code: label definitions ship in `src/aigauge/providers/meter_catalog/`, overlaid by an editable per-OS app-data override file. Only the primary meters drive the tray/menu-bar colour; the rest are informational and appear when a tile is expanded.
+- Weekly self-scan of each provider's usage page — and a "Re-scan meters now" action in Settings — that reads every labelled row the usage container renders and adopts unrecognised ones as new informational meters, recording where each came from (source, timestamp, account, and the redacted row text that justified it). The scan is local: it reads what the embedded browser already rendered and fetches nothing.
 - GitHub Copilot AI credit usage via GitHub REST billing summary endpoints for user or organization billing scopes, with a legacy premium-request fallback.
 - OpenRouter account/key data via `/credits`, `/key`, and `/activity`, including balance, UTC day/month spend, optional daily budget gauge, and top model activity.
 - Adaptive refresh cadence with active and idle intervals, manual refresh, and refresh pull-forward shortly after known reset times.

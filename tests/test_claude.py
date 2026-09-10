@@ -1,4 +1,8 @@
+import logging
+
+from aigauge.gauge import provider_max_percent
 from aigauge.models import SnapshotStatus
+from aigauge.providers.catalog import adopt_rows, load_catalog
 from aigauge.providers.claude import CLAUDE_USAGE_URL, _build_snapshot
 
 
@@ -322,3 +326,146 @@ def test_payloads_predating_the_ambiguous_flag_still_build():
     )
 
     assert snapshot.status == SnapshotStatus.OK
+
+
+# --- one field per meter the page shows ------------------------------------
+#
+# Claude renders more than two meters and kept adding more. Every catalog meter
+# now becomes its own field; only Session and Weekly stay untagged, because
+# tagged metrics are excluded from the tray colour (gauge.provider_max_percent).
+
+
+def _row(percent, kind="used", reset_text=None):
+    return {
+        "percent": percent,
+        "kind": kind,
+        "ambiguous": False,
+        "reset_text": reset_text,
+    }
+
+
+def _full_payload():
+    return {
+        "logged_out": False,
+        "session": _row(64, reset_text="2 hr 59 min"),
+        "weekly_all": _row(30, reset_text="3 days"),
+        "rows": {
+            "session": _row(64, reset_text="2 hr 59 min"),
+            "weekly_all": _row(30, reset_text="3 days"),
+            "opus_only": _row(91, reset_text="3 days"),
+            "sonnet_only": _row(44),
+            "cowork_only": _row(3),
+            "claude_design": _row(4),
+            "daily_routine_runs": _row(12, reset_text="5 hr"),
+        },
+        "title": "Claude",
+        "url": CLAUDE_USAGE_URL,
+        "body_text": "Plan usage Current session 64% used Weekly 30% used",
+    }
+
+
+def test_every_meter_the_page_shows_becomes_its_own_field():
+    snapshot = _build_snapshot(_full_payload())
+
+    assert snapshot.status == SnapshotStatus.OK
+    assert [m.label for m in snapshot.metrics] == [
+        "Session",
+        "Weekly",
+        "Opus only",
+        "Sonnet only",
+        "Cowork only",
+        "Claude Design",
+        "Daily routine runs",
+    ]
+
+
+def test_only_session_and_weekly_drive_the_tray_colour():
+    snapshot = _build_snapshot(_full_payload())
+
+    untagged = [m.label for m in snapshot.metrics if m.tag is None]
+    assert untagged == ["Session", "Weekly"]
+    # Opus sits at 91%; untagged it would take the tray indicator red.
+    assert provider_max_percent(snapshot) == 64
+
+
+def test_a_breakdown_row_the_page_renders_oddly_does_not_fail_the_snapshot():
+    """A new meter must not be able to take Session and Weekly down with it."""
+    payload = _full_payload()
+    payload["rows"]["opus_only"] = _row(42, kind="unknown")
+
+    snapshot = _build_snapshot(payload)
+
+    assert snapshot.status == SnapshotStatus.OK
+    assert "Opus only" not in [m.label for m in snapshot.metrics]
+    assert [m.label for m in snapshot.metrics if m.tag is None] == ["Session", "Weekly"]
+
+
+def test_a_page_with_only_breakdown_rows_errors_rather_than_showing_no_gauge():
+    """No primary meter read means the page was not read.
+
+    The tile would otherwise render OK with nothing on it, and the refresh
+    would never retry - the failure looks like an idle account.
+    """
+    payload = _full_payload()
+    payload.pop("session")
+    payload.pop("weekly_all")
+    for key in ("session", "weekly_all"):
+        payload["rows"].pop(key)
+
+    snapshot = _build_snapshot(payload)
+
+    assert snapshot.status == SnapshotStatus.ERROR
+    assert "layout may have changed" in (snapshot.error or "")
+
+
+def test_an_informational_row_that_cannot_be_read_says_so_in_the_log(caplog):
+    """Dropping it is right; dropping it silently is not.
+
+    The tile just shows one gauge fewer than the page does, and without this
+    nothing says which meter went missing or why.
+    """
+    payload = _full_payload()
+    payload["rows"]["opus_only"] = _row(42, kind="unknown")
+
+    with caplog.at_level(logging.INFO, logger="aigauge.providers.claude"):
+        snapshot = _build_snapshot(payload)
+
+    assert snapshot.status == SnapshotStatus.OK
+    assert "Opus only" in caplog.text
+    assert "no used/remaining wording" in caplog.text
+
+
+def test_a_payload_without_the_rows_block_still_reads_both_primary_meters():
+    # Cached snapshots and hand-built payloads predate `rows`.
+    payload = _full_payload()
+    payload.pop("rows")
+
+    snapshot = _build_snapshot(payload)
+
+    assert [m.label for m in snapshot.metrics] == ["Session", "Weekly"]
+
+
+def test_an_adopted_meter_shows_up_as_a_field_on_the_next_refresh(tmp_path):
+    adopt_rows(
+        "claude",
+        [{"label": "Cowork sessions", "percent": 7.0, "kind": "used",
+          "reset_text": "3 days", "in_container": True}],
+        base_dir=tmp_path,
+    )
+    payload = _full_payload()
+    payload["rows"]["cowork_sessions"] = _row(7, reset_text="3 days")
+
+    snapshot = _build_snapshot(
+        payload, catalog=load_catalog("claude", base_dir=tmp_path)
+    )
+
+    adopted = next(m for m in snapshot.metrics if m.label == "Cowork sessions")
+    assert adopted.percent_used == 7
+    assert adopted.tag is not None, "an adopted meter is never primary"
+
+
+def test_the_daily_row_keeps_its_one_day_window():
+    snapshot = _build_snapshot(_full_payload())
+
+    daily = next(m for m in snapshot.metrics if m.label == "Daily routine runs")
+    assert daily.window.days == 1

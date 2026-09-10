@@ -1,8 +1,10 @@
+import os
+import stat
 import sys
 
 import pytest
 
-from aigauge.secret_storage import load_secret, save_secret
+from aigauge.secret_storage import _atomic_write, load_secret, save_secret
 
 
 @pytest.fixture(autouse=True)
@@ -106,3 +108,21 @@ def test_multiple_secrets_independent():
     save_secret("a", None)
     assert load_secret("a") is None
     assert load_secret("b") == "beta"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+def test_a_mode_is_still_applied_where_there_is_no_fchmod(tmp_path, monkeypatch):
+    """Windows has no os.fchmod, and a caller asking for a mode is not a crash.
+
+    Only the Windows secrets path passes no mode, so this was reachable the
+    moment a second caller wanted one — the meter catalog did, and every
+    adoption on Windows raised AttributeError out of the write.
+    """
+    monkeypatch.delattr(os, "fchmod", raising=False)
+    path = tmp_path / "file.dat"
+
+    _atomic_write(path, b"payload", mode=0o600, prefix=".test-")
+
+    assert path.read_bytes() == b"payload"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert list(tmp_path.glob("*.tmp")) == []
