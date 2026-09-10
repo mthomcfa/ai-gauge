@@ -1261,6 +1261,28 @@ def test_a_truncated_marketplace_query_drops_the_split_it_could_not_finish(
 
 
 @responses.activate
+def test_a_backwards_clock_jump_does_not_park_the_in_flight_flag(
+    monkeypatch, config
+):
+    """The staleness rule measures from `last_fetch_at`, and the clock guard
+    directly above it nulls a stamp that sits in the future. After a backwards
+    correction (an NTP step, a bad RTC) there was therefore no clock left for
+    `IN_FLIGHT_STALE_AFTER` to fire against, and a lost worker held the tile
+    for the life of the process - the exact failure the expiry was added for."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    state = az.state_for(SUB)
+    state.in_flight = True
+    state.last_fetch_at = datetime.now() + timedelta(hours=2)
+
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+
+    assert az.state_for(SUB).in_flight is False
+    assert "already in progress" not in (snapshot.error or "")
+    assert snapshot.status == SnapshotStatus.OK
+
+
+@responses.activate
 def test_a_failed_dispatch_does_not_park_the_tile(monkeypatch, config):
     """in_flight is set by the caller and cleared by the callee, so the one
     path where the callee never runs used to leak it for the whole process."""

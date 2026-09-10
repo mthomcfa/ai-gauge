@@ -1801,6 +1801,11 @@ class AzureProvider(Provider):
         # out than the largest back-off we can produce is too.
         if state.last_fetch_at is not None and state.last_fetch_at > now:
             state.last_fetch_at = None
+            # The staleness rule below measures from this stamp, so removing
+            # it would leave in_flight nothing to expire against: a lost
+            # worker would hold the tile for the life of the process, which is
+            # what that rule exists to prevent.
+            state.in_flight = False
         if (
             state.blocked_until is not None
             and state.blocked_until > now + MAX_ERROR_BACKOFF
