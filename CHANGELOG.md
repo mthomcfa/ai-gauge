@@ -194,7 +194,7 @@ twin.
 
 ### Testing
 
-- 907 → 1074 tests. Every finding in both rounds now has a regression test that
+- 907 → 1080 tests. Every finding in both rounds now has a regression test that
   fails on the code as reviewed — round 1 shipped five that did not, which a
   mutation run over the fixes is what found. Several drive the real worker
   rather than the inline stand-in the suite had been using (which is why the

@@ -1474,6 +1474,33 @@ def test_an_unreadable_continuation_page_is_not_an_empty_page(
     assert "truncated" in (summary.note or "").lower()
 
 
+@responses.activate
+def test_an_unreadable_continuation_page_stops_the_loop():
+    """Not only marked truncated: there is nothing to be gained from reading
+    further pages of a response whose schema this parser cannot follow, and
+    each one is a request against a tenant-wide quota."""
+    page1 = query_payload([[5.0, 20260901, STORAGE_ID, "Storage", "CAD"]])
+    page1["properties"]["nextLink"] = f"{QUERY_URL}?$skiptoken=a"
+    unreadable = {
+        "error": {"code": "GatewayTimeout"},
+        "properties": {"nextLink": f"{QUERY_URL}?$skiptoken=b"},
+    }
+    responses.add(responses.POST, QUERY_URL, json=page1, status=200)
+    responses.add(responses.POST, QUERY_URL, json=unreadable, status=200)
+    responses.add(
+        responses.POST,
+        QUERY_URL,
+        json=query_payload([[900.0, 20260902, STORAGE_ID, "Storage", "CAD"]]),
+        status=200,
+    )
+
+    parsed, _metric = az.fetch_query("tok", SUB, date(2026, 9, 1), date(2026, 10, 1))
+
+    assert len(responses.calls) == 2, "the loop kept paging past an unreadable page"
+    assert parsed.truncated is True
+    assert parsed.total == pytest.approx(5.0)
+
+
 def test_merging_a_page_with_no_cost_column_marks_the_total_a_subtotal():
     """Belt and braces for any future caller of the merge helper."""
     into = az.QueryRows(total=10.0, cost_column_found=True)
@@ -1611,6 +1638,39 @@ def test_a_description_shaped_aad_error_cannot_smuggle_an_id_through():
     code = exc.value.code
     assert code == "AADSTS7000215", "the description rode out as a code"
     assert TENANT not in str(exc.value) and CLIENT not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "expires_in,expected_max_s",
+    [
+        (float("inf"), 86400),
+        (1e20, 86400),
+        (10 ** 20, 86400),
+        (3600, 3600),
+        ("nan", 700),
+    ],
+)
+@responses.activate
+def test_a_hostile_expires_in_neither_raises_nor_outlives_the_day(
+    expires_in, expected_max_s
+):
+    """int(float("inf")) raises OverflowError, and json.loads accepts both
+    Infinity and 1e20 - the same defect class that threw a 429's own back-off
+    away one file over, and _fetch does not name OverflowError."""
+    from aigauge.providers import _azure_auth
+
+    responses.add(
+        responses.POST,
+        TOKEN_URL,
+        json={"access_token": "tok", "expires_in": expires_in},
+        status=200,
+    )
+    now = datetime(2026, 9, 9)
+    assert get_token(TENANT, CLIENT, "s", now=now) == "tok"
+
+    cached = next(iter(_azure_auth._CACHE.values()))
+    assert cached.expires_at > now
+    assert (cached.expires_at - now).total_seconds() <= expected_max_s
 
 
 def test_a_keyring_failure_still_forgets_the_cached_token(monkeypatch):
