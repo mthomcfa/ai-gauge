@@ -1945,6 +1945,26 @@ def test_a_keyring_failure_still_forgets_the_cached_token(monkeypatch):
     assert not _azure_auth._CACHE
 
 
+def test_a_token_minted_during_the_keyring_write_is_forgotten_too(monkeypatch):
+    """The trailing clear_cache() reads as redundant on a single thread, and
+    it is not: the Azure worker runs on a pool thread and can mint a bearer
+    from the *old* secret in the window between the leading clear and the
+    keyring write, which would leave it cached under the old digest for its
+    whole lifetime."""
+    from aigauge import config as config_module
+    from aigauge.providers import _azure_auth
+
+    def _mint_mid_write(service, account, value):
+        _azure_auth._CACHE[(TENANT, CLIENT, "old-digest")] = _azure_auth._CachedToken(
+            token="minted-from-the-old-secret",
+            expires_at=datetime.now() + timedelta(hours=1),
+        )
+
+    monkeypatch.setattr(config_module.keyring, "set_password", _mint_mid_write)
+    config_module.set_azure_client_secret("new-secret")
+    assert not _azure_auth._CACHE
+
+
 @responses.activate
 def test_an_unexpected_exception_does_not_log_the_subscription_id(
     caplog, monkeypatch, config
@@ -1972,6 +1992,37 @@ def test_an_unexpected_exception_does_not_log_the_subscription_id(
     assert SUB not in caplog.text, "the traceback put the subscription id in the log"
     assert SUB not in (snapshot.error or "")
     assert "classification=unexpected_exception" in caplog.text
+
+
+@responses.activate
+def test_the_worker_records_a_failure_of_the_recording_itself(
+    caplog, monkeypatch, config
+):
+    """`work()` records its own failures, so `_Worker.run`'s blanket handler
+    only ever sees an exception raised by that recording. It is the second
+    copy of the same rule, over the same log file: the exception type, never a
+    traceback whose message is the request URL."""
+    import logging
+
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    url = (
+        f"https://management.azure.com/subscriptions/{SUB}"
+        "/providers/Microsoft.CostManagement/query"
+    )
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError(f"Max retries exceeded with url: {url}")
+
+    monkeypatch.setattr(az.AzureProvider, "_fetch", _boom)
+    monkeypatch.setattr(az.AzureProvider, "_remember_error", _boom)
+    with caplog.at_level(logging.DEBUG):
+        snapshot = _run_through_pool(az.AzureProvider(config, pool=_InlinePool()))
+
+    assert snapshot.status == SnapshotStatus.ERROR
+    assert "RuntimeError" in (snapshot.error or "")
+    assert SUB not in caplog.text, "the traceback put the subscription id in the log"
+    assert SUB not in (snapshot.error or "")
 
 
 # --- marketplace splits a row, it does not swallow a resource ---------------
