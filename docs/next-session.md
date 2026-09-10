@@ -497,10 +497,28 @@ the calls that were made, and why:
 - **A cost column is found by name, never by position**, and its absence is an
   error routed through `_remember_error`. `row_count == 0` *with* a column is
   still a legitimate empty month, since the data lags 8–72 h.
-- **A zero total with an unreadable offer type shows no gauge.** Cost
+- **An unreadable offer type shows no gauge, whatever the total.** Cost
   Management Reader without Reader is the likely role split, and an Azure
-  Sponsorship subscription reports exactly zero. A *positive* total rules that
-  out and keeps its gauge.
+  Sponsorship subscription reports zero while the credit drains. Round 1 let a
+  *positive* total rule that out; round 2 reversed it, because a Sponsorship
+  subscription still bills Marketplace and other non-sponsored charges
+  normally — so a small positive total is exactly what one looks like while
+  the sponsored credit drains unreported. The money is still shown and the
+  note says Reader is what the check needs; only the percentage is refused.
+- **One `gaugeable` flag governs every percentage on the tile.** An allowance,
+  a complete read, and nothing about the data that makes the sum meaningless.
+  The summary percent, the breakdown shares and whether there is a forecast
+  row at all follow it together, because a tile that says "no gauge is shown
+  for a subtotal" and then prints a projection of that subtotal one row down
+  has told the reader nothing.
+- **A number the tile has disowned is never printed.** More than one billing
+  currency shows per-currency subtotals (`CAD 100.00 + JPY 1,000.00`, at most
+  three then `+N more`), never their sum. A truncated read shows `incomplete`
+  on the row and moves the subtotal into the note, labelled as read so far.
+- **`_snapshot_signature` ignores `reset_label`, for every provider.** It is a
+  caption — a ticking countdown, or Azure's spend to the cent — and either one
+  counted as "this provider changed", which reset the adaptive backoff and
+  pushed the whole app back into active-cadence polling.
 - **A budget is a calendar-month figure.** It is preferred over the Settings
   allowance only when `reset_day == 1`, only when its currency matches the
   cost data, only when it is unscoped (or scoped to exactly the configured

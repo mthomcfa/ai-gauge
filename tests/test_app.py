@@ -558,6 +558,22 @@ def test_the_cadence_signature_ignores_informational_meters():
     assert _snapshot_signature(quiet) == _snapshot_signature(moved)
 
 
+def test_a_caption_change_alone_is_not_a_cadence_change():
+    """reset_label is a caption - a ticking countdown, or Azure's spend to the
+    cent. Either one reset the adaptive backoff for *every* provider and
+    pushed the whole app back into active-cadence polling."""
+    before = _snapshot_with(
+        UsageMetric(label="Spend this month", percent_used=24.0,
+                    reset_label="CAD 36.10 of 150.00 · resets 1 Oct")
+    )
+    after = _snapshot_with(
+        UsageMetric(label="Spend this month", percent_used=24.0,
+                    reset_label="CAD 36.42 of 150.00 · resets 1 Oct")
+    )
+
+    assert _snapshot_signature(before) == _snapshot_signature(after)
+
+
 def test_the_cadence_signature_still_follows_the_primary_meters():
     before = _snapshot_with(UsageMetric(label="Session", percent_used=64.0))
     after = _snapshot_with(UsageMetric(label="Session", percent_used=65.0))

@@ -1838,17 +1838,6 @@ def test_zero_spend_with_an_unreadable_offer_type_gets_no_gauge():
     assert "sponsorship" in note
 
 
-def test_an_unreadable_offer_type_with_real_spend_keeps_its_gauge():
-    """A Sponsorship subscription cannot report positive spend, so a positive
-    total rules the ambiguity out."""
-    snapshot = az.build_snapshot(
-        _aggregate(offer_known=False), AzureConfig(monthly_allowance=150.0)
-    )
-    summary = snapshot.metrics[0]
-    assert summary.percent_used == pytest.approx(24.07, abs=0.01)
-    assert "offer type" in (summary.note or "").lower()
-
-
 def test_mixed_currencies_are_not_summed_into_a_gauge():
     rows = [
         [100.0, 20260901, STORAGE_ID, "Storage", "JPY"],
@@ -1938,6 +1927,118 @@ def test_network_supplied_strings_are_bounded_at_parse_time():
     parsed = az.parse_query_response(query_payload(rows))
     assert len(parsed.currency) <= 8
     assert max(len(name) for name in parsed.by_service) <= 120
+
+
+# --- the tile never prints a number it has just disowned --------------------
+#
+# Every rule below is one flag: a snapshot is gaugeable when there is an
+# allowance, the read is complete, and nothing about the data makes the sum
+# meaningless. The summary percent, the breakdown shares and the forecast row
+# all follow it, because a tile that says "no gauge is shown for a subtotal"
+# and then prints a percentage two rows down has told the user nothing.
+
+
+def test_a_subtotal_gets_no_forecast_row_and_no_breakdown_shares():
+    snapshot = az.build_snapshot(
+        _aggregate(partial=True, forecast_total=90.0),
+        AzureConfig(monthly_allowance=150.0),
+    )
+    labels = [m.label for m in snapshot.metrics]
+    assert "Forecast end of month" not in labels
+    assert snapshot.metrics[0].percent_used is None
+    assert all(
+        m.percent_used is None for m in snapshot.metrics if m.tag == az.BREAKDOWN_TAG
+    )
+
+
+def test_a_subtotal_is_never_printed_as_the_total():
+    snapshot = az.build_snapshot(
+        _aggregate(partial=True), AzureConfig(monthly_allowance=150.0)
+    )
+    summary = snapshot.metrics[0]
+    assert "incomplete" in (summary.reset_label or "")
+    assert "36.10" not in (summary.reset_label or "")
+    note = summary.note or ""
+    assert "CAD 36.10" in note and "incomplete" in note
+
+
+def test_mixed_currencies_are_shown_as_subtotals_not_as_a_sum():
+    """1,100.00 is what CAD 100.00 plus JPY 1,000.00 is not."""
+    snapshot = az.build_snapshot(
+        _aggregate(
+            total=1100.0,
+            currency="",
+            mixed_currency=True,
+            currency_totals=[("CAD", 100.0), ("JPY", 1000.0)],
+            buckets=[("Svc A", 100.0), ("Svc B", 1000.0)],
+            forecast_total=2000.0,
+        ),
+        AzureConfig(monthly_allowance=150.0),
+    )
+    summary = snapshot.metrics[0]
+    assert "1,100.00" not in (summary.reset_label or "")
+    assert "CAD 100.00" in (summary.reset_label or "")
+    assert "JPY 1,000.00" in (summary.reset_label or "")
+    assert summary.percent_used is None
+    breakdown = [m for m in snapshot.metrics if m.tag == az.BREAKDOWN_TAG]
+    assert breakdown and all(m.percent_used is None for m in breakdown)
+    assert all("currenc" in (m.note or "").lower() for m in breakdown)
+    assert "Forecast end of month" not in [m.label for m in snapshot.metrics]
+
+
+def test_more_than_three_currencies_are_summarised_not_listed():
+    snapshot = az.build_snapshot(
+        _aggregate(
+            total=10.0,
+            currency="",
+            mixed_currency=True,
+            currency_totals=[
+                ("CAD", 4.0), ("JPY", 3.0), ("EUR", 2.0), ("GBP", 1.0)
+            ],
+        ),
+        AzureConfig(monthly_allowance=150.0),
+    )
+    assert "1 more" in (snapshot.metrics[0].reset_label or "")
+
+
+def test_the_currency_split_survives_paging():
+    rows_page1 = [[100.0, 20260901, STORAGE_ID, "Storage", "CAD"]]
+    rows_page2 = [[1000.0, 20260902, OPENAI_ID, "Azure OpenAI", "JPY"]]
+    into = az.parse_query_response(query_payload(rows_page1))
+    az._merge_query_rows(into, az.parse_query_response(query_payload(rows_page2)))
+    assert into.mixed_currency is True
+    assert into.by_currency == {"CAD": pytest.approx(100.0), "JPY": pytest.approx(1000.0)}
+
+
+def test_an_unreadable_offer_type_never_gauges_whatever_the_total():
+    """A Sponsorship subscription still bills Marketplace and other
+    non-sponsored charges normally, so a positive total is exactly what one
+    looks like while the sponsored credit drains unreported."""
+    for total in (0.0, 0.001, 75.0):
+        snapshot = az.build_snapshot(
+            _aggregate(total=total, offer_known=False),
+            AzureConfig(monthly_allowance=150.0),
+        )
+        summary = snapshot.metrics[0]
+        assert summary.percent_used is None, f"gauged a {total} total"
+        note = (summary.note or "").lower()
+        assert "reader" in note and "sponsorship" in note
+        # The money is still shown; only the percentage is refused.
+        assert _money_in(summary, total)
+
+
+def _money_in(metric, total):
+    return f"{total:,.2f}" in (metric.reset_label or "") + (metric.note or "")
+
+
+def test_the_printed_reset_day_is_the_one_the_countdown_counts_to():
+    """West of UTC the tile printed 1 Oct and counted down to 30 Sep."""
+    snapshot = az.build_snapshot(_aggregate(), AzureConfig(monthly_allowance=150.0))
+    summary = snapshot.metrics[0]
+    assert summary.resets_at is not None
+    local = summary.resets_at
+    printed = f"{local.day} {local.strftime('%b')}"
+    assert f"resets {printed}" in (summary.reset_label or "")
 
 
 # --- the token cache is a credential, and behaves like one -----------------

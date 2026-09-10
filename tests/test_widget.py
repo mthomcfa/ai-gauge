@@ -996,6 +996,32 @@ def test_metric_row_sizes_a_long_reset_label_to_fit(qtbot):
     assert row.reset.width() > 58
 
 
+def test_a_long_reset_label_is_elided_and_kept_in_the_tooltip(qtbot):
+    """A currency with no two-digit magnitude, or an allowance above ~1e6,
+    ran past the column and was clipped mid-string with the amounts nowhere
+    else in the UI."""
+    row = _MetricRow()
+    qtbot.addWidget(row)
+    label = "JPY 12,345,678.00 of 50,000,000.00 · resets 28 Feb"
+
+    row.set_metric(
+        "Spend this month",
+        24.0,
+        datetime.now() + timedelta(days=20),
+        label,
+        note="Data as of 2026-09-08.",
+        window=timedelta(days=30),
+    )
+
+    drawn = row.reset.text()
+    assert row.reset.fontMetrics().horizontalAdvance(drawn) <= row.reset.width()
+    assert drawn != label, "the label fitted, so this test proves nothing"
+    assert drawn.startswith("JPY 12,345,678.00"), "elided from the wrong end"
+    tooltip = row.reset.toolTip()
+    assert label in tooltip
+    assert "Data as of 2026-09-08." in tooltip
+
+
 def test_metric_row_keeps_the_narrow_countdown_column_for_a_countdown(qtbot):
     row = _MetricRow()
     qtbot.addWidget(row)

@@ -150,6 +150,13 @@ def _snapshot_signature(snapshot: UsageSnapshot) -> tuple:
     dozen of them offers a dozen numbers that can twitch, each one resetting
     the backoff. The cadence should follow the meters the tile is actually
     about.
+
+    ``reset_label`` is deliberately absent for every provider. It is a
+    caption, not a meter: a countdown that ticks, or Azure's spend to the
+    cent. Either one counted as "this provider changed", which reset
+    ``_unchanged_cycles`` and pushed the whole app back into active-cadence
+    polling — for one cent, or for the clock. The label and the rounded
+    percentage are what the cadence is about.
     """
     return (
         snapshot.status.value,
@@ -162,7 +169,6 @@ def _snapshot_signature(snapshot: UsageSnapshot) -> tuple:
                     if metric.percent_used is not None
                     else None
                 ),
-                metric.reset_label,
             )
             for metric in snapshot.metrics
             if metric.tag is None

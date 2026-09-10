@@ -61,6 +61,11 @@ from .ratio import (
 )
 
 ROW_BAR_HEIGHT = 8
+# How wide the right-hand column may grow for a reset_label that is a phrase
+# rather than a countdown. Wide enough for a seven-figure amount in a currency
+# with no two-digit magnitude; past that the text is elided and the full
+# string lives in the tooltip.
+_RESET_LABEL_MAX_WIDTH = 240
 PACE_TICK_OVERHANG = 2
 CHIP_NOTCH_HEIGHT = 4
 CHIP_NOTCH_HALF_WIDTH = 3.5
@@ -670,11 +675,23 @@ class _MetricRow(QWidget):
             # tile is collapsed - and a fixed 58 px would clip it.
             if len(rel) > 8:
                 text_width = self.reset.fontMetrics().horizontalAdvance(rel) + 4
-                self.reset.setFixedWidth(max(92, min(190, text_width)))
+                width = max(92, min(_RESET_LABEL_MAX_WIDTH, text_width))
+                self.reset.setFixedWidth(width)
+                # Elided from the right, not clipped: a currency with no
+                # two-digit magnitude ran off the end of the column and the
+                # amount was unrecoverable from the UI. The leading amount is
+                # the part worth keeping, so the tail goes first.
+                self.reset.setText(
+                    self.reset.fontMetrics().elidedText(
+                        rel, Qt.TextElideMode.ElideRight, width
+                    )
+                )
             else:
                 self.reset.setFixedWidth(58)
         if reset_label:
-            self.reset.setToolTip(note or reset_label)
+            # The full phrase, then the note: whatever the column elided is
+            # still reachable here, and the amounts are in the note as well.
+            self.reset.setToolTip("\n\n".join(part for part in (rel, note) if part))
         elif resets_at:
             self.reset.setToolTip(resets_at.strftime("%Y-%m-%d %H:%M"))
         elif not split_note:

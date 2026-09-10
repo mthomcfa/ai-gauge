@@ -289,6 +289,9 @@ class QueryRows:
     # row without re-querying.
     rows: list[tuple[str, str, float]] = field(default_factory=list)
     latest_usage_date: date | None = None
+    # Subtotals per billing currency. When more than one appears they cannot
+    # be added, and the tile has to show these instead of their sum.
+    by_currency: dict[str, float] = field(default_factory=dict)
     row_count: int = 0
     # False when the response carried no readable cost column at all - schema
     # drift, or an ARM error document returned with a 200. That is an error,
@@ -347,6 +350,7 @@ def parse_query_response(payload: Any) -> QueryRows:
             code = str(row[currency_at] or "").strip()[:CURRENCY_MAX_LEN]
             if code:
                 currencies.add(code)
+                out.by_currency[code] = out.by_currency.get(code, 0.0) + cost
                 if not out.currency:
                     out.currency = code
         if date_at is not None and date_at < len(row) and cost:
@@ -407,6 +411,9 @@ class AzureAggregate:
     partial: bool = False
     # More than one billing currency appeared in the rows.
     mixed_currency: bool = False
+    # (code, amount) per billing currency, largest first. Only interesting
+    # when mixed_currency is set, which is when their sum is meaningless.
+    currency_totals: list[tuple[str, float]] = field(default_factory=list)
     # Whether the subscription's offer type was actually read. False means the
     # Sponsorship check could not run, which matters only when spend is zero.
     offer_known: bool = True
@@ -510,6 +517,23 @@ def _money(amount: float, currency: str) -> str:
     return f"{currency} {amount:,.2f}" if currency else f"{amount:,.2f}"
 
 
+MAX_CURRENCY_ROWS = 3
+
+
+def _currency_subtotals(
+    totals: list[tuple[str, float]], *, limit: int = MAX_CURRENCY_ROWS
+) -> str:
+    """Per-currency subtotals, never their sum.
+
+    Adding JPY to CAD produces a number that means nothing, and the tile said
+    so in a note while printing that number on the row beside it.
+    """
+    shown = " + ".join(_money(amount, code) for code, amount in totals[:limit])
+    if len(totals) > limit:
+        shown = f"{shown} + {len(totals) - limit} more"
+    return shown
+
+
 def _truncate(label: str) -> str:
     if len(label) <= LABEL_MAX_LEN:
         return label
@@ -590,27 +614,31 @@ def build_snapshot(
             "period, so the rows cannot be added together and no gauge is "
             "shown."
         )
-    elif not aggregate.offer_known and aggregate.total <= 0:
+    elif not aggregate.offer_known:
         # Cost Management Reader without Reader is the likely role split, and
-        # an Azure Sponsorship subscription reports exactly this: zero, while
-        # the credit drains.
+        # an Azure Sponsorship subscription reports zero while the credit
+        # drains. A positive total does *not* rule that out: a Sponsorship
+        # subscription still bills Marketplace and other non-sponsored charges
+        # normally, so a small positive total is exactly what one looks like.
         ungauged_note = (
-            "The subscription's offer type could not be read (Reader role), "
-            "so an Azure Sponsorship offer - which Cost Management reports as "
-            "zero cost while the credit drains - cannot be ruled out. No gauge "
-            "is shown for a zero total."
-        )
-    offer_note: str | None = None
-    if ungauged_note is None and not aggregate.offer_known:
-        offer_note = (
-            "The subscription's offer type could not be read (Reader role); "
-            "the positive total rules out an unsupported Sponsorship offer."
+            "The subscription's offer type could not be read, so an Azure "
+            "Sponsorship offer - which Cost Management reports as zero cost "
+            "while the sponsored credit drains - cannot be ruled out, and a "
+            "non-zero total does not rule it out either. Grant the app "
+            "registration the Reader role for that check. No gauge is shown."
         )
     spend_text = _money(aggregate.total, currency)
-    if allowance and not aggregate.partial and ungauged_note is None:
-        percent = max(0.0, min(100.0, aggregate.total / allowance * 100.0))
-    else:
-        percent = None
+    # One flag, so the tile cannot disown a number on one row and print a
+    # percentage derived from it on the next. It governs the summary percent,
+    # the breakdown shares and whether there is a forecast row at all.
+    gaugeable = (
+        bool(allowance) and not aggregate.partial and ungauged_note is None
+    )
+    percent = (
+        max(0.0, min(100.0, aggregate.total / allowance * 100.0))
+        if gaugeable
+        else None
+    )
     # The label is a key, not a caption: history.py keys an in-flight period on
     # provider::label, so a label carrying the running total makes a new key on
     # every fetch - the rollover comparison never runs, no period is ever
@@ -618,16 +646,40 @@ def build_snapshot(
     # reset_label, which _MetricRow renders inline next to the bar, so it is
     # still on the collapsed row rather than hidden in a tooltip.
     label = "Spend this month"
-    money_text = (
-        f"{spend_text} of {allowance:,.2f}" if allowance else spend_text
+    amounts_text = (
+        _currency_subtotals(aggregate.currency_totals)
+        if aggregate.mixed_currency and aggregate.currency_totals
+        else spend_text
     )
+    if aggregate.partial:
+        # A subtotal presented as a total is the failure this whole module is
+        # shaped around. The number moves into the note, where it can be
+        # labelled for what it is.
+        money_text = "incomplete"
+        amounts_note = f"{amounts_text} read so far, which is incomplete."
+    elif aggregate.mixed_currency:
+        money_text = amounts_text
+        amounts_note = f"Subtotals by billing currency: {amounts_text}."
+    elif allowance:
+        money_text = f"{spend_text} of {allowance:,.2f}"
+        amounts_note = f"{spend_text} of {allowance:,.2f} this period."
+    else:
+        money_text = spend_text
+        amounts_note = f"{spend_text} this period."
     if aggregate.period_end:
-        end = aggregate.period_end
+        # The printed day and resets_at have to be the same instant: the label
+        # was built from the UTC date and the countdown from its local
+        # rendering, so west of UTC the tile printed 1 Oct and counted down to
+        # 30 Sep.
+        end = _boundary_local(aggregate.period_end).date()
         reset_label = f"{money_text} · resets {end.day} {end.strftime('%b')}"
     else:
         reset_label = money_text
 
-    note_parts = [_as_of_note(aggregate)]
+    # The amounts stay in the note as well as on the row: the row's column is
+    # elided when the text runs long, and a tooltip is not somewhere a number
+    # should only exist.
+    note_parts = [amounts_note, _as_of_note(aggregate)]
     note_parts.append(
         "Costs are gross: Cost Management excludes free and prepaid credits, so "
         "this measures consumption against your stated allowance, not a live "
@@ -635,8 +687,6 @@ def build_snapshot(
     )
     if ungauged_note:
         note_parts.append(ungauged_note)
-    elif offer_note:
-        note_parts.append(offer_note)
     if aggregate.partial:
         note_parts.append(
             "Cost Management returned more results than were read, so these "
@@ -669,9 +719,13 @@ def build_snapshot(
     for name, cost in aggregate.buckets:
         # Clamped for display only: a refund row makes a share negative and
         # pushes another over 100, and the row label prints the percentage
-        # verbatim. The money stays exact in the note.
+        # verbatim. The money stays exact in the note. A share of a total the
+        # summary row refused to gauge is the same wrong number one row down,
+        # so these follow the same flag.
         share = (
-            max(0.0, min(100.0, cost / total * 100.0)) if total > 0 else None
+            max(0.0, min(100.0, cost / total * 100.0))
+            if gaugeable and total > 0
+            else None
         )
         if name == FOUNDRY_BUCKET:
             note = (
@@ -690,6 +744,12 @@ def build_snapshot(
             note = _money(cost, currency)
             if len(name) > LABEL_MAX_LEN:
                 note = f"{name}\n{note}"
+        if aggregate.mixed_currency:
+            note = (
+                f"{note}\nThis period billed in more than one currency "
+                f"({_currency_subtotals(aggregate.currency_totals)}), so these "
+                "rows have no share of a common total."
+            )
         metrics.append(
             UsageMetric(
                 label=_truncate(name),
@@ -709,12 +769,12 @@ def build_snapshot(
         # omitting it is the honest outcome. (The number stays in the
         # diagnostics payload, which is where a bug report needs it.)
         forecast_total = None
-    if forecast_total is not None:
-        forecast_share = (
-            max(0.0, min(100.0, forecast_total / allowance * 100.0))
-            if allowance
-            else None
-        )
+    if forecast_total is not None and gaugeable:
+        # Not merely ungauged: a projection built from a subtotal, or from
+        # rows in currencies that cannot be added, is not a projection of
+        # anything the row above it shows. (The number stays in the
+        # diagnostics payload, which is where a bug report needs it.)
+        forecast_share = max(0.0, min(100.0, forecast_total / allowance * 100.0))
         metrics.append(
             UsageMetric(
                 label="Forecast end of month",
@@ -766,6 +826,9 @@ def _diagnostic_raw(aggregate: AzureAggregate) -> dict[str, Any]:
         "forecast_total": aggregate.forecast_total,
         "quota_id": aggregate.quota_id,
         "sponsorship": aggregate.sponsorship,
+        "currency_totals": [
+            [code, round(amount, 6)] for code, amount in aggregate.currency_totals
+        ],
         "service_count": aggregate.service_count,
         "row_count": aggregate.row_count,
         "cost_metric": aggregate.cost_metric,
@@ -1042,6 +1105,8 @@ def _merge_query_rows(into: QueryRows, page: QueryRows) -> None:
         into.by_resource[resource_id] = into.by_resource.get(resource_id, 0.0) + cost
     for service, cost in page.by_service.items():
         into.by_service[service] = into.by_service.get(service, 0.0) + cost
+    for code, cost in page.by_currency.items():
+        into.by_currency[code] = into.by_currency.get(code, 0.0) + cost
     into.rows.extend(page.rows)
     into.row_count += page.row_count
     if page.latest_usage_date is not None and (
@@ -2008,6 +2073,9 @@ class AzureProvider(Provider):
             quota_id=state.quota_id,
             sponsorship=is_sponsorship(state.quota_id),
             mixed_currency=parsed.mixed_currency,
+            currency_totals=sorted(
+                parsed.by_currency.items(), key=lambda kv: (-kv[1], kv[0])
+            ),
             offer_known=state.quota_id is not None,
             service_count=service_count,
             row_count=parsed.row_count,
