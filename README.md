@@ -203,11 +203,18 @@ the month's spend must not turn the tray red.
   currency. The tile shows whichever currency the API reports and never assumes
   dollars.
 - If the subscription already has a **monthly cost Budget** in Azure, that
-  amount is used instead, so the figure does not live in two places.
+  amount is used instead, so the figure does not live in two places — but only
+  when it measures the same money: a budget in another currency, one scoped to
+  a different resource group, or one read against an anniversary reset day is
+  refused, and the tile says so and uses your allowance instead. An Azure
+  Budget is always a calendar month.
 - **Reset day** defaults to 1 (calendar month). Set it to the day your credit
   actually renews — a Visual Studio credit resets on its own anniversary, not
   on the 1st, and querying the calendar month would measure the wrong window.
   Capped at 28 so the date exists in February.
+- The period boundary is a **UTC date**, because Cost Management dates its
+  usage in UTC; the countdown next to the bar shows that instant in your local
+  time. East of UTC the tile therefore rolls over before your local midnight.
 
 #### Cost is gross of credits
 

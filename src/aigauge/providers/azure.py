@@ -152,8 +152,32 @@ def period_bounds(today: date, reset_day: int) -> tuple[date, date]:
     return start, date(end_year, end_month, reset_day)
 
 
-def _local_midnight(day: date) -> datetime:
-    return datetime(day.year, day.month, day.day)
+def _utc_today() -> date:
+    """Today, as Cost Management dates it.
+
+    Cost Management works in UTC dates, and the query window is sent as
+    ``+00:00`` timestamps. Deriving the period from the *local* calendar date
+    made the two disagree by the UTC offset around the reset instant: east of
+    UTC the new period opened up to 13 h early and the query asked for a window
+    that had not begun - returning nothing, showing "no usage processed yet",
+    and holding that for an hour behind the throttle. Copilot already computes
+    UTC month bounds, so this also stops the two Microsoft tiles disagreeing
+    about when the same 1st of the month resets.
+    """
+    return datetime.now(timezone.utc).date()
+
+
+def _boundary_local(day: date) -> datetime:
+    """A period boundary (a UTC date) as a local wall-clock time.
+
+    The boundary is a UTC instant; the countdown next to the bar is read in
+    local time, so it is converted rather than reinterpreted.
+    """
+    return (
+        datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+        .astimezone()
+        .replace(tzinfo=None)
+    )
 
 
 # --------------------------------------------------------------------------
@@ -508,10 +532,10 @@ def build_snapshot(
     currency = aggregate.currency
     allowance, allowance_source = _allowance(aggregate, azure_cfg)
     resets_at = (
-        _local_midnight(aggregate.period_end) if aggregate.period_end else None
+        _boundary_local(aggregate.period_end) if aggregate.period_end else None
     )
     window = (
-        _local_midnight(aggregate.period_end) - _local_midnight(aggregate.period_start)
+        timedelta(days=(aggregate.period_end - aggregate.period_start).days)
         if aggregate.period_end and aggregate.period_start
         else None
     )
@@ -1624,7 +1648,7 @@ class AzureProvider(Provider):
 
         notes: list[str] = []
         now = datetime.now()
-        period_start, period_end = period_bounds(now.date(), azure_cfg.reset_day)
+        period_start, period_end = period_bounds(_utc_today(), azure_cfg.reset_day)
 
         try:
             # Discovery: near-static, so it is cached for a day and its failure
@@ -1948,7 +1972,7 @@ def _probe() -> int:
     print("token: ok")
 
     subscription_id = azure_cfg.subscription_id or ""
-    start, end = period_bounds(date.today(), azure_cfg.reset_day)
+    start, end = period_bounds(_utc_today(), azure_cfg.reset_day)
     print(f"period: {start} -> {end} (reset day {azure_cfg.reset_day})")
 
     try:

@@ -332,7 +332,9 @@ def test_breakdown_tag_matches_openrouters_literal():
 def test_summary_row_carries_reset_and_window():
     snapshot = az.build_snapshot(_aggregate(), AzureConfig(monthly_allowance=150.0))
     summary = snapshot.metrics[0]
-    assert summary.resets_at == datetime(2026, 10, 1)
+    assert summary.resets_at == datetime(
+        2026, 10, 1, tzinfo=timezone.utc
+    ).astimezone().replace(tzinfo=None)
     assert summary.window == timedelta(days=30)
     assert summary.tag is None
 
@@ -1732,3 +1734,42 @@ def test_the_token_endpoint_refuses_a_non_guid_tenant():
 
     with pytest.raises(ValueError):
         _azure_auth.token_endpoint("evil.example/x")
+
+
+# --- the period is a UTC window --------------------------------------------
+
+
+def test_utc_today_is_the_utc_date_not_the_local_one():
+    assert az._utc_today() == datetime.now(timezone.utc).date()
+
+
+@responses.activate
+def test_the_query_window_follows_the_utc_date(monkeypatch, config):
+    """Cost Management dates are UTC dates. Deriving the period from the local
+    calendar date opens the new period up to 13 h early east of UTC, and the
+    query then asks for a window that has not started - an empty tile, held by
+    the hourly throttle."""
+    import json as _json
+
+    monkeypatch.setattr(az, "_utc_today", lambda: date(2026, 9, 30))
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    _run(az.AzureProvider(config), monkeypatch)
+
+    body = _json.loads(
+        [c for c in responses.calls if "CostManagement/query" in c.request.url][0]
+        .request.body
+    )
+    assert body["timePeriod"]["from"].startswith("2026-09-01")
+    assert body["timePeriod"]["to"].startswith("2026-09-30")
+
+
+def test_resets_at_is_the_utc_boundary_rendered_locally():
+    """The boundary is a UTC instant; the countdown shows it in local time,
+    which is also what Copilot does with the same 1st-of-the-month."""
+    snapshot = az.build_snapshot(_aggregate(), AzureConfig(monthly_allowance=150.0))
+    expected = (
+        datetime(2026, 10, 1, tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
+    )
+    assert snapshot.metrics[0].resets_at == expected
+    assert snapshot.metrics[0].window == timedelta(days=30)
