@@ -7,7 +7,7 @@ column map. A fixture written as a convenient dict would test nothing.
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 import requests
@@ -202,13 +202,9 @@ def test_parse_usage_date_accepts_both_documented_shapes():
     assert az._parse_usage_date(None) is None
 
 
-def test_parse_query_response_tolerates_a_missing_cost_column():
-    parsed = az.parse_query_response({"properties": {"columns": [], "rows": [[1]]}})
-    assert parsed.total == 0.0
-    assert parsed.row_count == 0
-
-
-def test_cost_column_falls_back_to_the_first_numeric_non_date_column():
+def test_cost_column_falls_back_to_a_column_that_names_itself_a_cost():
+    """The candidate list covers every documented name; the fallback only has
+    to survive a rename, so it matches on the name and never on position."""
     columns = [
         {"name": "UsageDate", "type": "Number"},
         {"name": "SomeFutureCostName", "type": "Number"},
@@ -1378,3 +1374,176 @@ def test_a_budget_does_not_apply_to_an_anniversary_period(monkeypatch, config):
     assert "budget" in note.lower()
     # 28.55 of the settings allowance (150), not of the 500 budget.
     assert snapshot.metrics[0].percent_used == pytest.approx(19.03, abs=0.01)
+
+
+# --- never a confident wrong number ----------------------------------------
+#
+# The module's own doctrine, applied to the Sponsorship case from the start:
+# a gauge that reads 0% because something upstream changed shape is worse than
+# a visible failure, because the user has no way to detect it.
+
+
+def test_the_cost_column_is_never_guessed_from_position():
+    """A future UsageQuantity column ahead of the cost column would otherwise
+    be summed and formatted as money."""
+    columns = [
+        {"name": "UsageQuantity", "type": "Number"},
+        {"name": "SomeFutureCostName", "type": "Number"},
+    ]
+    assert az._cost_column(columns, az._column_index(columns)) == 1
+
+
+def test_parse_query_response_reports_a_missing_cost_column():
+    """Schema drift must be distinguishable from "no spend this month"."""
+    parsed = az.parse_query_response({"properties": {"columns": [], "rows": [[1]]}})
+    assert parsed.cost_column_found is False
+    assert parsed.total == 0.0
+    assert parsed.row_count == 0
+
+
+def test_an_arm_error_body_returned_as_200_is_not_an_empty_month():
+    parsed = az.parse_query_response({"error": {"code": "GatewayTimeout"}})
+    assert parsed.cost_column_found is False
+
+
+@responses.activate
+def test_a_response_with_no_cost_column_is_an_error_not_a_zero_gauge(
+    monkeypatch, config
+):
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    responses.replace(
+        responses.POST, QUERY_URL, json={"error": {"code": "GatewayTimeout"}}, status=200
+    )
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+    assert snapshot.status == SnapshotStatus.ERROR
+    assert "cost column" in (snapshot.error or "").lower()
+    # And the error is remembered, so the throttle holds.
+    assert az.state_for(SUB).last_error is not None
+
+
+def test_zero_spend_on_a_known_offer_still_gets_its_gauge():
+    """Legitimate at the start of a period: Cost Management lags 8-72 h."""
+    snapshot = az.build_snapshot(
+        _aggregate(total=0.0, data_as_of=None, buckets=[], row_count=0),
+        AzureConfig(monthly_allowance=150.0),
+    )
+    summary = snapshot.metrics[0]
+    assert summary.percent_used == pytest.approx(0.0)
+    assert "No usage has been processed" in (summary.note or "")
+
+
+def test_zero_spend_with_an_unreadable_offer_type_gets_no_gauge():
+    """Cost Management Reader without Reader is the likely role split, and a
+    Sponsorship subscription reports exactly this - zero, forever."""
+    snapshot = az.build_snapshot(
+        _aggregate(total=0.0, data_as_of=None, buckets=[], row_count=0, offer_known=False),
+        AzureConfig(monthly_allowance=150.0),
+    )
+    summary = snapshot.metrics[0]
+    assert summary.percent_used is None
+    note = (summary.note or "").lower()
+    assert "offer type" in note
+    assert "sponsorship" in note
+
+
+def test_an_unreadable_offer_type_with_real_spend_keeps_its_gauge():
+    """A Sponsorship subscription cannot report positive spend, so a positive
+    total rules the ambiguity out."""
+    snapshot = az.build_snapshot(
+        _aggregate(offer_known=False), AzureConfig(monthly_allowance=150.0)
+    )
+    summary = snapshot.metrics[0]
+    assert summary.percent_used == pytest.approx(24.07, abs=0.01)
+    assert "offer type" in (summary.note or "").lower()
+
+
+def test_mixed_currencies_are_not_summed_into_a_gauge():
+    rows = [
+        [100.0, 20260901, STORAGE_ID, "Storage", "JPY"],
+        [10.0, 20260901, OPENAI_ID, "Azure OpenAI", "CAD"],
+    ]
+    parsed = az.parse_query_response(query_payload(rows))
+    assert parsed.mixed_currency is True
+    assert parsed.currency == ""
+    snapshot = az.build_snapshot(
+        _aggregate(total=parsed.total, currency=parsed.currency, mixed_currency=True),
+        AzureConfig(monthly_allowance=200.0),
+    )
+    summary = snapshot.metrics[0]
+    assert summary.percent_used is None
+    assert "currenc" in (summary.note or "").lower()
+
+
+def test_breakdown_shares_are_clamped_for_display():
+    """A refund row makes a share negative and pushes another over 100."""
+    snapshot = az.build_snapshot(
+        _aggregate(
+            total=10.0,
+            buckets=[("Azure OpenAI", 100.0), ("Refunded thing", -90.0)],
+        ),
+        AzureConfig(monthly_allowance=1000.0),
+    )
+    shares = [m.percent_used for m in snapshot.metrics if m.tag == az.BREAKDOWN_TAG]
+    assert shares == [pytest.approx(100.0), pytest.approx(0.0)]
+    # The money is still readable in the note.
+    notes = " ".join(m.note or "" for m in snapshot.metrics if m.tag == az.BREAKDOWN_TAG)
+    assert "-90.00" in notes
+
+
+def test_a_usage_date_in_the_future_is_not_data_as_of():
+    """Stale data must not read as fresh - the one thing the line prevents."""
+    future = (datetime.now(timezone.utc).date() + timedelta(days=400)).strftime("%Y%m%d")
+    rows = [
+        [4.0, 20260905, STORAGE_ID, "Storage", "CAD"],
+        [1.0, int(future), STORAGE_ID, "Storage", "CAD"],
+    ]
+    parsed = az.parse_query_response(query_payload(rows))
+    assert parsed.latest_usage_date == date(2026, 9, 5)
+
+
+def test_the_forecast_body_filters_the_same_charge_type_as_the_query():
+    """Otherwise the two rows are not measuring the same thing."""
+    body = az.forecast_body(date(2026, 9, 1), date(2026, 10, 1), cost_metric="Cost")
+    clauses = body["dataset"]["filter"]
+    assert clauses["dimensions"]["name"] == "ChargeType"
+    assert clauses["dimensions"]["values"] == ["Usage"]
+
+
+@responses.activate
+def test_a_forecast_below_the_actual_spend_is_dropped(monkeypatch, config):
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    responses.replace(
+        responses.POST,
+        FORECAST_URL,
+        json=query_payload([[0.0, 20260930, "", "", "CAD"]]),
+        status=200,
+    )
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+    assert not any(m.label == "Forecast end of month" for m in snapshot.metrics)
+
+
+def test_a_zero_cost_foundry_row_is_still_pinned():
+    rows = [[100.0, 20260901, f"{STORAGE_ID}-{i}", f"Service {i}", "CAD"] for i in range(8)]
+    rows.append([0.0, 20260901, FOUNDRY_ID, "Foundry Tools", "CAD"])
+    parsed = az.parse_query_response(query_payload(rows))
+    buckets, _f, _m, _s = az.bucket_costs(parsed, {FOUNDRY_ID.lower()}, {})
+    assert buckets[0][0] == az.FOUNDRY_BUCKET
+
+
+def test_query_rows_are_bounded():
+    rows = [
+        [1.0, 20260901, f"{STORAGE_ID}-{i}", f"Service {i}", "CAD"]
+        for i in range(az.MAX_QUERY_ROWS + 100)
+    ]
+    parsed = az.parse_query_response(query_payload(rows))
+    assert parsed.row_count == az.MAX_QUERY_ROWS
+    assert parsed.truncated is True
+
+
+def test_network_supplied_strings_are_bounded_at_parse_time():
+    rows = [[1.0, 20260901, STORAGE_ID, "S" * 5000, "C" * 3000]]
+    parsed = az.parse_query_response(query_payload(rows))
+    assert len(parsed.currency) <= 8
+    assert max(len(name) for name in parsed.by_service) <= 120

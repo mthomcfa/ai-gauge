@@ -39,7 +39,7 @@ import logging
 import math
 import threading
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 
 import requests
@@ -101,6 +101,14 @@ _COST_COLUMN_CANDIDATES = ("Cost", "PreTaxCost", "CostUSD", "PreTaxCostUSD", "to
 # nextLink is therefore the normal case on a busy subscription, not an edge one.
 # The cap is a ceiling on one refresh's request count, not an expected limit.
 MAX_QUERY_PAGES = 20
+# A ceiling on what one response can cost us in memory and time. A period with
+# 50 000 daily ResourceId x ServiceName rows is already outside this tile's
+# design; past this the total is a subtotal and says so.
+MAX_QUERY_ROWS = 50_000
+# Currency codes are three letters and service names are a phrase. Both come
+# off the wire and both reach a Qt label and current.json.
+CURRENCY_MAX_LEN = 8
+SERVICE_NAME_MAX_LEN = 120
 
 _PERMISSION_HINT = (
     "Grant the app registration Cost Management Reader (for cost queries, "
@@ -175,12 +183,16 @@ def _cost_column(columns: list[Any], index: dict[str, int]) -> int | None:
         position = index.get(candidate.lower())
         if position is not None:
             return position
-    # Last resort: the first numeric column that is not the usage date.
+    # Last resort: a numeric column that *names itself* a cost. The candidate
+    # list already covers every documented name, so this only has to survive a
+    # rename. It deliberately no longer falls back on position: the first
+    # numeric non-date column can be a quantity, and summing a quantity into a
+    # money label is a wrong number rather than a visible failure.
     for position, column in enumerate(columns or []):
         if not isinstance(column, dict):
             continue
         name = str(column.get("name") or "").strip().lower()
-        if name in ("usagedate", "billingmonth"):
+        if name in ("usagedate", "billingmonth") or "cost" not in name:
             continue
         if str(column.get("type") or "").strip().lower() == "number":
             return position
@@ -238,6 +250,13 @@ class QueryRows:
     rows: list[tuple[str, str, float]] = field(default_factory=list)
     latest_usage_date: date | None = None
     row_count: int = 0
+    # False when the response carried no readable cost column at all - schema
+    # drift, or an ARM error document returned with a 200. That is an error,
+    # not a month with no spend, and the two must not look alike.
+    cost_column_found: bool = False
+    # More than one billing currency in one response: the rows cannot be added
+    # together, so no gauge is shown for the sum.
+    mixed_currency: bool = False
     # Set when a page of results was left unread - a refused nextLink or the
     # page cap. The total is then a subtotal, and must not be shown as a gauge.
     truncated: bool = False
@@ -249,22 +268,30 @@ def parse_query_response(payload: Any) -> QueryRows:
     properties = payload.get("properties") if isinstance(payload, dict) else None
     if not isinstance(properties, dict):
         return out
-    columns = properties.get("columns") or []
-    rows = properties.get("rows") or []
+    columns = properties.get("columns")
+    rows = properties.get("rows")
     if not isinstance(columns, list) or not isinstance(rows, list):
         return out
     index = _column_index(columns)
     cost_at = _cost_column(columns, index)
     if cost_at is None:
         return out
+    out.cost_column_found = True
     resource_at = index.get("resourceid")
     service_at = index.get("servicename")
     currency_at = index.get("currency")
     if currency_at is None:
         currency_at = index.get("billingcurrency")
     date_at = index.get("usagedate")
+    # Cost Management is a *lagging* source: a usage date past tomorrow is not
+    # a fresh number, it is a malformed one, and "data as of" exists precisely
+    # to stop stale data reading as fresh.
+    latest_plausible = datetime.now(timezone.utc).date() + timedelta(days=1)
+    currencies: set[str] = set()
 
-    for row in rows:
+    if len(rows) > MAX_QUERY_ROWS:
+        out.truncated = True
+    for row in rows[:MAX_QUERY_ROWS]:
         if not isinstance(row, list) or cost_at >= len(row):
             continue
         out.row_count += 1
@@ -275,16 +302,22 @@ def parse_query_response(payload: Any) -> QueryRows:
             resource_id = str(row[resource_at] or "").strip()
         service = ""
         if service_at is not None and service_at < len(row):
-            service = str(row[service_at] or "").strip()
-        if currency_at is not None and currency_at < len(row) and not out.currency:
-            out.currency = str(row[currency_at] or "").strip()
+            service = str(row[service_at] or "").strip()[:SERVICE_NAME_MAX_LEN]
+        if currency_at is not None and currency_at < len(row):
+            code = str(row[currency_at] or "").strip()[:CURRENCY_MAX_LEN]
+            if code:
+                currencies.add(code)
+                if not out.currency:
+                    out.currency = code
         if date_at is not None and date_at < len(row) and cost:
             # "Data as of" is the latest day that actually carries cost. A
             # trailing zero-cost day is the API padding the range, not evidence
             # that the day has been processed.
             day = _parse_usage_date(row[date_at])
-            if day is not None and (
-                out.latest_usage_date is None or day > out.latest_usage_date
+            if (
+                day is not None
+                and day <= latest_plausible
+                and (out.latest_usage_date is None or day > out.latest_usage_date)
             ):
                 out.latest_usage_date = day
         if resource_id:
@@ -294,6 +327,11 @@ def parse_query_response(payload: Any) -> QueryRows:
         if service:
             out.by_service[service] = out.by_service.get(service, 0.0) + cost
         out.rows.append((resource_id.lower(), service, cost))
+    if len(currencies) > 1:
+        # Adding JPY to CAD produces a number that means nothing, and printing
+        # it with whichever code came first is the confident wrong answer.
+        out.mixed_currency = True
+        out.currency = ""
     return out
 
 
@@ -327,6 +365,11 @@ class AzureAggregate:
     cost_metric: str = COST_METRIC_PRIMARY
     # A page of the cost query was left unread, so ``total`` is a subtotal.
     partial: bool = False
+    # More than one billing currency appeared in the rows.
+    mixed_currency: bool = False
+    # Whether the subscription's offer type was actually read. False means the
+    # Sponsorship check could not run, which matters only when spend is zero.
+    offer_known: bool = True
     notes: list[str] = field(default_factory=list)
 
 
@@ -391,7 +434,10 @@ def bucket_costs(
     ranked = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
     # Foundry is never folded into "Other": it is the row the tile exists to
     # show, and a quiet month would otherwise hide it.
-    pinned = [pair for pair in ranked if pair[0] == FOUNDRY_BUCKET and pair[1]]
+    # Pinned on the bucket name alone: a Foundry row that spent 0.00 this
+    # month is still the row the tile exists to show, and folding it into
+    # "Other" is exactly the quiet month the pin is for.
+    pinned = [pair for pair in ranked if pair[0] == FOUNDRY_BUCKET]
     rest = [pair for pair in ranked if pair not in pinned]
     top_rows = max(1, min(MAX_BREAKDOWN_ROWS, top_rows))
     keep = pinned + rest[: max(0, top_rows - len(pinned))]
@@ -487,8 +533,34 @@ def build_snapshot(
             )
         )
 
+    # Reasons the number on this tile cannot honestly carry a percentage.
+    # Each one is a case where a gauge would be confidently wrong rather than
+    # visibly broken, which is the trade this whole module is built around.
+    ungauged_note: str | None = None
+    if aggregate.mixed_currency:
+        ungauged_note = (
+            "Cost Management returned more than one billing currency for this "
+            "period, so the rows cannot be added together and no gauge is "
+            "shown."
+        )
+    elif not aggregate.offer_known and aggregate.total <= 0:
+        # Cost Management Reader without Reader is the likely role split, and
+        # an Azure Sponsorship subscription reports exactly this: zero, while
+        # the credit drains.
+        ungauged_note = (
+            "The subscription's offer type could not be read (Reader role), "
+            "so an Azure Sponsorship offer - which Cost Management reports as "
+            "zero cost while the credit drains - cannot be ruled out. No gauge "
+            "is shown for a zero total."
+        )
+    offer_note: str | None = None
+    if ungauged_note is None and not aggregate.offer_known:
+        offer_note = (
+            "The subscription's offer type could not be read (Reader role); "
+            "the positive total rules out an unsupported Sponsorship offer."
+        )
     spend_text = _money(aggregate.total, currency)
-    if allowance and not aggregate.partial:
+    if allowance and not aggregate.partial and ungauged_note is None:
         percent = max(0.0, min(100.0, aggregate.total / allowance * 100.0))
         label = f"Spend this month ({spend_text} of {allowance:,.2f})"
     elif allowance:
@@ -504,6 +576,10 @@ def build_snapshot(
         "this measures consumption against your stated allowance, not a live "
         "credit balance."
     )
+    if ungauged_note:
+        note_parts.append(ungauged_note)
+    elif offer_note:
+        note_parts.append(offer_note)
     if aggregate.partial:
         note_parts.append(
             "Cost Management returned more results than were read, so these "
@@ -533,7 +609,12 @@ def build_snapshot(
 
     total = aggregate.total
     for name, cost in aggregate.buckets:
-        share = (cost / total * 100.0) if total > 0 else None
+        # Clamped for display only: a refund row makes a share negative and
+        # pushes another over 100, and the row label prints the percentage
+        # verbatim. The money stays exact in the note.
+        share = (
+            max(0.0, min(100.0, cost / total * 100.0)) if total > 0 else None
+        )
         if name == FOUNDRY_BUCKET:
             note = (
                 f"{_money(cost, currency)} across "
@@ -732,6 +813,28 @@ def _scope(subscription_id: str) -> str:
     return f"{MANAGEMENT_HOST}/subscriptions/{subscription_id}"
 
 
+def _charge_type_filter() -> dict:
+    """Usage only - the same clause on the query and the forecast.
+
+    The two rows are compared on the tile, so they have to be measuring the
+    same thing: a forecast that includes purchases and refunds is not a
+    projection of the usage number above it.
+    """
+    return {
+        "dimensions": {"name": "ChargeType", "operator": "In", "values": ["Usage"]}
+    }
+
+
+def _resource_group_filter(resource_group: str) -> dict:
+    return {
+        "dimensions": {
+            "name": "ResourceGroupName",
+            "operator": "In",
+            "values": [resource_group],
+        }
+    }
+
+
 def query_body(
     period_start: date,
     period_end: date,
@@ -748,15 +851,7 @@ def query_body(
     "data as of" derivable at all - without it there is no UsageDate column and
     no way to tell a fully-processed period from a half-processed one.
     """
-    filters: list[dict] = [
-        {
-            "dimensions": {
-                "name": "ChargeType",
-                "operator": "In",
-                "values": ["Usage"],
-            }
-        }
-    ]
+    filters: list[dict] = [_charge_type_filter()]
     if marketplace_only:
         filters.append(
             {
@@ -768,15 +863,7 @@ def query_body(
             }
         )
     if resource_group:
-        filters.append(
-            {
-                "dimensions": {
-                    "name": "ResourceGroupName",
-                    "operator": "In",
-                    "values": [resource_group],
-                }
-            }
-        )
+        filters.append(_resource_group_filter(resource_group))
     # QueryFilter's "and" requires at least two clauses; a lone clause goes in
     # unwrapped.
     query_filter = filters[0] if len(filters) == 1 else {"and": filters}
@@ -826,7 +913,12 @@ def _next_query_link(payload: Any) -> tuple[str, bool]:
 def _merge_query_rows(into: QueryRows, page: QueryRows) -> None:
     """Fold one page of results into the running total."""
     into.total += page.total
-    if not into.currency:
+    if page.mixed_currency or (
+        page.currency and into.currency and page.currency != into.currency
+    ):
+        into.mixed_currency = True
+        into.currency = ""
+    elif not into.currency and not into.mixed_currency:
         into.currency = page.currency
     for resource_id, cost in page.by_resource.items():
         into.by_resource[resource_id] = into.by_resource.get(resource_id, 0.0) + cost
@@ -840,6 +932,8 @@ def _merge_query_rows(into: QueryRows, page: QueryRows) -> None:
     ):
         into.latest_usage_date = page.latest_usage_date
     into.truncated = into.truncated or page.truncated
+    if into.row_count > MAX_QUERY_ROWS:
+        into.truncated = True
 
 
 def _follow_query_pages(
@@ -906,6 +1000,12 @@ def fetch_query(
         if response.status_code == 200:
             payload = _json(response)
             parsed = parse_query_response(payload)
+            if not parsed.cost_column_found:
+                # A 200 whose body is an ARM error document, or a schema the
+                # parser cannot read. Either way it is not an empty month.
+                raise requests.HTTPError(
+                    "Cost Management returned no cost column"
+                )
             _follow_query_pages(token, body, payload, parsed)
             log.debug(
                 "provider api diagnosis provider=azure classification=query_ok "
@@ -927,6 +1027,37 @@ def fetch_query(
     raise requests.HTTPError(f"Cost Management query returned HTTP {last_status}")
 
 
+def forecast_body(
+    period_start: date,
+    period_end: date,
+    *,
+    cost_metric: str,
+    resource_group: str | None = None,
+) -> dict:
+    """Build the Forecast API request, filtered like the actual-cost query."""
+    filters: list[dict] = [_charge_type_filter()]
+    if resource_group:
+        filters.append(_resource_group_filter(resource_group))
+    return {
+        "type": "ActualCost",
+        # ForecastTimeframe's only legal value is Custom.
+        "timeframe": "Custom",
+        "timePeriod": {
+            "from": f"{period_start.isoformat()}T00:00:00+00:00",
+            "to": f"{(period_end - timedelta(days=1)).isoformat()}T23:59:59+00:00",
+        },
+        "dataset": {
+            "granularity": "Daily",
+            "aggregation": {"totalCost": {"name": cost_metric, "function": "Sum"}},
+            "filter": filters[0] if len(filters) == 1 else {"and": filters},
+        },
+        # Actual-to-date plus projected-remainder, so the row is a full-period
+        # number rather than only the unspent tail.
+        "includeActualCost": True,
+        "includeFreshPartialCost": False,
+    }
+
+
 def fetch_forecast(
     token: str,
     subscription_id: str,
@@ -946,31 +1077,12 @@ def fetch_forecast(
         f"{_scope(subscription_id)}/providers/Microsoft.CostManagement/forecast"
         f"?api-version={COST_MANAGEMENT_API_VERSION}"
     )
-    body: dict[str, Any] = {
-        "type": "ActualCost",
-        # ForecastTimeframe's only legal value is Custom.
-        "timeframe": "Custom",
-        "timePeriod": {
-            "from": f"{period_start.isoformat()}T00:00:00+00:00",
-            "to": f"{(period_end - timedelta(days=1)).isoformat()}T23:59:59+00:00",
-        },
-        "dataset": {
-            "granularity": "Daily",
-            "aggregation": {"totalCost": {"name": cost_metric, "function": "Sum"}},
-        },
-        # Actual-to-date plus projected-remainder, so the row is a full-period
-        # number rather than only the unspent tail.
-        "includeActualCost": True,
-        "includeFreshPartialCost": False,
-    }
-    if resource_group:
-        body["dataset"]["filter"] = {
-            "dimensions": {
-                "name": "ResourceGroupName",
-                "operator": "In",
-                "values": [resource_group],
-            }
-        }
+    body = forecast_body(
+        period_start,
+        period_end,
+        cost_metric=cost_metric,
+        resource_group=resource_group,
+    )
     response = arm_post(token, url, body, "forecast")
     if response.status_code != 200:
         log.info(
@@ -1548,6 +1660,18 @@ class AzureProvider(Provider):
                 cost_metric=cost_metric,
                 resource_group=azure_cfg.resource_group,
             )
+            if forecast_total is not None and (
+                forecast_total <= 0 or forecast_total < parsed.total
+            ):
+                # A full-period projection below what has already been spent
+                # is not a projection. Omitting the row is honest; the tile is
+                # built to lose it silently when Cost Management cannot
+                # produce one.
+                log.info(
+                    "provider api diagnosis provider=azure "
+                    "classification=forecast_implausible"
+                )
+                forecast_total = None
         except AzureThrottled as exc:
             state.blocked_until = datetime.now() + timedelta(seconds=exc.retry_after)
             log.warning(
@@ -1593,6 +1717,8 @@ class AzureProvider(Provider):
             forecast_total=forecast_total,
             quota_id=state.quota_id,
             sponsorship=is_sponsorship(state.quota_id),
+            mixed_currency=parsed.mixed_currency,
+            offer_known=state.quota_id is not None,
             service_count=service_count,
             row_count=parsed.row_count,
             cost_metric=cost_metric,
