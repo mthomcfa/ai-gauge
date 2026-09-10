@@ -399,6 +399,28 @@ def test_sponsorship_replaces_the_gauge_with_a_warning():
     assert all(m.percent_used is None for m in snapshot.metrics if m.tag is None)
 
 
+def test_a_sponsorship_offer_leaves_no_percentage_anywhere_on_the_tile():
+    """The warning row says Cost Management does not report this spend at all.
+    A share of that total, or a forecast projected from it, is the same
+    unreported number one row further down, so sponsorship suppresses every
+    percentage exactly as a truncated read or an unreadable offer type does."""
+    snapshot = az.build_snapshot(
+        _aggregate(
+            total=6.75,
+            quota_id="Sponsored_2016-01-01",
+            sponsorship=True,
+            buckets=[("Foundry", 4.50), ("Marketplace models", 2.25)],
+            forecast_total=42.0,
+        ),
+        AzureConfig(monthly_allowance=100.0),
+    )
+    assert all(m.percent_used is None for m in snapshot.metrics)
+    assert not any(m.label == "Forecast end of month" for m in snapshot.metrics)
+    # The money is still reported; only the percentages are refused.
+    assert "CAD 6.75" in (snapshot.metrics[1].reset_label or "")
+    assert "CAD 4.50" in (snapshot.metrics[2].note or "")
+
+
 @pytest.mark.parametrize(
     "quota_id,expected",
     [

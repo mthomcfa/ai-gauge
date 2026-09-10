@@ -653,9 +653,14 @@ def build_snapshot(
     spend_text = _money(aggregate.total, currency)
     # One flag, so the tile cannot disown a number on one row and print a
     # percentage derived from it on the next. It governs the summary percent,
-    # the breakdown shares and whether there is a forecast row at all.
+    # the breakdown shares and whether there is a forecast row at all -
+    # sponsorship included, which is the one reason that used to suppress the
+    # summary percent by itself and leave the rows below it gauged.
     gaugeable = (
-        bool(allowance) and not aggregate.partial and ungauged_note is None
+        bool(allowance)
+        and not aggregate.partial
+        and not aggregate.sponsorship
+        and ungauged_note is None
     )
     percent = (
         max(0.0, min(100.0, aggregate.total / allowance * 100.0))
@@ -735,7 +740,7 @@ def build_snapshot(
     metrics.append(
         UsageMetric(
             label=label,
-            percent_used=None if aggregate.sponsorship else percent,
+            percent_used=percent,
             resets_at=resets_at,
             reset_label=reset_label,
             note=" ".join(note_parts),
