@@ -1556,6 +1556,27 @@ def test_a_repeated_nextlink_stops_the_loop_instead_of_multiplying_the_total(
     assert "truncated" in (summary.note or "").lower()
 
 
+@responses.activate
+def test_a_repeated_nextlink_says_the_subtotal_may_count_rows_twice(
+    monkeypatch, config
+):
+    """Every other early exit leaves a subtotal, so the note says "read so
+    far" - which tells the reader the true figure is *higher*. A link back to
+    a page already read is the opposite case: those rows were counted again
+    before the guard fired, so the figure is higher than the truth, and the
+    same sentence would point the reader the wrong way."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    payload = query_payload([[5.0, 20260901, STORAGE_ID, "Storage", "CAD"]])
+    payload["properties"]["nextLink"] = f"{QUERY_URL}?$skiptoken=forever"
+    responses.replace(responses.POST, QUERY_URL, json=payload, status=200)
+
+    note = (_run(az.AzureProvider(config), monkeypatch).metrics[0].note or "")
+
+    assert "more than once" in note
+    assert "read so far" not in note
+
+
 @pytest.mark.parametrize(
     "body",
     [None, {}, {"error": {"code": "GatewayTimeout"}}, "quantity-only"],

@@ -318,6 +318,12 @@ class QueryRows:
     # Set when a page of results was left unread - a refused nextLink or the
     # page cap. The total is then a subtotal, and must not be shown as a gauge.
     truncated: bool = False
+    # Set when the loop stopped because a nextLink pointed back at a page it
+    # had already read. Truncated like the rest, but in the other direction:
+    # the repeated page's rows were counted again before the guard fired, so
+    # the figure is above the truth rather than below it, and the note has to
+    # say so rather than "read so far".
+    repeated_link: bool = False
 
 
 def parse_query_response(payload: Any) -> QueryRows:
@@ -424,6 +430,9 @@ class AzureAggregate:
     cost_metric: str = COST_METRIC_PRIMARY
     # A page of the cost query was left unread, so ``total`` is a subtotal.
     partial: bool = False
+    # The read stopped on a nextLink pointing back at a page already read, so
+    # the subtotal is above the truth rather than below it.
+    repeated_rows: bool = False
     # More than one billing currency appeared in the rows.
     mixed_currency: bool = False
     # (code, amount) per billing currency, largest first. Only interesting
@@ -684,7 +693,14 @@ def build_snapshot(
         # shaped around. The number moves into the note, where it can be
         # labelled for what it is.
         money_text = "incomplete"
-        amounts_note = f"{amounts_text} read so far, which is incomplete."
+        amounts_note = (
+            # "read so far" tells the reader the true figure is higher. A
+            # repeated page makes it lower, so it gets its own sentence.
+            f"{amounts_text} counted, which may include rows counted more "
+            "than once."
+            if aggregate.repeated_rows
+            else f"{amounts_text} read so far, which is incomplete."
+        )
     elif aggregate.mixed_currency:
         money_text = amounts_text
         amounts_note = f"Subtotals by billing currency: {amounts_text}."
@@ -715,7 +731,13 @@ def build_snapshot(
     )
     if ungauged_note:
         note_parts.append(ungauged_note)
-    if aggregate.partial:
+    if aggregate.partial and aggregate.repeated_rows:
+        note_parts.append(
+            "Cost Management pointed back at a page that had already been "
+            "read, so the results are truncated and the figure above may "
+            "count some rows more than once; no gauge is shown for it."
+        )
+    elif aggregate.partial:
         note_parts.append(
             "Cost Management returned more results than were read, so these "
             "results are truncated and the total is incomplete; no gauge is "
@@ -1169,6 +1191,7 @@ def _merge_query_rows(into: QueryRows, page: QueryRows) -> None:
     # Belt and braces: _follow_query_pages refuses an unreadable page before
     # it gets here, and any future caller gets the same answer.
     into.truncated = into.truncated or page.truncated or not page.cost_column_found
+    into.repeated_link = into.repeated_link or page.repeated_link
     if into.row_count > MAX_QUERY_ROWS:
         into.truncated = True
 
@@ -1208,6 +1231,7 @@ def _follow_query_pages(
                 pages,
             )
             parsed.truncated = True
+            parsed.repeated_link = True
             return
         followed.add(url)
         if budget is not None and not budget.spend():
@@ -2175,6 +2199,7 @@ class AzureProvider(Provider):
             row_count=parsed.row_count,
             cost_metric=cost_metric,
             partial=parsed.truncated,
+            repeated_rows=parsed.repeated_link,
             notes=notes,
         )
         fetched_at = datetime.now()
