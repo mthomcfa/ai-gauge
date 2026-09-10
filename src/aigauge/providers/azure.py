@@ -96,6 +96,11 @@ FOUNDRY_ACCOUNT_KIND = "aiservices"
 COST_METRIC_PRIMARY = "Cost"
 COST_METRIC_FALLBACK = "PreTaxCost"
 _COST_COLUMN_CANDIDATES = ("Cost", "PreTaxCost", "CostUSD", "PreTaxCostUSD", "totalCost")
+# The Query API pages at ~1000 rows, and Daily granularity grouped on ResourceId
+# *and* ServiceName reaches that at roughly 33 resources over a month. Following
+# nextLink is therefore the normal case on a busy subscription, not an edge one.
+# The cap is a ceiling on one refresh's request count, not an expected limit.
+MAX_QUERY_PAGES = 20
 
 _PERMISSION_HINT = (
     "Grant the app registration Cost Management Reader (for cost queries, "
@@ -233,6 +238,9 @@ class QueryRows:
     rows: list[tuple[str, str, float]] = field(default_factory=list)
     latest_usage_date: date | None = None
     row_count: int = 0
+    # Set when a page of results was left unread - a refused nextLink or the
+    # page cap. The total is then a subtotal, and must not be shown as a gauge.
+    truncated: bool = False
 
 
 def parse_query_response(payload: Any) -> QueryRows:
@@ -317,6 +325,8 @@ class AzureAggregate:
     service_count: int = 0
     row_count: int = 0
     cost_metric: str = COST_METRIC_PRIMARY
+    # A page of the cost query was left unread, so ``total`` is a subtotal.
+    partial: bool = False
     notes: list[str] = field(default_factory=list)
 
 
@@ -450,8 +460,11 @@ def build_snapshot(
         )
 
     spend_text = _money(aggregate.total, currency)
-    if allowance:
+    if allowance and not aggregate.partial:
         percent = max(0.0, min(100.0, aggregate.total / allowance * 100.0))
+        label = f"Spend this month ({spend_text} of {allowance:,.2f})"
+    elif allowance:
+        percent = None
         label = f"Spend this month ({spend_text} of {allowance:,.2f})"
     else:
         percent = None
@@ -463,6 +476,12 @@ def build_snapshot(
         "this measures consumption against your stated allowance, not a live "
         "credit balance."
     )
+    if aggregate.partial:
+        note_parts.append(
+            "Cost Management returned more results than were read, so these "
+            "results are truncated and the total is incomplete; no gauge is "
+            "shown for a subtotal."
+        )
     if allowance_source == "budget":
         note_parts.append("Allowance read from an Azure Budget on this subscription.")
     elif allowance_source == "none":
@@ -756,6 +775,73 @@ def query_body(
     }
 
 
+def _next_query_link(payload: Any) -> tuple[str, bool]:
+    """Return (url_to_follow, refused).
+
+    ``nextLink`` is server-supplied, so it gets the same host pin the Cognitive
+    Services page loop uses: only a link back to ARM is followed, and a link
+    anywhere else stops the loop rather than being requested.
+    """
+    properties = payload.get("properties") if isinstance(payload, dict) else None
+    link = properties.get("nextLink") if isinstance(properties, dict) else None
+    if not isinstance(link, str) or not link:
+        return "", False
+    if not link.startswith(f"{MANAGEMENT_HOST}/"):
+        log.warning(
+            "provider api diagnosis provider=azure "
+            "classification=query_nextlink_refused"
+        )
+        return "", True
+    return link, False
+
+
+def _merge_query_rows(into: QueryRows, page: QueryRows) -> None:
+    """Fold one page of results into the running total."""
+    into.total += page.total
+    if not into.currency:
+        into.currency = page.currency
+    for resource_id, cost in page.by_resource.items():
+        into.by_resource[resource_id] = into.by_resource.get(resource_id, 0.0) + cost
+    for service, cost in page.by_service.items():
+        into.by_service[service] = into.by_service.get(service, 0.0) + cost
+    into.rows.extend(page.rows)
+    into.row_count += page.row_count
+    if page.latest_usage_date is not None and (
+        into.latest_usage_date is None
+        or page.latest_usage_date > into.latest_usage_date
+    ):
+        into.latest_usage_date = page.latest_usage_date
+    into.truncated = into.truncated or page.truncated
+
+
+def _follow_query_pages(
+    token: str, body: dict, payload: Any, parsed: QueryRows
+) -> None:
+    """Read the remaining pages of a query into ``parsed``.
+
+    Cost Management continues a POST query by re-POSTing the same body to the
+    ``nextLink`` it returned.
+    """
+    pages = 1
+    while True:
+        url, refused = _next_query_link(payload)
+        if refused:
+            parsed.truncated = True
+            return
+        if not url:
+            return
+        if pages >= MAX_QUERY_PAGES:
+            parsed.truncated = True
+            return
+        response = arm_post(token, url, body, "cost query")
+        if response.status_code != 200:
+            parsed.truncated = True
+            return
+        payload = _json(response)
+        _merge_query_rows(parsed, parse_query_response(payload))
+        pages += 1
+
+
 def fetch_query(
     token: str,
     subscription_id: str,
@@ -768,7 +854,9 @@ def fetch_query(
 ) -> tuple[QueryRows, str]:
     """Run one cost query, retrying once with the other cost metric name.
 
-    Returns (parsed, metric_name_that_worked).
+    Follows ``nextLink`` until the results run out, the link points somewhere
+    other than ARM, or the page cap is reached; the last two mark the result
+    truncated. Returns (parsed, metric_name_that_worked).
     """
     url = (
         f"{_scope(subscription_id)}/providers/Microsoft.CostManagement/query"
@@ -788,13 +876,18 @@ def fetch_query(
         )
         response = arm_post(token, url, body, "cost query")
         if response.status_code == 200:
+            payload = _json(response)
+            parsed = parse_query_response(payload)
+            _follow_query_pages(token, body, payload, parsed)
             log.debug(
                 "provider api diagnosis provider=azure classification=query_ok "
-                "metric=%s marketplace=%s",
+                "metric=%s marketplace=%s rows=%s truncated=%s",
                 metric,
                 marketplace_only,
+                parsed.row_count,
+                parsed.truncated,
             )
-            return parse_query_response(_json(response)), metric
+            return parsed, metric
         last_status = response.status_code
         if response.status_code != 400:
             break
@@ -1367,6 +1460,7 @@ class AzureProvider(Provider):
             service_count=service_count,
             row_count=parsed.row_count,
             cost_metric=cost_metric,
+            partial=parsed.truncated,
             notes=notes,
         )
         fetched_at = datetime.now()

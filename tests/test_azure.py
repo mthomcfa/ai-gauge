@@ -1052,3 +1052,54 @@ def test_a_non_list_value_in_discovery_does_not_raise(bad):
 def test_the_error_backoff_exponent_is_capped():
     """~1030 consecutive errors used to raise OverflowError out of the backoff."""
     assert az._error_backoff(5000) == az.MAX_ERROR_BACKOFF
+
+
+# --- the cost query is paged ------------------------------------------------
+#
+# Daily granularity grouped on ResourceId *and* ServiceName reaches the API's
+# ~1000-row page at roughly 33 resources over a month, so a busy subscription
+# is exactly the one that would have under-reported.
+
+
+@responses.activate
+def test_the_cost_query_follows_nextlink_and_sums_every_page():
+    page1 = query_payload([[10.0, 20260901, STORAGE_ID, "Storage", "CAD"]])
+    page1["properties"]["nextLink"] = f"{QUERY_URL}?$skiptoken=abc"
+    page2 = query_payload([[5.0, 20260902, OPENAI_ID, "Azure OpenAI", "CAD"]])
+    responses.add(responses.POST, QUERY_URL, json=page1, status=200)
+    responses.add(responses.POST, QUERY_URL, json=page2, status=200)
+
+    parsed, _metric = az.fetch_query("tok", SUB, date(2026, 9, 1), date(2026, 10, 1))
+    assert parsed.total == pytest.approx(15.0)
+    assert parsed.row_count == 2
+    assert parsed.by_service["Azure OpenAI"] == pytest.approx(5.0)
+    assert parsed.truncated is False
+    assert len(responses.calls) == 2
+
+
+@responses.activate
+def test_a_foreign_nextlink_on_the_cost_query_is_never_requested(monkeypatch, config):
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    payload = query_payload(DEFAULT_ROWS)
+    payload["properties"]["nextLink"] = "https://management.azure.com.evil.example/x"
+    responses.replace(responses.POST, QUERY_URL, json=payload, status=200)
+
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+    hosts = {requests.utils.urlparse(c.request.url).hostname for c in responses.calls}
+    assert hosts <= {"login.microsoftonline.com", "management.azure.com"}
+    summary = snapshot.metrics[0]
+    # A partial total must not be presented as a clean gauge.
+    assert summary.percent_used is None
+    assert "truncated" in (summary.note or "").lower()
+
+
+@responses.activate
+def test_the_query_page_loop_is_capped():
+    payload = query_payload([[1.0, 20260901, STORAGE_ID, "Storage", "CAD"]])
+    payload["properties"]["nextLink"] = f"{QUERY_URL}?$skiptoken=forever"
+    responses.add(responses.POST, QUERY_URL, json=payload, status=200)
+
+    parsed, _metric = az.fetch_query("tok", SUB, date(2026, 9, 1), date(2026, 10, 1))
+    assert len(responses.calls) == az.MAX_QUERY_PAGES
+    assert parsed.truncated is True
