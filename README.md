@@ -271,6 +271,14 @@ timestamp of the real fetch. It also honours the API's own back-off headers on
 a 429. Cost Management rate limits are shared across your whole tenant, so this
 throttle protects anything else you run against the same subscription.
 
+Saving Settings does not buy a fetch either. A change to what the query asks
+for — the reset day, the resource group, the Marketplace toggle, pinned
+Foundry IDs — leaves the previous figures on the tile without a percentage,
+with a note saying the settings changed and when the next fetch is due; the
+new question is asked at that fetch. The allowance and the row count only
+change how the answer is shown, so those take effect immediately, from the
+cached result.
+
 The tile's top row always says which date the numbers are actually from.
 
 #### Checking it against a real account

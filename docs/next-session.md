@@ -490,6 +490,15 @@ unnecessary source of behaviour change.
   the marketplace query returns a (resource, service) pair the main query does
   not, its cost does not appear anywhere and no note says so. The alternative —
   adding it — would break the invariant that the buckets sum to the total.
+  (A marketplace query that was *cut short* is different and is handled: the
+  split is discarded for that refresh and the note says so.)
+- **A failed discovery is cached like a successful one.** The offer read and
+  the Foundry account list are both taken under one `DISCOVERY_TTL` stamp that
+  is written whether or not they succeeded, so a 403 or a 500 on the offer
+  read costs the gauge for 24 hours, not for one refresh — the note says
+  Reader is what the check needs, but nothing retries it sooner. Stamping only
+  a successful read, or retrying discovery at the next window while keeping
+  the rest cached, is the fix and was not made here.
 - **The App-level in-flight scheduler has no watchdog.** `app.py` clears
   `_inflight` only when a snapshot arrives, and `_schedule_next_refresh`,
   `refresh_now` and `refresh_provider` all return early while it is non-empty.
@@ -525,21 +534,36 @@ the calls that were made, and why:
   (tenant, client, secret digest); changing it resets the whole `_State` and
   the token cache, because everything cached describes a different app
   registration. `_query_identity` is what the request asks for (reset day,
-  resource group, marketplace toggle, row count, pinned Foundry ids);
-  changing it drops only `aggregate`, `fetched_at` and `last_error` and keeps
-  `last_fetch_at`, `blocked_until` and `consecutive_errors`. A settings save is
-  a one-click human action that is easy to loop, and "at most one live fetch an
-  hour" is a promise made to the tenant, not to this tile — so the next render
-  is the fail-closed "waiting for the next Azure fetch window" snapshot. That
-  includes `top_rows`, which is only a display setting: re-bucketing it without
-  a refetch would mean holding every parsed row (up to `MAX_QUERY_ROWS` of
-  them) for the life of the process.
+  resource group, marketplace toggle, pinned Foundry ids); changing it marks
+  the cached aggregate `stale_settings` and keeps `last_fetch_at`,
+  `blocked_until` and `consecutive_errors`. A settings save is a one-click
+  human action that is easy to loop, and "at most one live fetch an hour" is a
+  promise made to the tenant, not to this tile — so no fetch follows the save.
+  What the tile shows until the window opens is the old figures with no
+  percentage on any row and a note naming the time of the next fetch: those
+  amounts are still the last real reading of this subscription, and dropping
+  them left the tile in error for up to an hour with nothing saying why. Only
+  a fetch that succeeds under the new settings clears the flag.
+- **The row count and the allowance are display settings, in neither
+  identity.** `build_snapshot` re-reads both on every render, so editing
+  either re-renders from the cached aggregate with no API call. That is why
+  the aggregate keeps every distinct bucket (`MAX_KEPT_BUCKETS`, with the tail
+  pre-folded into Other) rather than only the rows the setting asked for at
+  fetch time: the alternative — holding every parsed row, up to
+  `MAX_QUERY_ROWS` of them, for the life of the process — is what made
+  `top_rows` part of the query identity in the first place, and the cap here
+  is on distinct service names instead.
 - **A tolerant sub-fetch re-raises `AzureThrottled`.** The five of them
   (`_safe_quota_id`, `_safe_foundry_ids`, `_safe_budget`, `_safe_forecast`, the
   marketplace query) share one shape: re-raise the 429, note a permission
   error, note anything else. A 429 is an answer about the whole tenant, not a
   detail of one sub-fetch, and `_fetch`'s handler is the only place it is
-  recorded.
+  recorded. A 5xx is raised into that last branch rather than returned as an
+  empty answer (`_server_error`), because "the server is failing" and "there
+  is nothing here" reached the caller as the same value and the note never
+  fired for the failure that actually happens. A 4xx still returns: a forecast
+  a new subscription has no history for is a 400, and a note on every refresh
+  would be noise.
 - **A cost column is found by name, never by position**, and its absence is an
   error routed through `_remember_error`. `row_count == 0` *with* a column is
   still a legitimate empty month, since the data lags 8–72 h.
@@ -552,15 +576,21 @@ the calls that were made, and why:
   the sponsored credit drains unreported. The money is still shown and the
   note says Reader is what the check needs; only the percentage is refused.
 - **One `gaugeable` flag governs every percentage on the tile.** An allowance,
-  a complete read, and nothing about the data that makes the sum meaningless.
-  The summary percent, the breakdown shares and whether there is a forecast
-  row at all follow it together, because a tile that says "no gauge is shown
-  for a subtotal" and then prints a projection of that subtotal one row down
-  has told the reader nothing.
+  a complete read, one billing currency, a readable offer type, no Sponsorship
+  offer, and settings that have not changed since the figures were read. The
+  summary percent, the breakdown shares and whether there is a forecast row at
+  all follow it together, because a tile that says "no gauge is shown for a
+  subtotal" and then prints a projection of that subtotal one row down has
+  told the reader nothing. Sponsorship was the last reason to sit outside the
+  flag — it suppressed the summary percentage by its own path and left the
+  rows below it gauged.
 - **A number the tile has disowned is never printed.** More than one billing
   currency shows per-currency subtotals (`CAD 100.00 + JPY 1,000.00`, at most
   three then `+N more`), never their sum. A truncated read shows `incomplete`
-  on the row and moves the subtotal into the note, labelled as read so far.
+  on the row and moves the subtotal into the note, labelled as read so far —
+  except when the read stopped on a repeated `nextLink`, where the subtotal is
+  too *high* rather than too low and the note says it may count rows more than
+  once.
 - **`_snapshot_signature` ignores `reset_label`, for every provider.** It is a
   caption — a ticking countdown, or Azure's spend to the cent — and either one
   counted as "this provider changed", which reset the adaptive backoff and
@@ -575,9 +605,10 @@ the calls that were made, and why:
   `reset_day == 1`, only when its currency matches the cost data, and only
   when it measures the same scope: unfiltered when the tile is unfiltered, or
   filtered to exactly the configured resource group when it is. An unfiltered
-  budget on a resource-group-filtered tile is refused too — it under-reports
-  by the ratio between them. The smallest qualifying one wins. Budget
-  pagination is deliberately not followed.
+  budget on a resource-group-filtered tile is refused too: it covers spend the
+  tile does not measure, so the gauge would under-report by the ratio between
+  them. The smallest qualifying one wins. Budget pagination is deliberately
+  not followed.
 - **The period boundary is a UTC date**, because that is how Cost Management
   dates usage; `resets_at` converts it to local time for display. Copilot does
   the same, so the two Microsoft tiles agree about the 1st of the month.

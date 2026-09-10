@@ -90,116 +90,137 @@ Copilot is unchanged and simply moves under it. Azure is new.
 ### Hardening from review
 
 Three reviews — security, correctness and adversarial — went over the Azure
-work before it merged. What they found, and what changed:
+work in three rounds before it merged, each round re-reading the previous
+round's fixes. What follows is not a diary of the rounds: it is the set of
+rules that came out of them and now stand, with the failure each one closes.
 
-- **The hourly throttle now fails closed.** It is the property the whole module
-  is shaped around, because Cost Management quotas are shared tenant-wide. An
-  exception outside `_fetch`'s except list left the state object blank, and the
-  gate only engaged on state a *finished* fetch leaves behind — so with nothing
-  cached and nothing remembered it fell through and fetched live on every
-  refresh cycle. One malformed field was enough to reach it: a non-string
-  `nextLink`, or a `Retry-After` of `inf`, which threw the 429 handling away
-  along with the server's own back-off. The gate now returns a "waiting for the
-  next fetch window" snapshot rather than falling through, every outcome is
-  recorded, a fetch already in flight dispatches nothing more, and a clock that
-  jumped forward no longer parks the tile forever.
+- **The hourly throttle fails closed.** It is the property the whole module is
+  shaped around, because Cost Management quotas are shared tenant-wide. Inside
+  the window with nothing cached and nothing remembered, the gate returns a
+  "waiting for the next fetch window" snapshot rather than falling through to
+  a live fetch — the old gate only engaged on state a *finished* fetch leaves
+  behind, so one exception outside `_fetch`'s except list left `_State` blank
+  and the tile fetched on every refresh cycle. Every outcome is now recorded,
+  including an exception no one anticipated; one malformed field was enough to
+  reach the old hole (a non-string `nextLink`, or a `Retry-After` of `inf`,
+  which threw the 429 handling away along with the server's own back-off).
+  A fetch already in flight dispatches nothing more, a dispatch that fails
+  before the worker runs does not leak the in-flight flag, the flag expires
+  after 15 minutes so a lost worker cannot park the tile for the life of the
+  process, and a clock that jumped in either direction cannot park it either.
+- **Two identities, because a settings save is not a new tenant.** The
+  credential triple (tenant, client, secret digest) is one identity: changing
+  it resets the whole `_State` and the cached bearer, since everything held
+  describes a different app registration. What the request *asks for* — the
+  reset day, the resource group, the Marketplace toggle, the pinned Foundry
+  ids — is a second: changing it drops the gauge but not the throttle, because
+  "at most one live fetch an hour" is a promise to the tenant rather than to
+  this tile, and ten OK presses in Settings used to be ten live fetches. The
+  old figures are still shown, with no percentage on any row and a note saying
+  the settings changed and when the next fetch is due. The row count and the
+  allowance are display settings and are in neither identity: both re-render
+  from the cached aggregate with no API call, which is why the aggregate keeps
+  every distinct bucket rather than only the rows the setting asked for.
 - **The cost query follows `nextLink`.** The Query API pages at ~1000 rows,
   which Daily granularity grouped on ResourceId and ServiceName reaches at
   roughly 33 resources — so page 1's subtotal was being shown as the month's
   spend on exactly the busiest subscriptions. Pages are followed back to ARM
-  only, capped at 20, and a truncated result carries a note and no gauge.
-- **Identifiers no longer ride out on an error string.** A transport failure
-  stringifies with the request URL, and every ARM URL carries the subscription
-  or tenant GUID; Copy diagnostics redacted it but `ai-gauge.log`, the tile
-  tooltip, the error dialog and `--probe` did not. Errors now name the
-  exception type instead of quoting it, the log line and the dialog header are
-  redacted, the header is escaped (it is rich text), and the redaction pass
-  itself covers child resource names, `%2F`-encoded paths and un-hyphenated
-  GUIDs.
+  only, capped at 20, and every way the loop can end early marks the result
+  truncated: a refused host, a non-200, a page whose body carries no readable
+  cost column (an ARM error document returned as 200 on page 7 merged as zero
+  and gauged the under-reported total), a link back to a page already read,
+  and a spent request budget. A repeated link is the one case where the
+  subtotal is too *high* rather than too low, and the note says so instead of
+  "read so far". One refresh also has a wall-clock deadline and a request
+  ceiling for its page loops.
+- **The tile never prints a number it has just disowned.** One flag governs
+  the summary percentage, the breakdown shares and whether there is a forecast
+  row at all: an allowance, a complete read, one billing currency, a readable
+  offer type, no Sponsorship offer, and settings that have not changed since
+  the figures were read. A share of a total the summary refused to gauge is
+  the same wrong number one row down, and a forecast built from it is that
+  number projected. The amounts are always shown; only the percentages go.
+  More than one billing currency shows per-currency subtotals rather than
+  their meaningless sum, and a truncated read reads "incomplete" on the row
+  with the subtotal moved into the note.
+- **An unreadable offer type shows no gauge, whatever the total.** Cost
+  Management Reader without Reader is the likely role split, and an Azure
+  Sponsorship subscription reports zero cost while the sponsored credit
+  drains. A positive total does not rule that out — a sponsored subscription
+  still bills Marketplace and other non-sponsored charges normally — so
+  **Reader is required for a gauge**, not only for the Foundry roll-up. Said
+  in the README and in the settings hint.
+- **A typed allowance is always the denominator.** "Smallest qualifying budget
+  wins" is the right rule between budgets and the wrong rule against a number
+  a person typed: a 1.00 alert canary or a per-team budget would otherwise
+  take the tile and the tray dot over. A qualifying budget is reported in the
+  note instead, and becomes the denominator only when nothing is typed. Even
+  then it has to measure the same money: a budget in another currency, one
+  scoped to a different resource group, one covering the whole subscription
+  while the tile is filtered to a resource group (it covers spend the tile
+  does not measure, so the gauge would under-report), a non-finite amount, or
+  any budget at all when the reset day is not the 1st (a Budget's monthly
+  grain is the calendar month) is refused, with a note saying so.
 - **The Marketplace row moves a charge, not a resource.** It was keyed on
   resource id, so a resource with 900.00 of ordinary usage and 1.00 of
-  Marketplace charge reported all 901.00 as Marketplace spend.
-- **An Azure Budget is only used when it measures the same money.** A budget in
-  another currency, one scoped to a different resource group, a non-finite
-  amount, or any budget at all when the reset day is not the 1st (a Budget's
-  monthly grain is the calendar month) is refused, with a note saying so and
-  the Settings allowance used instead. Where several apply, the smallest wins.
-- **Several more ways to print a confident wrong number are closed.** An
-  unreadable cost column or an ARM error body returned as 200 is an error
-  rather than a month with no spend; the cost column is never guessed from
-  position; zero spend with the offer type unreadable carries no gauge, because
-  that is what an unsupported Sponsorship subscription looks like; rows in
-  several currencies are not added together; a forecast below the spend already
-  recorded is dropped; breakdown shares are clamped for display; a usage date
-  in the future is not "data as of"; and row counts, currency codes and service
-  names are bounded at parse time.
-- **The cached bearer token behaves like the credential it is.** It is keyed on
-  the secret's digest, dropped when the secret is saved or cleared, dropped on
-  an ARM 401, and dropped when the app registration changes — a rotated secret
-  used to keep producing a working tile for the rest of the token's lifetime.
-- **Settings reach the next request.** The reset day, resource group,
-  marketplace toggle, row count and pinned Foundry ids are part of the cache
-  key now, so changing one refetches instead of replaying the old answer for an
-  hour. The allowance spin box matches the config bound rather than silently
-  rewriting a large allowance, a Foundry *project* id can be pinned, and the
-  ids are re-validated where they become URLs.
+  Marketplace charge reported all 901.00 as Marketplace spend; it is keyed on
+  the (resource, service) pair with a per-row clamp. A Marketplace query that
+  was cut short discards the split for that refresh rather than moving part of
+  a resource's charge and leaving the rest — the month's total does not depend
+  on it, so the row goes and the note says why.
+- **A tolerant sub-fetch costs a row, never the tile — and never the
+  back-off.** The offer read, Foundry discovery, budgets, the forecast and the
+  Marketplace query all share one shape: re-raise a 429, because it is an
+  answer about the whole tenant and dropping it meant issuing more requests
+  inside the window Azure had just asked us to stay out of; note a permission
+  error; note anything else. A 5xx raises rather than reading as an empty
+  answer, so the note fires for the failure that actually happens rather than
+  only for the rarer 403.
+- **Identifiers do not ride out on an error string.** A transport failure
+  stringifies with the request URL, and every ARM URL carries the subscription
+  or tenant GUID; Copy diagnostics redacted it but `ai-gauge.log`, the tile
+  tooltip, the error dialog and `--probe` did not. Errors name the exception
+  type instead of quoting it, no Azure log line writes a traceback, and the
+  dialog header redacts first and escapes last so the markers are visible
+  rather than eaten as unknown tags. The redaction pass is a scalpel: child
+  resource names and `%2F`-encoded paths are covered, names containing an
+  apostrophe redact whole, and the un-hyphenated GUID rule is anchored to
+  Azure contexts so another provider's md5 or session id survives the blob.
+  `_sanitize_raw` caps dict keys, list, tuple and set contents and depth; the
+  email pattern is bounded at both ends and linear, with bounds wide enough to
+  cover the whole run they have to match; and the AAD error code is one token.
+- **The cached bearer token behaves like the credential it is.** Keyed on the
+  secret's digest, dropped before *and* after the secret is saved or cleared,
+  dropped on an ARM 401, and dropped when the app registration changes — a
+  rotated secret used to keep producing a working tile for the rest of the
+  token's lifetime.
+- **Nothing the server sends can steer a request.** `nextLink` is host-pinned
+  on both page loops; `Retry-After` is parsed defensively and capped; the cost
+  column is found by name, never by position, and a name that makes it an
+  identifier or a classification (`CostCenter`) is refused; row counts,
+  currency codes and service names are bounded at parse time; a usage date in
+  the future is not "data as of". A poisoned `config.json` coerces field by
+  field instead of failing to load, and a resource id containing a path
+  traversal segment is refused.
 - **The allowance period is a UTC window**, matching how Cost Management dates
-  its usage, with the boundary shown in local time. The summary row's label is
-  stable ("Spend this month"), with the amounts alongside the bar, so history
-  keys one period instead of one per fetch.
-
-A second round of the same three reviews went over the fixes. What it found
-was of one kind: places where a rule was enforced at one point and not at its
-twin.
-
-- **The throttle class, not the trigger.** The tolerant sub-fetches had been
-  widened to `except Exception`, which swallowed the 429 they were never meant
-  to catch — so the tenant-wide back-off Azure asked for was dropped and the
-  refresh carried on issuing requests inside it. All five now re-raise it, note
-  a permission error and note anything else; a 403 on the marketplace query no
-  longer discards a cost query that already succeeded. A dispatch that fails
-  before the worker runs no longer leaks the in-flight flag and parks the tile
-  until restart, and the flag expires. The identity check is split, so changing
-  what the request asks for drops the cached answer without reopening the fetch
-  window: ten OK presses in Settings were ten live fetches. Two log lines no
-  longer write a traceback whose message is the request URL. A refresh has a
-  wall-clock deadline and a request ceiling for its page loops.
-- **The pagination class.** The cost-column rule now runs on every page, not
-  only the first: an ARM error document returned as 200 on page 7 of 12 merged
-  as zero and the under-reported total was shown as a clean gauge. A `nextLink`
-  that points back at a page already read stops the loop instead of counting
-  its rows again.
-- **The tile never prints a number it has just disowned.** One flag governs the
-  summary percent, the breakdown shares and whether there is a forecast row at
-  all. More than one billing currency shows per-currency subtotals rather than
-  their meaningless sum; a truncated read reads "incomplete" and moves the
-  subtotal into the note. An unreadable offer type now refuses the gauge
-  whatever the total — a Sponsorship subscription still bills Marketplace and
-  other non-sponsored charges, so a positive total does not rule it out. The
-  printed reset day comes from the same instant the countdown counts to.
-- **A typed allowance is always the denominator**, with a qualifying budget
-  reported in the note instead of replacing it; and an unfiltered budget is
-  refused for a tile filtered to one resource group, which it over-counts.
-- **Redaction is a scalpel again.** The compact-GUID rule is anchored to Azure
-  contexts and the resource-name rule needs a dotted namespace, so an md5 or
-  another provider's `/providers/` URL survives the blob. Names containing an
-  apostrophe redact whole. The dialog header redacts first and escapes last, so
-  the markers are visible rather than eaten as unknown tags. `_sanitize_raw`
-  caps dict keys and tuples and has a depth cap, the email pattern is bounded
-  at both ends, the AAD error code is one token, and the token cache is cleared
-  before as well as after the keyring write.
+  its usage, with the boundary shown in local time — the printed reset day now
+  comes from the same instant the countdown counts to. The summary row's label
+  is stable ("Spend this month"), with the amounts alongside the bar, because
+  history keys an in-flight period on the label and a label carrying the
+  running total opened a new period on every fetch.
 - **Refresh cadence ignores `reset_label`, for every provider.** It is a
   caption — a ticking countdown, or spend to the cent — and either one counted
   as activity and pushed the whole app back into active-cadence polling.
 
 ### Testing
 
-- 907 → 1080 tests. Every finding in both rounds now has a regression test that
-  fails on the code as reviewed — round 1 shipped five that did not, which a
-  mutation run over the fixes is what found. Several drive the real worker
-  rather than the inline stand-in the suite had been using (which is why the
-  throttle hole was invisible to it), and the UTC-period tests run under a
-  non-UTC zone, where they had been tautologies.
+- 907 → 1099 tests. Every finding in all three rounds has a regression test
+  that fails on the code as reviewed — round 1 shipped five that did not,
+  which a mutation run over the fixes is what found, and each later round's
+  fixes were mutated the same way. Several drive the real worker rather than
+  the inline stand-in the suite had been using (which is why the throttle hole
+  was invisible to it), and the UTC-period tests run under a non-UTC zone,
+  where they had been tautologies.
 
 ## 1.1.0+cfa.3 - 2026-09-09
 

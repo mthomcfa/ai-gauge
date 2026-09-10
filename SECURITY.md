@@ -171,11 +171,15 @@ bearer tokens, and sensitive response bodies. Review logs before sharing them
 in an issue.
 
 **Copy diagnostics** additionally redacts Azure identifiers before the blob
-reaches the clipboard: GUIDs become `<guid>`, and resource-group and resource
-names become `<redacted>`. A subscription or tenant GUID identifies the account
-the way an email address does, and resource names are chosen by the account
-holder — they routinely name a client or a project. The resource *shape* is
-kept, so a bug report still says which provider and resource type was involved.
+reaches the clipboard: GUIDs become `<guid>` — the hyphenated form anywhere,
+and the un-hyphenated 32-hex form only where it is written as part of an Azure
+path (`subscriptions/`, `tenants/`, `directories/`, or their `%2F`-encoded
+equivalents), so that another provider's md5, ETag or session id survives the
+blob intact — and resource-group and resource names become `<redacted>`. A
+subscription or tenant GUID identifies the account the way an email address
+does, and resource names are chosen by the account holder — they routinely
+name a client or a project. The resource *shape* is kept, so a bug report
+still says which provider and resource type was involved.
 The Azure provider also builds its own diagnostic payload as an allowlist that
 contains no identifiers at all, so the redaction pass is defence in depth
 rather than the only guard.
