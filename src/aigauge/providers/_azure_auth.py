@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import re
 import threading
 from dataclasses import dataclass
@@ -34,6 +35,11 @@ _EXPIRY_SKEW = timedelta(minutes=5)
 # in a RichText dialog header. Reduce it to the alphabet a code can have.
 _CODE_RE = re.compile(r"[^A-Za-z0-9_.\-]")
 _CODE_MAX_LEN = 64
+# Bounds on the lifetime Entra ID claims for a token. An hour is the norm; the
+# bounds are here so a hostile or broken value cannot produce a cache entry
+# that is either useless or effectively immortal.
+_MIN_LIFETIME_S = 60
+_MAX_LIFETIME_S = 86400
 
 
 class AzureAuthError(Exception):
@@ -169,12 +175,21 @@ def get_token(
     if not token or not isinstance(token, str):
         raise AzureAuthError("Entra ID returned no access_token.")
 
+    # int(float("inf")) raises OverflowError, and json.loads accepts both
+    # Infinity and 1e20 - the same defect class that threw a 429's back-off
+    # away one file over. Parse defensively, then clamp: a token that claims a
+    # one-second life is as unusable as one that claims a century.
     try:
-        expires_in = int(payload.get("expires_in", 0) or 0)
-    except (TypeError, ValueError):
+        number = float(payload.get("expires_in", 0) or 0)
+        expires_in = int(number) if math.isfinite(number) else 0
+    except (TypeError, ValueError, OverflowError):
         expires_in = 0
     # A missing/unusable expires_in must not produce an immortal cache entry.
-    lifetime = timedelta(seconds=expires_in) if expires_in > 0 else timedelta(minutes=10)
+    lifetime = (
+        timedelta(seconds=max(_MIN_LIFETIME_S, min(expires_in, _MAX_LIFETIME_S)))
+        if expires_in > 0
+        else timedelta(minutes=10)
+    )
     expires_at = now + max(timedelta(minutes=1), lifetime - _EXPIRY_SKEW)
 
     with _LOCK:

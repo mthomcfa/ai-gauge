@@ -38,6 +38,7 @@ import hashlib
 import logging
 import math
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
@@ -73,6 +74,11 @@ MAX_ERROR_BACKOFF = timedelta(hours=6)
 # Discovery calls (offer type, Foundry resource list) describe things that
 # change on the order of months, not minutes.
 DISCOVERY_TTL = timedelta(hours=24)
+# in_flight is set by the caller and cleared by the worker, so a worker that
+# never reports back - killed, hung on a socket the timeout did not cover -
+# would hold the tile until the process restarts. Nothing else can clear it,
+# so it expires.
+IN_FLIGHT_STALE_AFTER = timedelta(minutes=15)
 
 # Same value as OpenRouter's MODEL_BREAKDOWN_TAG, and it must stay that way:
 # history.py, gauge.provider_max_percent and the menu-bar dot all filter on the
@@ -101,6 +107,12 @@ _COST_COLUMN_CANDIDATES = ("Cost", "PreTaxCost", "CostUSD", "PreTaxCostUSD", "to
 # nextLink is therefore the normal case on a busy subscription, not an edge one.
 # The cap is a ceiling on one refresh's request count, not an expected limit.
 MAX_QUERY_PAGES = 20
+# One refresh's own ceiling, on top of the per-request timeout. Page loops are
+# the only thing here that multiplies: 20 cost-query pages plus 20 marketplace
+# pages plus 10 discovery pages at REQUEST_TIMEOUT each is ~13 min on one
+# QThreadPool thread that every other provider is queued behind.
+REFRESH_DEADLINE_SECONDS = 90.0
+MAX_ARM_REQUESTS_PER_REFRESH = 40
 # A ceiling on what one response can cost us in memory and time. A period with
 # 50 000 daily ResourceId x ServiceName rows is already outside this tile's
 # design; past this the total is a subtotal and says so.
@@ -874,6 +886,41 @@ def arm_get(token: str, url: str, what: str) -> requests.Response:
     return response
 
 
+@dataclass
+class _RequestBudget:
+    """A wall-clock and request-count ceiling for one refresh.
+
+    It guards the two loops that can multiply - the cost-query ``nextLink``
+    chain and the discovery page loop - because those are what turn a slow or
+    hostile ARM into minutes of a shared ``QThreadPool`` thread. The fixed
+    handful of calls around them (token, subscription, budgets, forecast) is
+    deliberately outside it: they cannot repeat, so counting them would only
+    make the ceiling harder to reason about.
+
+    ``clock`` is injected so a test can exhaust the deadline without waiting.
+    """
+
+    deadline_seconds: float = REFRESH_DEADLINE_SECONDS
+    max_requests: int = MAX_ARM_REQUESTS_PER_REFRESH
+    clock: Callable[[], float] = time.monotonic
+    used: int = 0
+    exhausted: bool = False
+    started_at: float = 0.0
+
+    def __post_init__(self) -> None:
+        self.started_at = self.clock()
+
+    def spend(self) -> bool:
+        """Take one request from the budget; False when there is none left."""
+        if self.used >= self.max_requests or (
+            self.clock() - self.started_at > self.deadline_seconds
+        ):
+            self.exhausted = True
+            return False
+        self.used += 1
+        return True
+
+
 def _scope(subscription_id: str) -> str:
     # Re-validated here, at the point the id becomes a URL, and not only where
     # it was stored: AzureConfig coerces a bad id to None at load and the
@@ -1008,12 +1055,19 @@ def _merge_query_rows(into: QueryRows, page: QueryRows) -> None:
 
 
 def _follow_query_pages(
-    token: str, body: dict, payload: Any, parsed: QueryRows
+    token: str,
+    body: dict,
+    payload: Any,
+    parsed: QueryRows,
+    budget: "_RequestBudget | None" = None,
 ) -> None:
     """Read the remaining pages of a query into ``parsed``.
 
     Cost Management continues a POST query by re-POSTing the same body to the
-    ``nextLink`` it returned.
+    ``nextLink`` it returned. Every way this loop can end early - a refused
+    host, the page cap, a non-200, a body with no readable cost column, a link
+    it has already followed, an exhausted request budget - marks the result
+    truncated, because the alternative is a subtotal shown as a total.
     """
     pages = 1
     while True:
@@ -1026,12 +1080,21 @@ def _follow_query_pages(
         if pages >= MAX_QUERY_PAGES:
             parsed.truncated = True
             return
+        if budget is not None and not budget.spend():
+            log.warning(
+                "provider api diagnosis provider=azure "
+                "classification=query_budget_exhausted pages=%s",
+                pages,
+            )
+            parsed.truncated = True
+            return
         response = arm_post(token, url, body, "cost query")
         if response.status_code != 200:
             parsed.truncated = True
             return
         payload = _json(response)
-        _merge_query_rows(parsed, parse_query_response(payload))
+        page = parse_query_response(payload)
+        _merge_query_rows(parsed, page)
         pages += 1
 
 
@@ -1044,6 +1107,7 @@ def fetch_query(
     cost_metric: str = COST_METRIC_PRIMARY,
     resource_group: str | None = None,
     marketplace_only: bool = False,
+    budget: "_RequestBudget | None" = None,
 ) -> tuple[QueryRows, str]:
     """Run one cost query, retrying once with the other cost metric name.
 
@@ -1077,7 +1141,7 @@ def fetch_query(
                 raise requests.HTTPError(
                     "Cost Management returned no cost column"
                 )
-            _follow_query_pages(token, body, payload, parsed)
+            _follow_query_pages(token, body, payload, parsed, budget)
             log.debug(
                 "provider api diagnosis provider=azure classification=query_ok "
                 "metric=%s marketplace=%s rows=%s truncated=%s",
@@ -1321,7 +1385,12 @@ def is_sponsorship(quota_id: str | None) -> bool:
     return "sponsor" in (quota_id or "").lower()
 
 
-def fetch_foundry_resource_ids(token: str, subscription_id: str) -> set[str]:
+def fetch_foundry_resource_ids(
+    token: str,
+    subscription_id: str,
+    *,
+    budget: "_RequestBudget | None" = None,
+) -> set[str]:
     """Foundry resource ids, discovered by resource *kind*.
 
     Not by ResourceType: Azure OpenAI, Speech, Vision, Language and Foundry all
@@ -1337,6 +1406,13 @@ def fetch_foundry_resource_ids(token: str, subscription_id: str) -> set[str]:
     found: set[str] = set()
     pages = 0
     while url and pages < 10:
+        if budget is not None and not budget.spend():
+            log.warning(
+                "provider api diagnosis provider=azure "
+                "classification=discovery_budget_exhausted pages=%s",
+                pages,
+            )
+            break
         response = arm_get(token, url, "Cognitive Services accounts")
         if response.status_code != 200:
             log.info(
@@ -1381,6 +1457,10 @@ class _State:
     # worse, a user who has just fixed a wrong client secret would keep seeing
     # the auth error for the rest of the backoff window. See _identity().
     identity: tuple | None = None
+    # What the *request* asks for, as opposed to who is asking. Kept apart
+    # from ``identity`` because the two invalidate different things: see
+    # _query_identity().
+    query_identity: tuple | None = None
     last_fetch_at: datetime | None = None
     # Set before a work item is dispatched and cleared when it finishes. Two
     # refreshes arriving before the first completes would otherwise both pass
@@ -1405,10 +1485,8 @@ _STATES: dict[str, _State] = {}
 _STATES_LOCK = threading.Lock()
 
 
-def _identity(
-    tenant_id: str, client_id: str, client_secret: str, azure_cfg
-) -> tuple:
-    """A change detector for everything the cached aggregate depends on.
+def _identity(tenant_id: str, client_id: str, client_secret: str) -> tuple:
+    """*Who* is asking. A change here resets the whole _State.
 
     The secret is reduced to a truncated digest purely so that *rotating* it
     invalidates the cached backoff: without this, a user who fixed a wrong
@@ -1417,18 +1495,37 @@ def _identity(
     worked. An unchanged wrong secret still backs off, so a bad credential is
     not retried every five minutes against Entra ID.
 
-    The query-shaping settings are here for the same reason. They are consumed
-    inside _fetch - which period, which scope, which queries, which buckets -
-    so a cached aggregate built before the change answers a different question
-    than the one the settings now ask, and the throttle would replay it for an
-    hour with a manual Refresh unable to force it. Only monthly_allowance is
-    absent, because build_snapshot re-reads it on every render.
+    Everything cached under the old triple - the aggregate, the bearer, the
+    throttle window, the error backoff - describes a different app
+    registration, so all of it goes.
     """
     digest = hashlib.sha256(client_secret.encode("utf-8", "replace")).hexdigest()
+    return (tenant_id, client_id, digest[:16])
+
+
+def _query_identity(azure_cfg) -> tuple:
+    """*What* the request asks for. A change here drops only the answer.
+
+    These settings are consumed inside _fetch - which period, which scope,
+    which queries, which buckets - so a cached aggregate built before the
+    change answers a different question than the one the settings now ask, and
+    the throttle would otherwise replay it for an hour.
+
+    What it deliberately does **not** drop is ``last_fetch_at``,
+    ``blocked_until`` and ``consecutive_errors``. Those are promises made to
+    the *tenant*, not to this tile: README and SECURITY.md say at most one live
+    fetch an hour, and a settings save is a one-click human action that is easy
+    to loop. So the next render is the fail-closed "waiting for the next Azure
+    fetch window" snapshot rather than a fresh query.
+
+    ``top_rows`` is only a display setting, but re-bucketing it without a
+    refetch would mean keeping every parsed row alongside the aggregate (up to
+    MAX_QUERY_ROWS of them) for the life of the process, so it is treated like
+    the rest: the answer is dropped and re-read at the next window.
+    ``monthly_allowance`` is absent because build_snapshot re-reads it on every
+    render, so editing it re-colours the gauge with no API call at all.
+    """
     return (
-        tenant_id,
-        client_id,
-        digest[:16],
         getattr(azure_cfg, "reset_day", 1),
         getattr(azure_cfg, "resource_group", None) or "",
         bool(getattr(azure_cfg, "include_marketplace", False)),
@@ -1545,7 +1642,8 @@ class AzureProvider(Provider):
         ):
             state.blocked_until = None
 
-        identity = _identity(tenant_id, client_id, secret, azure_cfg)
+        identity = _identity(tenant_id, client_id, secret)
+        shape = _query_identity(azure_cfg)
         if state.identity is not None and state.identity != identity:
             # Re-pointed at a different app registration: everything cached
             # here describes the old one, including the throttle window.
@@ -1558,7 +1656,32 @@ class AzureProvider(Provider):
             state = _State()
             with _STATES_LOCK:
                 _STATES[subscription_id] = state
+        elif state.query_identity is not None and state.query_identity != shape:
+            # The question changed, not the asker. Drop the answer; keep the
+            # promise about how often this tile may ask.
+            log.info(
+                "provider api diagnosis provider=azure "
+                "classification=query_settings_changed cache_dropped=1"
+            )
+            state.aggregate = None
+            state.fetched_at = None
+            state.last_error = None
         state.identity = identity
+        state.query_identity = shape
+
+        # Nothing but a finished worker clears in_flight, so a dispatch that
+        # was lost - a pool torn down mid-shutdown, a worker killed - would
+        # park the tile for the life of the process.
+        if (
+            state.in_flight
+            and state.last_fetch_at is not None
+            and now - state.last_fetch_at > IN_FLIGHT_STALE_AFTER
+        ):
+            log.warning(
+                "provider api diagnosis provider=azure "
+                "classification=in_flight_stale cleared=1"
+            )
+            state.in_flight = False
 
         # Serve the cache rather than the API. The refresh loop above this can
         # fire every five minutes when the user is active, and every minute
@@ -1625,9 +1748,11 @@ class AzureProvider(Provider):
             except Exception as exc:  # noqa: BLE001
                 # Anything _fetch does not name still has to be *recorded*:
                 # an exception that leaves _State blank is an exception that
-                # switches the throttle off. The type name only - a message
-                # can carry the request URL, and with it the subscription id.
-                log.exception(
+                # switches the throttle off. The type name only, and no
+                # traceback: a message can carry the request URL, and with it
+                # the subscription id, and this line goes to a log file the
+                # error dialog invites the user to attach to a bug report.
+                log.error(
                     "provider api diagnosis provider=azure "
                     "classification=unexpected_exception type=%s",
                     type(exc).__name__,
@@ -1639,7 +1764,24 @@ class AzureProvider(Provider):
             finally:
                 state.in_flight = False
 
-        self._run_async(work, on_done)
+        try:
+            self._run_async(work, on_done)
+        except Exception as exc:  # noqa: BLE001 - the dispatch failed, so
+            # work() never ran and its finally never cleared the flag. Route
+            # it through the same recording path a fetch failure takes, and
+            # deliver a snapshot rather than raising into App's refresh loop.
+            state.in_flight = False
+            log.error(
+                "provider api diagnosis provider=azure "
+                "classification=dispatch_failed type=%s",
+                type(exc).__name__,
+            )
+            on_done(
+                self._remember_error(
+                    state,
+                    _error(f"Azure refresh failed ({type(exc).__name__})."),
+                )
+            )
 
     # -- the fetch itself ---------------------------------------------------
 
@@ -1687,6 +1829,7 @@ class AzureProvider(Provider):
 
         notes: list[str] = []
         now = datetime.now()
+        budget = _RequestBudget()
         period_start, period_end = period_bounds(_utc_today(), azure_cfg.reset_day)
 
         try:
@@ -1698,7 +1841,7 @@ class AzureProvider(Provider):
             ):
                 state.quota_id = self._safe_quota_id(token, subscription_id, notes)
                 state.foundry_ids = self._safe_foundry_ids(
-                    token, subscription_id, notes
+                    token, subscription_id, notes, budget=budget
                 )
                 state.discovery_at = now
 
@@ -1720,6 +1863,7 @@ class AzureProvider(Provider):
                 period_end,
                 cost_metric=state.cost_metric,
                 resource_group=azure_cfg.resource_group,
+                budget=budget,
             )
             state.cost_metric = cost_metric
 
@@ -1735,6 +1879,7 @@ class AzureProvider(Provider):
                         cost_metric=cost_metric,
                         resource_group=azure_cfg.resource_group,
                         marketplace_only=True,
+                        budget=budget,
                     )
                     for rid, service, cost in mp_parsed.rows:
                         if not rid:
@@ -1744,7 +1889,13 @@ class AzureProvider(Provider):
                             marketplace_costs.get(key, 0.0) + cost
                         )
                     marketplace_cost = mp_parsed.total
-                except (requests.HTTPError, requests.RequestException):
+                except AzureThrottled:
+                    raise
+                except AzurePermissionError:
+                    # An extra row, not the tile: a 403 here used to discard a
+                    # cost query that had already succeeded.
+                    notes.append("Marketplace breakdown unavailable this refresh.")
+                except Exception:  # noqa: BLE001 - tolerant by design.
                     notes.append("Marketplace breakdown unavailable this refresh.")
 
             buckets, foundry_cost, bucket_marketplace, service_count = bucket_costs(
@@ -1776,6 +1927,7 @@ class AzureProvider(Provider):
                 subscription_id,
                 period_start,
                 period_end,
+                notes,
                 cost_metric=cost_metric,
                 resource_group=azure_cfg.resource_group,
             )
@@ -1861,23 +2013,50 @@ class AzureProvider(Provider):
 
     # -- tolerant sub-fetches ----------------------------------------------
 
+    # Every one of these follows the same three-branch shape:
+    #
+    #   except AzureThrottled: raise      - the server's back-off is a fact
+    #                                       about the whole tenant, not a
+    #                                       detail of this sub-fetch, and the
+    #                                       only place it is recorded is
+    #                                       _fetch's handler.
+    #   except AzurePermissionError:      - note and carry on: a missing role
+    #                                       costs one row, never the tile.
+    #   except Exception:                 - note and carry on.
+    #
+    # Widening the last branch without the first is what let a 429 on
+    # discovery be swallowed while the refresh issued four more ARM requests
+    # inside the window Azure had just asked us to stay out of.
+
     def _safe_quota_id(
         self, token: str, subscription_id: str, notes: list[str]
     ) -> str | None:
         try:
             return fetch_quota_id(token, subscription_id)
+        except AzureThrottled:
+            raise
         except AzurePermissionError:
             notes.append("Offer type unknown (Reader role missing).")
             return None
         except Exception:  # noqa: BLE001 - this layer is tolerant by design:
             # discovery failure is a note, never the reason the tile breaks.
+            notes.append("The subscription's offer type could not be read.")
             return None
 
     def _safe_foundry_ids(
-        self, token: str, subscription_id: str, notes: list[str]
+        self,
+        token: str,
+        subscription_id: str,
+        notes: list[str],
+        *,
+        budget: "_RequestBudget | None" = None,
     ) -> set[str]:
         try:
-            return fetch_foundry_resource_ids(token, subscription_id)
+            found = fetch_foundry_resource_ids(
+                token, subscription_id, budget=budget
+            )
+        except AzureThrottled:
+            raise
         except AzurePermissionError:
             notes.append(
                 "Cannot list Foundry resources (Reader role missing); pin their "
@@ -1885,7 +2064,13 @@ class AzureProvider(Provider):
             )
             return set()
         except Exception:  # noqa: BLE001 - tolerant by design; see above.
+            notes.append("Foundry resources could not be listed this refresh.")
             return set()
+        if budget is not None and budget.exhausted:
+            notes.append(
+                "Foundry discovery stopped at this refresh's request budget."
+            )
+        return found
 
     def _safe_budget(
         self,
@@ -1903,9 +2088,13 @@ class AzureProvider(Provider):
                 currency=currency,
                 resource_group=resource_group,
             )
+        except AzureThrottled:
+            raise
         except AzurePermissionError:
+            notes.append("Azure Budgets could not be read (role missing).")
             return None, None
-        except (requests.HTTPError, requests.RequestException):
+        except Exception:  # noqa: BLE001 - tolerant by design; see above.
+            notes.append("Azure Budgets were unavailable this refresh.")
             return None, None
         if note:
             notes.append(note)
@@ -1917,6 +2106,7 @@ class AzureProvider(Provider):
         subscription_id: str,
         period_start: date,
         period_end: date,
+        notes: list[str],
         *,
         cost_metric: str,
         resource_group: str | None,
@@ -1930,9 +2120,13 @@ class AzureProvider(Provider):
                 cost_metric=cost_metric,
                 resource_group=resource_group,
             )
+        except AzureThrottled:
+            raise
         except AzurePermissionError:
+            notes.append("The forecast could not be read (role missing).")
             return None
-        except (requests.HTTPError, requests.RequestException):
+        except Exception:  # noqa: BLE001 - tolerant by design; see above.
+            notes.append("The forecast was unavailable this refresh.")
             return None
 
     def _remember_error(
@@ -1959,7 +2153,8 @@ class AzureProvider(Provider):
                     snapshot = work()
                 except Exception as exc:  # noqa: BLE001 - work() already
                     # records its own failures; this only covers the dispatch.
-                    log.exception(
+                    # No traceback: see work()'s handler.
+                    log.error(
                         "provider api diagnosis provider=azure "
                         "classification=unexpected_exception type=%s",
                         type(exc).__name__,

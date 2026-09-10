@@ -1054,6 +1054,289 @@ def test_the_error_backoff_exponent_is_capped():
     assert az._error_backoff(5000) == az.MAX_ERROR_BACKOFF
 
 
+_THROTTLE_HEADERS = {"Retry-After": "21600"}
+# What each tolerant sub-fetch is followed by, so a 429 on it can be shown to
+# stop the refresh rather than merely be swallowed.
+_AFTER_ENDPOINT = {
+    "subscription": "CostManagement/query",
+    "accounts": "CostManagement/query",
+    "marketplace": "Consumption/budgets",
+    "budgets": "CostManagement/forecast",
+    "forecast": None,
+}
+
+
+def _throttle(endpoint):
+    """Turn one ARM endpoint into a 429 asking for a six-hour back-off."""
+    if endpoint == "subscription":
+        responses.replace(
+            responses.GET, SUBSCRIPTION_URL, json={}, status=429,
+            headers=_THROTTLE_HEADERS,
+        )
+    elif endpoint == "accounts":
+        responses.replace(
+            responses.GET, ACCOUNTS_URL, json={}, status=429,
+            headers=_THROTTLE_HEADERS,
+        )
+    elif endpoint == "budgets":
+        responses.replace(
+            responses.GET, BUDGETS_URL, json={}, status=429,
+            headers=_THROTTLE_HEADERS,
+        )
+    elif endpoint == "forecast":
+        responses.replace(
+            responses.POST, FORECAST_URL, json={}, status=429,
+            headers=_THROTTLE_HEADERS,
+        )
+    elif endpoint == "marketplace":
+        # The marketplace query is the second POST to the query URL, so this
+        # is added rather than replaced: responses serves them in order.
+        responses.add(
+            responses.POST, QUERY_URL, json={}, status=429,
+            headers=_THROTTLE_HEADERS,
+        )
+    else:  # pragma: no cover - guard against a typo in the parametrisation
+        raise AssertionError(endpoint)
+
+
+@pytest.mark.parametrize("endpoint", sorted(_AFTER_ENDPOINT))
+@responses.activate
+def test_a_429_on_any_sub_fetch_still_records_the_servers_backoff(
+    endpoint, monkeypatch, config
+):
+    """A tolerant sub-fetch may swallow its own failure. It may never swallow
+    the tenant-wide back-off the server asked for: the 429 is the one answer
+    that is about every other caller in the tenant, not about this fetch."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    config.azure.include_marketplace = True
+    _stub_everything()
+    _throttle(endpoint)
+
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+
+    state = az.state_for(SUB)
+    assert state.blocked_until is not None, "the server's back-off was dropped"
+    assert snapshot.status == SnapshotStatus.ERROR
+    assert "rate limiting" in (snapshot.error or "")
+    after = _AFTER_ENDPOINT[endpoint]
+    if after is not None:
+        assert not [c for c in responses.calls if after in c.request.url], (
+            "the refresh carried on issuing ARM requests inside the 429 window"
+        )
+
+
+@responses.activate
+def test_a_403_on_the_marketplace_query_does_not_take_the_tile_down(
+    monkeypatch, config
+):
+    """The marketplace breakdown is an extra row, not the tile."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    config.azure.include_marketplace = True
+    _stub_everything()
+    responses.add(responses.POST, QUERY_URL, json={}, status=403)
+
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+
+    assert snapshot.status == SnapshotStatus.OK
+    assert "Marketplace breakdown unavailable" in (snapshot.metrics[0].note or "")
+
+
+@responses.activate
+def test_a_failed_dispatch_does_not_park_the_tile(monkeypatch, config):
+    """in_flight is set by the caller and cleared by the callee, so the one
+    path where the callee never runs used to leak it for the whole process."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+
+    class _BoomPool:
+        def start(self, runnable):
+            raise RuntimeError("QThreadPool has been deleted")
+
+    captured: list = []
+    az.AzureProvider(config, pool=_BoomPool()).refresh(captured.append)
+
+    assert captured, "the dispatch failure was raised into the App refresh loop"
+    assert captured[0].status == SnapshotStatus.ERROR
+    assert "RuntimeError" in (captured[0].error or "")
+    state = az.state_for(SUB)
+    assert state.in_flight is False
+    assert state.last_error is not None
+
+    second: list = []
+    az.AzureProvider(config, pool=_BoomPool()).refresh(second.append)
+    assert "already in progress" not in (second[0].error or "")
+
+
+@responses.activate
+def test_the_in_flight_flag_alone_refuses_a_second_dispatch(monkeypatch, config):
+    """last_fetch_at is nulled between the two refreshes, so the hourly floor
+    cannot be what refuses the second one - the flag has to be."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    dispatched: list = []
+
+    class _HoldingPool:
+        def start(self, runnable):
+            dispatched.append(runnable)
+
+    provider = az.AzureProvider(config, pool=_HoldingPool())
+    provider.refresh(lambda snap: None)
+    assert len(dispatched) == 1
+
+    az.state_for(SUB).last_fetch_at = None
+    captured: list = []
+    provider.refresh(captured.append)
+    assert len(dispatched) == 1, "a second live fetch was dispatched"
+    assert "already in progress" in (captured[0].error or "")
+
+
+@responses.activate
+def test_a_stale_in_flight_flag_does_not_park_the_tile_forever(monkeypatch, config):
+    """Nothing but a completed worker clears the flag, so a worker that never
+    reported has to time out rather than hold the tile until restart."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    state = az.state_for(SUB)
+    state.in_flight = True
+    state.last_fetch_at = datetime.now() - timedelta(hours=3)
+
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+
+    assert snapshot.status == SnapshotStatus.OK
+    assert az.state_for(SUB).in_flight is False
+
+
+@responses.activate
+def test_an_exception_no_one_anticipated_is_recorded_by_the_real_worker(
+    monkeypatch, config
+):
+    """C-1's actual hole: the catch-all in work() had no test that failed
+    without it, because the fixture that used to reach it stopped raising."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+
+    def _boom(*args, **kwargs):
+        raise KeyError("surprise")
+
+    monkeypatch.setattr(az.AzureProvider, "_fetch", _boom)
+    pool = _InlinePool()
+    provider = az.AzureProvider(config, pool=pool)
+
+    snapshot = _run_through_pool(provider)
+    assert snapshot.status == SnapshotStatus.ERROR
+    assert "KeyError" in (snapshot.error or "")
+    state = az.state_for(SUB)
+    assert state.blocked_until is not None, "the hourly floor was switched off"
+    assert state.consecutive_errors == 1
+    assert state.in_flight is False
+
+    calls = len(responses.calls)
+    _run_through_pool(provider)
+    assert len(responses.calls) == calls, "the second refresh went to the network"
+    assert pool.started == 1
+
+
+@responses.activate
+def test_a_blocked_until_past_the_backoff_ceiling_is_cleared(monkeypatch, config):
+    """The twin of the last_fetch_at clock-jump reset: no back-off this module
+    can produce exceeds MAX_ERROR_BACKOFF, so one that does is a bad clock."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    az.state_for(SUB).blocked_until = datetime.now() + timedelta(days=3650)
+
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+    assert snapshot.status == SnapshotStatus.OK
+
+
+@responses.activate
+def test_toggling_a_display_setting_does_not_buy_a_live_fetch(monkeypatch, config):
+    """A settings save is a one-click human action and it is easy to loop.
+    Changing what the query asks for invalidates the cached answer; it does
+    not reopen the fetch window, which is what README and SECURITY.md promise."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    for press in range(10):
+        config.azure.top_rows = 5 if press % 2 else 6
+        snapshot = _run(az.AzureProvider(config), monkeypatch)
+
+    queries = [c for c in responses.calls if "CostManagement/query" in c.request.url]
+    tokens = [c for c in responses.calls if c.request.url.startswith(TOKEN_URL)]
+    assert len(queries) == 1, "a settings toggle reopened the hourly window"
+    assert len(tokens) == 1
+    # And the stale answer is not replayed either: the tile says it is waiting.
+    assert snapshot.status == SnapshotStatus.ERROR
+    assert "window" in (snapshot.error or "")
+
+
+@responses.activate
+def test_a_credential_change_still_resets_everything(monkeypatch, config):
+    """The credential triple is the one identity that means the cached
+    back-off describes a different app registration."""
+    secret = {"value": "shhh"}
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: secret["value"])
+    _stub_everything()
+    _run(az.AzureProvider(config), monkeypatch)
+    az.state_for(SUB).blocked_until = datetime.now() + timedelta(hours=5)
+
+    secret["value"] = "rotated"
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+
+    assert snapshot.status == SnapshotStatus.OK
+    assert az.state_for(SUB).blocked_until is None
+
+
+def test_a_refresh_stops_paging_when_its_wall_clock_budget_runs_out():
+    """MAX_QUERY_PAGES x REQUEST_TIMEOUT is ~13 minutes on one pool thread,
+    shared with every other provider."""
+    ticks = iter([0.0])
+    budget = az._RequestBudget(clock=lambda: next(ticks, 500.0))
+    parsed = az.QueryRows(cost_column_found=True)
+    payload = query_payload([])
+    payload["properties"]["nextLink"] = f"{QUERY_URL}?$skiptoken=abc"
+
+    with responses.RequestsMock(assert_all_requests_are_fired=False) as mock:
+        mock.add(responses.POST, QUERY_URL, json=query_payload([]), status=200)
+        az._follow_query_pages("tok", {}, payload, parsed, budget)
+        assert not mock.calls, "a page was fetched past the refresh deadline"
+    assert parsed.truncated is True
+
+
+def test_a_refresh_stops_paging_when_its_request_budget_runs_out():
+    budget = az._RequestBudget(max_requests=2, clock=lambda: 0.0)
+    parsed = az.QueryRows(cost_column_found=True)
+    payload = query_payload([[1.0, 20260901, STORAGE_ID, "Storage", "CAD"]])
+    payload["properties"]["nextLink"] = f"{QUERY_URL}?$skiptoken=a"
+    page2 = query_payload([[1.0, 20260902, STORAGE_ID, "Storage", "CAD"]])
+    page2["properties"]["nextLink"] = f"{QUERY_URL}?$skiptoken=b"
+    page3 = query_payload([[1.0, 20260903, STORAGE_ID, "Storage", "CAD"]])
+    page3["properties"]["nextLink"] = f"{QUERY_URL}?$skiptoken=c"
+
+    with responses.RequestsMock() as mock:
+        mock.add(responses.POST, QUERY_URL, json=page2, status=200)
+        mock.add(responses.POST, QUERY_URL, json=page3, status=200)
+        az._follow_query_pages("tok", {}, payload, parsed, budget)
+        assert len(mock.calls) == 2
+    assert parsed.truncated is True
+
+
+@responses.activate
+def test_discovery_stops_at_the_refresh_request_budget(monkeypatch, config):
+    responses.add(
+        responses.GET,
+        ACCOUNTS_URL,
+        json={
+            "value": [{"id": FOUNDRY_ID, "kind": "AIServices"}],
+            "nextLink": f"{ACCOUNTS_URL}?$skiptoken=abc",
+        },
+        status=200,
+    )
+    budget = az._RequestBudget(max_requests=1, clock=lambda: 0.0)
+    found = az.fetch_foundry_resource_ids("tok", SUB, budget=budget)
+    assert found == {FOUNDRY_ID.lower()}
+    assert len(responses.calls) == 1
+    assert budget.exhausted is True
+
+
 # --- the cost query is paged ------------------------------------------------
 #
 # Daily granularity grouped on ResourceId *and* ServiceName reaches the API's
@@ -1215,6 +1498,35 @@ def test_the_aad_error_code_is_reduced_to_a_code():
     assert "\n" not in code and "<b>" not in code and " " not in code
     message = str(exc.value)
     assert "\n" not in message and "<b>" not in message
+
+
+@responses.activate
+def test_an_unexpected_exception_does_not_log_the_subscription_id(
+    caplog, monkeypatch, config
+):
+    """log.exception implies exc_info=True, so the formatted traceback appends
+    the exception's message verbatim - and a transport failure's message is
+    the request URL, which carries the subscription id. ai-gauge.log is the
+    file the error dialog's "Open log folder" button points at."""
+    import logging
+
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    url = (
+        f"https://management.azure.com/subscriptions/{SUB}"
+        "/providers/Microsoft.CostManagement/query"
+    )
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError(f"Max retries exceeded with url: {url}")
+
+    monkeypatch.setattr(az.AzureProvider, "_fetch", _boom)
+    with caplog.at_level(logging.DEBUG):
+        snapshot = _run_through_pool(az.AzureProvider(config, pool=_InlinePool()))
+
+    assert SUB not in caplog.text, "the traceback put the subscription id in the log"
+    assert SUB not in (snapshot.error or "")
+    assert "classification=unexpected_exception" in caplog.text
 
 
 # --- marketplace splits a row, it does not swallow a resource ---------------
@@ -1666,7 +1978,10 @@ def test_changing_the_reset_day_refetches_instead_of_replaying_the_old_period(
 ):
     """_identity detected credential changes only, so every setting that
     shapes the *request* was replayed from the cached aggregate for an hour -
-    and a manual Refresh went through the same gate, so it could not force it."""
+    and a manual Refresh went through the same gate, so it could not force it.
+
+    The cached answer is dropped at once; the *window* is not reopened, so the
+    new question is asked at the next one."""
     import json as _json
 
     monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
@@ -1676,6 +1991,9 @@ def test_changing_the_reset_day_refetches_instead_of_replaying_the_old_period(
     config.azure.reset_day = 15
     responses.reset()
     _stub_everything()
+    stale = _run(az.AzureProvider(config), monkeypatch)
+    assert stale.status == SnapshotStatus.ERROR, "the old period was replayed"
+    az.state_for(SUB).last_fetch_at -= az.MIN_FETCH_INTERVAL
     _run(az.AzureProvider(config), monkeypatch)
 
     queries = [c for c in responses.calls if "CostManagement/query" in c.request.url]
@@ -1700,6 +2018,8 @@ def test_changing_the_reset_day_refetches_instead_of_replaying_the_old_period(
 def test_every_query_shaping_setting_invalidates_the_cache(
     monkeypatch, config, field, value
 ):
+    """Invalidates the answer, not the fetch window: the stale aggregate is
+    never served again, and the new question is asked at the next window."""
     monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
     _stub_everything()
     responses.add(responses.POST, QUERY_URL, json=query_payload([]), status=200)
@@ -1707,8 +2027,13 @@ def test_every_query_shaping_setting_invalidates_the_cache(
     calls = len(responses.calls)
 
     setattr(config.azure, field, value)
+    stale = _run(az.AzureProvider(config), monkeypatch)
+    assert stale.status == SnapshotStatus.ERROR, f"{field} was replayed from the cache"
+    assert len(responses.calls) == calls, f"{field} reopened the fetch window"
+
+    az.state_for(SUB).last_fetch_at -= az.MIN_FETCH_INTERVAL
     _run(az.AzureProvider(config), monkeypatch)
-    assert len(responses.calls) > calls, f"{field} was replayed from the cache"
+    assert len(responses.calls) > calls, f"{field} never reached a request"
 
 
 @pytest.mark.parametrize("bad", ["evil.example/x", "x/../../y", "", "a?b=c"])

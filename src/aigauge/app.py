@@ -672,7 +672,10 @@ class App(QObject):
                 UsageSnapshot(
                     provider=name,
                     status=SnapshotStatus.ERROR,
-                    error=str(exc),
+                    # str(exc) on a transport failure carries the request URL,
+                    # and this string reaches the tile, the tray tooltip and
+                    # the error dialog. Same redaction the log line below uses.
+                    error=_redact_azure_ids(str(exc)),
                 )
             )
 

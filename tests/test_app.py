@@ -717,3 +717,33 @@ def test_the_snapshot_error_log_line_redacts_azure_identifiers(qapp, caplog):
 
     assert sub not in caplog.text
     assert "<guid>" in caplog.text
+
+
+def test_a_provider_that_raises_out_of_refresh_is_redacted_too(qapp):
+    """refresh() raising is turned into an ERROR snapshot here, and that
+    string reaches the tile, the tray tooltip and the dialog header - none of
+    which redact. The other exit from this method already redacts."""
+    from types import SimpleNamespace as _NS
+
+    app = App.__new__(App)
+    app._inflight = set()  # noqa: SLF001
+    sub = "11111111-2222-3333-4444-555555555555"
+    captured: list = []
+    app._signals = _NS(  # noqa: SLF001
+        snapshot_ready=_NS(emit=captured.append)
+    )
+
+    def _raise(_on_done):
+        raise RuntimeError(
+            "Max retries exceeded with url: /subscriptions/"
+            f"{sub}/providers/Microsoft.CostManagement/query"
+        )
+
+    app._providers = {"azure": _NS(refresh=_raise)}  # noqa: SLF001
+    app._refresh_queue = ["azure"]  # noqa: SLF001
+
+    app._start_next_refresh()  # noqa: SLF001
+
+    assert captured, "the exception was not turned into a snapshot"
+    assert sub not in (captured[0].error or "")
+    assert "<guid>" in (captured[0].error or "")
