@@ -11,6 +11,7 @@ early (``_EXPIRY_SKEW``) so a token can't expire mid-request.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import threading
@@ -56,11 +57,22 @@ class _CachedToken:
     expires_at: datetime
 
 
-# Keyed by (tenant_id, client_id). Module-level, so the cache survives the
-# provider rebuild that App does on every settings change - otherwise every
-# OK press would mint a fresh token.
-_CACHE: dict[tuple[str, str], _CachedToken] = {}
+# Keyed by (tenant_id, client_id, secret digest). Module-level, so the cache
+# survives the provider rebuild that App does on every settings change -
+# otherwise every OK press would mint a fresh token.
+#
+# The secret is part of the key, not just of the request: a token minted from
+# an old secret is a live derived credential, so rotating the secret (or
+# mistyping it) has to stop producing a working tile immediately rather than
+# for the rest of the token's ~55-minute cached lifetime. The digest is
+# truncated because it is a change detector, not a place to keep a secret -
+# the same shape azure._identity() uses.
+_CACHE: dict[tuple[str, str, str], _CachedToken] = {}
 _LOCK = threading.Lock()
+
+
+def _secret_digest(client_secret: str) -> str:
+    return hashlib.sha256(client_secret.encode("utf-8", "replace")).hexdigest()[:16]
 
 
 def token_endpoint(tenant_id: str) -> str:
@@ -71,6 +83,21 @@ def clear_cache() -> None:
     """Forget every cached token (settings change, tests)."""
     with _LOCK:
         _CACHE.clear()
+
+
+def invalidate(tenant_id: str, client_id: str) -> None:
+    """Forget the tokens minted for one app registration.
+
+    Called when ARM answers 401: the bearer is dead, and re-presenting it
+    until it expires on its own helps nobody. 403 is deliberately not a
+    trigger - that is an RBAC decision made per request, and the token is
+    fine.
+    """
+    with _LOCK:
+        for key in [
+            key for key in _CACHE if key[0] == tenant_id and key[1] == client_id
+        ]:
+            del _CACHE[key]
 
 
 def get_token(
@@ -86,7 +113,7 @@ def get_token(
     requests.RequestException on a transport failure.
     """
     now = now or datetime.now()
-    key = (tenant_id, client_id)
+    key = (tenant_id, client_id, _secret_digest(client_secret))
     with _LOCK:
         cached = _CACHE.get(key)
         if cached is not None and cached.expires_at > now:
@@ -146,7 +173,7 @@ def get_token(
     expires_at = now + max(timedelta(minutes=1), lifetime - _EXPIRY_SKEW)
 
     with _LOCK:
-        _CACHE[(tenant_id, client_id)] = _CachedToken(token=token, expires_at=expires_at)
+        _CACHE[key] = _CachedToken(token=token, expires_at=expires_at)
     log.debug(
         "provider api diagnosis provider=azure classification=token_ok "
         "expires_in=%s cached_for_s=%s",

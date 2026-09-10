@@ -1018,6 +1018,13 @@ def get_azure_client_secret() -> str | None:
 
 
 def set_azure_client_secret(secret: str | None) -> None:
+    # A bearer token minted from the old secret is a live derived credential.
+    # Both paths drop it: "Clear saved client secret" must not leave one
+    # resident in memory, and a rotated secret must take effect now rather
+    # than when the cached token happens to expire. Imported locally to keep
+    # this module free of provider imports.
+    from .providers._azure_auth import clear_cache
+
     if secret:
         keyring.set_password(KEYRING_SERVICE, KEYRING_AZURE_CLIENT_SECRET, secret)
     else:
@@ -1025,6 +1032,7 @@ def set_azure_client_secret(secret: str | None) -> None:
             keyring.delete_password(KEYRING_SERVICE, KEYRING_AZURE_CLIENT_SECRET)
         except keyring.errors.KeyringError:
             pass
+    clear_cache()
 
 
 def _cookie_key(provider: str) -> str:

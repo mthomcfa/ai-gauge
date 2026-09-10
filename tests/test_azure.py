@@ -1547,3 +1547,108 @@ def test_network_supplied_strings_are_bounded_at_parse_time():
     parsed = az.parse_query_response(query_payload(rows))
     assert len(parsed.currency) <= 8
     assert max(len(name) for name in parsed.by_service) <= 120
+
+
+# --- the token cache is a credential, and behaves like one -----------------
+
+
+@responses.activate
+def test_a_rotated_client_secret_is_not_served_from_the_token_cache():
+    """A secret rotated because it leaked must stop working at once, not in
+    55 minutes' time."""
+    now = datetime(2026, 9, 9, 12, 0)
+    responses.add(
+        responses.POST, TOKEN_URL, json={"access_token": "old", "expires_in": 3600}
+    )
+    assert get_token(TENANT, CLIENT, "secret-1", now=now) == "old"
+    responses.replace(
+        responses.POST, TOKEN_URL, json={"access_token": "new", "expires_in": 3600}
+    )
+    assert get_token(TENANT, CLIENT, "secret-2", now=now) == "new"
+    assert len(responses.calls) == 2
+
+
+def test_clearing_the_saved_secret_forgets_the_token(monkeypatch):
+    from aigauge import config as config_module
+    from aigauge.providers import _azure_auth
+
+    monkeypatch.setattr(
+        config_module.keyring, "delete_password", lambda service, account: None
+    )
+    _azure_auth._CACHE[(TENANT, CLIENT, "digest")] = _azure_auth._CachedToken(
+        token="live", expires_at=datetime.now() + timedelta(hours=1)
+    )
+    config_module.set_azure_client_secret(None)
+    assert not _azure_auth._CACHE
+
+
+def test_saving_a_new_secret_forgets_the_previous_token(monkeypatch):
+    from aigauge import config as config_module
+    from aigauge.providers import _azure_auth
+
+    monkeypatch.setattr(
+        config_module.keyring, "set_password", lambda service, account, value: None
+    )
+    _azure_auth._CACHE[(TENANT, CLIENT, "digest")] = _azure_auth._CachedToken(
+        token="live", expires_at=datetime.now() + timedelta(hours=1)
+    )
+    config_module.set_azure_client_secret("new-secret")
+    assert not _azure_auth._CACHE
+
+
+@responses.activate
+def test_a_401_from_arm_drops_the_cached_token(monkeypatch, config):
+    """403 is an RBAC decision made per request; 401 says the bearer is dead,
+    and re-presenting it for the rest of its cached lifetime helps nobody."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    responses.add(
+        responses.POST, TOKEN_URL, json={"access_token": "tok", "expires_in": 3600}
+    )
+    responses.add(responses.GET, SUBSCRIPTION_URL, json={}, status=401)
+    responses.add(responses.GET, ACCOUNTS_URL, json={}, status=401)
+    responses.add(responses.POST, QUERY_URL, json={}, status=401)
+
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+    assert snapshot.status == SnapshotStatus.AUTH_REQUIRED
+    from aigauge.providers import _azure_auth
+
+    assert not _azure_auth._CACHE, "the dead bearer is still cached"
+
+
+@responses.activate
+def test_a_403_from_arm_keeps_the_cached_token(monkeypatch, config):
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    responses.add(
+        responses.POST, TOKEN_URL, json={"access_token": "tok", "expires_in": 3600}
+    )
+    responses.add(responses.GET, SUBSCRIPTION_URL, json={}, status=403)
+    responses.add(responses.GET, ACCOUNTS_URL, json={}, status=403)
+    responses.add(responses.POST, QUERY_URL, json={}, status=403)
+
+    _run(az.AzureProvider(config), monkeypatch)
+    from aigauge.providers import _azure_auth
+
+    assert _azure_auth._CACHE, "a permission decision is not a dead token"
+
+
+@responses.activate
+def test_changing_the_app_registration_also_drops_the_token(monkeypatch, config):
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    provider = az.AzureProvider(config)
+    _run(provider, monkeypatch)
+    from aigauge.providers import _azure_auth
+
+    assert _azure_auth._CACHE
+
+    config.azure.tenant_id = "44444444-4444-4444-4444-444444444444"
+    responses.reset()
+    responses.add(
+        responses.POST,
+        f"https://login.microsoftonline.com/{config.azure.tenant_id}"
+        "/oauth2/v2.0/token",
+        json={"error": "invalid_client"},
+        status=401,
+    )
+    _run(provider, monkeypatch)
+    assert not any(key[0] == TENANT for key in _azure_auth._CACHE)

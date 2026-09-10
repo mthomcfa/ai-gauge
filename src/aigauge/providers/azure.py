@@ -46,7 +46,7 @@ import requests
 
 from ..config import Config, get_azure_client_secret
 from ..models import SnapshotStatus, UsageMetric, UsageSnapshot
-from ._azure_auth import AzureAuthError, get_token
+from ._azure_auth import AzureAuthError, clear_cache, get_token, invalidate
 from .base import Provider
 
 log = logging.getLogger("aigauge.providers.azure")
@@ -730,7 +730,15 @@ class AzureThrottled(Exception):
 
 
 class AzurePermissionError(Exception):
-    """401/403 from ARM: the app registration is missing a role."""
+    """401/403 from ARM: the app registration is missing a role.
+
+    ``status`` distinguishes the two: 401 says the bearer is not acceptable,
+    403 says this identity may not do this. Only the first invalidates a token.
+    """
+
+    def __init__(self, message: str, *, status: int = 0):
+        super().__init__(message)
+        self.status = status
 
 
 def retry_after_seconds(headers: Any) -> int:
@@ -776,7 +784,8 @@ def _check(response: requests.Response, what: str) -> None:
     if response.status_code in (401, 403):
         raise AzurePermissionError(
             f"Azure rejected the {what} request ({response.status_code}). "
-            + _PERMISSION_HINT
+            + _PERMISSION_HINT,
+            status=response.status_code,
         )
 
 
@@ -1458,6 +1467,8 @@ class AzureProvider(Provider):
                 "provider api diagnosis provider=azure "
                 "classification=identity_changed cache_cleared=1"
             )
+            # Including the bearer: it was minted for the old registration.
+            clear_cache()
             state = _State()
             with _STATES_LOCK:
                 _STATES[subscription_id] = state
@@ -1692,6 +1703,8 @@ class AzureProvider(Provider):
                 backoff=False,
             )
         except AzurePermissionError as exc:
+            if getattr(exc, "status", 0) == 401:
+                invalidate(tenant_id, client_id)
             return self._remember_error(state, _auth_required(str(exc)))
         except requests.HTTPError as exc:
             return self._remember_error(state, _error(str(exc)))
