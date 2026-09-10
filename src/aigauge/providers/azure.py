@@ -333,31 +333,59 @@ class AzureAggregate:
 def bucket_costs(
     parsed: QueryRows,
     foundry_ids: set[str],
-    marketplace_ids: set[str],
+    marketplace_costs: dict[tuple[str, str], float] | None = None,
     *,
     top_rows: int = MAX_BREAKDOWN_ROWS,
 ) -> tuple[list[tuple[str, float]], float | None, float | None, int]:
-    """Partition rows into display buckets that sum to the total exactly.
+    """Partition rows into display buckets that sum to the total.
 
     Each cost row lands in exactly one bucket - Foundry, Marketplace, or its
     ServiceName - so the rows can never double-count. That is the whole reason
     Foundry is a row rather than a tile: a Foundry *tile* would show spend that
     the Azure tile is also showing, and nothing in the layout would say so.
+    The buckets sum to the query total to within float rounding: they are
+    accumulated in a different order from ``QueryRows.total``, so bit-exact
+    equality is not something to assert.
+
+    ``foundry_ids`` are matched on resource id, because a Foundry resource's
+    whole spend belongs to the Foundry row. ``marketplace_costs`` is keyed on
+    the *(resource id, service)* pair and carries an amount, because a
+    Marketplace charge is one charge on a resource that also bills ordinary
+    Azure usage - keying it on the resource id alone moved that resource's
+    entire spend into the Marketplace row.
+
+    ``resource_id`` keys are compared lower-cased; the ids are lowered here so
+    a caller that did not do it gets the same answer rather than a silent zero.
     """
+    marketplace_costs = {
+        (str(rid).lower(), service): cost
+        for (rid, service), cost in (marketplace_costs or {}).items()
+    }
+    remaining = dict(marketplace_costs)
+    foundry_ids = {rid.lower() for rid in foundry_ids}
     totals: dict[str, float] = {}
     foundry_cost: float | None = 0.0 if foundry_ids else None
-    marketplace_cost: float | None = 0.0 if marketplace_ids else None
+    marketplace_cost: float | None = 0.0 if marketplace_costs else None
     services: set[str] = set()
     for resource_id, service, cost in parsed.rows:
         if foundry_ids and resource_id and resource_id in foundry_ids:
-            bucket = FOUNDRY_BUCKET
             foundry_cost = (foundry_cost or 0.0) + cost
-        elif marketplace_ids and resource_id and resource_id in marketplace_ids:
-            bucket = MARKETPLACE_BUCKET
-            marketplace_cost = (marketplace_cost or 0.0) + cost
-        else:
-            bucket = service or "Unattributed"
-            services.add(bucket)
+            totals[FOUNDRY_BUCKET] = totals.get(FOUNDRY_BUCKET, 0.0) + cost
+            continue
+        # Move at most what the marketplace query said this exact row spent,
+        # and never more than the row holds.
+        moved = 0.0
+        available = remaining.get((resource_id, service), 0.0)
+        if available > 0 and cost > 0:
+            moved = min(cost, available)
+            remaining[(resource_id, service)] = available - moved
+            marketplace_cost = (marketplace_cost or 0.0) + moved
+            totals[MARKETPLACE_BUCKET] = totals.get(MARKETPLACE_BUCKET, 0.0) + moved
+        cost -= moved
+        if moved and not cost:
+            continue
+        bucket = service or "Unattributed"
+        services.add(bucket)
         totals[bucket] = totals.get(bucket, 0.0) + cost
 
     ranked = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
@@ -1392,7 +1420,7 @@ class AzureProvider(Provider):
             )
             state.cost_metric = cost_metric
 
-            marketplace_ids: set[str] = set()
+            marketplace_costs: dict[tuple[str, str], float] = {}
             marketplace_cost: float | None = None
             if azure_cfg.include_marketplace:
                 try:
@@ -1405,9 +1433,13 @@ class AzureProvider(Provider):
                         resource_group=azure_cfg.resource_group,
                         marketplace_only=True,
                     )
-                    marketplace_ids = {
-                        rid for rid, _service, _cost in mp_parsed.rows if rid
-                    }
+                    for rid, service, cost in mp_parsed.rows:
+                        if not rid:
+                            continue
+                        key = (rid, service)
+                        marketplace_costs[key] = (
+                            marketplace_costs.get(key, 0.0) + cost
+                        )
                     marketplace_cost = mp_parsed.total
                 except (requests.HTTPError, requests.RequestException):
                     notes.append("Marketplace breakdown unavailable this refresh.")
@@ -1415,7 +1447,7 @@ class AzureProvider(Provider):
             buckets, foundry_cost, bucket_marketplace, service_count = bucket_costs(
                 parsed,
                 foundry_ids,
-                marketplace_ids,
+                marketplace_costs,
                 top_rows=azure_cfg.top_rows,
             )
 
@@ -1671,7 +1703,7 @@ def _probe() -> int:
         print(f"  {name}: {cost:.2f}")
 
     buckets, foundry_cost, _mp, service_count = bucket_costs(
-        parsed, foundry, set(), top_rows=azure_cfg.top_rows
+        parsed, foundry, {}, top_rows=azure_cfg.top_rows
     )
     print(f"buckets ({service_count} distinct services):")
     for name, cost in buckets:

@@ -279,7 +279,7 @@ def test_marketplace_rows_are_reclassified_not_added():
     rows = DEFAULT_ROWS + [[4.10, 20260908, MARKET_ID, "Global resources", "CAD"]]
     parsed = az.parse_query_response(query_payload(rows))
     buckets, _foundry, marketplace, _services = az.bucket_costs(
-        parsed, {FOUNDRY_ID.lower()}, {MARKET_ID.lower()}
+        parsed, {FOUNDRY_ID.lower()}, {(MARKET_ID.lower(), "Global resources"): 4.10}
     )
     assert marketplace == pytest.approx(4.10)
     assert sum(cost for _n, cost in buckets) == pytest.approx(parsed.total)
@@ -1215,3 +1215,57 @@ def test_the_aad_error_code_is_reduced_to_a_code():
     assert "\n" not in code and "<b>" not in code and " " not in code
     message = str(exc.value)
     assert "\n" not in message and "<b>" not in message
+
+
+# --- marketplace splits a row, it does not swallow a resource ---------------
+
+
+def test_marketplace_moves_its_own_amount_not_the_whole_resource():
+    """A resource with 900 of ordinary usage and 1.00 of Marketplace charge
+    must not have all 901 reported as Marketplace model spend."""
+    rows = [
+        [900.0, 20260908, MARKET_ID, "Azure App Service", "CAD"],
+        [1.0, 20260908, MARKET_ID, "Global resources", "CAD"],
+    ]
+    parsed = az.parse_query_response(query_payload(rows))
+    marketplace = {(MARKET_ID.lower(), "Global resources"): 1.0}
+
+    buckets, _foundry, marketplace_cost, _services = az.bucket_costs(
+        parsed, set(), marketplace
+    )
+    by_name = dict(buckets)
+    assert marketplace_cost == pytest.approx(1.0)
+    assert by_name[az.MARKETPLACE_BUCKET] == pytest.approx(1.0)
+    assert by_name["Azure App Service"] == pytest.approx(900.0)
+    assert sum(cost for _n, cost in buckets) == pytest.approx(parsed.total)
+
+
+def test_marketplace_never_moves_more_than_the_main_row_holds():
+    rows = [[2.0, 20260908, MARKET_ID, "Global resources", "CAD"]]
+    parsed = az.parse_query_response(query_payload(rows))
+    buckets, _f, marketplace_cost, _s = az.bucket_costs(
+        parsed, set(), {(MARKET_ID.lower(), "Global resources"): 50.0}
+    )
+    assert marketplace_cost == pytest.approx(2.0)
+    assert sum(cost for _n, cost in buckets) == pytest.approx(parsed.total)
+
+
+@responses.activate
+def test_the_marketplace_query_only_reclassifies_its_own_rows(monkeypatch, config):
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    config.azure.include_marketplace = True
+    main_rows = [
+        [900.0, 20260908, MARKET_ID, "Azure App Service", "CAD"],
+        [1.0, 20260908, MARKET_ID, "Global resources", "CAD"],
+    ]
+    _stub_everything(rows=main_rows)
+    responses.add(
+        responses.POST,
+        QUERY_URL,
+        json=query_payload([[1.0, 20260908, MARKET_ID, "Global resources", "CAD"]]),
+        status=200,
+    )
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+    assert snapshot.raw["marketplace_cost"] == pytest.approx(1.0)
+    rows = {m.label: m.note for m in snapshot.metrics if m.tag == az.BREAKDOWN_TAG}
+    assert "CAD 1.00" in rows[az.MARKETPLACE_BUCKET]
