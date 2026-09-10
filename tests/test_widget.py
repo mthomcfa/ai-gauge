@@ -973,3 +973,31 @@ def test_summary_chip_receives_account_colors(qtbot):
 
     expected = QColor("#654321").darker(135)
     assert chip._fill_color.name() == expected.name()  # noqa: SLF001
+
+
+def test_metric_row_sizes_a_long_reset_label_to_fit(qtbot):
+    """A reset_label is normally a countdown, but Azure puts the money there
+    so the amounts stay on the row when the tile is collapsed. The 58 px
+    countdown column would clip it."""
+    row = _MetricRow()
+    qtbot.addWidget(row)
+
+    row.set_metric(
+        "Spend this month",
+        24.0,
+        datetime.now() + timedelta(days=20),
+        "CAD 36.10 of 150.00 · resets 1 Oct",
+        note="…",
+        window=timedelta(days=30),
+    )
+
+    assert row.reset.text() == "CAD 36.10 of 150.00 · resets 1 Oct"
+    assert not row.reset.isHidden()
+    assert row.reset.width() > 58
+
+
+def test_metric_row_keeps_the_narrow_countdown_column_for_a_countdown(qtbot):
+    row = _MetricRow()
+    qtbot.addWidget(row)
+    row.set_metric("Weekly", 20.0, datetime.now() + timedelta(days=2), "idle")
+    assert row.reset.width() == 58

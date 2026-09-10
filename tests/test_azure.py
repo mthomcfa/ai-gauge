@@ -181,8 +181,9 @@ def test_currency_is_taken_from_the_response_never_assumed():
         az.AzureAggregate(total=10.0, currency=parsed.currency, buckets=[]),
         AzureConfig(monthly_allowance=100.0),
     )
-    assert "JPY 10.00" in snapshot.metrics[0].label
-    assert "$" not in snapshot.metrics[0].label
+    row = snapshot.metrics[0].reset_label or ""
+    assert "JPY 10.00" in row
+    assert "$" not in row
 
 
 def test_data_as_of_is_the_latest_day_that_actually_has_cost():
@@ -351,7 +352,7 @@ def test_no_allowance_means_no_gauge_but_still_a_number():
     snapshot = az.build_snapshot(_aggregate(), AzureConfig())
     summary = snapshot.metrics[0]
     assert summary.percent_used is None
-    assert "CAD 36.10" in summary.label
+    assert "CAD 36.10" in (summary.reset_label or "")
     assert "Set a monthly allowance" in (summary.note or "")
 
 
@@ -1773,3 +1774,35 @@ def test_resets_at_is_the_utc_boundary_rendered_locally():
     )
     assert snapshot.metrics[0].resets_at == expected
     assert snapshot.metrics[0].window == timedelta(days=30)
+
+
+# --- the summary label is a key, so it has to be stable ---------------------
+
+
+def test_the_summary_label_is_stable_as_spend_changes():
+    """history.py keys in-flight periods on provider::label, so a label that
+    moves with the money makes a new key on every fetch: the rollover
+    comparison never runs, no period is ever closed, and current.json grows
+    without bound."""
+    first = az.build_snapshot(
+        _aggregate(total=36.10), AzureConfig(monthly_allowance=150.0)
+    )
+    second = az.build_snapshot(
+        _aggregate(total=37.01), AzureConfig(monthly_allowance=150.0)
+    )
+    assert first.metrics[0].label == second.metrics[0].label == "Spend this month"
+
+
+def test_the_amounts_stay_visible_on_the_row():
+    """Moving the money out of the label must not move it out of the tile:
+    reset_label is what the row renders inline, next to the bar."""
+    snapshot = az.build_snapshot(_aggregate(), AzureConfig(monthly_allowance=150.0))
+    summary = snapshot.metrics[0]
+    assert summary.reset_label == "CAD 36.10 of 150.00 · resets 1 Oct"
+
+
+def test_the_row_still_reads_without_an_allowance():
+    snapshot = az.build_snapshot(_aggregate(), AzureConfig())
+    summary = snapshot.metrics[0]
+    assert summary.percent_used is None
+    assert summary.reset_label.startswith("CAD 36.10")

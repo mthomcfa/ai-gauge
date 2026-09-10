@@ -664,7 +664,15 @@ class _MetricRow(QWidget):
         else:
             self.reset.setText(rel)
             self.reset.setVisible(bool(rel))
-            self.reset.setFixedWidth(58)
+            # The column is sized for a countdown ("3.1d", "idle"), but a
+            # provider may put a whole phrase in reset_label - Azure puts the
+            # spend and the allowance there so they stay on the row when the
+            # tile is collapsed - and a fixed 58 px would clip it.
+            if len(rel) > 8:
+                text_width = self.reset.fontMetrics().horizontalAdvance(rel) + 4
+                self.reset.setFixedWidth(max(92, min(190, text_width)))
+            else:
+                self.reset.setFixedWidth(58)
         if reset_label:
             self.reset.setToolTip(note or reset_label)
         elif resets_at:

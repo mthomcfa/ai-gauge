@@ -586,13 +586,23 @@ def build_snapshot(
     spend_text = _money(aggregate.total, currency)
     if allowance and not aggregate.partial and ungauged_note is None:
         percent = max(0.0, min(100.0, aggregate.total / allowance * 100.0))
-        label = f"Spend this month ({spend_text} of {allowance:,.2f})"
-    elif allowance:
-        percent = None
-        label = f"Spend this month ({spend_text} of {allowance:,.2f})"
     else:
         percent = None
-        label = f"Spend this month ({spend_text})"
+    # The label is a key, not a caption: history.py keys an in-flight period on
+    # provider::label, so a label carrying the running total makes a new key on
+    # every fetch - the rollover comparison never runs, no period is ever
+    # closed, and current.json grows without bound. The money moves to
+    # reset_label, which _MetricRow renders inline next to the bar, so it is
+    # still on the collapsed row rather than hidden in a tooltip.
+    label = "Spend this month"
+    money_text = (
+        f"{spend_text} of {allowance:,.2f}" if allowance else spend_text
+    )
+    if aggregate.period_end:
+        end = aggregate.period_end
+        reset_label = f"{money_text} · resets {end.day} {end.strftime('%b')}"
+    else:
+        reset_label = money_text
 
     note_parts = [_as_of_note(aggregate)]
     note_parts.append(
@@ -626,6 +636,7 @@ def build_snapshot(
             label=label,
             percent_used=None if aggregate.sponsorship else percent,
             resets_at=resets_at,
+            reset_label=reset_label,
             note=" ".join(note_parts),
             window=window,
         )
