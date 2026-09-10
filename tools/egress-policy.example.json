@@ -1,0 +1,42 @@
+{
+  "//": "Copy to <repo>/.egress-policy.json and edit. See docs/opencode-plugin-evaluation.md.",
+  "destinations": {
+    "//allow": "Deny-by-default. Globs match the provider/model id the agent will use.",
+    "allow": ["openrouter/*", "local/*"],
+    "server": "http://127.0.0.1:4096"
+  },
+  "rules": {
+    "//": "Override any detector: block | redact | warn | off.",
+    "classification-banner": "block",
+    "email-address": "redact"
+  },
+  "paths": {
+    "//deny": "Naming one of these in a payload is itself the finding.",
+    "deny": [
+      "**/.env",
+      "**/.env.*",
+      "**/*.pem",
+      "**/*.pfx",
+      "**/id_rsa",
+      "**/id_ed25519",
+      "**/.npmrc",
+      "**/.aws/credentials",
+      "**/.claude/.credentials.json",
+      "**/secrets/**"
+    ],
+    "//workspace_roots": "Empty means any workspace. Set it to pin delegation to known trees.",
+    "workspace_roots": []
+  },
+  "limits": {
+    "max_payload_bytes": 400000,
+    "max_findings_listed": 40
+  },
+  "posture": {
+    "forbid_permission_allow": ["bash", "webfetch", "external_directory"],
+    "require_server_password": true
+  },
+  "audit": {
+    "//path": "Empty uses the per-OS state directory.",
+    "path": ""
+  }
+}
