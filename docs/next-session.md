@@ -397,3 +397,35 @@ added to a JSON file instead of a code change and a release.
   adopted meter whose aliases the bundled catalog has since learned is dropped
   at load), but not a key collision with different wording. Namespacing
   adopted keys is the fix, and it is a file-format change.
+
+---
+
+## 8. Delegating to OpenCode — evaluated, guarded, not adopted
+
+`docs/opencode-plugin-evaluation.md` is the full review of the two plugin
+families that connect Claude Code and OpenCode, read at the commits named in
+it. Two things from it are operational rather than advisory:
+
+- **`opencode-plugin-cc` rewrites OpenCode's global permissions on every server
+  start**, setting `bash`, `edit`, `webfetch` and `external_directory` to
+  `allow` in `~/.config/opencode/opencode.json`. Reverting it once is not
+  enough — the next delegation puts it back. `python tools/egress_guard.py
+  posture` is what notices, and it runs as part of every `preflight` and
+  `dispatch`.
+- **The subscription-bridge plugins are declined, not parked.** OpenCode's own
+  provider docs state that Anthropic prohibits using a Claude Pro/Max
+  subscription from OpenCode, and the plugins that do it work by impersonating
+  Claude Code down to the system prompt and billing-header signature. Nothing
+  about that improves with a later version.
+
+**What the guard is not.** `tools/egress_guard.py` is a choke point, not a
+sandbox or a DLP product. It sees the payload handed to it and refuses on
+credential shapes, denied paths, marked material and unapproved destinations.
+It cannot see what a delegated agent fetches on its own once `bash` and
+`webfetch` are allowed, which is why the evaluation puts a network allowlist
+under it rather than treating the scan as sufficient. Regex detection has false
+negatives by construction: a clean scan means nothing known-bad was found.
+
+**Nothing in the app changed.** The guard is developer tooling in `tools/`,
+stdlib-only so it runs without the app's dependencies, and no version bump goes
+with it.
