@@ -985,12 +985,65 @@ def fetch_forecast(
     return parsed.total
 
 
-def fetch_budget(token: str, subscription_id: str) -> tuple[float | None, str | None]:
-    """A real monthly cost Budget on the subscription, if one exists.
+def _budget_currency(properties: dict) -> str:
+    """The currency a Budget is denominated in.
+
+    The Budget resource does not carry a currency field of its own; the unit
+    rides on currentSpend, and on forecastSpend when the budget has not been
+    spent against yet.
+    """
+    for key in ("currentSpend", "forecastSpend"):
+        block = properties.get(key)
+        if isinstance(block, dict):
+            unit = str(block.get("unit") or "").strip()
+            if unit:
+                return unit
+    return ""
+
+
+def _budget_scope_matches(properties: dict, resource_group: str | None) -> bool:
+    """Whether this budget measures the same thing the tile does.
+
+    A subscription-scope budget routinely carries a dimension filter - one
+    resource group, one service - and such a budget is *not* the whole
+    subscription's allowance. The only filter accepted is one that names
+    exactly the resource group the tile is already filtered to.
+    """
+    budget_filter = properties.get("filter")
+    if not budget_filter:
+        return True
+    if not resource_group or not isinstance(budget_filter, dict):
+        return False
+    dimensions = budget_filter.get("dimensions")
+    if not isinstance(dimensions, dict):
+        return False
+    if str(dimensions.get("name") or "").strip().lower() != "resourcegroupname":
+        return False
+    values = dimensions.get("values")
+    if not isinstance(values, list) or len(values) != 1:
+        return False
+    return str(values[0]).strip().lower() == resource_group.strip().lower()
+
+
+def fetch_budget(
+    token: str,
+    subscription_id: str,
+    *,
+    currency: str = "",
+    resource_group: str | None = None,
+) -> tuple[float | None, str | None, str | None]:
+    """A real monthly cost Budget on the subscription, if one applies.
 
     Preferred over the settings allowance: if the owner already told Azure what
     the monthly number is, restating it in this app is a second copy to keep in
-    sync. Returns (amount, timeGrain).
+    sync. But it is only the right denominator when it measures the same money:
+    a budget in another currency, or scoped to some other resource group, is
+    refused rather than silently divided into a CAD total. Where several
+    qualify the smallest wins - it is the one that alerts first, and the
+    conservative choice. Not paged on purpose: a subscription with more monthly
+    cost budgets than one page holds is outside this tile's design.
+
+    Returns (amount, timeGrain, note).
     """
     url = (
         f"{_scope(subscription_id)}/providers/Microsoft.Consumption/budgets"
@@ -1003,11 +1056,14 @@ def fetch_budget(token: str, subscription_id: str) -> tuple[float | None, str | 
             "status=%s",
             response.status_code,
         )
-        return None, None
+        return None, None, None
     payload = _json(response)
     values = payload.get("value") if isinstance(payload, dict) else None
     if not isinstance(values, list):
-        return None, None
+        return None, None, None
+
+    note: str | None = None
+    candidates: list[tuple[float, str]] = []
     for item in values:
         if not isinstance(item, dict):
             continue
@@ -1016,16 +1072,32 @@ def fetch_budget(token: str, subscription_id: str) -> tuple[float | None, str | 
             continue
         if str(properties.get("category") or "").strip().lower() != "cost":
             continue
-        if str(properties.get("timeGrain") or "").strip().lower() != "monthly":
+        grain = str(properties.get("timeGrain") or "").strip()
+        if grain.lower() != "monthly":
             continue
-        amount = properties.get("amount")
-        try:
-            value = float(amount)
-        except (TypeError, ValueError):
+        # _to_float, not float(): json.loads accepts Infinity and NaN, and
+        # float("inf") > 0 is True - an infinite denominator reads as 0%.
+        value = _to_float(properties.get("amount"))
+        if value <= 0:
             continue
-        if value > 0:
-            return value, str(properties.get("timeGrain"))
-    return None, None
+        if not _budget_scope_matches(properties, resource_group):
+            note = (
+                "An Azure Budget exists but is scoped to something other than "
+                "this subscription view; using the allowance from Settings."
+            )
+            continue
+        budget_currency = _budget_currency(properties)
+        if currency and budget_currency and budget_currency.lower() != currency.lower():
+            note = (
+                "An Azure Budget exists but is in a different currency from "
+                "the cost data; using the allowance from Settings."
+            )
+            continue
+        candidates.append((value, grain))
+    if not candidates:
+        return None, None, note
+    amount, grain = min(candidates, key=lambda pair: pair[0])
+    return amount, grain, None
 
 
 def fetch_quota_id(token: str, subscription_id: str) -> str | None:
@@ -1452,8 +1524,22 @@ class AzureProvider(Provider):
             )
 
             budget_amount, budget_grain = self._safe_budget(
-                token, subscription_id, notes
+                token,
+                subscription_id,
+                notes,
+                currency=parsed.currency,
+                resource_group=azure_cfg.resource_group,
             )
+            if budget_amount is not None and azure_cfg.reset_day != 1:
+                # A Budget's Monthly grain is the calendar month. An
+                # anniversary period measures a different window, so using it
+                # would divide one window's spend by another window's budget.
+                notes.append(
+                    "An Azure Budget exists, but it covers the calendar month "
+                    "rather than this allowance period; using the allowance "
+                    "from Settings."
+                )
+                budget_amount, budget_grain = None, None
             forecast_total = self._safe_forecast(
                 token,
                 subscription_id,
@@ -1562,14 +1648,28 @@ class AzureProvider(Provider):
             return set()
 
     def _safe_budget(
-        self, token: str, subscription_id: str, notes: list[str]
+        self,
+        token: str,
+        subscription_id: str,
+        notes: list[str],
+        *,
+        currency: str,
+        resource_group: str | None,
     ) -> tuple[float | None, str | None]:
         try:
-            return fetch_budget(token, subscription_id)
+            amount, grain, note = fetch_budget(
+                token,
+                subscription_id,
+                currency=currency,
+                resource_group=resource_group,
+            )
         except AzurePermissionError:
             return None, None
         except (requests.HTTPError, requests.RequestException):
             return None, None
+        if note:
+            notes.append(note)
+        return amount, grain
 
     def _safe_forecast(
         self,
@@ -1711,7 +1811,12 @@ def _probe() -> int:
     print(f"Foundry roll-up: {foundry_cost if foundry_cost is not None else 'n/a'}")
 
     try:
-        amount, grain = fetch_budget(token, subscription_id)
+        amount, grain, _note = fetch_budget(
+            token,
+            subscription_id,
+            currency=parsed.currency,
+            resource_group=azure_cfg.resource_group,
+        )
         print(f"azure budget: {amount if amount else 'none'} ({grain or '-'})")
     except Exception as exc:  # noqa: BLE001
         print(f"azure budget: failed ({type(exc).__name__})")

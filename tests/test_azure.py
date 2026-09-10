@@ -526,9 +526,10 @@ def test_budget_prefers_a_monthly_cost_budget():
         },
         status=200,
     )
-    amount, grain = az.fetch_budget("tok", SUB)
+    amount, grain, note = az.fetch_budget("tok", SUB, currency="CAD")
     assert amount == pytest.approx(250.0)
     assert grain == "Monthly"
+    assert note is None
 
 
 @responses.activate
@@ -1269,3 +1270,111 @@ def test_the_marketplace_query_only_reclassifies_its_own_rows(monkeypatch, confi
     assert snapshot.raw["marketplace_cost"] == pytest.approx(1.0)
     rows = {m.label: m.note for m in snapshot.metrics if m.tag == az.BREAKDOWN_TAG}
     assert "CAD 1.00" in rows[az.MARKETPLACE_BUCKET]
+
+
+# --- an Azure Budget is only sometimes the right denominator ---------------
+
+
+def _budget(amount, **props):
+    body = {"category": "Cost", "timeGrain": "Monthly", "amount": amount}
+    body.update(props)
+    return {"properties": body}
+
+
+def _budgets(*items):
+    responses.add(responses.GET, BUDGETS_URL, json={"value": list(items)}, status=200)
+
+
+@pytest.mark.parametrize("amount", [float("inf"), "1e400", float("nan"), "abc", -5, 0])
+@responses.activate
+def test_a_non_finite_or_unusable_budget_amount_is_ignored(amount):
+    """float('inf') > 0 is True, and total/inf*100 is 0.0 - a gauge pinned at
+    0% while spend accrues is the failure this module refuses everywhere else."""
+    _budgets(_budget(amount))
+    got, grain, _note = az.fetch_budget("tok", SUB, currency="CAD")
+    assert got is None and grain is None
+
+
+@responses.activate
+def test_a_scoped_budget_is_not_the_subscriptions_allowance():
+    """Subscription-scope budgets routinely carry a dimension filter; a £5
+    budget on one resource group is not the whole subscription's allowance."""
+    _budgets(
+        _budget(
+            5.0,
+            filter={
+                "dimensions": {
+                    "name": "ResourceGroupName",
+                    "operator": "In",
+                    "values": ["rg-unrelated"],
+                }
+            },
+        )
+    )
+    got, _grain, _note = az.fetch_budget("tok", SUB, currency="CAD")
+    assert got is None
+
+
+@responses.activate
+def test_a_budget_scoped_to_the_configured_resource_group_is_accepted():
+    _budgets(
+        _budget(
+            5.0,
+            filter={
+                "dimensions": {
+                    "name": "ResourceGroupName",
+                    "operator": "In",
+                    "values": ["RG-AI"],
+                }
+            },
+        )
+    )
+    got, _grain, _note = az.fetch_budget(
+        "tok", SUB, currency="CAD", resource_group="rg-ai"
+    )
+    assert got == pytest.approx(5.0)
+
+
+@responses.activate
+def test_a_budget_in_another_currency_is_refused_with_a_note():
+    _budgets(_budget(200.0, currentSpend={"amount": 30.0, "unit": "USD"}))
+    got, _grain, note = az.fetch_budget("tok", SUB, currency="CAD")
+    assert got is None
+    assert "currency" in (note or "").lower()
+
+
+@responses.activate
+def test_the_smallest_qualifying_budget_wins():
+    """The smallest is the one that alerts first, and the conservative
+    denominator when several apply."""
+    _budgets(_budget(2000.0), _budget(300.0), _budget(900.0))
+    got, _grain, _note = az.fetch_budget("tok", SUB, currency="CAD")
+    assert got == pytest.approx(300.0)
+
+
+@responses.activate
+def test_a_budget_currency_can_come_from_the_forecast_unit():
+    _budgets(_budget(250.0, forecastSpend={"amount": 40.0, "unit": "CAD"}))
+    got, _grain, _note = az.fetch_budget("tok", SUB, currency="CAD")
+    assert got == pytest.approx(250.0)
+
+
+@responses.activate
+def test_a_budget_does_not_apply_to_an_anniversary_period(monkeypatch, config):
+    """An Azure Budget is a calendar-month figure; a reset day of 15 measures
+    a different window, so the numerator and denominator would disagree."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    config.azure.reset_day = 15
+    _stub_everything()
+    responses.replace(
+        responses.GET,
+        BUDGETS_URL,
+        json={"value": [_budget(500.0, currentSpend={"amount": 1.0, "unit": "CAD"})]},
+        status=200,
+    )
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+    assert snapshot.raw["budget_amount"] is None
+    note = snapshot.metrics[0].note or ""
+    assert "budget" in note.lower()
+    # 28.55 of the settings allowance (150), not of the 500 budget.
+    assert snapshot.metrics[0].percent_used == pytest.approx(19.03, abs=0.01)
