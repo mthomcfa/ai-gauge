@@ -1038,3 +1038,54 @@ def test_an_epochless_snapshot_for_a_live_dispatch_only_repaints():
     assert app._inflight == {"copilot"}  # noqa: SLF001
     assert app._watchdogs.get("copilot") is watchdog  # noqa: SLF001
     assert app._cycle_active is True  # noqa: SLF001
+
+
+def test_the_heartbeat_leaves_a_healthy_cycle_alone():
+    """The wedge recovery is safe only because of the order of its guards.
+
+    A healthy cycle passes twice through "nothing in flight, no watchdog
+    left, cycle still open" - between two browser dispatches - and only the
+    `_refresh_queue` test in the first guard tells that apart from a wedge.
+    Moving that test out of the first guard passes every other test in this
+    suite, and turns the heartbeat into a thing that abandons the second half
+    of every cycle whose browser queue is between dispatches. The only
+    symptom would be providers quietly not refreshing.
+    """
+    claude = _BrowserProvider(_ok("claude"), hold=True)
+    codex = _BrowserProvider(_ok("codex"), hold=True)
+    app = _app({"claude": claude, "codex": codex})
+
+    app.refresh_now(manual=False)
+    assert app._inflight == {"claude"}  # noqa: SLF001
+    assert app._refresh_queue == ["codex"]  # noqa: SLF001
+    # Hold the queue where a real cycle holds it: `_advance_cycle` hands the
+    # next provider to `QTimer.singleShot`, so between the two there is a
+    # moment with an empty `_inflight` and no watchdog at all.
+    app._start_next_refresh = lambda: None  # noqa: SLF001
+    claude.pending(_ok("claude"))
+    assert app._inflight == set()  # noqa: SLF001
+    assert app._watchdogs == {}  # noqa: SLF001
+    assert app._refresh_queue == ["codex"]  # noqa: SLF001
+    assert app._cycle_active is True  # noqa: SLF001
+
+    app._log_heartbeat()  # noqa: SLF001
+
+    assert app._cycle_active is True, "a healthy cycle was declared wedged"  # noqa: SLF001
+    assert app._refresh_queue == ["codex"], "the queued provider was dropped"  # noqa: SLF001
+
+
+def test_the_heartbeat_still_ends_a_cycle_with_nothing_left_to_run():
+    """The positive half, beside the negative one: an empty queue *and* an
+    empty `_inflight` *and* no watchdog is the state that cannot recover on
+    its own, because `_schedule_next_refresh` was never reached."""
+    claude = _BrowserProvider(_ok("claude"), hold=True)
+    app = _app({"claude": claude})
+
+    app.refresh_now(manual=False)
+    app._inflight.clear()  # noqa: SLF001 - a cycle that lost its dispatch
+    app._watchdogs.clear()  # noqa: SLF001
+    assert app._cycle_active is True  # noqa: SLF001
+
+    app._log_heartbeat()  # noqa: SLF001
+
+    assert app._cycle_active is False, "the wedged cycle was left open"  # noqa: SLF001
