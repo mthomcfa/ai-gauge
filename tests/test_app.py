@@ -1477,6 +1477,32 @@ def test_a_provider_the_user_switched_off_and_on_again_is_a_new_object():
     assert app._providers["copilot"] is not first  # noqa: SLF001
 
 
+def test_an_accounts_kind_change_is_a_new_provider_object():
+    """The reuse key is the account id *and* the exact class.
+
+    Keeping the previous object for an id whose kind changed would point a
+    Codex account at a `ClaudeProvider` - a scrape of the wrong page against
+    the right profile. Not reachable through the UI, where ids are
+    kind-prefixed; it is the check that makes the reuse safe, which is
+    exactly why it is worth pinning.
+    """
+    from aigauge.config import BrowserAccount
+    from aigauge.providers.claude import ClaudeProvider
+    from aigauge.providers.codex import CodexProvider
+
+    config = Config()
+    config.browser_accounts = [BrowserAccount(id="x-1", kind="claude")]
+    app = _provider_app(config)
+    assert isinstance(app._providers["x-1"], ClaudeProvider)  # noqa: SLF001
+
+    config.browser_accounts = [BrowserAccount(id="x-1", kind="codex")]
+    app._build_providers()  # noqa: SLF001
+
+    assert isinstance(app._providers["x-1"], CodexProvider), (  # noqa: SLF001
+        "an account that changed kind kept the provider for the old one"
+    )
+
+
 def test_a_rebuilt_browser_provider_still_refuses_a_live_scrape():
     """End to end: the account is scraping, the settings save rebuilds the
     provider, and the fresh object still refuses. Nine concurrent

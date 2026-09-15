@@ -1138,6 +1138,78 @@ def test_a_late_answer_from_a_slow_provider_repaints_its_tile():
     assert ratios == ["copilot"], "the burn-rate row stayed hidden"
 
 
+def test_a_skipped_provider_leaves_the_cycles_books_straight():
+    """A provider dropped from the queue mid-cycle is not part of the cycle.
+
+    Leaving it in `_cycle_names` and in `_cycle_total` makes the header count
+    toward a denominator that never arrives and puts a name in the verdict
+    set that never answered.
+    """
+    claude = _BrowserProvider(_ok("claude"), hold=True)
+    codex = _BrowserProvider(_ok("codex"))
+    app = _app({"claude": claude, "codex": codex})
+
+    app.refresh_now(manual=False)
+    assert app._cycle_total == 2  # noqa: SLF001
+    assert app._cycle_names == {"claude", "codex"}  # noqa: SLF001
+
+    # A settings save removes codex while it is queued behind claude.
+    app._providers.pop("codex")  # noqa: SLF001
+    claude.pending(_ok("claude"))
+
+    assert codex.calls == 0, "a removed provider was dispatched"
+    assert "codex" not in app._cycle_names, (  # noqa: SLF001
+        "a provider that never ran is in the cycle's verdict set"
+    )
+    assert app._cycle_total == 1, "the header counts toward a name that skipped"  # noqa: SLF001
+    assert app._cycle_active is False, "the cycle never closed"  # noqa: SLF001
+
+
+def test_a_later_cycles_pool_budgets_replace_the_earlier_ones():
+    """`_pool_wait_budgets` is what a dispatch may spend waiting for a thread.
+
+    Accumulating it instead of replacing it inflates every later watchdog
+    with the budgets of providers that are not in this cycle at all - a
+    one-provider retry would be given the whole previous cycle's slack, and a
+    watchdog that fires late is a watchdog that does not bound anything.
+    """
+    copilot = _Provider(_ok("copilot"), hold=True)
+    openrouter = _Provider(_ok("openrouter"), hold=True)
+    azure = _Provider(_ok("azure"), hold=True)
+    app = _app({"copilot": copilot, "openrouter": openrouter, "azure": azure})
+
+    app.refresh_now(manual=False)
+    assert set(app._pool_wait_budgets) == {"copilot", "openrouter", "azure"}  # noqa: SLF001
+    crowded = app._watchdogs["copilot"].interval_ms  # noqa: SLF001
+    for provider in (copilot, openrouter, azure):
+        provider.pending(_ok(provider.snapshot.provider))
+
+    app.refresh_provider("copilot")
+
+    assert app._pool_wait_budgets == {"copilot": 60.0}, (  # noqa: SLF001
+        "a cycle inherited the budgets of the one before it"
+    )
+    # 60 s of REST budget plus 20 s of watchdog slack, and nothing ahead of
+    # it in the pool.
+    assert app._watchdogs["copilot"].interval_ms == 80_000  # noqa: SLF001
+    assert crowded > 80_000, "the first cycle's slack was not measured at all"
+
+
+def test_a_repaint_updates_the_tray():
+    """Per snapshot, not per cycle: the tray dot and its tooltip used to be a
+    whole cycle behind the tiles, which is minutes on a failing cycle. A
+    repaint is a snapshot reaching a tile, so it is a tray update too."""
+    copilot = _Provider(_ok("copilot"))
+    app = _app({"copilot": copilot})
+    app.refresh_now(manual=False)
+    tray: list[int] = []
+    app._update_tray = lambda: tray.append(1)  # noqa: SLF001
+
+    app._repaint_snapshot(app._snapshots["copilot"])  # noqa: SLF001
+
+    assert tray == [1], "the tray stayed a cycle behind the tile it just painted"
+
+
 def test_a_late_answer_is_recorded_and_not_only_painted():
     """A slow-but-healthy provider had a healthy tile and no history at all.
 
@@ -1426,7 +1498,9 @@ def test_a_purge_that_runs_is_taken_off_the_pending_list(monkeypatch):
 
 def test_the_pending_purges_run_before_any_provider_is_built():
     """Order matters: a provider built first can start a scrape on the very
-    profile that is owed a deletion."""
+    profile that is owed a deletion, and a cookie hydrated first re-creates
+    the directory the purge is about to delete - putting a removed account's
+    live session credential back on disk."""
     import inspect
 
     source = inspect.getsource(App.__init__)
@@ -1434,6 +1508,9 @@ def test_the_pending_purges_run_before_any_provider_is_built():
     assert source.index("_drain_pending_profile_purges") < source.index(
         "self._build_providers()"
     ), "a provider could be scraping the profile that is owed a deletion"
+    assert source.index("_drain_pending_profile_purges") < source.index(
+        "hydrate_all_from_keyring"
+    ), "a cookie was hydrated into a profile that is owed a deletion"
 
 
 def test_a_retry_due_on_a_parked_provider_is_kept_for_when_the_park_lifts(
