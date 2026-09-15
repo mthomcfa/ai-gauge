@@ -3,8 +3,15 @@
 State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#16,
 610 tests passing, all five providers reading.
 
+> **Updated 2026-09-15** by the hardening follow-up (`1.3.1+cfa.6`,
+> 1 239 tests), which closed most of what the refresh-cadence work left in
+> [§8.3](#83-known-soft-spots-in-what-was-built): the REST park, the
+> "Clear all browser data" purge, the dispatch epoch's name, the log
+> summariser and the scraper's uncapped log lines. What is still open there
+> is marked as such.
+>
 > **Updated 2026-09-15** by the refresh-cadence work (`1.3.0+cfa.5`,
-> 1 216 tests). Its residuals are folded into
+> 1 216 tests). Its residuals were folded into
 > [§8.3](#83-known-soft-spots-in-what-was-built) rather than given a section
 > of their own, because they are the same scheduler.
 >
@@ -650,42 +657,46 @@ unnecessary source of behaviour change.
   `Config.load()` — the migration always re-inserts both fixed accounts — so
   the fallback was left alone and its test renamed to claim only what it
   checks.
-- **Only the browser providers refuse a re-entrant refresh; Copilot and
-  OpenRouter do not, and that is now a thread-pool question.** The App parks a
-  provider whose dispatch its watchdog abandoned, but the assumed-dead ceiling
-  has to let it go eventually, and for the browser providers the account-keyed
-  live-scrape registry then catches it. Azure is covered by its own
-  `state.in_flight` gate. Copilot and OpenRouter have neither, and `requests`'
-  `timeout` is per socket operation rather than a total, so a server that
-  sends one byte every 14 s against a 15 s timeout holds a worker forever.
+- **A hung REST worker no longer accumulates siblings, but the socket
+  itself is still unbounded.** Copilot and OpenRouter refuse nothing of
+  their own (Azure has its `state.in_flight` gate), and `requests`' `timeout`
+  is per socket operation rather than a total, so a server that sends one
+  byte every 14 s against a 15 s timeout holds a worker forever. The
+  assumed-dead ceiling used to hand that endpoint a fresh worker every time
+  it expired.
 
-  **The bound is the pool, not the request rate.** Copilot, OpenRouter and
-  Azure all submit to `QThreadPool.globalInstance()`, so the live socket count
-  can never exceed `maxThreadCount`; measured over six fake hours against a
-  byte-dripping server, every pool slot ends up stuck (1 of 1, 2 of 2, 4 of 4,
-  8 of 8) with an unbounded FIFO of queued runnables growing about four or
-  five objects an hour. The request *rate* falls rather than amplifies -
-  queued runnables never get a thread, so nothing is sent.
+  **Option (c) was taken in 1.3.1+cfa.6.** A provider whose `uses_browser`
+  is False stays parked until its worker reports back - any snapshot for
+  that name, live or late - or until `_REST_PARK_BACKSTOP_SECONDS` (one
+  hour), whichever is first; the browser providers keep the 2x ceiling,
+  because the account-keyed live-scrape registry catches the one case it
+  lets through. Six fake hours against a wedged REST worker: **50 dispatches
+  before, 6 after**, no two closer than 3 680 s, with the browser sibling
+  unchanged at 26 and 28. The `abandoned` log line names the rule that
+  applied (`ceiling=browser_2x` / `ceiling=rest_backstop`). This was safe to
+  do only because all three REST providers always call `on_done` unless
+  `work()` never returns - Copilot's and OpenRouter's `_run_async` wrap
+  `work()` in try/except, Azure's does the same and its `work()` has a
+  `finally`.
 
-  **The consequence is availability.** All three REST tiles are dead for the
-  life of the process, with no recovery path; before the watchdog work the
-  same server produced one stuck worker and a stalled app, so this converts a
-  one-slot leak into an all-slots leak plus a growing queue. Measured in the
-  six-hour fuzz with a double that never answers and never refuses: browser
-  providers went from 19 concurrent to **1**, the REST ones to 15 in that
-  model, and 9 live workers against the dripping server.
+  **The bound was the pool, and the pool still fills if the socket never
+  closes.** Copilot, OpenRouter and Azure all submit to
+  `QThreadPool.globalInstance()`, so the live socket count can never exceed
+  `maxThreadCount`; measured over six fake hours against a byte-dripping
+  server, every pool slot ends up stuck (1 of 1, 2 of 2, 4 of 4, 8 of 8)
+  with an unbounded FIFO of queued runnables growing about four or five
+  objects an hour, after which all three REST tiles are dead for the life of
+  the process. What the park change removes is the *supply* of new stuck
+  workers - one an hour per provider instead of one every few minutes - not
+  the wedged worker itself.
 
-  **Fix options, for the maintainer to pick.** (a) A total-response deadline
-  on the REST side - `stream=True` plus an elapsed check while reading - which
-  is the only one that actually bounds the socket. (b) A dedicated
-  `QThreadPool` per provider, so one wedged provider cannot starve the other
-  two; cheapest containment, and it does not free the wedged worker. (c) Keep
-  the assumed-dead ceiling for browser providers only, and require a REST
-  worker to report back before its park is released. (d) A busy flag on the
-  provider - the smallest change, but it means writing a provider attribute
-  from a pool thread, which is the one thing this scheduler currently never
-  does: every provider `on_done` only emits a queued signal. Any of these
-  deserves its own change rather than a tail-end addition here.
+  **What is left is option (a): a total-response deadline on the REST
+  side** - `stream=True` plus an elapsed check while reading - which is the
+  only one that actually bounds the socket, and the only one that frees a
+  worker already stuck. (b), a dedicated `QThreadPool` per provider, is
+  still available as containment and still does not free anything. (d), a
+  busy flag on the provider, is now moot: the park does that job from the
+  App side, without writing a provider attribute from a pool thread.
 
   **Every dispatch of a hung REST provider costs a slot, which is why the
   kept retry is folded into the cadence.** An earlier draft of the retry
@@ -693,8 +704,10 @@ unnecessary source of behaviour change.
   measured against the round-2 tree with the same seeds that was 4→5 and 6→7
   dispatches an hour and 15→17 worst concurrent REST workers in the 60-seed
   six-hour fuzz. Owing the due no earlier than the next cadence wake puts all
-  three numbers back (4, 6, 15/14/15). It does not contain the leak; it just
-  stops this feature widening it.
+  three numbers back (4, 6, 15/14/15). With an hour-long park the same rule
+  is what keeps the due riding ordinary cadence wakes - pinned over eleven
+  five-minute wakes inside one park - rather than arming an hour-long timer
+  of its own.
 - **On a one-core host every REST watchdog is about six minutes.**
   `_pool_wait_slack` adds `sum(every other REST budget) / maxThreadCount` to a
   dispatch's watchdog, because the cycle hands openrouter, copilot and azure
@@ -712,21 +725,14 @@ unnecessary source of behaviour change.
   to catch, and feeds the parking machinery - but the alternative is to scale
   the allowance by pool size (or to have providers report when their work
   actually starts, which is a Provider-API change: the API is one callback).
-- **"Clear all browser data" still purges a profile the App may be scraping.**
-  Profile deletion moved out of the settings dialog for the *removal* path,
-  because only the App knows whether a scrape of that account is still holding
-  the directory. `settings_dialog._clear_all_browser_data` still calls
-  `purge_profile` synchronously for every configured account, every account on
-  disk and the three fixed ids - including one whose scrape is live. That is
-  the same `deleteLater()`-then-`rmtree` under a live `QuietWebEnginePage`
-  that `_run_profile_purges` exists to prevent, and it is the most reachable
-  way to produce the destroyed page that used to strand the live-scrape guard
-  (that half is fixed: the guard expires, and `_finish` no longer loses its
-  emit to a diagnostic). Left as is because it is an explicit, confirmed user
-  action behind a warning dialog, unlike a settings save; the fix is to emit
-  the id list to the App the way `removed_profile_ids` now does and let
-  `_purge_removed_profiles` defer it, and/or to have both purge paths ask
-  `account_is_busy()` - the signal now exists and neither caller consults it.
+- ~~**"Clear all browser data" still purges a profile the App may be
+  scraping.**~~ **Closed in 1.3.1+cfa.6.** The dialog emits the id list on
+  `browser_data_clear_requested` and the App defers each one exactly as it
+  defers a removal; both purge paths now also ask `account_is_busy()`. The
+  clear-all ids are held on a separate in-memory list, because the persisted
+  `pending_profile_purges` drain skips an id that is also a configured
+  account by design - so a quit inside the deferral window loses that one
+  clear and the user clicks again, which the deferral line says.
 - **A deferred purge makes the app write `config.json` on its own.**
   `_run_profile_purges` records what is still owed, and it is called from
   `App.__init__` and from the five-minute heartbeat - so while a purge is
@@ -737,59 +743,55 @@ unnecessary source of behaviour change.
   is that `Config.save()` serialises the whole model, so a key an older or
   newer build wrote that this one does not model is dropped, and a concurrent
   hand-edit is overwritten. Worth knowing before adding a second such writer;
-  not worth a mechanism on its own. (It also means an ad-hoc harness that
+  not worth a mechanism on its own. (1.3.1+cfa.6 added a second deferral
+  list, for "Clear all browser data", and deliberately did **not** persist
+  it - so it is not a second writer, at the cost of losing one clear if the
+  app quits inside the window.) (It also means an ad-hoc harness that
   drives `_run_profile_purges` must set `APPDATA` - an override on every OS,
   which `tests/conftest.py` sets for the suite - or it edits the developer's
   real config.)
-- **The log summariser's shared budget does not cover `repr()` values or
-  large numbers, and `_raw_summary` catches only `TypeError`.** The budget is
-  charged for strings, for dict keys and for elided nodes, but the numeric
-  branch charges a flat eight characters whatever the magnitude and the
-  `repr()` fallback is charged after the fact and never clipped: a 5 MB
-  `bytes` value still produces a record 9.5x the rotation, and fifty
-  4 200-digit JSON integers produce 210 KB. Separately, three inputs make the
-  walk raise something `except TypeError` does not catch - an object whose
-  `__repr__` raises, a dict key whose `__str__` raises, and a `dict` subclass
-  whose `items()` raises - and that escapes into `_on_snapshot`. None of it is
-  reachable today: browser payloads arrive through the QtWebEngine JS bridge
-  (no bytes, no integers), `json.loads` itself refuses a number of more than
-  4 300 digits, and the two REST providers that keep a verbatim server dict do
-  so only on an OK snapshot while `raw_summary=` prints only on
-  ERROR/AUTH_REQUIRED. It would bite the first time an extractor or a provider
-  returns something that is not plain JSON. Fix:
-  `budget[0] -= max(8, len(str(value)))` in the numeric branch, clip the
-  `repr()` to `_LOG_VALUE_LIMIT` the way the string branch already does, and
-  widen the `except` - a log line must never be able to raise.
-- **The dispatch epoch is matched against the name the payload carries.**
-  `_dispatch`'s `_emit` forwards the provider's own `snapshot.provider` and
-  pairs it with the dispatch's epoch; every gate downstream keys on that name.
-  Epochs advance in lockstep across a cycle, so a snapshot mislabelled with a
-  *sibling account's* id is accepted as that sibling's live answer - clearing
-  its `_inflight` entry, destroying its watchdog, joining the cycle's verdict
-  and painting its tile with another account's numbers; the late path now has
-  the same reach. Unreachable today, and checked rather than assumed:
-  `ScrapeRunner` sets `provider=self._account_id`, the browser builders take
-  `account_id=` from the App, and the three REST providers hardcode their
-  literal, so no extractor's output reaches the field. The fix belongs in one
-  place - `replace(snap, provider=_name)` in `_emit`, so the App's own notion
-  of what it dispatched is the only thing that can decide which tile is
-  touched.
-- **The resume-artifact threshold is still unreachable on an awake machine,
-  and two `scraper.py` log lines still carry uncapped page text.** Both
-  pre-date this work; `webview/scraper.py` is touched by it only in `_finish`,
-  where the diagnostics now give way to the `done` signal. The threshold: the scraper calls a timeout a resume artifact past
+- ~~**The log summariser's shared budget does not cover `repr()` values or
+  large numbers, and `_raw_summary` catches only `TypeError`.**~~ **Closed in
+  1.3.1+cfa.6**, with one correction to the fix sketched here:
+  `len(str(value))` is itself the crash, because CPython 3.11+ raises
+  `ValueError` on `str()` of an int over 4 300 digits and `json.dumps` hits
+  the same limit from the inside. The length is estimated from
+  `bit_length()` and a number past `_LOG_VALUE_LIMIT` digits never reaches
+  the serialiser at all. The `repr()` fallback is wrapped and clipped, the
+  key walk is guarded in both functions that do it (`_raw_keys_for_log` is
+  evaluated in the same log call and would have raised first), and
+  `_raw_summary` catches `Exception` with a *bounded* literal - `repr(raw)`
+  was the unbounded thing it exists to prevent. Measured before and after:
+  5 MB `bytes` 5 000 012 → 312 characters, fifty 4 200-digit integers
+  210 440 → 50, and the three raising inputs return a string.
+- ~~**The dispatch epoch is matched against the name the payload
+  carries.**~~ **Closed in 1.3.1+cfa.6.** `_emit` sends
+  `replace(snap, provider=_name)`, so the App's own notion of what it
+  dispatched is the only thing that can decide which tile is touched, and a
+  payload that named something else is logged once - naming the dispatched
+  provider and a fixed literal, never the payload's own string.
+- **The resume-artifact threshold is still unreachable on an awake
+  machine.** The scraper calls a timeout a resume artifact past
   `timeout_ms x max_attempts x RESUME_ARTIFACT_FACTOR`, which for Claude is
   40 x 2 x 3 = 240 s, while the App's watchdog for the same provider is
   160 + 20 s - so the watchdog always wins and the classification only ever
   fires across a real machine suspend, which is what it was written for.
   `self._started_at` is also set once in `__init__` and not reset in
-  `_begin_attempt`. The log lines: `title=%r` and `result_keys=%s` print
-  `document.title` and the extractor's key names with no length cap, the
-  healthy one at INFO - worst case measured at 1.5 MB for a single record,
-  2.9x the 512 KiB rotation. The fix is the same one-line clip applied at
-  three call sites (`self._page.title()[:200]`, `sorted(result)[:50]` with
-  clipped names). Suppressive or diagnostic only, with no request-rate
-  consequence, so both are left for a scraper-scoped change.
+  `_begin_attempt`. Comparing against the App's budget rather than the
+  scraper's, and bypassing the retry branch for a classified resume
+  artifact, is the rest of the fix; it is scraper *timing* and was left for
+  its own change.
+
+  ~~**Two `scraper.py` log lines carry uncapped page text.**~~ **Closed in
+  1.3.1+cfa.6**, and there were four title sites rather than the three the
+  earlier note counted. Titles clip at 200 and the key list takes
+  `raw_keys=`'s shape (50 names of 60, with the true count beside them).
+  Measured by driving `_finish` with a 1 MB `document.title` and 10 000 keys
+  of 1 000 characters: `scrape ok` 11 079 134 → 3 814 characters and
+  `scrape fail` 1 000 367 → 570. `_safe_url` was checked and was already
+  bounded at 300. Note that `_load_failure_context` still puts the raw title
+  into the *payload*, which is bounded downstream by `_raw_summary` and by
+  `error_dialog._sanitize_raw` rather than at source.
 - **`CopilotProvider` and `OpenRouterProvider` do not declare
   `refresh_budget_seconds`.** Both take the flat 60 s default. Copilot's real
   nominal ceiling is 10 + 15 + 15 s of `requests` timeouts, each per socket
