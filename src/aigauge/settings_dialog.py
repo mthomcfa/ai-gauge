@@ -1301,7 +1301,7 @@ class SettingsDialog(QDialog):
             url = OPENCODE_GO_USAGE_URL
         _open_in_browser(url)
 
-    def _profile_ids_on_disk(self) -> tuple[list[str], list[str]]:
+    def _profile_dirs_on_disk(self) -> tuple[list[str], list[str]]:
         """Every name in `profiles/`, and the ones this sweep can act on.
 
         Names on disk are read from the filesystem, so they are not bounded
@@ -1365,7 +1365,7 @@ class SettingsDialog(QDialog):
         account_ids |= {"claude", "codex", "opencode_go"}
         # Ids on disk that are not accounts go the same way: they are exactly
         # the leftovers this button exists to sweep up.
-        on_disk, usable = self._profile_ids_on_disk()
+        on_disk, usable = self._profile_dirs_on_disk()
         unusable = len(on_disk) - len(usable)
         # The keyring pass takes every name, including the ones the sweep
         # will not touch: no reachable keyring entry can exist under such a
@@ -1381,7 +1381,10 @@ class SettingsDialog(QDialog):
                 # The id can have come off the filesystem, so it is bounded
                 # here rather than trusted to be one the app generated.
                 log.exception("failed to clear the stored cookie for %.64r", account_id)
-        self._cleared_profile_ids |= account_ids
+        # Assigned, not accumulated: the button's set is every configured
+        # account, every fixed id and every usable name on disk, so a second
+        # click can only cover what the first did.
+        self._cleared_profile_ids = set(account_ids)
         self.browser_data_clear_requested.emit(sorted(account_ids))
         # A count only: the names are the ones the id rule rejected, which is
         # exactly the text there is no reason to put in a log line.

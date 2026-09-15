@@ -1699,6 +1699,23 @@ def test_the_whole_snapshot_error_log_call_is_total():
     for raw in (_IterRaises(a=1), _LenRaises(a=1), _ItemsRaises(a=1), None, {}):
         assert isinstance(_raw_keys_for_log(raw), str)
         assert isinstance(_raw_summary(raw), str)
+
+    # A key that refuses to print costs that key its name and nothing else.
+    # The end-to-end guard above would otherwise hide a missing per-key one,
+    # which throws the whole list away on a payload that is mostly readable.
+    class _KeyStrRaises:
+        def __str__(self):
+            raise ValueError("this key refuses to be printed")
+
+        def __hash__(self):
+            return 11
+
+    keys = _raw_keys_for_log({_KeyStrRaises(): 1, "usage": 2, "limit": 3})
+    assert "'usage'" in keys and "'limit'" in keys, keys
+    assert "'<key>'" in keys, keys
+    assert '"<key>"' in _raw_summary({_KeyStrRaises(): 1, "usage": 2}), (
+        "one unprintable key cost the whole summary"
+    )
     # An empty or absent payload still reads as an empty one.
     assert _raw_summary(None) == "{}" and _raw_summary({}) == "{}"
     assert _raw_keys_for_log(None) == "[]"

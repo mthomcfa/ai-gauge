@@ -1,8 +1,18 @@
 import logging
+import time
 
 import pytest
 
 from aigauge.webview.scraper import HeadlessScraper
+
+# How far back a stand-in's clock is pushed to stand for "the lid was closed
+# mid-scrape". It is an offset from `time.monotonic()`, never an absolute
+# value: `_is_resume_artifact` compares `monotonic() - _started_at` against
+# three times the scrape budget, so a literal 0.0 measures the *host's
+# uptime*. A CI runner 74.9 s into its first boot put that below the 75 s
+# threshold and the classification never happened, while every long-lived
+# runner passed.
+_A_SUSPEND_AGO = 300_000.0
 
 
 def test_extractor_retry_limit_is_retryable_transport_error():
@@ -82,7 +92,9 @@ class _LoadFailStandIn:
         self._provider = "claude"
         self._attempt = 1
         self._render_terminated = False
-        self._started_at = 0.0
+        # What the real scraper does at construction, so elapsed is ~0 and
+        # nothing is a resume artifact unless a test asks for one.
+        self._started_at = time.monotonic()
         self._timeout_ms = 25000
         self._max_attempts = 1
         self._RETRYABLE_ERRORS = ()
@@ -256,7 +268,7 @@ def test_a_timeout_measured_across_a_suspend_is_named_as_one(caplog):
     import logging
 
     stand_in = _LoadFailStandIn()
-    stand_in._started_at = 0.0  # monotonic zero: elapsed is hours, not seconds
+    stand_in._started_at = time.monotonic() - _A_SUSPEND_AGO  # ~3.5 days
 
     with caplog.at_level(logging.WARNING, logger="aigauge.webview.scraper"):
         HeadlessScraper._finish(stand_in, None, "timeout")
@@ -267,8 +279,6 @@ def test_a_timeout_measured_across_a_suspend_is_named_as_one(caplog):
 
 
 def test_an_ordinary_timeout_is_not_called_a_resume_artifact():
-    import time
-
     stand_in = _LoadFailStandIn()
     # Timed out at its own budget, as a slow page does.
     stand_in._started_at = time.monotonic() - 26.0
@@ -283,7 +293,7 @@ def test_a_page_that_failed_to_load_is_never_a_resume_artifact():
     """Only a timeout can be measured across a suspend; every other failure
     is reported by Chromium at the moment it happens."""
     stand_in = _LoadFailStandIn()
-    stand_in._started_at = 0.0
+    stand_in._started_at = time.monotonic() - _A_SUSPEND_AGO
 
     HeadlessScraper._finish(stand_in, None, "page failed to load")
 
@@ -471,7 +481,13 @@ def test_the_scrapers_key_walk_cannot_raise_and_its_class_name_is_bounded():
         def __hash__(self):
             return 11
 
-    assert isinstance(_result_keys_for_log({_KeyStrRaises(): 1}), str)
+    # One key that refuses to print costs that key its name and nothing
+    # else: the outer guard added beside this one would otherwise mask a
+    # missing per-key guard by throwing the whole list away.
+    line = _result_keys_for_log({_KeyStrRaises(): 1, "usage": 2, "limit": 3})
+    assert "'usage'" in line and "'limit'" in line, line
+    assert "'<key>'" in line, line
+
     huge = type("N" * 1_000_000, (), {})()
     assert len(_result_keys_for_log(huge)) == 60
 
