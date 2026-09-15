@@ -272,3 +272,46 @@ def test_a_build_retry_keeps_the_runner_busy(fake_scraper):
 
     fake_scraper.instances[-1].done.emit({"payload": 2}, "")
     assert received and rn.busy() is False
+
+
+def test_a_page_cannot_name_its_own_error_class(fake_scraper):
+    """`error_class` is a scheduler input, and on the "extractor retry limit
+    exceeded" branch `result` is the extractor's own return dict - a value
+    that came out of the provider page. No shipped extractor emits
+    `classification`, and the scheduler only tests the value for membership
+    in a two-element tuple, so this is not reachable today. The allowlist is
+    what keeps it unreachable."""
+    received: list[UsageSnapshot] = []
+    rn = ScrapeRunner(
+        account_id="x",
+        url="http://example",
+        extractor_js="",
+        build=lambda payload: _ok_snapshot(),
+        log=logging.getLogger("test"),
+    )
+    rn.run(received.append)
+
+    fake_scraper.instances[-1].done.emit(
+        {"classification": "throttled", "body_text": "..."},
+        "extractor retry limit exceeded",
+    )
+
+    assert received[0].error_class is None, "a page set a scheduler input"
+
+
+def test_a_scraper_may_still_name_a_resume_artifact(fake_scraper):
+    received: list[UsageSnapshot] = []
+    rn = ScrapeRunner(
+        account_id="x",
+        url="http://example",
+        extractor_js="",
+        build=lambda payload: _ok_snapshot(),
+        log=logging.getLogger("test"),
+    )
+    rn.run(received.append)
+
+    fake_scraper.instances[-1].done.emit(
+        {"classification": "resume_artifact"}, "timeout"
+    )
+
+    assert received[0].error_class == "resume_artifact"

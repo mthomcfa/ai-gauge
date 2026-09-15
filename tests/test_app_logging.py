@@ -199,6 +199,7 @@ def _app(providers: dict[str, _Provider]) -> App:
     app._dispatch_epoch = {}  # noqa: SLF001
     app._abandoned = {}  # noqa: SLF001
     app._pool_wait_budgets = {}  # noqa: SLF001
+    app._pending_profile_purges = []  # noqa: SLF001
     app._dispatching = False  # noqa: SLF001
     app._next_refresh_reason = "startup"  # noqa: SLF001
     app._active_until = datetime.now() + timedelta(minutes=30)  # noqa: SLF001
@@ -695,6 +696,97 @@ def test_a_retry_cycle_does_not_advance_the_idle_backoff():
     app._on_refresh_timer()  # noqa: SLF001
 
     assert app._unchanged_cycles == before  # noqa: SLF001
+
+
+def test_a_removed_accounts_profile_is_not_deleted_under_a_live_scrape(
+    monkeypatch, caplog
+):
+    """`purge_profile` releases the cached `QWebEngineProfile` and rmtree's
+    its directory. A settings save can remove an account while its refresh is
+    still out - F14's own comment names that scenario, and F14 drops the
+    *snapshot* without stopping the *scrape*. Qt requires a profile to
+    outlive its pages, and a page that survives its profile can flush rotated
+    session cookies back into the directory that was just deleted, putting a
+    removed account's live credential back on disk.
+    """
+    purged: list[str] = []
+    monkeypatch.setattr(app_module, "purge_profile", purged.append)
+    claude = _BrowserProvider(_ok("claude"), hold=True)
+    app = _app({"claude": claude})
+    app.refresh_now(manual=False)
+    assert app._inflight == {"claude"}  # noqa: SLF001
+
+    with caplog.at_level(logging.INFO, logger="aigauge.app"):
+        app._providers.pop("claude")  # noqa: SLF001 - what _build_providers does
+        app._purge_removed_profiles(["claude"])  # noqa: SLF001
+
+    assert purged == [], "a profile was deleted under a live page"
+    assert "profile purge deferred account=claude" in caplog.text
+
+    claude.pending(_ok("claude"))
+
+    assert purged == ["claude"], "the deferred purge never ran"
+    assert app._pending_profile_purges == []  # noqa: SLF001
+
+
+def test_a_profile_waiting_on_an_abandoned_scrape_is_purged_when_it_lets_go(
+    monkeypatch,
+):
+    purged: list[str] = []
+    monkeypatch.setattr(app_module, "purge_profile", purged.append)
+    claude = _BrowserProvider(_ok("claude"), hold=True)
+    app = _app({"claude": claude})
+    app.refresh_now(manual=False)
+    late = claude.pending
+    app._watchdogs["claude"].fire()  # noqa: SLF001
+
+    app._providers.pop("claude")  # noqa: SLF001
+    app._purge_removed_profiles(["claude"])  # noqa: SLF001
+    assert purged == [], "the abandoned scrape still holds the profile"
+
+    late(_ok("claude"))
+
+    assert purged == ["claude"]
+
+
+def test_a_wedged_cycle_is_ended_by_the_heartbeat(caplog):
+    """`_recover_dead_timer` declined to act in the one state that needs it.
+
+    A `_cycle_active` that is true with nothing in flight, nothing queued and
+    no watchdog left is unrecoverable on its own: `_schedule_next_refresh`
+    was never reached, so there is no timer, and the one mechanism that could
+    start one opted out on `_cycle_active`. The fixed paths into that state
+    are closed, but the recovery should not be the thing that cannot help.
+    """
+    app = _app({"claude": _Provider(_ok("claude"))})
+    app._cycle_active = True  # noqa: SLF001
+    app._cycle_started_at = None  # noqa: SLF001
+    app._timer.active = False  # noqa: SLF001
+
+    with caplog.at_level(logging.WARNING, logger="aigauge.app"):
+        app._log_heartbeat()  # noqa: SLF001
+
+    assert "cycle was wedged" in caplog.text
+    assert app._cycle_active is False  # noqa: SLF001
+    assert app._timer.active is True  # noqa: SLF001
+
+
+def test_a_queued_per_provider_refresh_that_cannot_run_says_so(caplog):
+    """`_ordered()` filters the queued names against `_providers`; with
+    nothing left neither branch ran and nothing was logged, so a settings
+    save that removed the provider a user had just asked to refresh looked
+    identical to the request never having been made."""
+    claude = _BrowserProvider(_ok("claude"), hold=True)
+    codex = _BrowserProvider(_ok("codex"))
+    app = _app({"claude": claude, "codex": codex})
+    app.refresh_now(manual=False)
+    app.refresh_provider("codex")
+    app._providers.pop("codex")  # noqa: SLF001
+
+    with caplog.at_level(logging.INFO, logger="aigauge.app"):
+        claude.pending(_ok("claude"))
+
+    assert "refresh pending manual dropped scope=codex" in caplog.text
 
 
 def test_the_heartbeat_carries_the_error_retry_state(caplog):

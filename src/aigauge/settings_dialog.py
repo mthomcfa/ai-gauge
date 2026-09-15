@@ -542,6 +542,8 @@ class SettingsDialog(QDialog):
         self._config = config
         self._browser_account_rows: list[_BrowserAccountRow] = []
         self._removed_browser_account_ids: list[str] = []
+        # Read by App._on_settings_finished after apply_to; see apply_to.
+        self.removed_profile_ids: list[str] = []
         self._browser_accounts = [
             account.model_copy(deep=True) for account in browser_accounts(config)
         ]
@@ -1715,11 +1717,15 @@ class SettingsDialog(QDialog):
         config.providers.openrouter = self.openrouter_cb.isChecked()
         config.providers.opencode_go = self.opencode_go_cb.isChecked()
         for account_id in self._removed_browser_account_ids:
+            # The stored credential goes now: it is a keyring entry, nothing
+            # holds it open, and it is the thing that matters.
             set_provider_cookie(account_id, None)
-            try:
-                purge_profile(account_id)
-            except Exception:  # noqa: BLE001 - never let cleanup crash the save
-                log.exception("failed to purge profile for %s", account_id)
+        # The on-disk QtWebEngine profile is the App's to delete, because only
+        # the App knows whether a scrape of that account is still holding it.
+        # Qt requires a profile to outlive its pages, and a page that survives
+        # its profile can flush rotated session cookies back into a directory
+        # that was just removed. See App._run_profile_purges.
+        self.removed_profile_ids = list(self._removed_browser_account_ids)
         # Copy so the saved config never aliases this dialog's working state.
         config.copilot.colors = self._provider_colors["copilot"].model_copy(deep=True)
         config.openrouter.colors = self._provider_colors["openrouter"].model_copy(

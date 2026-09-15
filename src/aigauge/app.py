@@ -3,6 +3,7 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -49,6 +50,7 @@ from .ratio_dialog import RatioHistoryDialog
 from .settings_dialog import SettingsDialog
 from .webview.cookies import hydrate_all_from_keyring
 from .webview.login_window import LoginWindow
+from .webview.profile import purge_profile
 from .widget import UsageWidget
 
 log = logging.getLogger("aigauge.app")
@@ -118,7 +120,13 @@ def _refresh_budget_seconds(provider) -> float:
         budget = float(getattr(provider, "refresh_budget_seconds", 0) or 0)
     except (TypeError, ValueError):
         budget = 0.0
-    return budget if budget > 0 else _REST_REFRESH_BUDGET_SECONDS
+    # isfinite, not just > 0: int(inf * 1000) raises OverflowError, and it
+    # would raise inside _arm_watchdog - which runs *before* _dispatch's
+    # try/except around provider.refresh, so the name would be left in
+    # _inflight with neither a dispatch nor a watchdog.
+    if not math.isfinite(budget) or budget <= 0:
+        return _REST_REFRESH_BUDGET_SECONDS
+    return budget
 
 
 def _make_dot_tray_icon(color: str | None = None) -> QIcon:
@@ -400,6 +408,9 @@ class App(QObject):
         # The REST providers this cycle handed to the thread pool, with their
         # budgets: what a dispatch may spend waiting for a pool thread.
         self._pool_wait_budgets: dict[str, float] = {}
+        # Accounts the user removed whose on-disk profile is waiting for a
+        # live scrape to let go of it. See _run_profile_purges.
+        self._pending_profile_purges: list[str] = []
         # The names this cycle is accounting for. A snapshot from outside it
         # repaints its tile without joining its progress or its verdict.
         self._cycle_names: set[str] = set()
@@ -570,6 +581,11 @@ class App(QObject):
     def _log_heartbeat(self) -> None:
         self._log_lifecycle_event("heartbeat")
         self._recover_dead_timer()
+        # A profile whose scrape was abandoned is only released when that
+        # worker reports back or its ceiling passes; the heartbeat is what
+        # notices the second of those.
+        if self._pending_profile_purges:
+            self._run_profile_purges()
 
     def _recover_dead_timer(self) -> None:
         """Restart a scheduler that stopped scheduling.
@@ -580,7 +596,26 @@ class App(QObject):
         restart fixes it. The heartbeat is the one timer still running, so it
         is what notices.
         """
-        if self._inflight or self._refresh_queue or self._cycle_active:
+        if self._inflight or self._refresh_queue:
+            return
+        if self._cycle_active:
+            if self._watchdogs:
+                # A dispatch is still bounded; its watchdog will end it.
+                return
+            # Nothing in flight, nothing queued, no watchdog left, and a cycle
+            # that still calls itself open. This is the one state that cannot
+            # recover on its own - there is no timer, because
+            # _schedule_next_refresh was never reached - and it was also the
+            # one state this method declined to act in.
+            log.warning(
+                "refresh cycle was wedged (active with nothing in flight); ending it"
+            )
+            self._end_cycle()
+            return
+        if not self._providers:
+            # With no provider configured at all, refresh_now returns before
+            # it touches the timer, so rescheduling here only logs a warning
+            # every five minutes forever.
             return
         try:
             if self._timer.isActive():
@@ -756,6 +791,16 @@ class App(QObject):
         move, and retrying it quickly only burns page loads. Nor is a failure
         the provider marked as something other than its own (see
         _NO_FAST_RETRY_ERROR_CLASSES).
+
+        One consequence worth stating: "three retries and then the normal
+        cadence" is a bound on a *run* of errors, not on a provider. Any
+        non-ERROR status pops the entry, so a provider alternating
+        AUTH_REQUIRED and ERROR - OpenCode's exact pattern in the desktop log,
+        95 auth failures and 38 errors, never a success - refills the ladder
+        each time. Measured, that is about one extra dispatch per cycle for
+        that provider while the healthy ones drop from 17 an hour to 10, so it
+        is not an amplification; it is just not the bound the sentence above
+        sounds like.
         """
         name = snapshot.provider
         if snapshot.status != SnapshotStatus.ERROR:
@@ -969,7 +1014,8 @@ class App(QObject):
 
     def _run_pending_manual(self) -> None:
         full = self._pending_manual_refresh
-        names = self._ordered(self._pending_manual_providers)
+        wanted = list(self._pending_manual_providers)
+        names = self._ordered(wanted)
         self._pending_manual_refresh = False
         self._pending_manual_providers = []
         if full:
@@ -978,6 +1024,12 @@ class App(QObject):
         elif names:
             log.info("refresh pending manual running scope=%s", ",".join(names))
             self._begin_cycle(names, manual=True, reason="manual")
+        elif wanted:
+            # _ordered() filters against _providers, so a settings save that
+            # removed the provider the user had just asked to refresh left
+            # neither branch running and no line at all - indistinguishable
+            # from the request never having been made.
+            log.info("refresh pending manual dropped scope=%s", ",".join(wanted))
 
     def _uses_browser(self, name: str) -> bool:
         return bool(getattr(self._providers.get(name), "uses_browser", False))
@@ -1052,6 +1104,42 @@ class App(QObject):
             self._abandoned.pop(name, None)
             return False
         return True
+
+    def _purge_removed_profiles(self, account_ids) -> None:
+        for account_id in account_ids:
+            if account_id not in self._pending_profile_purges:
+                self._pending_profile_purges.append(account_id)
+        self._run_profile_purges()
+
+    def _run_profile_purges(self) -> None:
+        """Delete a removed account's profile, once nothing is still using it.
+
+        `purge_profile` calls `deleteLater()` on the cached
+        `QWebEngineProfile` and then rmtree's its directory. A settings save
+        can remove an account while its refresh is still out - F14's own
+        comment names that scenario - and Qt requires a profile to outlive its
+        pages, so destroying it under a live `QuietWebEnginePage` is a
+        use-after-free. The surviving page can also flush rotated session
+        cookies back into the directory that was just deleted, which puts a
+        removed account's live credential back on disk.
+
+        The keyring secret is cleared immediately by the dialog either way;
+        this is only the on-disk profile, and deferring it costs nothing.
+        """
+        waiting: list[str] = []
+        for account_id in self._pending_profile_purges:
+            if account_id in self._inflight or self._is_abandoned(account_id):
+                log.info(
+                    "profile purge deferred account=%s reason=refresh_in_flight",
+                    account_id,
+                )
+                waiting.append(account_id)
+                continue
+            try:
+                purge_profile(account_id)
+            except Exception:  # noqa: BLE001 - cleanup must not crash the app
+                log.exception("failed to purge profile for %s", account_id)
+        self._pending_profile_purges = waiting
 
     def _pool_wait_slack(self, name: str) -> float:
         """How long this dispatch may sit in the thread pool before it starts.
@@ -1366,6 +1454,7 @@ class App(QObject):
                 name,
                 epoch,
             )
+            self._run_profile_purges()
 
     def _advance_cycle(self) -> None:
         """Dispatch the next provider, or close the cycle when none is left."""
@@ -1397,6 +1486,14 @@ class App(QObject):
         elif not self._current_refresh_manual and not self._cycle_partial:
             # A retry cycle polls one provider; "nothing changed" there says
             # nothing about whether the app is idle.
+            #
+            # The guard is deliberately asymmetric: a partial cycle cannot
+            # *advance* the backoff but a partial cycle whose one tile moved
+            # still zeroes it and re-arms the active window above, so a
+            # provider that flaps ERROR to OK on its retry cadence -
+            # OpenRouter had 22 such errors in 4.5 days - holds the whole app
+            # in active mode. Symmetry would be worse: a real change is a real
+            # change, whoever noticed it.
             self._unchanged_cycles += 1
         # Merge rather than replace: a partial cycle must not erase the
         # baseline for the providers it did not visit.
@@ -1424,6 +1521,7 @@ class App(QObject):
         self._current_refresh_manual = False
         self._widget.set_refreshing(False)
         self._update_tray()
+        self._run_profile_purges()
         self._schedule_next_refresh()
         if self._pending_manual_refresh or self._pending_manual_providers:
             QTimer.singleShot(0, self._run_pending_manual)
@@ -1680,6 +1778,9 @@ class App(QObject):
         if accepted:
             dlg.apply_to(self._config)
             self._build_providers()
+            self._purge_removed_profiles(
+                getattr(dlg, "removed_profile_ids", None) or []
+            )
             self._widget.apply_gauge_colors()
             # Colour-only changes must not wait for the next network refresh.
             self._update_tray()

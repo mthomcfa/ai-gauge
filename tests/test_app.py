@@ -110,6 +110,7 @@ def _refresh_app_stub() -> App:
     app._dispatch_epoch = {}  # noqa: SLF001
     app._abandoned = {}  # noqa: SLF001
     app._pool_wait_budgets = {}  # noqa: SLF001
+    app._pending_profile_purges = []  # noqa: SLF001
     app._dispatching = False  # noqa: SLF001
     app._watchdogs = {}  # noqa: SLF001
     app._pending_manual_refresh = False  # noqa: SLF001
@@ -1039,6 +1040,7 @@ def test_the_watchdog_timers_do_not_accumulate(qapp):
     app._abandoned = {}  # noqa: SLF001
     app._dispatch_epoch = {}  # noqa: SLF001
     app._pool_wait_budgets = {}  # noqa: SLF001
+    app._pending_profile_purges = []  # noqa: SLF001
     provider = SimpleNamespace(uses_browser=False, refresh_budget_seconds=60.0)
     app._providers = {"copilot": provider}  # noqa: SLF001
 
@@ -1116,6 +1118,7 @@ def test_the_snapshot_error_log_line_redacts_azure_identifiers(qapp, caplog):
     app._dispatch_epoch = {}  # noqa: SLF001
     app._abandoned = {}  # noqa: SLF001
     app._pool_wait_budgets = {}  # noqa: SLF001
+    app._pending_profile_purges = []  # noqa: SLF001
     app._dispatching = False  # noqa: SLF001
     app._watchdogs = {}  # noqa: SLF001
     app._error_retry = {}  # noqa: SLF001
@@ -1165,6 +1168,7 @@ def _mid_cycle_app(widget) -> App:
     app._dispatch_epoch = {}  # noqa: SLF001
     app._abandoned = {}  # noqa: SLF001
     app._pool_wait_budgets = {}  # noqa: SLF001
+    app._pending_profile_purges = []  # noqa: SLF001
     app._dispatching = False  # noqa: SLF001
     app._watchdogs = {}  # noqa: SLF001
     app._error_retry = {}  # noqa: SLF001
@@ -1242,6 +1246,7 @@ def test_a_snapshot_for_a_provider_the_user_removed_is_dropped(qapp):
     app._dispatch_epoch = {}  # noqa: SLF001
     app._abandoned = {}  # noqa: SLF001
     app._pool_wait_budgets = {}  # noqa: SLF001
+    app._pending_profile_purges = []  # noqa: SLF001
     app._dispatching = False  # noqa: SLF001
     app._watchdogs = {}  # noqa: SLF001
     app._inflight = {"opencode_go"}  # noqa: SLF001
@@ -1306,6 +1311,7 @@ def test_a_provider_that_raises_out_of_refresh_is_redacted_too(qapp, monkeypatch
     app._dispatch_epoch = {}  # noqa: SLF001
     app._abandoned = {}  # noqa: SLF001
     app._pool_wait_budgets = {}  # noqa: SLF001
+    app._pending_profile_purges = []  # noqa: SLF001
     app._cycle_started_at = None  # noqa: SLF001
     sub = "11111111-2222-3333-4444-555555555555"
     captured: list = []

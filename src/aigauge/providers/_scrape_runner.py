@@ -9,6 +9,18 @@ from ..models import SnapshotStatus, UsageSnapshot
 from ..webview.scraper import HeadlessScraper
 
 
+# The one class a scrape may name about itself. `throttled` is deliberately
+# absent: a page must not be able to tell the scheduler to stop retrying it.
+_SCRAPER_ERROR_CLASSES = ("resume_artifact",)
+
+
+def _allowed_error_class(result: Any) -> str | None:
+    if not isinstance(result, dict):
+        return None
+    value = result.get("classification")
+    return value if value in _SCRAPER_ERROR_CLASSES else None
+
+
 class ScrapeRunner:
     """Drives a HeadlessScraper and feeds the payload to a builder.
 
@@ -82,11 +94,17 @@ class ScrapeRunner:
                     # machine suspend. Carrying the label through is what
                     # lets the scheduler tell "this provider is broken" from
                     # "this laptop was asleep".
-                    error_class=(
-                        result.get("classification")
-                        if isinstance(result, dict)
-                        else None
-                    ),
+                    #
+                    # Allowlisted, because on the "extractor retry limit
+                    # exceeded" branch `result` is the extractor's own return
+                    # dict - a value that came out of the provider page - and
+                    # error_class is a scheduler input. No shipped extractor
+                    # emits `classification`, and the scheduler only ever
+                    # tests it for membership in a two-element tuple, so this
+                    # is not reachable today; the allowlist is what keeps it
+                    # unreachable when a future extractor adds a key or a
+                    # future consumer formats the value.
+                    error_class=_allowed_error_class(result),
                     raw=result if isinstance(result, dict) else {},
                 )
                 self._log.warning(
