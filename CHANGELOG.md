@@ -6,6 +6,123 @@
 > earlier `0.6.4` entry predates that convention and **is not** upstream's
 > `v0.6.4`, which is different code.
 
+## 1.3.0+cfa.5 - 2026-09-15
+
+The refresh cycle. Four and a half days of a real desktop log — 137 cycles,
+2026-09-10 to 09-15 — were read before any of this was written, and the
+numbers in the entries below are that log's, not estimates.
+
+### Changed
+
+- **The error fast-retry is per provider.** It was cycle-wide: any ERROR
+  snapshot anywhere meant the *next cycle* ran in one minute, for every
+  provider. 124 of the 137 cycles contained at least one ERROR or
+  AUTH_REQUIRED — OpenCode never succeeded once in the whole run, 95 auth
+  failures and 38 errors — so a third of all cycles started within two minutes
+  of the previous one and five healthy providers were re-scraped because of one
+  broken tile. Claude alone costs a median of 18.5 s and a p90 of 48 s of
+  browser time per scrape, so the app was very nearly always refreshing. Then
+  the bound bit the wrong way round: past three failing cycles *nobody* got a
+  fast retry, and since no cycle was ever clean the counter never reset, so a
+  genuinely transient failure elsewhere got nothing.
+
+  Each provider now carries its own consecutive-error count and its own due
+  time. An ERROR schedules that provider's retry at 1, 2 then 4 minutes and
+  then falls back to the normal cadence; OK clears it; AUTH_REQUIRED clears it
+  too, because signing in is the user's move and retrying it quickly only
+  burns page loads. A wake that is only a retry refreshes **only the providers
+  that are due**, not the whole queue.
+
+- **The cheap providers no longer queue behind the browsers.** Copilot,
+  OpenRouter and Azure are plain HTTPS calls on a thread pool; only the
+  refresh queue made them wait. Cycles ran a median of 48 s, a p90 of 79 s and
+  a maximum of 100 s, nearly all of it browser time, with Copilot's payload —
+  about a second's work — landing near the end of each one. They are now
+  dispatched together at cycle start. The browser providers stay strictly
+  serial: QtWebEngine is GUI-thread-only and each scrape holds a profile.
+  Copilot also joins OpenRouter and Azure at the head of the queue.
+
+- **The cadence signature follows the snapshot's status, not its error text.**
+  Azure's fail-closed message counts a minute down — "Waiting for the next
+  Azure fetch window (43 min)" — so it differed on every cycle, which read as
+  "this provider changed", re-armed the 30-minute active window and zeroed the
+  idle backoff for every provider, on a clock. `unchanged_cycles` was 0 in 55
+  of 204 heartbeats and only ever reached 9–12 overnight, so the documented
+  idle backoff almost never engaged. The message still reaches the tile, the
+  tooltip and the log; it just no longer decides how often the app polls.
+
+### Added
+
+- **The scheduler logs what it does.** It logged nothing at all, so the cycles
+  in that desktop log had to be *inferred* from runs of provider activity
+  separated by 45 s of quiet, and "I clicked Refresh and nothing happened" was
+  unprovable either way. There are now lines for the start of a cycle (manual,
+  reason, providers), its end (duration, changed, errors, auth_required), the
+  next scheduled wake **and the reason that chose it** (active, idle,
+  error_retry, reset_pull_forward, manual), a queued or ignored manual
+  refresh, and a start/done pair per provider turn. The heartbeat prints the
+  per-provider retry state, which was computed and then dropped by its own
+  format string. Azure's cached path and OpenRouter's healthy path were
+  `debug`, which the file handler drops — between live fetches neither
+  provider left any trace at all — and are now `info`.
+
+- **A watchdog on every dispatch.** `_inflight` was cleared only by an
+  arriving snapshot, and the scheduler returns early while it is non-empty, so
+  one provider that never called back stopped every future refresh until the
+  app was restarted. Each dispatch now has a deadline taken from the provider
+  itself — the browser providers derive it from their scraper timeout times
+  the attempts they may make, Azure reports the deadline it already enforces,
+  and a REST provider gets a flat 60 s — after which the App gives up on that
+  provider, records the failure and carries on. The heartbeat also restarts a
+  refresh timer that is not running.
+
+- **A visible refreshing state.** The header said `· active next now` for the
+  whole cycle: `set_refreshing` wrote "refreshing…" and the 1 Hz label tick
+  overwrote it within the second, while the countdown it rewrote from was
+  stale and already in the past. The refreshing state is now durable, counts
+  the cycle off ("· refreshing 2/6"), and scheduled cycles mark their tiles
+  too — lightly, since nobody asked for them — where before a scheduled
+  refresh showed nothing at all. The tray updates per snapshot rather than at
+  cycle end, so the dot and its tooltip stop being a whole cycle behind the
+  tiles.
+
+### Fixed
+
+- **A manual refresh during a cycle is no longer discarded.** `refresh_now`
+  and `refresh_provider` both returned early while anything was in flight, the
+  Refresh button is disabled for the whole cycle, and the tray menu's "Refresh
+  now" was therefore a no-op — at exactly the moment a tile looks stale, which
+  is usually mid-cycle. Saving settings mid-cycle had the same hole. The
+  request is queued and runs once when the cycle closes.
+- **A snapshot for a provider you just removed no longer re-creates its
+  tile.** A settings save rebuilds the providers while a refresh is still out,
+  and the late snapshot came back through `ensure_tile`.
+- **`BrowserAccount.enabled` is honoured.** The field existed and nothing read
+  it, so a disabled account still cost a browser scrape every cycle.
+- **A timeout measured across a machine suspend is not counted as a provider
+  failure.** A laptop resumed after two days reported `elapsed_s=228477`
+  against an 80 s budget; every resume cost one spurious failure per provider,
+  and each of those armed the fast retry. Such a timeout is logged as
+  `classification=resume_artifact` and skipped by the retry. The scrape still
+  fails — the timing itself is unchanged.
+
+### Notes
+
+- **Azure's own throttle is untouched.** Its fail-closed "waiting for the next
+  fetch window" and "a fetch is already in progress" snapshots now carry a
+  one-word error class so the scheduler does not read a provider that is
+  deliberately not fetching as a provider that failed. The hourly floor, the
+  backoff and the cache are exactly as they were.
+- **Metric labels still count toward the cadence.** OpenRouter's
+  `Today ($3.10/$5.00)` and Copilot's `Credits (12.5/1500)` can still read as
+  a change. Hashing a stable `key` instead is the same repo-wide decision that
+  `history` and `ratio` are waiting on, and it does not belong bundled with a
+  cadence fix.
+- **Two tiles in that log were broken by configuration, not by the app.**
+  OpenCode was not signed in and Copilot's PAT lacked `read:user`. Neither is
+  fixed here; both now cost less, because a provider that keeps failing is no
+  longer everyone's problem.
+
 ## 1.2.0+cfa.4 - 2026-09-10
 
 Adds a **Microsoft** section: Azure, Foundry, and Copilot under one heading.
