@@ -61,10 +61,19 @@ from .ratio import (
 )
 
 ROW_BAR_HEIGHT = 8
+# How wide the right-hand column may grow for a reset_label that is a phrase
+# rather than a countdown. Wide enough for a seven-figure amount in a currency
+# with no two-digit magnitude; past that the text is elided and the full
+# string lives in the tooltip.
+_RESET_LABEL_MAX_WIDTH = 240
 PACE_TICK_OVERHANG = 2
 CHIP_NOTCH_HEIGHT = 4
 CHIP_NOTCH_HALF_WIDTH = 3.5
-PROVIDER_ORDER = ("claude", "codex", "opencode_go", "copilot", "openrouter")
+# Azure sits next to Copilot so the two Microsoft tiles render as a pair.
+PROVIDER_ORDER = ("claude", "codex", "opencode_go", "copilot", "azure", "openrouter")
+# The tile header has room for "Microsoft · Azure"; a summary chip does not,
+# and a chip that wraps costs a whole row in the collapsed panel.
+COMPACT_DISPLAY_NAMES = {"azure": "Azure"}
 COLLAPSED_MIN_HEIGHT = WINDOW_COLLAPSED_HEIGHT
 
 
@@ -660,9 +669,29 @@ class _MetricRow(QWidget):
         else:
             self.reset.setText(rel)
             self.reset.setVisible(bool(rel))
-            self.reset.setFixedWidth(58)
+            # The column is sized for a countdown ("3.1d", "idle"), but a
+            # provider may put a whole phrase in reset_label - Azure puts the
+            # spend and the allowance there so they stay on the row when the
+            # tile is collapsed - and a fixed 58 px would clip it.
+            if len(rel) > 8:
+                text_width = self.reset.fontMetrics().horizontalAdvance(rel) + 4
+                width = max(92, min(_RESET_LABEL_MAX_WIDTH, text_width))
+                self.reset.setFixedWidth(width)
+                # Elided from the right, not clipped: a currency with no
+                # two-digit magnitude ran off the end of the column and the
+                # amount was unrecoverable from the UI. The leading amount is
+                # the part worth keeping, so the tail goes first.
+                self.reset.setText(
+                    self.reset.fontMetrics().elidedText(
+                        rel, Qt.TextElideMode.ElideRight, width
+                    )
+                )
+            else:
+                self.reset.setFixedWidth(58)
         if reset_label:
-            self.reset.setToolTip(note or reset_label)
+            # The full phrase, then the note: whatever the column elided is
+            # still reachable here, and the amounts are in the note as well.
+            self.reset.setToolTip("\n\n".join(part for part in (rel, note) if part))
         elif resets_at:
             self.reset.setToolTip(resets_at.strftime("%Y-%m-%d %H:%M"))
         elif not split_note:
@@ -1659,7 +1688,9 @@ class UsageWidget(QWidget):
             and provider not in ("claude", "codex")
             and account.name
             and account.name.strip()
-            else display_name_for_account(self._config, provider)
+            else COMPACT_DISPLAY_NAMES.get(
+                provider, display_name_for_account(self._config, provider)
+            )
         )
         snapshot = self._snapshots.get(provider)
         percent: float | None = None

@@ -3,9 +3,11 @@
 State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#16,
 610 tests passing, all five providers reading.
 
-> **Updated for `1.1.0+cfa.3`.** The Claude/Codex label definitions moved out of
-> the extractors into a meter catalog (§7), and the Codex polarity defect that
-> headed §4 is fixed. Everything else below stands as written.
+> **Updated 2026-09-10** by the Microsoft/Azure work (`1.2.0+cfa.4`, 907 tests).
+> Its own parked items are in [§8](#8-parked-from-the-microsoftazure-work).
+> Before it, `1.1.0+cfa.3` moved the Claude/Codex label definitions out of the
+> extractors into a meter catalog (§7) and fixed the Codex polarity defect that
+> headed §4. Everything in §§1–6 below is unchanged and still current.
 
 `1.0.0+cfa.1` does not start — it raises `AttributeError` during `App.__init__`.
 Fixed in `+cfa.2`; the two carry different version strings on purpose, because
@@ -397,3 +399,240 @@ added to a JSON file instead of a code change and a release.
   adopted meter whose aliases the bundled catalog has since learned is dropped
   at load), but not a key collision with different wording. Namespacing
   adopted keys is the fix, and it is a file-format change.
+
+## 8. Parked from the Microsoft/Azure work
+
+Added 2026-09-09 with the Azure month-to-date spend tile (`1.2.0+cfa.4`).
+
+### 8.1 Unverified against a live Azure account — run the probe first
+
+The provider was written against the REST specification
+(`Azure/azure-rest-api-specs`) and current Microsoft documentation, not against
+a real subscription. Everything below is a *shape* the docs support but a live
+account has not confirmed. One command settles all of it:
+
+```bash
+python -m aigauge.providers.azure --probe
+```
+
+| What | Why it might differ | What the code does |
+| --- | --- | --- |
+| Cost metric name — `Cost` vs `PreTaxCost` | MCA and EA/pay-as-you-go disagree, and every example in the REST spec uses `PreTaxCost` while the automation docs use `Cost`. | Tries `Cost`, retries once on a 400 with `PreTaxCost`, then remembers which worked. The response column is found by name-candidate list, then by a numeric column whose *name* contains "cost" — never by position. A response with no cost column is an error, not a month with no spend. |
+| `ClientType: ai-gauge` request header | Documented in Q&A and SDK behaviour (it maps to the SDK's ApplicationID), not in the REST reference. If it is ignored we share the anonymous rate-limit bucket — a throughput question, not a correctness one. | Sent on every ARM request. |
+| `ResourceGroupName` as the filter dimension | The optional resource-group filter uses this name; the docs show `ResourceGroup` in some places. | Only used when the user sets the filter; leaving it blank avoids the question. |
+| Whether Marketplace model charges really carry a distinct `ResourceId` | The design assumes they do, and buckets them by id like Foundry. If they share a resource id with something else the row would absorb it. | Off by default; the toggle is the opt-in. |
+| Whether a Foundry resource's cost rows carry the *account* id rather than a project child id | Projects are `accounts/projects` children and are documented as billing to the parent. If cost rows name the child, the roll-up under-reports. | The probe prints the resource ids found and the bucket totals, so a mismatch shows up as a Foundry row that is smaller than expected. The Settings field accepts one child `type/name` segment, so a project id can be pinned by hand if the probe shows that shape. |
+
+`api-version`s were all confirmed present in the spec repo: Cost Management
+`2025-03-01`, Consumption budgets `2024-08-01`, Cognitive Services `2024-10-01`,
+subscriptions `2022-12-01`. Newer stable versions exist for the first three
+(`2026-06-01`, `2026-06-01`, `2026-07-01`) and were **not** adopted — there is
+no feature here that needs them, and an unnecessary version bump is an
+unnecessary source of behaviour change.
+
+### 8.2 Deliberately not built
+
+- **"Pin Foundry to the compact chip."** Offered as optional in the brief and
+  skipped. The compact chip shows one number with one colour, and the Foundry
+  row's percentage is a *share of spend*, not usage against a limit — the same
+  category error that `gauge.provider_max_percent` exists to prevent. Doing it
+  properly means deciding what the chip's colour should mean for a share, which
+  is a design question, not a wiring one. The plumbing (`COMPACT_DISPLAY_NAMES`
+  in `widget.py`) is where it would go.
+- **Multi-subscription support.** One subscription per install. Two would need
+  either two tiles (and a second throttle budget against a tenant-wide rate
+  limit) or a roll-up with a currency-mismatch problem, since subscriptions can
+  bill in different currencies. Neither is a small change, and the owner has one
+  subscription.
+- **A Vercel provider.** Named in the brief as a future provider; nothing was
+  started. Worth noting that its shape is closer to OpenRouter's (an API key and
+  a spend number) than to Azure's.
+- **Per-provider refresh throttling in `app.py`.** §4 records that the error
+  fast-retry is cycle-wide, and Azure would have been the provider most hurt by
+  it. Rather than fix the shared scheduler, the Azure provider defends itself
+  with its own hourly floor. That is the right defence for a tenant-shared rate
+  limit either way — a scheduler fix would not remove the need for it — but it
+  does mean §4's entry is still open and one more provider now works around it
+  rather than through it.
+
+### 8.3 Known soft spots in what was built
+
+- **Throttle state is module-level and keyed by subscription id.** That is what
+  makes it survive `App._build_providers()` on every settings save, which is the
+  whole point. It also means it is process-global: two `AzureProvider` instances
+  for the same subscription share one budget (correct), and the state is not
+  written to disk, so a restart is a fresh hour (acceptable — a restart is a
+  human action, not a loop; SECURITY.md now says "per app run" rather than
+  implying the floor survives a restart).
+- **`data as of` is derived, not reported.** Cost Management does not return a
+  freshness timestamp, so the tile uses the latest `UsageDate` that carries
+  non-zero cost, ignoring any date later than tomorrow. A genuinely zero-cost
+  day inside the period reads as "no data yet" for that day. There is no better
+  signal available.
+- **The forecast row trusts Cost Management's own projection** rather than
+  extrapolating locally. When it is unavailable — or when it comes back at or
+  below the spend already recorded, which is not a projection — the row is
+  simply absent, which is honest but means it silently comes and goes early in
+  a period.
+- **A refresh has a request budget, and it only guards the loops.** A
+  wall-clock deadline (`REFRESH_DEADLINE_SECONDS`) and a request ceiling
+  (`MAX_ARM_REQUESTS_PER_REFRESH`) cover the cost-query `nextLink` chain and
+  the discovery page loop, because those are what multiply. The fixed handful
+  around them — token, subscription, budgets, forecast — is outside it: they
+  cannot repeat, and counting them would make the ceiling harder to reason
+  about.
+- **A subscription that exceeds the page cap every hour stays ungauged.** A
+  truncated aggregate is cached like a good one, so the hour that follows is
+  "no gauge, with a note" rather than an hour of error backoff — the right
+  trade, but permanent for such a subscription. A monthly-granularity retry
+  (losing only `data_as_of`) would produce a complete total and was not built.
+- **An unmatched Marketplace pair contributes nothing and is not noted.** If
+  the marketplace query returns a (resource, service) pair the main query does
+  not, its cost does not appear anywhere and no note says so. The alternative —
+  adding it — would break the invariant that the buckets sum to the total.
+  (A marketplace query that was *cut short* is different and is handled: the
+  split is discarded for that refresh and the note says so.)
+- **A failed discovery is cached like a successful one.** The offer read and
+  the Foundry account list are both taken under one `DISCOVERY_TTL` stamp that
+  is written whether or not they succeeded, so a 403 or a 500 on the offer
+  read costs the gauge for 24 hours, not for one refresh — the note says
+  Reader is what the check needs, but nothing retries it sooner. Stamping only
+  a successful read, or retrying discovery at the next window while keeping
+  the rest cached, is the fix and was not made here.
+- **The App-level in-flight scheduler has no watchdog.** `app.py` clears
+  `_inflight` only when a snapshot arrives, and `_schedule_next_refresh`,
+  `refresh_now` and `refresh_provider` all return early while it is non-empty.
+  The Azure provider bounds its own worst case now, but a provider that never
+  calls back still stalls the cycle. `AzureProvider`'s own `in_flight` flag
+  does have one (`IN_FLIGHT_STALE_AFTER`).
+- **The tile and tray tooltips rely on `snapshot.error` being clean at
+  source.** `_exception_summary` is what keeps a request URL out of it;
+  `widget.py` renders the string as-is, and only `app.py`'s log lines and the
+  error dialog redact. A future provider that puts an id in `snapshot.error`
+  would put it in a tooltip.
+- **History still keys on the display label.** The Azure summary label is
+  stable now, so Azure closes periods correctly, but `history._state_key` is
+  still `provider::label` and OpenRouter's `Today ($x/$y)` and Copilot's
+  `Credits (12.5/1500)` have the original shape. A stable `key` field on
+  `UsageMetric`, used by `history` and `ratio`, is the repo-wide fix and was
+  out of scope here.
+
+- **One CI job segfaulted in a native thread, once, and the cause is not
+  pinned.** Run 67 on `aab1de9` died with `Fatal Python error: Segmentation
+  fault` in the Ubuntu 22.04 / 3.11 job while the other five jobs and every
+  local run passed. faulthandler showed the main thread parked in a
+  `responses`-mocked request inside `test_the_query_page_loop_is_capped` -
+  pure Python - and labelled it `Thread`, not `Current thread`, so the fault
+  was in a thread with no Python state: a Qt or Chromium thread left running
+  by earlier files (`test_app.py` constructs a real `App()`), or the
+  `Release of profile requested but WebEnginePage still not deleted` hazard
+  the suite prints at exit. Commits `13f7aec` and `2c2b0e2` removed the one
+  thing this PR had added of that class - three tests setting `TZ` and
+  calling `time.tzset()` under those threads - and their messages name it as
+  the cause. That was overstated: those tests sit at the end of the Azure
+  file and had not run when the crash landed. The removal stands as hygiene;
+  the segfault is a suite-level soft spot that predates this PR's code and
+  belongs with the WebEngine teardown warning, not with Azure.
+
+### 8.4 Decisions taken in review, so they are not relitigated
+
+Three reviews went over this feature before it merged (see the
+"Hardening from review" block in `CHANGELOG.md` for the findings). These are
+the calls that were made, and why:
+
+- **The throttle fails closed.** Inside the fetch window with nothing cached
+  and nothing remembered, `refresh()` returns an error snapshot naming the
+  wait. It never falls through to a live fetch. Every fetch outcome — including
+  an exception no one anticipated — is recorded in `_State`, because a blank
+  state is what switched the throttle off. If a future change needs a "fetch
+  now" escape hatch, it must clear `last_fetch_at` explicitly rather than rely
+  on the gate letting anything through.
+- **The identity check is two checks.** `_identity` is the credential triple
+  (tenant, client, secret digest); changing it resets the whole `_State` and
+  the token cache, because everything cached describes a different app
+  registration. `_query_identity` is what the request asks for (reset day,
+  resource group, marketplace toggle, pinned Foundry ids); changing it marks
+  the cached aggregate `stale_settings` and keeps `last_fetch_at`,
+  `blocked_until` and `consecutive_errors`. A settings save is a one-click
+  human action that is easy to loop, and "at most one live fetch an hour" is a
+  promise made to the tenant, not to this tile — so no fetch follows the save.
+  What the tile shows until the window opens is the old figures with no
+  percentage on any row and a note naming the time of the next fetch: those
+  amounts are still the last real reading of this subscription, and dropping
+  them left the tile in error for up to an hour with nothing saying why. Only
+  a fetch that succeeds under the new settings clears the flag.
+- **The row count and the allowance are display settings, in neither
+  identity.** `build_snapshot` re-reads both on every render, so editing
+  either re-renders from the cached aggregate with no API call. That is why
+  the aggregate keeps every distinct bucket (`MAX_KEPT_BUCKETS`, with the tail
+  pre-folded into Other) rather than only the rows the setting asked for at
+  fetch time: the alternative — holding every parsed row, up to
+  `MAX_QUERY_ROWS` of them, for the life of the process — is what made
+  `top_rows` part of the query identity in the first place, and the cap here
+  is on distinct service names instead.
+- **A tolerant sub-fetch re-raises `AzureThrottled`.** The five of them
+  (`_safe_quota_id`, `_safe_foundry_ids`, `_safe_budget`, `_safe_forecast`, the
+  marketplace query) share one shape: re-raise the 429, note a permission
+  error, note anything else. A 429 is an answer about the whole tenant, not a
+  detail of one sub-fetch, and `_fetch`'s handler is the only place it is
+  recorded. A 5xx is raised into that last branch rather than returned as an
+  empty answer (`_server_error`), because "the server is failing" and "there
+  is nothing here" reached the caller as the same value and the note never
+  fired for the failure that actually happens. A 4xx still returns: a forecast
+  a new subscription has no history for is a 400, and a note on every refresh
+  would be noise.
+- **A cost column is found by name, never by position**, and its absence is an
+  error routed through `_remember_error`. `row_count == 0` *with* a column is
+  still a legitimate empty month, since the data lags 8–72 h.
+- **An unreadable offer type shows no gauge, whatever the total.** Cost
+  Management Reader without Reader is the likely role split, and an Azure
+  Sponsorship subscription reports zero while the credit drains. Round 1 let a
+  *positive* total rule that out; round 2 reversed it, because a Sponsorship
+  subscription still bills Marketplace and other non-sponsored charges
+  normally — so a small positive total is exactly what one looks like while
+  the sponsored credit drains unreported. The money is still shown and the
+  note says Reader is what the check needs; only the percentage is refused.
+- **One `gaugeable` flag governs every percentage on the tile.** An allowance,
+  a complete read, one billing currency, a readable offer type, no Sponsorship
+  offer, and settings that have not changed since the figures were read. The
+  summary percent, the breakdown shares and whether there is a forecast row at
+  all follow it together, because a tile that says "no gauge is shown for a
+  subtotal" and then prints a projection of that subtotal one row down has
+  told the reader nothing. Sponsorship was the last reason to sit outside the
+  flag — it suppressed the summary percentage by its own path and left the
+  rows below it gauged.
+- **A number the tile has disowned is never printed.** More than one billing
+  currency shows per-currency subtotals (`CAD 100.00 + JPY 1,000.00`, at most
+  three then `+N more`), never their sum. A truncated read shows `incomplete`
+  on the row and moves the subtotal into the note, labelled as read so far —
+  except when the read stopped on a repeated `nextLink`, where the subtotal is
+  too *high* rather than too low and the note says it may count rows more than
+  once.
+- **`_snapshot_signature` ignores `reset_label`, for every provider.** It is a
+  caption — a ticking countdown, or Azure's spend to the cent — and either one
+  counted as "this provider changed", which reset the adaptive backoff and
+  pushed the whole app back into active-cadence polling.
+- **A typed allowance is always the denominator.** Round 1 preferred a
+  budget unconditionally and round 2 reversed it: "smallest qualifying budget
+  wins" is the right rule between budgets, and the wrong rule against a number
+  a person typed, since a 1.00 alert canary or a per-team budget would take
+  the tile and the tray dot over. A qualifying budget is reported in the note
+  instead. It becomes the denominator only when nothing is typed.
+- **A budget is a calendar-month figure.** Even then it qualifies only when
+  `reset_day == 1`, only when its currency matches the cost data, and only
+  when it measures the same scope: unfiltered when the tile is unfiltered, or
+  filtered to exactly the configured resource group when it is. An unfiltered
+  budget on a resource-group-filtered tile is refused too: it covers spend the
+  tile does not measure, so the gauge would under-report by the ratio between
+  them. The smallest qualifying one wins. Budget pagination is deliberately
+  not followed.
+- **The period boundary is a UTC date**, because that is how Cost Management
+  dates usage; `resets_at` converts it to local time for display. Copilot does
+  the same, so the two Microsoft tiles agree about the 1st of the month.
+- **The summary metric's label is a key, not a caption.** It must stay
+  "Spend this month"; the money lives in `reset_label`, which the row renders
+  inline. Changing the label back would restart the history-key churn.
+- **Error strings name an exception type, never quote one.** `str(exc)` on a
+  requests exception carries the request URL and with it the subscription id.
+  The redaction in `error_dialog` is the second line of defence, not the
+  first.
