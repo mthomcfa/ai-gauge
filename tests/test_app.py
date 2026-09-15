@@ -1605,3 +1605,90 @@ def test_raw_summary_still_says_what_it_dropped():
 
     assert "more keys" in line
     assert len(line) < 6_000
+
+
+class _ReprRaises:
+    def __repr__(self):
+        raise ValueError("this object refuses to be printed")
+
+
+class _KeyStrRaises:
+    def __str__(self):
+        raise ValueError("this key refuses to be printed")
+
+    def __hash__(self):
+        return 7
+
+
+class _ItemsRaises(dict):
+    def items(self):
+        raise RuntimeError("this mapping refuses to be walked")
+
+
+def test_the_log_summariser_bounds_a_value_it_has_to_repr():
+    """The shared budget was charged for strings, keys and elided nodes, and
+    the `repr()` fallback was charged *after the fact* and never clipped.
+    Measured on the tree before this: one 5 MB `bytes` value produced a
+    5 000 012-character record, 9.5x the whole 512 KiB rotation, and it is
+    the browser payload path - `snapshot.raw` is the extractor's own dict."""
+    from decimal import Decimal
+
+    for label, raw in (
+        ("bytes", {"k": b"B" * 5_000_000}),
+        ("bytearray", {"k": bytearray(b"C" * 5_000_000)}),
+        ("set", {"k": set(range(50_000))}),
+        ("frozenset", {"k": frozenset(range(50_000))}),
+        ("Decimal", {"k": Decimal("1" * 5_000)}),
+    ):
+        line = _raw_summary(raw)
+        assert len(line) < 20_000, f"{label} produced a {len(line)}-char record"
+
+
+def test_the_log_summariser_never_converts_a_big_integer():
+    """CPython 3.11+ raises `ValueError` on `str()` of an int over 4 300
+    digits, and `json.dumps` hits the same limit from the inside - so asking
+    how long the number is is itself the crash. Its length is estimated from
+    `bit_length()` and the number never reaches the serialiser.
+
+    Measured before: fifty 4 200-digit integers produced a 210 440-character
+    record, and one 6 000-digit integer raised `ValueError` out of
+    `_on_snapshot`, which `except TypeError` did not catch.
+    """
+    fifty = _raw_summary({f"n{index}": int("9" * 4_200) for index in range(50)})
+    assert len(fifty) < 20_000, f"{len(fifty)} characters"
+
+    huge = _raw_summary({"n": 10**5_999})  # 6 000 digits: str() itself raises
+    assert len(huge) < 20_000
+    assert "digits" in huge, "the record does not say a number was elided"
+
+    # Ordinary numbers are still numbers, and bool is still bool.
+    assert _raw_summary({"n": 42, "f": 1.5, "b": True, "z": None}) == (
+        '{"b": true, "f": 1.5, "n": 42, "z": null}'
+    )
+
+
+def test_the_log_summariser_cannot_raise():
+    """It runs inside `_on_snapshot`, so anything it raises escapes into the
+    scheduler. Three payloads got past `except TypeError`: an object whose
+    `__repr__` raises, a dict key whose `__str__` raises, and a `dict`
+    subclass whose `items()` raises."""
+    from aigauge.app import _raw_keys_for_log
+
+    for label, raw in (
+        ("__repr__ raises", {"k": _ReprRaises()}),
+        ("key __str__ raises", {_KeyStrRaises(): 1}),
+        ("items() raises", _ItemsRaises(a=1)),
+    ):
+        line = _raw_summary(raw)
+        assert isinstance(line, str) and line, label
+        assert len(line) < 20_000, label
+        # Both fields of that log line are built from the same payload, so
+        # the key one has to survive it too.
+        keys = _raw_keys_for_log(raw)
+        assert isinstance(keys, str), label
+
+    # The fallback is a bounded literal. `repr(raw)` was the unbounded thing
+    # this function exists to prevent.
+    assert _raw_summary(_ItemsRaises(a="z" * 5_000_000)) == (
+        "<unsummarisable _ItemsRaises>"
+    )

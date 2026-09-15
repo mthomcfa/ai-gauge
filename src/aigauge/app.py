@@ -310,6 +310,18 @@ _LOG_KEY_LEN_LIMIT = 60
 _LOG_SUMMARY_BUDGET = 4000
 
 
+def _key_text(raw_key) -> str:
+    """A dict key as a string, from a payload that chose the keys.
+
+    `str()` runs the key's own `__str__`, which can raise - and both of the
+    functions below reach a key before anything catches anything.
+    """
+    try:
+        return str(raw_key)
+    except Exception:  # noqa: BLE001 - a log line must never raise
+        return "<key>"
+
+
 def _summarize_for_log(value, *, depth: int = 0, budget: list[int] | None = None):
     """A page-controlled payload, cut down to something a log line can hold.
 
@@ -333,8 +345,30 @@ def _summarize_for_log(value, *, depth: int = 0, budget: list[int] | None = None
         )
         budget[0] -= len(text)
         return text
-    if isinstance(value, (int, float, bool)) or value is None:
+    if isinstance(value, bool) or value is None:
+        # bool before int: it is an int subclass, and `true` costs four
+        # characters however the branch below would have charged for it.
         budget[0] -= 8
+        return value
+    if isinstance(value, int):
+        # Its printed length is *estimated*, never measured: CPython 3.11+
+        # raises ValueError on `str()` of an int over 4 300 digits and
+        # `json.dumps` hits the same limit from the inside, so asking how
+        # long it is is itself the crash. log10(2) is ~0.301, so bits // 3
+        # never underestimates the digits it would take.
+        digits = value.bit_length() // 3 + 2
+        budget[0] -= max(8, digits)
+        if digits > _LOG_VALUE_LIMIT:
+            # And past the value limit it does not travel at all. A flat 8
+            # per number let fifty 4 200-digit JSON integers - which
+            # `json.loads` will not produce, but an extractor or a provider
+            # can - write a 210 KB record against a 512 KiB rotation.
+            return f"<int {digits} digits>"
+        return value
+    if isinstance(value, float):
+        # repr() of a float is bounded by the format, so a flat charge is
+        # honest: 24 covers the longest of them with room to spare.
+        budget[0] -= 24
         return value
     if isinstance(value, dict):
         # Lists were already bounded; dictionaries were not. A page-controlled
@@ -342,14 +376,14 @@ def _summarize_for_log(value, *, depth: int = 0, budget: list[int] | None = None
         # against a 512 KiB rotation, which discards the user's existing
         # diagnostics - the log is the one artifact that makes a provider
         # failure explainable, so losing it is the expensive part.
-        items = sorted(value.items(), key=lambda item: str(item[0]))
+        items = sorted(value.items(), key=lambda item: _key_text(item[0]))
         summarized = {}
         dropped = len(items) - _LOG_DICT_KEY_LIMIT
         for raw_key, item in items[:_LOG_DICT_KEY_LIMIT]:
             if budget[0] <= 0:
                 dropped = len(items) - len(summarized)
                 break
-            key = str(raw_key)[:_LOG_KEY_LEN_LIMIT]
+            key = _key_text(raw_key)[:_LOG_KEY_LEN_LIMIT]
             budget[0] -= len(key) + 4
             summarized[key] = _summarize_for_log(
                 item, depth=depth + 1, budget=budget
@@ -368,7 +402,15 @@ def _summarize_for_log(value, *, depth: int = 0, budget: list[int] | None = None
         if len(value) > len(summarized):
             summarized.append(f"... {len(value) - len(summarized)} more")
         return summarized
-    text = repr(value)
+    try:
+        text = repr(value)
+    except Exception:  # noqa: BLE001 - a diagnostic, not a reason to raise
+        text = f"<unrepresentable {type(value).__name__}>"
+    # Clipped and charged exactly like the string branch. It was charged
+    # after the fact and never clipped, so one 5 MB `bytes` value produced a
+    # record 9.5x the whole rotation - measured at 5 000 012 characters.
+    if len(text) > _LOG_VALUE_LIMIT:
+        text = text[:_LOG_VALUE_LIMIT] + "..."
     budget[0] -= len(text)
     return text
 
@@ -385,7 +427,7 @@ def _raw_keys_for_log(raw: dict | None) -> str:
     """
     if not raw:
         return "[]"
-    keys = sorted(str(key) for key in raw)
+    keys = sorted(_key_text(key) for key in raw)
     shown = [key[:_LOG_KEY_LEN_LIMIT] for key in keys[:_LOG_DICT_KEY_LIMIT]]
     if len(keys) > _LOG_DICT_KEY_LIMIT:
         shown.append(f"... {len(keys) - _LOG_DICT_KEY_LIMIT} more")
@@ -393,10 +435,18 @@ def _raw_keys_for_log(raw: dict | None) -> str:
 
 
 def _raw_summary(raw: dict) -> str:
+    # `except Exception`, because a log line must never be able to raise:
+    # this one runs inside `_on_snapshot`, and an object whose `__repr__`
+    # raises, a key whose `__str__` raises or a `dict` subclass whose
+    # `items()` raises all produced something `except TypeError` did not
+    # catch. The fallback is a BOUNDED literal - `repr(raw)` was the
+    # unbounded thing this function exists to prevent, so having it as the
+    # escape hatch gave the whole payload back on the one path that had
+    # already gone wrong.
     try:
         return json.dumps(_summarize_for_log(raw), sort_keys=True, default=str)
-    except TypeError:
-        return repr(raw)
+    except Exception:  # noqa: BLE001
+        return f"<unsummarisable {type(raw).__name__}>"
 
 
 def _preserve_error_metrics(
