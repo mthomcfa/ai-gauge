@@ -1495,3 +1495,53 @@ def test_a_rebuilt_browser_provider_still_refuses_a_live_scrape():
     assert answers[0].status == SnapshotStatus.ERROR
     assert answers[0].error == "A refresh is already running."
     assert answers[0].error_class == "throttled"
+
+
+def _nested(fanout: int, depth: int):
+    if depth == 0:
+        return 1
+    return {f"k{index}": _nested(fanout, depth - 1) for index in range(fanout)}
+
+
+def test_raw_summary_caps_key_names_and_the_whole_record():
+    """`raw_summary=` is the other half of the line `raw_keys=` was capped on.
+
+    `_summarize_for_log` bounded the *number* of keys, the length of values
+    and the depth, and never the length of a key name or the total size -
+    and `snapshot.raw` on a browser provider is the extractor's own dict, so
+    a page chooses both. Measured before this cap: one 100 000-character key
+    name printed verbatim; a fan-out of 20 at depth 4 produced 2.2 MB; an
+    api-capture-shaped payload that stays inside `api_capture.js`'s own caps
+    produced 4.77 MB, which is 9x the whole 512 KiB rotation - one ERROR
+    scrape erasing the diagnostic history the line exists to build.
+
+    `error_dialog._sanitize_raw`, the clipboard path, has capped dict keys
+    for exactly this reason since the 1.0.0+cfa.1 audit addendum.
+    """
+    assert len(_raw_summary({"A" * 100_000: 1})) < 2_000
+    assert len(_raw_summary(_nested(20, 4))) < 6_000
+    assert len(_raw_summary(_nested(50, 4))) < 6_000
+
+    # api_capture.js caps URLs (12), keys per URL (200) and total bytes, but
+    # neither a key name nor a URL path.
+    hostile = {
+        "api": {
+            f"https://provider.example/{'p' * 40_000}/{index}": {
+                f"{'K' * 4_000}{key}": 1 for key in range(200)
+            }
+            for index in range(12)
+        },
+        "body_text": "b" * 8_000,
+    }
+    line = _raw_summary(hostile)
+    assert len(line) < 6_000, f"one raw_summary field was {len(line)} bytes"
+    assert "more keys" in line or "..." in line, "truncation must be visible"
+
+
+def test_raw_summary_still_says_what_it_dropped():
+    """A bound that hides the fact that it bit is a bound that makes the log
+    lie. The truncation marker is the diagnostic bit."""
+    line = _raw_summary({f"k{index}": "v" * 400 for index in range(200)})
+
+    assert "more keys" in line
+    assert len(line) < 6_000

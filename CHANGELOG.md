@@ -186,10 +186,19 @@ numbers in the entries below are that log's, not estimates.
   response key *names* — chosen by the server — into a rotating 512 KiB × 3
   log on every refresh, where one hostile response is a megabyte-long record
   and three discard the whole diagnostic history. Both OpenRouter lines now
-  print the first twenty names, clipped, plus the true count; the `raw_keys`
-  field beside `raw_summary` in the snapshot lines is capped the same way.
-  Nothing a provider page returns can name its own `error_class` any more
-  either: the scraper boundary allowlists the one value it is allowed to set.
+  print the first twenty names, clipped, plus the true count. Both fields of
+  the snapshot lines are capped too, and the second of them needed more than
+  a key cap: `raw_summary` bounded the number of keys, the length of values
+  and the depth, but not the length of a key *name* and not the total, and
+  those per-node caps multiply - fifty keys at each of three levels is
+  125 000 nodes. Measured against `snapshot.raw` as a browser extractor
+  returns it: 2.2 MB for a fan-out of 20, and 4.77 MB for an api-capture
+  shape that stays inside `api_capture.js`'s own limits - 9x the whole
+  rotation, from one ERROR scrape. It now clips key names and spends one
+  shared character budget across the walk, which puts the same payloads under
+  5 KB. Nothing a provider page returns can name its own `error_class` any
+  more either: the scraper boundary allowlists the one value it is allowed to
+  set.
 - **1 099 → 1 176 tests.** Every finding from both review lanes has a
   regression test, including two invariants driven over a fake clock: an hour
   of any provider behaviour buys a bounded number of cycles, and six hours of

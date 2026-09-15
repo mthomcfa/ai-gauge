@@ -263,18 +263,38 @@ _LOG_DICT_KEY_LIMIT = 50
 # A key *name* is a field name, not a value. Clipping it keeps a bounded list
 # of bounded strings even when the names themselves came off a provider page.
 _LOG_KEY_LEN_LIMIT = 60
+# And a cap on the whole record, because the per-node caps multiply. Fifty
+# keys at each of three levels is 125 000 nodes, so a payload nested four
+# deep with a fan-out of 20 measured 2.2 MB and an api-capture-shaped one
+# 4.77 MB - 9x the entire 512 KiB x 3 rotation, from one ERROR scrape.
+_LOG_SUMMARY_BUDGET = 4000
 
 
-def _summarize_for_log(value, *, depth: int = 0):
-    if depth > 3:
+def _summarize_for_log(value, *, depth: int = 0, budget: list[int] | None = None):
+    """A page-controlled payload, cut down to something a log line can hold.
+
+    `budget` is one shared character allowance for the whole summary, spent
+    as the walk emits key names and values. Per-node caps alone do not bound
+    the record: they bound each node and let the node *count* multiply.
+    """
+    if budget is None:
+        budget = [_LOG_SUMMARY_BUDGET]
+    if depth > 3 or budget[0] <= 0:
+        # An elided node still costs five characters on the line, so it is
+        # charged for: otherwise a wide-and-shallow payload buys unbounded
+        # ellipses with a budget it never spends.
+        budget[0] -= 5
         return "..."
     if isinstance(value, str):
-        return (
+        text = (
             value
             if len(value) <= _LOG_VALUE_LIMIT
             else value[:_LOG_VALUE_LIMIT] + "..."
         )
+        budget[0] -= len(text)
+        return text
     if isinstance(value, (int, float, bool)) or value is None:
+        budget[0] -= 8
         return value
     if isinstance(value, dict):
         # Lists were already bounded; dictionaries were not. A page-controlled
@@ -283,29 +303,45 @@ def _summarize_for_log(value, *, depth: int = 0):
         # diagnostics - the log is the one artifact that makes a provider
         # failure explainable, so losing it is the expensive part.
         items = sorted(value.items(), key=lambda item: str(item[0]))
-        summarized = {
-            str(k): _summarize_for_log(v, depth=depth + 1)
-            for k, v in items[:_LOG_DICT_KEY_LIMIT]
-        }
-        if len(items) > _LOG_DICT_KEY_LIMIT:
-            summarized["..."] = f"{len(items) - _LOG_DICT_KEY_LIMIT} more keys"
+        summarized = {}
+        dropped = len(items) - _LOG_DICT_KEY_LIMIT
+        for raw_key, item in items[:_LOG_DICT_KEY_LIMIT]:
+            if budget[0] <= 0:
+                dropped = len(items) - len(summarized)
+                break
+            key = str(raw_key)[:_LOG_KEY_LEN_LIMIT]
+            budget[0] -= len(key) + 4
+            summarized[key] = _summarize_for_log(
+                item, depth=depth + 1, budget=budget
+            )
+        if dropped > 0:
+            summarized["..."] = f"{dropped} more keys"
         return summarized
     if isinstance(value, (list, tuple)):
-        summarized = [_summarize_for_log(v, depth=depth + 1) for v in value[:5]]
-        if len(value) > 5:
-            summarized.append(f"... {len(value) - 5} more")
+        summarized = []
+        for item in value[:5]:
+            if budget[0] <= 0:
+                break
+            summarized.append(
+                _summarize_for_log(item, depth=depth + 1, budget=budget)
+            )
+        if len(value) > len(summarized):
+            summarized.append(f"... {len(value) - len(summarized)} more")
         return summarized
-    return repr(value)
+    text = repr(value)
+    budget[0] -= len(text)
+    return text
 
 
 def _raw_keys_for_log(raw: dict | None) -> str:
     """The key names of a provider payload, bounded.
 
-    `_raw_summary` below already caps what it prints. This list did not, and
-    `snapshot.raw` on the browser providers is the extractor's own dict - page
-    data. One payload with tens of thousands of keys is a megabyte-long record
-    against a 512 KiB x 3 rotation, which discards the diagnostic history the
-    line exists to build.
+    A flat list of the top-level names, so a layout change is diagnosable
+    from the log without reading the nested `_raw_summary` beside it.
+    `snapshot.raw` on the browser providers is the extractor's own dict -
+    page data - so both are capped: one payload with tens of thousands of
+    keys is a megabyte-long record against a 512 KiB x 3 rotation, which
+    discards the diagnostic history the line exists to build.
     """
     if not raw:
         return "[]"
