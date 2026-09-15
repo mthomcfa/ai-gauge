@@ -781,10 +781,13 @@ class App(QObject):
         self._timer.stop()
         self._schedule_next_refresh()
 
-    def _schedule_next_refresh(self) -> None:
-        if self._inflight or self._refresh_queue:
-            return
-        now = datetime.now()
+    def _cadence_refresh_time(self, now: datetime) -> tuple[datetime, str, int]:
+        """When the next *cadence* wake is owed, before any retry pulls it in.
+
+        Separate from `_schedule_next_refresh` because a deferred retry needs
+        the same answer: a due that cannot be run yet is folded onto this
+        moment rather than buying a wake of its own.
+        """
         max_minutes = max(1, self._config.refresh_interval_minutes)
         active = now < self._active_until
         minutes = _adaptive_refresh_minutes(
@@ -805,8 +808,16 @@ class App(QObject):
             reason = "reset_pull_forward"
             minutes = max(
                 1,
-                int((next_refresh_at - datetime.now()).total_seconds() // 60) or 1,
+                int((next_refresh_at - now).total_seconds() // 60) or 1,
             )
+        return next_refresh_at, reason, minutes
+
+    def _schedule_next_refresh(self) -> None:
+        if self._inflight or self._refresh_queue:
+            return
+        now = datetime.now()
+        active = now < self._active_until
+        next_refresh_at, reason, minutes = self._cadence_refresh_time(now)
         error_retry = self._error_retry_time(now)
         if error_retry is not None and error_retry < next_refresh_at:
             next_refresh_at = error_retry
@@ -1480,14 +1491,28 @@ class App(QObject):
                 runnable.append(name)
                 continue
             lifts_in = max(1.0, parked[1] - now)
-            errors, _due = self._error_retry.get(name, (0, None))
-            self._error_retry[name] = (
-                errors,
-                datetime.now() + timedelta(seconds=lifts_in),
+            # Owed no earlier than the next cadence wake, so the kept due
+            # folds into a cycle that was going to run anyway instead of
+            # buying a wake at the instant the park lifts. That wake was one
+            # extra dispatch per hour for a provider that is hung - measured
+            # at 5 rather than 4 for a browser provider and 7 rather than 6
+            # for a REST one - and the three REST providers have no
+            # re-entrancy guard of their own, so each extra dispatch is
+            # another worker holding a slot of the *global* QThreadPool for
+            # as long as the endpoint stays slow.
+            cadence_at, _reason, _minutes = self._cadence_refresh_time(
+                datetime.now()
             )
+            due_at = max(
+                datetime.now() + timedelta(seconds=lifts_in), cadence_at
+            )
+            errors, _due = self._error_retry.get(name, (0, None))
+            self._error_retry[name] = (errors, due_at)
             log.info(
-                "refresh retry deferred provider=%s reason=abandoned in_s=%.0f",
+                "refresh retry deferred provider=%s reason=abandoned in_s=%.0f "
+                "lifts_in_s=%.0f",
                 name,
+                max(0.0, (due_at - datetime.now()).total_seconds()),
                 lifts_in,
             )
         if not runnable:

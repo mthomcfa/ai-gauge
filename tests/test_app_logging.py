@@ -1475,11 +1475,22 @@ def test_a_retry_due_on_a_parked_provider_is_kept_for_when_the_park_lifts(
     errors, due = app._error_retry["claude"]  # noqa: SLF001
     assert errors == 1, "the streak was lost"
     assert due is not None, "the due was spent on a provider that could not run"
-    # Owed again exactly when the park lifts - not in the past, which would
-    # pin every later wake at the timer's 1 000 ms floor.
+    # Kept, and never owed earlier than the next cadence wake: a due armed
+    # for the instant the park lifts is one extra dispatch per hour for a
+    # provider that is hung, and for a REST one - which has no re-entrancy
+    # guard of its own - one more worker holding a slot of the global thread
+    # pool. Never in the past either, which would pin every later wake at the
+    # timer's 1 000 ms floor.
     lifts_in = 2 * budget_s
-    assert datetime.now() < due <= datetime.now() + timedelta(seconds=lifts_in + 2)
+    cadence_at, _reason, _minutes = app._cadence_refresh_time(datetime.now())  # noqa: SLF001
+    assert due >= datetime.now() + timedelta(seconds=lifts_in - 1), (
+        "owed before the park it is waiting on lifts"
+    )
+    assert due >= cadence_at - timedelta(seconds=1), (
+        "the retry bought a wake ahead of the cadence"
+    )
     assert app._timer.active is True, "the scheduler was left with no timer"  # noqa: SLF001
+    assert app._timer.started_ms >= (cadence_at - datetime.now()).total_seconds() * 1000 - 2000  # noqa: SLF001
 
     # The park lifts, the wall clock reaches the deadline it kept, and the
     # retry is what runs.
