@@ -83,6 +83,27 @@ _REST_REFRESH_BUDGET_SECONDS = 60.0
 # Enough slack that a provider finishing right at its own bound reports
 # normally rather than racing the watchdog.
 _WATCHDOG_SLACK_SECONDS = 20.0
+# How long after the watchdog gave up a provider stays parked, as a multiple
+# of the budget that expired. Until then its worker is presumed still out
+# there - a browser scrape holding the one cached QWebEngineProfile for that
+# account - and re-dispatching would put a second one on it. Past it the
+# worker is assumed dead, because parking a provider forever is its own
+# failure mode.
+_ABANDONED_CEILING_FACTOR = 2.0
+
+
+def _pool_capacity() -> int:
+    """How many REST refreshes can actually run at once.
+
+    `QThreadPool.globalInstance().maxThreadCount()` is the ideal thread count,
+    which is 1 on a single-core host and 2 on plenty of laptops.
+    """
+    try:
+        from PyQt6.QtCore import QThreadPool
+
+        return max(1, int(QThreadPool.globalInstance().maxThreadCount()))
+    except Exception:  # noqa: BLE001 - a budget is not worth crashing over
+        return 1
 
 
 def _refresh_budget_seconds(provider) -> float:
@@ -347,6 +368,20 @@ class App(QObject):
         self._cycle_total = 0
         self._cycle_partial = False
         self._dispatch_times: dict[str, float] = {}
+        # provider -> the number of the dispatch now outstanding. A snapshot
+        # is matched against it, so an answer from a dispatch the App has
+        # already given up on cannot be read as the current one.
+        self._dispatch_epoch: dict[str, int] = {}
+        # provider -> (the epoch the watchdog abandoned, when its worker may
+        # be assumed dead). While an entry is live the provider is not
+        # dispatched again by anything.
+        self._abandoned: dict[str, tuple[int, float]] = {}
+        # The REST providers this cycle handed to the thread pool, with their
+        # budgets: what a dispatch may spend waiting for a pool thread.
+        self._pool_wait_budgets: dict[str, float] = {}
+        # The names this cycle is accounting for. A snapshot from outside it
+        # repaints its tile without joining its progress or its verdict.
+        self._cycle_names: set[str] = set()
         self._dispatching = False
         self._next_refresh_reason = "startup"
         self._settings_dialog: SettingsDialog | None = None
@@ -586,6 +621,15 @@ class App(QObject):
             for name, state in self._error_retry.items()
             if name in self._providers
         }
+        # Same pruning for the other per-provider maps, so a removed provider
+        # leaves nothing behind. A name still in flight or still parked keeps
+        # its entries: its dispatch is what they bound.
+        keep = set(self._providers) | self._inflight | set(self._abandoned)
+        for mapping in (self._dispatch_times, self._dispatch_epoch):
+            for name in [n for n in mapping if n not in keep]:
+                mapping.pop(name, None)
+        for name in [n for n in self._watchdogs if n not in keep]:
+            self._cancel_watchdog(name)
 
     def _restart_timer(self) -> None:
         self._timer.stop()
@@ -786,6 +830,20 @@ class App(QObject):
         per-provider retry - so the log line that opens a cycle cannot
         disagree with what actually ran.
         """
+        # A provider the App has given up on but whose worker is still out
+        # there is not dispatched again - by this cycle or any other. Filter
+        # before the cycle's own totals are computed, so its progress and its
+        # verdict are about what actually ran.
+        wanted: list[str] = []
+        for name in names:
+            refusal = self._dispatch_refusal(name)
+            if refusal is None:
+                wanted.append(name)
+            else:
+                log.info(
+                    "refresh provider skipped provider=%s reason=%s", name, refusal
+                )
+        names = wanted
         if manual:
             self._active_until = datetime.now() + timedelta(
                 minutes=_ACTIVE_MODE_MINUTES
@@ -798,6 +856,7 @@ class App(QObject):
         self._cycle_total = len(names)
         self._cycle_started_at = time.monotonic()
         self._cycle_reason = reason
+        self._cycle_names = set(names)
         self._cycle_partial = len(names) < len(self._providers)
         self._cycle_active = True
         log.info(
@@ -818,6 +877,12 @@ class App(QObject):
         # until it is done.
         concurrent = [name for name in names if not self._uses_browser(name)]
         self._refresh_queue = [name for name in names if self._uses_browser(name)]
+        # What each of those may spend waiting for a pool thread, before its
+        # own work even starts. See _pool_wait_slack.
+        self._pool_wait_budgets = {
+            name: _refresh_budget_seconds(self._providers.get(name))
+            for name in concurrent
+        }
         self._dispatching = True
         try:
             for name in concurrent:
@@ -907,62 +972,151 @@ class App(QObject):
         if self._browser_in_flight():
             return
         name = self._refresh_queue.pop(0)
-        if self._providers.get(name) is None:
-            # A settings save removed this one while it was queued. Re-entering
-            # _start_next_refresh here returned on the empty-queue guard when
-            # the dropped name was the last entry, leaving _cycle_active true
-            # with nothing in flight: the timer stopped, the heartbeat's
-            # recovery blocked on _cycle_active, the Refresh button disabled,
-            # and any queued manual refresh stranded. _advance_cycle does both
-            # jobs - next provider, or close the cycle.
-            log.info(
-                "refresh provider dropped provider=%s reason=not_configured",
-                name,
-            )
+        refusal = self._dispatch_refusal(name)
+        if refusal is not None:
+            # Usually a settings save removed this one while it was queued.
+            # Re-entering _start_next_refresh here returned on the empty-queue
+            # guard when the dropped name was the last entry, leaving
+            # _cycle_active true with nothing in flight: the timer stopped,
+            # the heartbeat's recovery blocked on _cycle_active, the Refresh
+            # button disabled, and any queued manual refresh stranded.
+            # _advance_cycle does both jobs - next provider, or close the
+            # cycle.
+            log.info("refresh provider skipped provider=%s reason=%s", name, refusal)
+            self._cycle_names.discard(name)
             self._cycle_total = max(len(self._cycle_statuses), self._cycle_total - 1)
             self._advance_cycle()
             return
         self._dispatch(name)
 
+    def _dispatch_refusal(self, name: str) -> str | None:
+        """Why this provider must not be dispatched now, or None.
+
+        The single gate every path goes through - a scheduled cycle, a retry
+        wake, a manual refresh, a settings save - so a provider cannot be sent
+        out twice by one of them while another thinks it is idle.
+        """
+        if self._providers.get(name) is None:
+            return "not_configured"
+        if name in self._inflight:
+            return "already_in_flight"
+        if self._is_abandoned(name):
+            return "abandoned"
+        return None
+
+    def _is_abandoned(self, name: str) -> bool:
+        """Is a dispatch the watchdog gave up on still presumed to be running?
+
+        The watchdog ends the App's *wait*; it does not cancel the provider's
+        work. A browser provider is still loading a page on the one cached
+        QWebEngineProfile for that account (webview/profile.py returns one per
+        provider), and ClaudeProvider.refresh rebuilds its runner
+        unconditionally - so a second dispatch means two QWebEngineViews
+        writing one cookie store, which is how a spurious sign-out happens,
+        and N times the load on the provider from one desktop app.
+
+        The entry clears when the abandoned worker finally reports back, or
+        when twice its budget has passed and it can fairly be called dead.
+        """
+        entry = self._abandoned.get(name)
+        if entry is None:
+            return False
+        epoch, assumed_dead_at = entry
+        if time.monotonic() >= assumed_dead_at:
+            log.warning(
+                "refresh provider abandoned worker assumed dead provider=%s epoch=%s",
+                name,
+                epoch,
+            )
+            self._abandoned.pop(name, None)
+            return False
+        return True
+
+    def _pool_wait_slack(self, name: str) -> float:
+        """How long this dispatch may sit in the thread pool before it starts.
+
+        `_arm_watchdog` starts its clock at dispatch, but a REST provider's
+        `work()` starts when a `QThreadPool` thread frees up - and the cycle
+        now hands openrouter, copilot and azure to the pool in one burst. On a
+        host whose ideal thread count is 1 or 2 the last runnable waits behind
+        the others while its own budget is already running, so the watchdog
+        would fire inside a refresh that has not exceeded its own bound. The
+        providers are not asked to report when they start (three separate
+        `_run_async` implementations, and the Provider API is one callback),
+        so the allowance is explicit here instead.
+        """
+        budgets = self._pool_wait_budgets
+        if name not in budgets:
+            return 0.0
+        ahead = sum(budget for other, budget in budgets.items() if other != name)
+        return ahead / _pool_capacity()
+
     def _dispatch(self, name: str) -> None:
         provider = self._providers.get(name)
         if provider is None:
             return
+        refusal = self._dispatch_refusal(name)
+        if refusal is not None:
+            # Belt and braces: every caller asks first, and this is what makes
+            # "one dispatch per provider at a time" a property of the method
+            # rather than of its callers.
+            log.warning(
+                "refresh provider not dispatched provider=%s reason=%s",
+                name,
+                refusal,
+            )
+            return
+        epoch = self._dispatch_epoch.get(name, 0) + 1
+        self._dispatch_epoch[name] = epoch
         self._inflight.add(name)
         now = time.monotonic()
         self._dispatch_times[name] = now
         log.info(
-            "refresh provider start provider=%s queued_s=%.1f",
+            "refresh provider start provider=%s epoch=%s queued_s=%.1f",
             name,
+            epoch,
             max(0.0, now - (self._cycle_started_at or now)),
         )
-        self._arm_watchdog(name, provider)
+        self._arm_watchdog(name, provider, epoch)
 
-        def _emit(snap: UsageSnapshot, _name=name):
-            self._signals.snapshot_ready.emit(snap)
+        # The epoch travels with the answer, so a snapshot can be matched to
+        # the dispatch it answers rather than to whatever is in flight for
+        # that name when it lands.
+        def _emit(snap: UsageSnapshot, _epoch=epoch):
+            self._signals.snapshot_ready.emit((snap, _epoch))
 
         try:
             provider.refresh(_emit)
         except Exception as exc:  # noqa: BLE001
             self._signals.snapshot_ready.emit(
-                UsageSnapshot(
-                    provider=name,
-                    status=SnapshotStatus.ERROR,
-                    # str(exc) on a transport failure carries the request URL,
-                    # and this string reaches the tile, the tray tooltip and
-                    # the error dialog. Same redaction the log line below uses.
-                    error=_redact_azure_ids(str(exc)),
+                (
+                    UsageSnapshot(
+                        provider=name,
+                        status=SnapshotStatus.ERROR,
+                        # str(exc) on a transport failure carries the request
+                        # URL, and this string reaches the tile, the tray
+                        # tooltip and the error dialog. Same redaction the log
+                        # line below uses.
+                        error=_redact_azure_ids(str(exc)),
+                    ),
+                    epoch,
                 )
             )
 
-    def _arm_watchdog(self, name: str, provider: Provider) -> None:
+    def _arm_watchdog(self, name: str, provider: Provider, epoch: int = 0) -> None:
         """Bound one dispatch, so a provider that never answers cannot stall
         the cycle - and with it every future refresh."""
         self._cancel_watchdog(name)
-        budget = _refresh_budget_seconds(provider) + _WATCHDOG_SLACK_SECONDS
+        budget = (
+            _refresh_budget_seconds(provider)
+            + _WATCHDOG_SLACK_SECONDS
+            + self._pool_wait_slack(name)
+        )
         timer = QTimer(self)
         timer.setSingleShot(True)
-        timer.timeout.connect(lambda n=name, b=budget: self._on_watchdog(n, b))
+        timer.timeout.connect(
+            lambda n=name, b=budget, e=epoch: self._on_watchdog(n, b, e)
+        )
         timer.start(int(budget * 1000))
         self._watchdogs[name] = timer
 
@@ -987,20 +1141,39 @@ class App(QObject):
         except RuntimeError:
             pass
 
-    def _on_watchdog(self, name: str, budget: float) -> None:
+    def _on_watchdog(self, name: str, budget: float, epoch: int = 0) -> None:
         self._retire_watchdog(self._watchdogs.pop(name, None))
         if name not in self._inflight:
             return
+        if epoch and self._dispatch_epoch.get(name) != epoch:
+            # A watchdog outliving the dispatch it was armed for.
+            return
         log.warning(
-            "refresh provider watchdog provider=%s budget_s=%.0f - giving up",
+            "refresh provider watchdog provider=%s epoch=%s budget_s=%.0f - giving up",
             name,
+            epoch,
             budget,
         )
+        # The App stops waiting; the provider does not stop working. Park the
+        # name until that worker reports back or can be assumed dead, so no
+        # cycle, retry wake, manual refresh or settings save starts a second
+        # one alongside it.
+        assumed_dead_in = _ABANDONED_CEILING_FACTOR * budget
+        self._abandoned[name] = (epoch, time.monotonic() + assumed_dead_in)
+        log.warning(
+            "refresh provider abandoned provider=%s epoch=%s eligible_again_in_s=%.0f",
+            name,
+            epoch,
+            assumed_dead_in,
+        )
         self._signals.snapshot_ready.emit(
-            UsageSnapshot(
-                provider=name,
-                status=SnapshotStatus.ERROR,
-                error="Refresh timed out.",
+            (
+                UsageSnapshot(
+                    provider=name,
+                    status=SnapshotStatus.ERROR,
+                    error="Refresh timed out.",
+                ),
+                epoch,
             )
         )
 
@@ -1041,8 +1214,19 @@ class App(QObject):
             self._error_retry[name] = (errors, None)
         self._begin_cycle(due, manual=False, reason="error_retry")
 
-    def _on_snapshot(self, snapshot: UsageSnapshot) -> None:
+    def _on_snapshot(self, payload) -> None:
+        if isinstance(payload, tuple):
+            snapshot, epoch = payload
+        else:
+            # Not a dispatch answer: a settings save re-rendering a cached
+            # snapshot with a new denominator. There is no epoch to match.
+            snapshot, epoch = payload, None
         name = snapshot.provider
+        if epoch is not None and not (
+            name in self._inflight and self._dispatch_epoch.get(name) == epoch
+        ):
+            self._on_late_snapshot(snapshot, epoch)
+            return
         was_inflight = name in self._inflight
         self._inflight.discard(name)
         self._cancel_watchdog(name)
@@ -1071,8 +1255,14 @@ class App(QObject):
             self._snapshots.get(snapshot.provider),
         )
         self._snapshots[snapshot.provider] = snapshot
-        self._cycle_signatures[snapshot.provider] = _snapshot_signature(snapshot)
-        self._cycle_statuses[snapshot.provider] = snapshot.status
+        # A cycle accounts for what it dispatched. A snapshot from a provider
+        # it never asked - a per-provider retry running while something else
+        # reports - used to count toward its progress, its `errors=` line and
+        # its `changed` verdict.
+        in_cycle = self._cycle_active and name in self._cycle_names
+        if in_cycle:
+            self._cycle_signatures[snapshot.provider] = _snapshot_signature(snapshot)
+            self._cycle_statuses[snapshot.provider] = snapshot.status
         self._record_provider_outcome(snapshot)
         if snapshot.status == SnapshotStatus.ERROR:
             log.warning(
@@ -1109,7 +1299,7 @@ class App(QObject):
             )
         except Exception:  # noqa: BLE001
             log.exception("widget.set_ratio failed")
-        if self._cycle_active:
+        if in_cycle:
             # The cycle's own total, not one recomputed from the queue: while
             # the REST batch is going out, the providers not yet dispatched
             # are in neither set and the header would count down to a
@@ -1122,6 +1312,39 @@ class App(QObject):
         self._update_tray()
 
         self._advance_cycle()
+
+    def _on_late_snapshot(self, snapshot: UsageSnapshot, epoch: int) -> None:
+        """An answer from a dispatch that is no longer the current one.
+
+        Keying on the provider name alone had no dispatch identity: when a
+        scrape the watchdog had abandoned finally answered, the *new*
+        dispatch's `_inflight` entry made the stale answer look current, so it
+        cancelled the new dispatch's watchdog and closed the cycle while that
+        scrape was still running - live in neither `_inflight` nor
+        `_watchdogs`.
+
+        The answer is dropped rather than painted: it was produced by a
+        dispatch the App gave up on, possibly against a configuration the user
+        has since changed, and F14 already drops a snapshot whose provider is
+        gone for the same reason. What it does tell us is that the worker
+        finally let go, which is what un-parks the provider.
+        """
+        name = snapshot.provider
+        log.info(
+            "refresh provider late provider=%s epoch=%s current=%s status=%s - dropped",
+            name,
+            epoch,
+            self._dispatch_epoch.get(name, "-"),
+            snapshot.status.value,
+        )
+        abandoned = self._abandoned.get(name)
+        if abandoned is not None and abandoned[0] == epoch:
+            self._abandoned.pop(name, None)
+            log.info(
+                "refresh provider abandoned worker reported back provider=%s epoch=%s",
+                name,
+                epoch,
+            )
 
     def _advance_cycle(self) -> None:
         """Dispatch the next provider, or close the cycle when none is left."""

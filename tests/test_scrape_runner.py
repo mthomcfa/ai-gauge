@@ -223,3 +223,52 @@ def test_error_without_a_payload_still_yields_an_empty_dict(fake_scraper):
     fake_scraper.instances[0].done.emit(None, "timeout")
 
     assert received[0].raw == {}
+
+
+def test_a_runner_with_a_live_scraper_reports_itself_busy(fake_scraper):
+    """`busy()` is what stops a second `QWebEngineView` being opened on the
+    one cached `QWebEngineProfile` for an account. It must be true for exactly
+    as long as a scraper is loading a page, and false again the moment the
+    scraper answers - including across a build retry."""
+    received: list[UsageSnapshot] = []
+    rn = ScrapeRunner(
+        account_id="x",
+        url="http://example",
+        extractor_js="",
+        build=lambda payload: _ok_snapshot(),
+        log=logging.getLogger("test"),
+        build_max_attempts=2,
+    )
+    assert rn.busy() is False, "busy before anything ran"
+
+    rn.run(received.append)
+    assert rn.busy() is True, "a live scrape is not reported"
+
+    fake_scraper.instances[-1].done.emit({"payload": 1}, "")
+    assert received and rn.busy() is False
+
+
+def test_a_build_retry_keeps_the_runner_busy(fake_scraper):
+    received: list[UsageSnapshot] = []
+    attempts: list[int] = []
+
+    def _build(payload: Any) -> UsageSnapshot:
+        attempts.append(1)
+        return _ok_snapshot() if len(attempts) > 1 else _err_snapshot()
+
+    rn = ScrapeRunner(
+        account_id="x",
+        url="http://example",
+        extractor_js="",
+        build=_build,
+        log=logging.getLogger("test"),
+        build_max_attempts=2,
+    )
+    rn.run(received.append)
+    fake_scraper.instances[-1].done.emit({"payload": 1}, "")
+
+    assert not received, "the retry never started"
+    assert rn.busy() is True, "the second attempt is still a live scrape"
+
+    fake_scraper.instances[-1].done.emit({"payload": 2}, "")
+    assert received and rn.busy() is False

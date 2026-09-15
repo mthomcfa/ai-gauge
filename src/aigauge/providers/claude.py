@@ -806,6 +806,27 @@ class ClaudeProvider(Provider):
         self._runner: ScrapeRunner | None = None  # held to prevent GC
 
     def refresh(self, on_done: Callable[[UsageSnapshot], None]) -> None:
+        if self._runner is not None and self._runner.busy():
+            # The App's watchdog ends its own wait; it does not end the
+            # scrape. Starting a second one here would put a second
+            # QWebEngineView on the single cached QWebEngineProfile for this
+            # account - two writers to one cookie store, which is how a
+            # spurious sign-out happens, and two page loads against the
+            # provider from one desktop app. `throttled` because this is not
+            # the provider failing: it is the provider already working.
+            log.warning(
+                "provider refresh refused provider=%s reason=already_running",
+                self._account_id,
+            )
+            on_done(
+                UsageSnapshot(
+                    provider=self._account_id,
+                    status=SnapshotStatus.ERROR,
+                    error="A refresh is already running.",
+                    error_class="throttled",
+                )
+            )
+            return
         catalog = load_catalog("claude")
         # The scan is per provider *kind*, not per account: the meters are a
         # property of Claude's page, so the first account to refresh after the

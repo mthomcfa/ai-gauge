@@ -52,6 +52,17 @@ class ScrapeRunner:
         self._parent = parent
         self._scraper: HeadlessScraper | None = None
 
+    def busy(self) -> bool:
+        """Is a scrape of this account still loading a page?
+
+        ``_handle`` nulls ``_scraper`` before it answers, so this is False for
+        exactly as long as there is no live ``HeadlessScraper``. A provider
+        asks before starting another: `webview.profile.get_profile` returns
+        one cached ``QWebEngineProfile`` per account, so two live scrapers are
+        two ``QWebEngineView``s writing one cookie store.
+        """
+        return self._scraper is not None
+
     def run(self, on_done: Callable[[UsageSnapshot], None]) -> None:
         attempts = [0]
 

@@ -102,10 +102,14 @@ def _refresh_app_stub() -> App:
     app._current_refresh_manual = False  # noqa: SLF001
     app._cycle_signatures = {"old": ()}  # noqa: SLF001
     app._cycle_statuses = {}  # noqa: SLF001
+    app._cycle_names = set()  # noqa: SLF001
     app._cycle_active = False  # noqa: SLF001
     app._cycle_started_at = None  # noqa: SLF001
     app._cycle_reason = "startup"  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
+    app._dispatch_epoch = {}  # noqa: SLF001
+    app._abandoned = {}  # noqa: SLF001
+    app._pool_wait_budgets = {}  # noqa: SLF001
     app._dispatching = False  # noqa: SLF001
     app._watchdogs = {}  # noqa: SLF001
     app._pending_manual_refresh = False  # noqa: SLF001
@@ -878,6 +882,45 @@ def test_a_provider_waiting_on_its_own_throttle_is_not_a_failure():
     assert app._timer.started_ms > 65_000  # noqa: SLF001
 
 
+def test_a_browser_provider_refuses_a_refresh_while_one_is_running():
+    """The last line of defence for one profile, one scrape.
+
+    The App parks a provider its watchdog gave up on, but it cannot park it
+    forever - a worker that is genuinely dead would stall that tile for the
+    life of the process - so after twice its budget the name is eligible
+    again. If that worker is in fact still loading a page,
+    `ClaudeProvider.refresh` would rebuild its runner unconditionally and put
+    a second `QWebEngineView` on the single cached `QWebEngineProfile` for
+    the account: two writers to one cookie store. It refuses instead, and
+    says so with an error class the scheduler does not read as a failure.
+    """
+    from aigauge.providers.claude import ClaudeProvider
+    from aigauge.providers.codex import CodexProvider
+    from aigauge.providers.opencode_go import OpenCodeGoProvider
+
+    config = Config()
+    providers = [
+        ClaudeProvider(parent=None, account_id="claude", config=config),
+        CodexProvider(parent=None, account_id="codex", config=config),
+        OpenCodeGoProvider(config, parent=None),
+    ]
+    for provider in providers:
+        busy_runner = SimpleNamespace(busy=lambda: True)
+        provider._runner = busy_runner  # noqa: SLF001
+        answers: list[UsageSnapshot] = []
+
+        provider.refresh(answers.append)
+
+        assert len(answers) == 1, f"{type(provider).__name__} did not answer"
+        assert answers[0].status == SnapshotStatus.ERROR
+        assert answers[0].error_class == "throttled", (
+            "a provider that is already working is not a provider that failed"
+        )
+        assert provider._runner is busy_runner, (  # noqa: SLF001
+            f"{type(provider).__name__} started a second scrape on one profile"
+        )
+
+
 def test_a_throttled_answer_clears_a_retry_that_was_already_owed():
     """The early return for a no-fast-retry class left the old `due` behind.
 
@@ -1050,8 +1093,12 @@ def test_the_snapshot_error_log_line_redacts_azure_identifiers(qapp, caplog):
     app._snapshots = {}  # noqa: SLF001
     app._cycle_signatures = {}  # noqa: SLF001
     app._cycle_statuses = {}  # noqa: SLF001
+    app._cycle_names = set()  # noqa: SLF001
     app._cycle_active = False  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
+    app._dispatch_epoch = {}  # noqa: SLF001
+    app._abandoned = {}  # noqa: SLF001
+    app._pool_wait_budgets = {}  # noqa: SLF001
     app._dispatching = False  # noqa: SLF001
     app._watchdogs = {}  # noqa: SLF001
     app._error_retry = {}  # noqa: SLF001
@@ -1093,10 +1140,14 @@ def _mid_cycle_app(widget) -> App:
     app._snapshots = {}  # noqa: SLF001
     app._cycle_signatures = {}  # noqa: SLF001
     app._cycle_statuses = {}  # noqa: SLF001
+    app._cycle_names = {"claude", "codex"}  # noqa: SLF001
     app._cycle_total = 2  # noqa: SLF001
     app._cycle_active = True  # noqa: SLF001
     app._cycle_started_at = None  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
+    app._dispatch_epoch = {}  # noqa: SLF001
+    app._abandoned = {}  # noqa: SLF001
+    app._pool_wait_budgets = {}  # noqa: SLF001
     app._dispatching = False  # noqa: SLF001
     app._watchdogs = {}  # noqa: SLF001
     app._error_retry = {}  # noqa: SLF001
@@ -1168,8 +1219,12 @@ def test_a_snapshot_for_a_provider_the_user_removed_is_dropped(qapp):
     app._snapshots = {}  # noqa: SLF001
     app._cycle_signatures = {}  # noqa: SLF001
     app._cycle_statuses = {}  # noqa: SLF001
+    app._cycle_names = set()  # noqa: SLF001
     app._cycle_active = False  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
+    app._dispatch_epoch = {}  # noqa: SLF001
+    app._abandoned = {}  # noqa: SLF001
+    app._pool_wait_budgets = {}  # noqa: SLF001
     app._dispatching = False  # noqa: SLF001
     app._watchdogs = {}  # noqa: SLF001
     app._inflight = {"opencode_go"}  # noqa: SLF001
@@ -1231,6 +1286,9 @@ def test_a_provider_that_raises_out_of_refresh_is_redacted_too(qapp, monkeypatch
     app._inflight = set()  # noqa: SLF001
     app._watchdogs = {}  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
+    app._dispatch_epoch = {}  # noqa: SLF001
+    app._abandoned = {}  # noqa: SLF001
+    app._pool_wait_budgets = {}  # noqa: SLF001
     app._cycle_started_at = None  # noqa: SLF001
     sub = "11111111-2222-3333-4444-555555555555"
     captured: list = []
@@ -1250,5 +1308,7 @@ def test_a_provider_that_raises_out_of_refresh_is_redacted_too(qapp, monkeypatch
     app._start_next_refresh()  # noqa: SLF001
 
     assert captured, "the exception was not turned into a snapshot"
-    assert sub not in (captured[0].error or "")
-    assert "<guid>" in (captured[0].error or "")
+    snapshot, epoch = captured[0]
+    assert epoch == 1, "the answer must name the dispatch it answers"
+    assert sub not in (snapshot.error or "")
+    assert "<guid>" in (snapshot.error or "")

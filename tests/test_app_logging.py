@@ -193,8 +193,12 @@ def _app(providers: dict[str, _Provider]) -> App:
     app._cycle_started_at = None  # noqa: SLF001
     app._cycle_reason = "startup"  # noqa: SLF001
     app._cycle_statuses = {}  # noqa: SLF001
+    app._cycle_names = set()  # noqa: SLF001
     app._cycle_total = 0  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
+    app._dispatch_epoch = {}  # noqa: SLF001
+    app._abandoned = {}  # noqa: SLF001
+    app._pool_wait_budgets = {}  # noqa: SLF001
     app._dispatching = False  # noqa: SLF001
     app._next_refresh_reason = "startup"  # noqa: SLF001
     app._active_until = datetime.now() + timedelta(minutes=30)  # noqa: SLF001
@@ -268,7 +272,7 @@ def test_every_provider_turn_is_timed(caplog, two_providers):
 
     messages = [rec.getMessage() for rec in caplog.records]
     assert any(
-        m.startswith("refresh provider start provider=claude queued_s=")
+        m.startswith("refresh provider start provider=claude epoch=1 queued_s=")
         for m in messages
     )
     assert any(
@@ -477,19 +481,145 @@ def test_a_clean_cycle_disarms_every_watchdog_it_armed():
     assert all(timer.deleted for timer in armed), "a watchdog was never destroyed"
 
 
-def test_the_stuck_providers_late_snapshot_does_not_close_a_second_cycle():
+def test_the_stuck_providers_late_snapshot_cannot_touch_a_second_cycle():
+    """The old version of this test never started a second cycle, so it could
+    not see what it was named for.
+
+    `_on_snapshot` keyed on the provider name alone, with no dispatch
+    identity. When an abandoned scrape finally answered, the *new* dispatch's
+    `_inflight` entry made it look current: the stale answer was accepted, it
+    cancelled the new dispatch's watchdog, and `_advance_cycle` closed the
+    cycle while the new scrape was still running - a scrape live in neither
+    `_inflight` nor `_watchdogs`. Each dispatch now carries an epoch, and an
+    answer from an abandoned one is logged and dropped.
+    """
+    claude = _BrowserProvider(_ok("claude"), hold=True)
+    codex = _BrowserProvider(_ok("codex"), hold=True)
+    app = _app({"claude": claude, "codex": codex})
+
+    app.refresh_now(manual=False)
+    first_callback = claude.pending
+    app._watchdogs["claude"].fire()  # noqa: SLF001
+    # The abandoned scrape's turn is over; codex gets the browser slot.
+    assert app._inflight == {"codex"}  # noqa: SLF001
+    codex_watchdog = app._watchdogs["codex"]  # noqa: SLF001
+
+    # The abandoned scrape finally answers, mid-second-provider.
+    first_callback(_ok("claude"))
+
+    assert app._inflight == {"codex"}, "a late answer cleared someone else"  # noqa: SLF001
+    assert app._watchdogs.get("codex") is codex_watchdog  # noqa: SLF001
+    assert app._cycle_active is True, "a late answer closed a live cycle"  # noqa: SLF001
+    assert app._snapshots["claude"].status == SnapshotStatus.ERROR  # noqa: SLF001
+
+
+def test_a_provider_the_watchdog_gave_up_on_is_not_dispatched_again():
+    """The watchdog gives up on the App's side only: the provider's work is
+    untouched. `ClaudeProvider.refresh` rebuilds its runner unconditionally,
+    so a second dispatch puts a second `QWebEngineView` on the one cached
+    `QWebEngineProfile` for that account - two writers to one cookie store,
+    and N times the load on the provider from one desktop app.
+    """
+    claude = _BrowserProvider(_ok("claude"), hold=True)
+    app = _app({"claude": claude})
+
+    app.refresh_now(manual=False)
+    app._watchdogs["claude"].fire()  # noqa: SLF001
+    assert app._cycle_active is False, "the cycle did not close"  # noqa: SLF001
+
+    # None of the four ways back in may re-dispatch it.
+    app.refresh_now(manual=False)
+    app.refresh_now(manual=True)
+    app.refresh_provider("claude")
+    app._error_retry["claude"] = (1, datetime.now() - timedelta(seconds=1))  # noqa: SLF001
+    app._next_refresh_reason = "error_retry"  # noqa: SLF001
+    app._on_refresh_timer()  # noqa: SLF001
+
+    assert claude.calls == 1, "a second scrape was started on a live profile"
+    assert app._cycle_active is False, "a refused dispatch stalled the cycle"  # noqa: SLF001
+    assert app._timer.active is True  # noqa: SLF001
+
+
+def test_an_abandoned_worker_reporting_back_makes_its_provider_eligible():
     claude = _BrowserProvider(_ok("claude"), hold=True)
     app = _app({"claude": claude})
     app.refresh_now(manual=False)
+    late = claude.pending
     app._watchdogs["claude"].fire()  # noqa: SLF001
-    ends = app._timer.started_ms
 
-    # The provider finally reports back, long after the cycle closed.
-    claude.pending(_ok("claude"))
+    late(_ok("claude"))  # the abandoned scrape finally lets go
 
-    assert app._snapshots["claude"].status == SnapshotStatus.OK  # noqa: SLF001
-    assert app._cycle_active is False  # noqa: SLF001
-    assert app._timer.started_ms == ends, "a late snapshot re-armed the timer"
+    app.refresh_now(manual=True)
+    assert claude.calls == 2
+
+
+def test_an_abandoned_worker_is_assumed_dead_after_twice_its_budget(monkeypatch):
+    """A worker that never reports must not park its provider forever."""
+    clock = {"t": 0.0}
+    monkeypatch.setattr(
+        app_module, "time", SimpleNamespace(monotonic=lambda: clock["t"])
+    )
+    claude = _BrowserProvider(_ok("claude"), hold=True)
+    app = _app({"claude": claude})
+    app.refresh_now(manual=False)
+    watchdog = app._watchdogs["claude"]  # noqa: SLF001
+    budget_s = (watchdog.interval_ms or 0) / 1000.0
+    watchdog.fire()
+
+    clock["t"] = 2 * budget_s - 1
+    app.refresh_now(manual=True)
+    assert claude.calls == 1, "released before the ceiling"
+
+    clock["t"] = 2 * budget_s + 1
+    app.refresh_now(manual=True)
+    assert claude.calls == 2, "parked past the ceiling"
+
+
+def test_a_snapshot_from_outside_the_cycle_is_not_folded_into_it():
+    """A cycle's accounting is its own membership. A snapshot from a provider
+    this cycle never dispatched counted toward its progress, its `errors=`
+    line and its `changed` verdict."""
+    claude = _BrowserProvider(_ok("claude"), hold=True)
+    copilot = _Provider(_ok("copilot"))
+    app = _app({"claude": claude, "copilot": copilot})
+
+    app._begin_cycle(["claude"], manual=False, reason="error_retry")  # noqa: SLF001
+    progress_before = list(app._widget.progress)  # noqa: SLF001
+
+    app._on_snapshot(_ok("copilot"))  # noqa: SLF001
+
+    assert app._cycle_statuses == {}, "a foreign snapshot joined the cycle"  # noqa: SLF001
+    assert app._cycle_signatures == {}  # noqa: SLF001
+    assert app._widget.progress == progress_before  # noqa: SLF001
+    # The tile still gets its number.
+    assert app._snapshots["copilot"].status == SnapshotStatus.OK  # noqa: SLF001
+
+
+def test_the_rest_watchdog_allows_for_thread_pool_queue_time():
+    """`_arm_watchdog` starts its clock at dispatch, but a REST provider's
+    work starts when a `QThreadPool` thread frees up - and this release hands
+    all three REST providers to the pool at once. On a one-core host the
+    third runnable waits behind the first two while its own budget is already
+    running, so the watchdog would fire inside a refresh that has not
+    exceeded its own bound."""
+    providers = {
+        "copilot": _Provider(_ok("copilot"), hold=True),
+        "openrouter": _Provider(_ok("openrouter"), hold=True),
+        "azure": _Provider(_ok("azure"), hold=True),
+    }
+    app = _app(providers)
+
+    app.refresh_now(manual=False)
+
+    alone = _app({"copilot": _Provider(_ok("copilot"), hold=True)})
+    alone.refresh_now(manual=False)
+    solo_ms = alone._watchdogs["copilot"].interval_ms  # noqa: SLF001
+
+    assert app._watchdogs["copilot"].interval_ms > solo_ms, (  # noqa: SLF001
+        "the watchdog counts no queue time at all"
+    )
+
+
 
 
 def test_the_watchdog_budget_follows_the_providers_own_bound():
@@ -503,8 +633,21 @@ def test_the_watchdog_budget_follows_the_providers_own_bound():
     assert _refresh_budget_seconds(ClaudeProvider) == 160
     # 25 s x 1 x 2.
     assert _refresh_budget_seconds(CodexProvider) == 50
-    # Azure bounds its own refresh; the watchdog must not fire inside it.
-    assert _refresh_budget_seconds(AzureProvider) == 90
+    # Azure's REFRESH_DEADLINE_SECONDS bounds its *page loops* only; the
+    # fixed handful of calls around them is outside it by design. The
+    # watchdog has to allow for the whole refresh, so the provider reports
+    # its real worst case, not the floor.
+    from aigauge.providers.azure import (
+        MAX_FIXED_REQUESTS_PER_REFRESH,
+        REFRESH_DEADLINE_SECONDS,
+        REQUEST_TIMEOUT,
+    )
+
+    assert _refresh_budget_seconds(AzureProvider) == (
+        REFRESH_DEADLINE_SECONDS
+        + (MAX_FIXED_REQUESTS_PER_REFRESH + 1) * REQUEST_TIMEOUT
+    )
+    assert _refresh_budget_seconds(AzureProvider) > REFRESH_DEADLINE_SECONDS
     # A plain REST provider gets the flat budget.
     assert _refresh_budget_seconds(CopilotProvider) == 60
 
