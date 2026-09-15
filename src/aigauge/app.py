@@ -1308,6 +1308,13 @@ class App(QObject):
         if self._inflight or self._refresh_queue:
             if provider not in self._pending_manual_providers:
                 self._pending_manual_providers.append(provider)
+            # A person asked, and `_run_pending_manual` may not run this
+            # request as itself: when a settings save has already queued a
+            # *full* refresh, its `full` branch wins and drops the
+            # per-provider one. The save carries `asked=False`, so without
+            # this the queued sign-in - `open_login` and `open_cookie_paste`
+            # both call here - answered a parked tile with silence.
+            self._pending_manual_asked = True
             log.info(
                 "refresh_provider queued provider=%s inflight=%s queue=%s",
                 provider,

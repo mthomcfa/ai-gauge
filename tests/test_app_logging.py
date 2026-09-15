@@ -2386,3 +2386,34 @@ def test_a_newline_inside_a_short_id_cannot_forge_a_log_record(
         if "\n" in record.getMessage() or "\r" in record.getMessage()
     ]
     assert forged_lines == [], forged_lines
+
+
+def test_a_sign_in_queued_behind_a_settings_save_still_marks_the_tile():
+    """`refresh_provider` is what a successful sign-in calls.
+
+    `open_login` and `open_cookie_paste` both end with
+    `refresh_provider(name)`, and its queued branch recorded the provider
+    but not that a person had asked. A settings save queues a *full*
+    refresh with `asked=False`, and `_run_pending_manual`'s `full` branch
+    wins over the per-provider list - so OK in Settings during a cycle,
+    then sign in to a parked account, and the tile said nothing while the
+    refresh did not happen either. Queued on its own it always said so.
+    """
+    copilot = _Provider(_ok("copilot"), hold=True)
+    app = _app({"copilot": copilot})
+    app.refresh_now(manual=False)
+    app._watchdogs["copilot"].fire()  # noqa: SLF001 - park copilot
+    app._widget.status_hints.clear()  # noqa: SLF001
+
+    app._inflight.add("claude")  # noqa: SLF001 - a cycle is in flight
+    app.refresh_now(manual=True, asked=False)  # what the settings save runs
+    app.refresh_provider("copilot")  # what the sign-in runs
+    app._inflight.discard("claude")  # noqa: SLF001
+    assert app._widget.status_hints == []  # noqa: SLF001
+    assert app._pending_manual_providers == ["copilot"]  # noqa: SLF001
+
+    app._run_pending_manual()  # noqa: SLF001
+
+    assert app._widget.status_hints == [  # noqa: SLF001
+        ("copilot", "Waiting for the previous refresh to finish.")
+    ], "the queued sign-in was answered with silence"
