@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -892,55 +893,247 @@ def test_a_new_audit_file_is_owner_only(tmp_path):
 # --- gathering the diff ----------------------------------------------------
 
 
-def _git_repo(tmp_path) -> Path:
-    """A throwaway repository with a `diff.external` driver planted in it."""
+def _git(repo: Path, *args: str):
     import subprocess
 
-    repo = tmp_path / "repo"
-    repo.mkdir()
-
-    def git(*args):
-        return subprocess.run(
-            ["git", *args], cwd=repo, capture_output=True, text=True, check=False
-        )
-
-    git("init", "-q", "-b", "main")
-    git("config", "user.email", "t@example.org")
-    git("config", "user.name", "t")
-    (repo / "a.txt").write_text("one\n", encoding="utf-8")
-    git("add", "-A")
-    git("commit", "-qm", "one")
-    (repo / "a.txt").write_text("two\n", encoding="utf-8")
-    return repo
-
-
-def _plant_external_diff(repo: Path, sentinel: Path) -> None:
-    import subprocess
-
-    if sys.platform == "win32":  # pragma: no cover - the driver shape differs
-        driver = repo.parent / "extdiff.bat"
-        driver.write_text(f"@echo ran > {sentinel}\n", encoding="utf-8")
-    else:
-        driver = repo.parent / "extdiff.sh"
-        driver.write_text(f'#!/bin/sh\necho ran > "{sentinel}"\n', encoding="utf-8")
-        driver.chmod(0o755)
-    subprocess.run(
-        ["git", "config", "diff.external", str(driver)],
-        cwd=repo, capture_output=True, text=True, check=False,
+    return subprocess.run(
+        ["git", *args], cwd=repo, capture_output=True, text=True, check=False
     )
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX diff driver script")
-def test_include_diff_does_not_run_the_workspace_diff_driver(tmp_path):
-    """`--include-diff` alone was arbitrary command execution: any process that
-    can write the repo can plant `diff.external`, and the delegated agent runs
-    with `edit: allow`."""
+def _git_repo(tmp_path) -> Path:
+    """A throwaway repository: `main` at one commit, HEAD one commit ahead of
+    it, and an uncommitted change on top of that."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "t@example.org")
+    _git(repo, "config", "user.name", "t")
+    (repo / "a.txt").write_text("one\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "one")
+    _git(repo, "checkout", "-q", "-b", "work")
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "two")
+    (repo / "a.txt").write_text("UNCOMMITTED\n", encoding="utf-8")
+    return repo
+
+
+def _sentinel_script(repo: Path, sentinel: Path) -> Path:
+    if sys.platform == "win32":  # pragma: no cover - the driver shape differs
+        driver = repo.parent / "evil.bat"
+        driver.write_text(f"@echo ran >> {sentinel}\n", encoding="utf-8")
+        return driver
+    driver = repo.parent / "evil.sh"
+    driver.write_text(f'#!/bin/sh\necho ran >> "{sentinel}"\nexit 0\n', encoding="utf-8")
+    driver.chmod(0o755)
+    return driver
+
+
+def _plant_external_diff(repo: Path, sentinel: Path) -> None:
+    _git(repo, "config", "diff.external", str(_sentinel_script(repo, sentinel)))
+
+
+# Every way a repository's own files can name a command for git to run. Round 1
+# closed the first four; `core.fsmonitor`, `filter.*.clean`, `filter.*.process`
+# and `core.hooksPath` each still ran a planted script, four times per run, with
+# `verdict: allowed`, exit 0 and nothing in the audit trail.
+_GIT_EXECUTION_VECTORS = (
+    "diff.external",
+    "diff.driver.command",
+    "diff.driver.textconv",
+    "core.pager",
+    "core.fsmonitor",
+    "filter.driver.clean",
+    "filter.driver.process",
+    "core.hooksPath",
+    "core.sshCommand",
+    "uploadpack.packObjectsHook",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_CONFIG_PARAMETERS",
+)
+
+
+def _plant(repo: Path, sentinel: Path, vector: str, monkeypatch) -> None:
+    driver = _sentinel_script(repo, sentinel)
+    if vector == "diff.external":
+        _git(repo, "config", "diff.external", str(driver))
+    elif vector == "diff.driver.command":
+        _git(repo, "config", "diff.pwn.command", str(driver))
+        (repo / ".gitattributes").write_text("a.txt diff=pwn\n", encoding="utf-8")
+    elif vector == "diff.driver.textconv":
+        _git(repo, "config", "diff.pwn.textconv", str(driver))
+        (repo / ".gitattributes").write_text("a.txt diff=pwn\n", encoding="utf-8")
+    elif vector == "core.pager":
+        _git(repo, "config", "core.pager", str(driver))
+    elif vector == "core.fsmonitor":
+        _git(repo, "config", "core.fsmonitor", str(driver))
+    elif vector == "filter.driver.clean":
+        _git(repo, "config", "filter.pwn.clean", str(driver))
+        (repo / ".gitattributes").write_text("a.txt filter=pwn\n", encoding="utf-8")
+    elif vector == "filter.driver.process":
+        _git(repo, "config", "filter.pwn.process", str(driver))
+        (repo / ".gitattributes").write_text("a.txt filter=pwn\n", encoding="utf-8")
+    elif vector == "core.hooksPath":
+        hooks = repo.parent / "hooks"
+        hooks.mkdir(exist_ok=True)
+        for name in ("post-index-change", "pre-auto-gc", "post-checkout"):
+            hook = hooks / name
+            hook.write_text(driver.read_text(encoding="utf-8"), encoding="utf-8")
+            hook.chmod(0o755)
+        _git(repo, "config", "core.hooksPath", str(hooks))
+    elif vector == "core.sshCommand":
+        _git(repo, "config", "core.sshCommand", str(driver))
+    elif vector == "uploadpack.packObjectsHook":
+        _git(repo, "config", "uploadpack.packObjectsHook", str(driver))
+    elif vector == "GIT_EXTERNAL_DIFF":
+        monkeypatch.setenv("GIT_EXTERNAL_DIFF", str(driver))
+    elif vector == "GIT_CONFIG_PARAMETERS":
+        monkeypatch.setenv("GIT_CONFIG_PARAMETERS", f"'diff.external={driver}'")
+    else:  # pragma: no cover - a vector with no plant is a typo
+        raise AssertionError(vector)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX driver script and exec bit")
+@pytest.mark.parametrize("vector", _GIT_EXECUTION_VECTORS)
+def test_include_diff_runs_nothing_the_workspace_configured(vector, tmp_path, monkeypatch):
+    """`--include-diff` was arbitrary command execution in the operator's
+    context: any process that can write the repo can plant one of these, and
+    the delegated agent runs with `edit: allow`."""
     repo = _git_repo(tmp_path)
     sentinel = tmp_path / "ran"
-    _plant_external_diff(repo, sentinel)
-    args = eg.build_parser().parse_args(["scan", "--include-diff"])
+    _plant(repo, sentinel, vector, monkeypatch)
+    args = eg.build_parser().parse_args(["scan", "--include-diff", "--base", "main"])
     eg.build_payload(args, repo)
-    assert not sentinel.exists()
+    assert not sentinel.exists(), f"{vector} executed a workspace-planted command"
+    # And the shape that used to reach the worktree: a clean filter runs when
+    # git has to turn a worktree file into a blob, which is what `git diff` with
+    # no revision and `git status` both did. There is no such call now, so the
+    # missing base is a fault - and still nothing runs.
+    bare = eg.build_parser().parse_args(["scan", "--include-diff"])
+    with pytest.raises(SystemExit):
+        eg.build_payload(bare, repo)
+    assert not sentinel.exists(), f"{vector} executed on the worktree path"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX driver script and exec bit")
+@pytest.mark.parametrize("vector", _GIT_EXECUTION_VECTORS)
+def test_a_whole_preflight_runs_nothing_the_workspace_configured(
+    vector, tmp_path, monkeypatch
+):
+    """The same plants through the command that gathers, decides and audits:
+    the round-2 review measured four executions per run on this path."""
+    repo = _git_repo(tmp_path)
+    sentinel = tmp_path / "ran"
+    _plant(repo, sentinel, vector, monkeypatch)
+    _clean_posture(tmp_path, monkeypatch)
+    pol_file = tmp_path / "policy.json"
+    pol_file.write_text(
+        json.dumps(
+            {
+                "destinations": {"allow": ["openrouter/*"], "server": "http://127.0.0.1:4096"},
+                "audit": {"path": str(tmp_path / "audit.jsonl")},
+            }
+        ),
+        encoding="utf-8",
+    )
+    code = eg.main(
+        [
+            "--policy", str(pol_file), "--workspace", str(repo),
+            "preflight", "--include-diff", "--base", "main", "--model", "openrouter/x",
+        ]
+    )
+    assert code == 0
+    assert not sentinel.exists(), f"{vector} executed a workspace-planted command"
+
+
+def test_include_diff_without_a_base_is_a_fault(tmp_path):
+    """The guard diffs commit trees, never the worktree; without a base there
+    is no tree to diff, and falling back to the worktree is what ran the
+    workspace's clean filter."""
+    repo = _git_repo(tmp_path)
+    args = eg.build_parser().parse_args(["scan", "--include-diff"])
+    with pytest.raises(SystemExit):
+        eg.build_payload(args, repo)
+
+
+def test_the_diff_is_between_commits_and_not_the_worktree(tmp_path):
+    repo = _git_repo(tmp_path)
+    args = eg.build_parser().parse_args(["scan", "--include-diff", "--base", "main"])
+    payload = eg.build_payload(args, repo)
+    assert "two" in payload
+    assert "UNCOMMITTED" not in payload
+
+
+def test_git_is_never_asked_for_a_worktree_diff_or_a_status(tmp_path, monkeypatch):
+    """A filter driver can be called anything, so `-c filter.<name>.clean=` can
+    never be complete; not reading the worktree is what closes the class."""
+    repo = _git_repo(tmp_path)
+    calls: list[tuple[str, ...]] = []
+
+    def record(workspace, *args):
+        calls.append(args)
+        return "0000000000000000000000000000000000000000\n" if args[0] == "rev-parse" else ""
+
+    monkeypatch.setattr(eg, "_git", record)
+    args = eg.build_parser().parse_args(["scan", "--include-diff", "--base", "main"])
+    eg.build_payload(args, repo)
+    assert calls, "no git call at all"
+    assert not any(call[0] == "status" for call in calls)
+    for call in calls:
+        if call[0] == "diff":
+            assert any("...HEAD" in part for part in call), call
+
+
+def test_the_git_child_runs_with_no_git_environment_variables(monkeypatch):
+    """`GIT_EXTERNAL_DIFF`, `GIT_PAGER`, `GIT_SSH`, `GIT_ASKPASS` and
+    `GIT_CONFIG_PARAMETERS` each name a program or inject configuration."""
+    monkeypatch.setenv("GIT_EXTERNAL_DIFF", "/tmp/evil.sh")
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'diff.external=/tmp/evil.sh'")
+    monkeypatch.setenv("GIT_PAGER", "/tmp/evil.sh")
+    monkeypatch.setenv("SSH_ASKPASS", "/tmp/evil.sh")
+    env = eg._git_env()
+    assert "GIT_EXTERNAL_DIFF" not in env
+    assert "GIT_CONFIG_PARAMETERS" not in env
+    assert "GIT_PAGER" not in env
+    assert "SSH_ASKPASS" not in env
+    assert env["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert env["GIT_CONFIG_SYSTEM"] == os.devnull
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["core.fsmonitor", "core.hooksPath", "core.pager", "diff.external", "diff.textconv"],
+)
+def test_every_enumerable_command_key_is_pinned_on_the_argv(key, tmp_path, monkeypatch):
+    repo = _git_repo(tmp_path)
+    seen: list[list[str]] = []
+    import subprocess as _subprocess
+
+    def record(argv, **kwargs):
+        seen.append(argv)
+        return _subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(eg.subprocess, "run", record)
+    eg._git(repo, "diff")
+    assert seen
+    pins = [argv[index + 1] for argv in seen for index, part in enumerate(argv) if part == "-c"]
+    assert any(pin.startswith(f"{key}=") for pin in pins), pins
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+def test_include_diff_does_not_rewrite_the_workspace_index(tmp_path):
+    """`git status` refreshed and rewrote `.git/index` on every run - the one
+    thing the tool wrote inside the repository it was asked only to read."""
+    repo = _git_repo(tmp_path)
+    index = repo / ".git" / "index"
+    os.utime(index, (1_577_836_800, 1_577_836_800))  # 2020-01-01
+    before = index.stat().st_mtime
+    args = eg.build_parser().parse_args(["scan", "--include-diff", "--base", "main"])
+    eg.build_payload(args, repo)
+    assert index.stat().st_mtime == before
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX diff driver script")
@@ -962,7 +1155,7 @@ def test_a_refused_destination_never_reaches_git(tmp_path, monkeypatch):
     code = eg.main(
         [
             "--policy", str(pol_file), "--workspace", str(repo),
-            "preflight", "--include-diff", "--model", "openrouter/x",
+            "preflight", "--include-diff", "--base", "main", "--model", "openrouter/x",
         ]
     )
     assert code == 2
@@ -1007,7 +1200,7 @@ def test_a_failed_git_call_is_a_fault_not_an_empty_diff(tmp_path):
     nine-byte status line."""
     not_a_repo = tmp_path / "plain"
     not_a_repo.mkdir()
-    args = eg.build_parser().parse_args(["scan", "--include-diff"])
+    args = eg.build_parser().parse_args(["scan", "--include-diff", "--base", "main"])
     with pytest.raises(SystemExit):
         eg.build_payload(args, not_a_repo)
 

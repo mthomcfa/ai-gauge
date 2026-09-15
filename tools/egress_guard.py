@@ -719,14 +719,37 @@ def build_payload(args: argparse.Namespace, workspace: Path) -> str:
     if args.task:
         parts.append(args.task)
     if args.include_diff:
-        parts.append(_git(workspace, "status", "--short", "--untracked-files=all"))
-        diff = ["diff", "--no-ext-diff", "--no-textconv"]
-        if args.base:
-            diff += ["--end-of-options", f"{_verified_base(workspace, args.base)}...HEAD"]
-        else:
-            diff.append("--end-of-options")
-        parts.append(_git(workspace, *diff, "--"))
+        parts.append(_committed_diff(workspace, args.base))
     return "\n\n".join(p for p in parts if p)
+
+
+def _committed_diff(workspace: Path, base: str | None) -> str:
+    """The diff between two commits, never the worktree.
+
+    A clean filter (`filter.<driver>.clean`, selected by one line of
+    `.gitattributes`) is a command git runs on the operator's behalf whenever it
+    has to turn a worktree file into a blob - which `git diff` and `git status`
+    both do, and which pinning cannot prevent, because a filter driver can be
+    called anything and `-c` can only empty the names you can enumerate. A diff
+    between two commits reads blobs that are already clean, so no filter runs at
+    all; `git status` is gone with it, and with it the `core.fsmonitor` hook and
+    the `.git/index` rewrite it forced.
+
+    The cost is that uncommitted work is not in the payload. That is the right
+    trade for a tool whose threat model is a workspace the delegated agent can
+    write: commit first, or pass the text with `--task`/`--stdin`.
+    """
+    if not base:
+        raise Fault(
+            "--include-diff needs --base <ref>: the guard diffs commit trees, never the "
+            "worktree, so that a clean filter the workspace configures cannot run "
+            "(uncommitted changes are therefore not included)"
+        )
+    ref = _verified_base(workspace, base)
+    return _git(
+        workspace, "diff", "--no-ext-diff", "--no-textconv",
+        "--end-of-options", f"{ref}...HEAD", "--",
+    )
 
 
 def _verified_base(workspace: Path, base: str) -> str:
@@ -743,24 +766,66 @@ def _verified_base(workspace: Path, base: str) -> str:
     return base
 
 
-def _git(workspace: Path, *args: str) -> str:
-    """Run git with the workspace's own diff drivers disabled.
+# Every git configuration key that names a program for git to run and that can
+# be set in a repository's own `.git/config` - which is a file the delegated
+# agent can write. Emptying them is only half the answer (see `_committed_diff`
+# for the other half), but it is the half that can be enumerated.
+_GIT_PINS: tuple[str, ...] = (
+    "-c", "core.fsmonitor=false",
+    "-c", "core.hooksPath=" + os.devnull,
+    "-c", "core.pager=cat",
+    "-c", "core.sshCommand=",
+    "-c", "core.askPass=",
+    "-c", "diff.external=",
+    "-c", "diff.textconv=",
+    "-c", "uploadpack.packObjectsHook=",
+    "-c", "protocol.ext.allow=never",
+)
 
-    `diff.external` and `diff.textconv` are commands git runs on the operator's
-    behalf. A workspace the delegated agent can write - which is the whole
-    threat this tool exists for, per finding A1's `edit: allow` - is a
-    workspace where one can be planted, and `--include-diff` alone was then
-    enough to run it. A failed git call is a fault rather than an empty diff:
-    a user who believes they preflighted a diff must not have preflighted a
-    nine-byte status line.
+
+def _git_env() -> dict[str, str]:
+    """The child's environment, with every `GIT_*` variable dropped.
+
+    `GIT_EXTERNAL_DIFF`, `GIT_PAGER`, `GIT_SSH`, `GIT_ASKPASS` and
+    `GIT_CONFIG_PARAMETERS` each name a program or inject configuration, and
+    `GIT_CONFIG_COUNT`/`KEY`/`VALUE` inject it a second way; dropping the prefix
+    is shorter than the list and does not go stale. The global and system
+    configuration files are pointed at the null device so only the repository's
+    own config applies, and then only the keys above.
+    """
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.pop("SSH_ASKPASS", None)
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_SYSTEM"] = os.devnull
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    return env
+
+
+def _git(workspace: Path, *args: str) -> str:
+    """Run git so that nothing the workspace configures can execute.
+
+    A workspace the delegated agent can write - which is the whole threat this
+    tool exists for, per finding A1's `edit: allow` - is a workspace where a
+    command can be planted for git to run on the operator's behalf, and
+    `--include-diff` alone was then enough to run it. Round 1 closed
+    `diff.external` and `diff.textconv`; `core.fsmonitor`, `filter.*.clean`,
+    `filter.*.process` and `core.hooksPath` still executed, four times per run,
+    with `verdict: allowed` and nothing in the audit trail.
+
+    `--no-optional-locks` keeps git from rewriting the workspace's `.git/index`
+    as a side effect of being asked to read it. A failed git call is a fault
+    rather than an empty diff: a user who believes they preflighted a diff must
+    not have preflighted a nine-byte status line.
     """
     git = shutil.which("git")
     if git is None:
         raise Fault("git was not found on PATH, so --include-diff cannot be honoured")
     result = subprocess.run(
-        [git, "-c", "diff.external=", "-c", "diff.textconv=", "-c", "core.pager=cat",
-         "--no-pager", *args],
+        [git, *_GIT_PINS, "--no-pager", "--no-optional-locks", "--literal-pathspecs", *args],
         cwd=workspace,
+        env=_git_env(),
         capture_output=True,
         text=True,
         check=False,
