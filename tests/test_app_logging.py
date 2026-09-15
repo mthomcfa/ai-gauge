@@ -211,6 +211,7 @@ def _app(providers: dict[str, _Provider]) -> App:
     app._active_until = datetime.now() + timedelta(minutes=30)  # noqa: SLF001
     app._current_refresh_manual = False  # noqa: SLF001
     app._pending_manual_refresh = False  # noqa: SLF001
+    app._pending_manual_asked = False  # noqa: SLF001
     app._pending_manual_providers = []  # noqa: SLF001
     app._watchdogs = {}  # noqa: SLF001
     app._timer = _Timer()  # noqa: SLF001
@@ -1833,6 +1834,59 @@ def test_a_manual_refresh_on_a_parked_provider_says_so_on_the_tile():
     )
 
 
+def test_a_settings_save_does_not_write_the_parked_hint():
+    """The hint answers a question, and a settings save asks none.
+
+    `_on_settings_finished` applies the new settings and then runs a manual
+    refresh of its own, so pressing OK in Settings while any provider was
+    parked wrote "Waiting for the previous refresh to finish." onto that
+    tile although the user had asked for nothing - the same reasoning that
+    keeps a scheduled cycle silent. The refresh itself is unchanged: it is
+    still manual, it still re-arms the active window, and it still does not
+    dispatch the parked provider.
+    """
+    copilot = _Provider(_ok("copilot"), hold=True)
+    app = _app({"copilot": copilot})
+    app.refresh_now(manual=False)
+    app._watchdogs["copilot"].fire()  # noqa: SLF001
+    app._widget.status_hints.clear()  # noqa: SLF001
+
+    app.refresh_now(manual=True, asked=False)  # what the settings save runs
+
+    assert app._widget.status_hints == [], (  # noqa: SLF001
+        "a settings save marked a tile for a refusal nobody asked for"
+    )
+    assert copilot.calls == 1, "a settings save dispatched a parked provider"
+
+    # And the queued route: a save landing inside a cycle runs later, and
+    # must still not speak for the user then.
+    app._inflight.add("copilot")  # noqa: SLF001
+    app.refresh_now(manual=True, asked=False)
+    app._inflight.discard("copilot")  # noqa: SLF001
+    assert app._pending_manual_refresh is True  # noqa: SLF001
+    app._run_pending_manual()  # noqa: SLF001
+    assert app._widget.status_hints == [], (  # noqa: SLF001
+        "the queued settings-save refresh wrote the hint instead"
+    )
+
+    # A refresh the user did ask for still says it.
+    app.refresh_now(manual=True)
+    assert app._widget.status_hints == [  # noqa: SLF001
+        ("copilot", "Waiting for the previous refresh to finish.")
+    ]
+
+
+def test_the_settings_save_is_the_only_unasked_manual_refresh():
+    """Pinned at the call site, because the flag is easy to lose in a later
+    edit: it is one keyword on one call."""
+    import inspect
+
+    source = inspect.getsource(App._on_settings_finished)
+    assert "refresh_now(manual=True, asked=False)" in source, (
+        "the settings save is asking for a refresh on the user's behalf again"
+    )
+
+
 def test_a_manual_refresh_with_nothing_eligible_starts_no_cycle(caplog):
     """The retry wake stopped opening an empty cycle; the other three entry
     paths did not.
@@ -1976,6 +2030,25 @@ def test_clear_all_browser_data_waits_for_the_account_that_is_scraping(
     assert RealConfig.load().pending_data_clears == [], (
         "a clear that ran is still recorded as owed"
     )
+
+
+def test_an_id_on_both_deferral_lists_is_purged_once(monkeypatch):
+    """Removing an account and clearing all browser data in one dialog
+    session puts the same id on both lists. `purge_profile` is idempotent and
+    path-guarded, so the second call was harmless - but it doubled the log
+    noise on the one record that explains where a profile went."""
+    from aigauge.config import Config as RealConfig
+
+    purged: list[str] = []
+    monkeypatch.setattr(app_module, "purge_profile", purged.append)
+    app = _app({})
+    app._config = RealConfig()  # noqa: SLF001
+    app._pending_profile_purges = ["claude-dead"]  # noqa: SLF001
+    app._pending_data_clears = ["claude-dead", "codex-live"]  # noqa: SLF001
+
+    app._run_profile_purges()  # noqa: SLF001
+
+    assert purged == ["claude-dead", "codex-live"], purged
 
 
 def test_a_clear_request_takes_only_usable_ids(monkeypatch):

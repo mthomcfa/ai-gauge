@@ -88,9 +88,11 @@ and what a log line is allowed to cost.
   today, and checked rather than assumed (`ScrapeRunner` sets
   `provider=self._account_id`, the browser builders take `account_id=` from
   the App, the three REST providers hardcode their literal), but it is one
-  line in the one place that knows what it dispatched. The warning it logs
-  names the dispatched provider and a fixed literal; the payload's own string
-  is never printed.
+  line in the one place that knows what it dispatched: `_emit` compares the
+  payload's name with the dispatched one and re-stamps it with
+  `replace(snap, provider=_name)` when they differ. The warning it logs names
+  the dispatched provider and a fixed literal; the payload's own string is
+  never printed.
 - **The log summariser can no longer raise or print an unbounded value.** Its
   shared character budget covered strings, key names and elided nodes; the
   numeric branch charged a flat 8 whatever the magnitude and the `repr()`

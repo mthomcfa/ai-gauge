@@ -40,6 +40,7 @@ from .config import (
     BrowserAccount,
     ColorThresholds,
     Config,
+    _is_safe_profile_id,
     account_display_name,
     app_data_dir,
     browser_accounts,
@@ -1295,14 +1296,26 @@ class SettingsDialog(QDialog):
             url = OPENCODE_GO_USAGE_URL
         _open_in_browser(url)
 
-    def _profile_ids_on_disk(self) -> list[str]:
+    def _profile_ids_on_disk(self) -> tuple[list[str], int]:
+        """The ids this sweep can act on, and how many it cannot.
+
+        Names on disk are read from the filesystem, so they are not bounded
+        by anything the app generates. `purge_profile` refuses any that the
+        id rule rejects - that refusal is the containment guarantee and it
+        holds - but it refuses them one at a time, deep in the App, where the
+        user never hears about it. The count comes back here so the button
+        can say the directories were left alone rather than implying it
+        deleted everything in `profiles/`.
+        """
         try:
             profiles_root = app_data_dir() / "profiles"
             if not profiles_root.is_dir():
-                return []
-            return [child.name for child in profiles_root.iterdir() if child.is_dir()]
+                return [], 0
+            names = [child.name for child in profiles_root.iterdir() if child.is_dir()]
         except OSError:
-            return []
+            return [], 0
+        usable = [name for name in names if _is_safe_profile_id(name)]
+        return usable, len(names) - len(usable)
 
     def _clear_all_browser_data(self) -> None:
         """Clear the stored cookies here; hand the profiles to the App.
@@ -1339,21 +1352,35 @@ class SettingsDialog(QDialog):
         account_ids |= {"claude", "codex", "opencode_go"}
         # Ids on disk that are not accounts go the same way: they are exactly
         # the leftovers this button exists to sweep up.
-        account_ids |= set(self._profile_ids_on_disk())
+        on_disk, unusable = self._profile_ids_on_disk()
+        account_ids |= set(on_disk)
         for account_id in sorted(account_ids):
             try:
                 set_provider_cookie(account_id, None)
             except Exception:  # noqa: BLE001 - clear as much as possible
-                log.exception("failed to clear the stored cookie for %s", account_id)
+                # The id can have come off the filesystem, so it is bounded
+                # here rather than trusted to be one the app generated.
+                log.exception("failed to clear the stored cookie for %.64r", account_id)
         self.browser_data_clear_requested.emit(sorted(account_ids))
-        QMessageBox.information(
-            self,
-            "Browser data cleared",
+        # A count only: the names are the ones the id rule rejected, which is
+        # exactly the text there is no reason to put in a log line.
+        log.info(
+            "browser data clear requested count=%s unusable_dirs=%s",
+            len(account_ids),
+            unusable,
+        )
+        message = (
             "Saved cookies were deleted and the browser profiles are being "
             "removed; one that is being refreshed right now is removed as "
             "soon as that refresh finishes, or at the next start if you quit "
-            "before then. Sign in again to resume monitoring.",
+            "before then. Sign in again to resume monitoring."
         )
+        if unusable:
+            message += (
+                f"\n\n{unusable} folder(s) in the profiles directory are not "
+                "named like an account and were left alone."
+            )
+        QMessageBox.information(self, "Browser data cleared", message)
 
     def _rescan_meters(self) -> None:
         """Arm the meter scan that otherwise runs once a week.

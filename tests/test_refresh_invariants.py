@@ -182,6 +182,7 @@ def _build_app(clock: _Clock, providers: dict, config: Config) -> App:
     app._active_until = clock.now() + timedelta(minutes=30)  # noqa: SLF001
     app._current_refresh_manual = False  # noqa: SLF001
     app._pending_manual_refresh = False  # noqa: SLF001
+    app._pending_manual_asked = False  # noqa: SLF001
     app._pending_manual_providers = []  # noqa: SLF001
     app._watchdogs = {}  # noqa: SLF001
     app._cycle_active = False  # noqa: SLF001

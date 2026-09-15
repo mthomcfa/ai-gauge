@@ -548,6 +548,10 @@ class App(QObject):
         self._active_until = datetime.now() + timedelta(minutes=_ACTIVE_MODE_MINUTES)
         self._current_refresh_manual = False
         self._pending_manual_refresh = False
+        # Did a *person* ask for the queued refresh? A settings save runs one
+        # too, and the parked-tile hint is an answer to a question - see
+        # `_note_refresh_parked`.
+        self._pending_manual_asked = False
         self._pending_manual_providers: list[str] = []
         self._watchdogs: dict[str, QTimer] = {}
         self._cycle_active = False
@@ -1118,7 +1122,14 @@ class App(QObject):
             for name in names
         }
 
-    def _begin_cycle(self, names: list[str], *, manual: bool, reason: str) -> None:
+    def _begin_cycle(
+        self,
+        names: list[str],
+        *,
+        manual: bool,
+        reason: str,
+        asked: bool | None = None,
+    ) -> None:
         """Start one refresh cycle over ``names``, in queue order.
 
         The single entry point for every cycle - manual, scheduled or a
@@ -1141,9 +1152,13 @@ class App(QObject):
                 log.info(
                     "refresh provider skipped provider=%s reason=%s", name, refusal
                 )
-                if manual and refusal == "abandoned":
+                if (manual if asked is None else asked) and refusal == "abandoned":
                     # The user asked, and the answer is "not yet". A
-                    # scheduled cycle says nothing - nobody asked for it.
+                    # scheduled cycle says nothing - nobody asked for it, and
+                    # neither did a settings save, which applies the new
+                    # settings and refreshes on its own: pressing OK while a
+                    # provider was parked wrote "Waiting for the previous
+                    # refresh to finish." onto that tile in answer to nothing.
                     self._note_refresh_parked(name)
         names = wanted
         if not names:
@@ -1219,7 +1234,16 @@ class App(QObject):
             self._dispatching = False
         self._advance_cycle()
 
-    def refresh_now(self, manual: bool = True) -> None:
+    def refresh_now(self, manual: bool = True, *, asked: bool | None = None) -> None:
+        """Refresh every provider.
+
+        `asked` is "a person asked for this refresh", which is `manual`
+        everywhere except a settings save: that applies the new settings and
+        refreshes, without the user having asked for a refresh at all. The
+        only thing it decides is whether a provider refused as `abandoned`
+        writes the waiting hint onto its tile.
+        """
+        asked = manual if asked is None else asked
         if not self._providers:
             return
         if self._inflight or self._refresh_queue:
@@ -1230,6 +1254,7 @@ class App(QObject):
                 # stale, which is usually mid-cycle. Settings-save went the
                 # same way: apply, then a refresh_now that no-opped.
                 self._pending_manual_refresh = True
+                self._pending_manual_asked = self._pending_manual_asked or asked
                 log.info(
                     "refresh_now queued inflight=%s queue=%s",
                     ",".join(sorted(self._inflight)) or "-",
@@ -1248,6 +1273,7 @@ class App(QObject):
             _refresh_provider_order(self._providers),
             manual=manual,
             reason="manual" if manual else self._next_refresh_reason,
+            asked=asked,
         )
 
     def refresh_provider(self, provider: str) -> None:
@@ -1276,13 +1302,15 @@ class App(QObject):
 
     def _run_pending_manual(self) -> None:
         full = self._pending_manual_refresh
+        asked = self._pending_manual_asked
         wanted = list(self._pending_manual_providers)
         names = self._ordered(wanted)
         self._pending_manual_refresh = False
+        self._pending_manual_asked = False
         self._pending_manual_providers = []
         if full:
             log.info("refresh pending manual running scope=all")
-            self.refresh_now(manual=True)
+            self.refresh_now(manual=True, asked=asked)
         elif names:
             log.info("refresh pending manual running scope=%s", ",".join(names))
             self._begin_cycle(names, manual=True, reason="manual")
@@ -1394,8 +1422,9 @@ class App(QObject):
     def _drain_pending_purges(self) -> None:
         """Run what a previous run left owed - both lists, before anything else.
 
-        Neither list used to be in memory only: `App` has no `aboutToQuit`
-        hook that flushes them, and once an account is gone from
+        Neither list used to be in memory only: nothing flushes them at
+        `aboutToQuit` - the App has that connection, but it only logs - and
+        once an account is gone from
         `config.json` nothing at the next start looked for its directory -
         the only sweep of `profiles/` on disk is the manual Settings "Clear
         all browser data". What survived was a Chromium profile that uses
@@ -1548,15 +1577,30 @@ class App(QObject):
             return "scrape_in_flight"
         return None
 
-    def _purge_or_defer(self, account_ids: list[str], *, removal: bool) -> list[str]:
+    def _purge_or_defer(
+        self,
+        account_ids: list[str],
+        *,
+        removal: bool,
+        done: set[str] | None = None,
+    ) -> list[str]:
         """Purge what is free; return what is still waiting.
 
         `removal` picks the log line only. Both lists are recorded and both
         are drained at the next start; what differs is the drain's skip rule,
         which is why they are two lists.
+
+        `done` carries what this pass has already deleted, because one id can
+        be on both: removing an account and clearing all browser data in one
+        dialog session puts it on each. `purge_profile` is idempotent and
+        path-guarded, so the second call was harmless - it just said the same
+        thing twice in the log, which is the one place that has to stay
+        readable.
         """
         waiting: list[str] = []
         for account_id in account_ids:
+            if done is not None and account_id in done:
+                continue
             blocked = self._purge_blocked_reason(account_id)
             if blocked is not None:
                 log.info(
@@ -1574,6 +1618,8 @@ class App(QObject):
                 purge_profile(account_id)
             except Exception:  # noqa: BLE001 - cleanup must not crash the app
                 log.exception("failed to purge profile for %s", account_id)
+            if done is not None:
+                done.add(account_id)
         return waiting
 
     def _run_profile_purges(self) -> None:
@@ -1596,11 +1642,12 @@ class App(QObject):
         The keyring secret is cleared immediately by the dialog either way;
         this is only the on-disk profile, and deferring it costs nothing.
         """
+        done: set[str] = set()
         self._pending_profile_purges = self._purge_or_defer(
-            self._pending_profile_purges, removal=True
+            self._pending_profile_purges, removal=True, done=done
         )
         self._pending_data_clears = self._purge_or_defer(
-            self._pending_data_clears, removal=False
+            self._pending_data_clears, removal=False, done=done
         )
         # One write, after both lists have been worked: what is owed is what
         # is left on them.
@@ -2473,7 +2520,10 @@ class App(QObject):
             if old_openrouter_budget != new_openrouter_budget:
                 self._rerender_openrouter(new_openrouter_budget)
             self._restart_timer()
-            self.refresh_now(manual=True)
+            # Manual in every other respect - it re-arms the active window,
+            # and the user is looking at the app - but nobody asked for a
+            # refresh, so a parked provider says nothing on its tile.
+            self.refresh_now(manual=True, asked=False)
             if getattr(dlg, "start_at_login_error", False):
                 QMessageBox.warning(
                     self._widget,

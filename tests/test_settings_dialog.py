@@ -567,6 +567,51 @@ def test_clear_all_browser_data_says_when_a_busy_profile_goes(qtbot, monkeypatch
     assert "next start" in said[0], said[0]
 
 
+def test_clear_all_browser_data_says_what_it_left_behind(qtbot, monkeypatch):
+    """Names on disk are not bounded by anything the app generates.
+
+    `purge_profile` refuses any that the id rule rejects, which is the
+    containment guarantee and is exactly right - but it refuses them deep in
+    the App, one at a time, while the button promised to "delete every
+    account's saved cookie and embedded-browser profile". The count comes
+    back to the dialog, which says the folders were left alone; the names
+    themselves never reach the message or the log.
+    """
+    from aigauge.config import app_data_dir
+
+    monkeypatch.setattr(
+        settings_dialog.QMessageBox,
+        "question",
+        lambda *a, **k: settings_dialog.QMessageBox.StandardButton.Yes,
+    )
+    said: list[str] = []
+    monkeypatch.setattr(
+        settings_dialog.QMessageBox,
+        "information",
+        lambda parent, title, text, *a, **k: said.append(text),
+    )
+    monkeypatch.setattr(
+        settings_dialog, "set_provider_cookie", lambda account_id, value: None
+    )
+    profiles = app_data_dir() / "profiles"
+    (profiles / "claude-deadbeef").mkdir(parents=True)
+    (profiles / "not an id").mkdir()
+    (profiles / "also.bad!").mkdir()
+
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    with qtbot.waitSignal(dialog.browser_data_clear_requested) as signal:
+        _button(dialog, "clear_browser_data_btn").click()
+
+    ids = signal.args[0]
+    assert "claude-deadbeef" in ids, "a usable leftover was not swept"
+    assert not [one for one in ids if " " in one or "!" in one], (
+        "an unusable directory name was handed to the purge path"
+    )
+    assert "2 folder(s)" in said[0], said[0]
+    assert "not an id" not in said[0], "the message named a directory on disk"
+
+
 def test_the_settings_dialog_no_longer_deletes_profiles_itself():
     """Pinned as an import, because a future `from .webview.profile import
     purge_profile` here would silently restore the hazard."""

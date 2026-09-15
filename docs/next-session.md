@@ -607,6 +607,19 @@ unnecessary source of behaviour change.
   The heartbeat restarts a timer that is not running while nothing is in
   flight, and ends a cycle that is open with nothing in flight, nothing
   queued and no watchdog left.
+- **An account dropped by the reserved-id rule leaves its profile and its
+  keyring entry behind.** `Config._migrate` drops a `BrowserAccount` whose id
+  is one of `copilot`, `openrouter`, `opencode_go` or `azure` - the provider
+  keys `_build_providers` creates that are not accounts - so the account is
+  gone from the model and no removal path will ever queue its
+  `profiles/<id>` directory or its `ai-gauge` keyring cookie. Settings'
+  "Clear all browser data" is what reaches them, because it sweeps every
+  directory in `profiles/` as well as the configured accounts. Acceptable as
+  it stands: a config the app itself wrote cannot carry such an id
+  (generated ids are `<kind>-<uuid4>` and the fixed ones are
+  `claude`/`codex`), so reaching this needs a hand-edited or hostile
+  `config.json`, and whoever can write that can write the profile directory
+  too.
 - **`BrowserAccount.enabled` is parsed and ignored, on purpose.** F13 made
   `_enabled_providers` and `_build_providers` honour it. That was reverted
   before merge: nothing in the app ever *writes* the field except the config
@@ -775,11 +788,20 @@ unnecessary source of behaviour change.
   5 MB `bytes` 5 000 012 → 312 characters, fifty 4 200-digit integers
   210 440 → 50, and the three raising inputs return a string.
 - ~~**The dispatch epoch is matched against the name the payload
-  carries.**~~ **Closed in 1.3.1+cfa.6.** `_emit` sends
-  `replace(snap, provider=_name)`, so the App's own notion of what it
-  dispatched is the only thing that can decide which tile is touched, and a
-  payload that named something else is logged once - naming the dispatched
-  provider and a fixed literal, never the payload's own string.
+  carries.**~~ **Closed in 1.3.1+cfa.6.** `_emit` compares the payload's own
+  `provider` with the name the App dispatched and re-stamps it with
+  `replace(snap, provider=_name)` when they differ, so the App's own notion
+  of what it dispatched is the only thing that can decide which tile is
+  touched, and a payload that named something else is logged once - naming
+  the dispatched provider and a fixed literal, never the payload's own
+  string. The comparison is a `getattr(snap, "provider", _name)` rather than
+  an unconditional `replace`, deliberately: `dataclasses.replace` raises on
+  anything that is not a dataclass, and a diagnostic must not be the thing
+  that breaks a dispatch. What that leaves is a payload object with no
+  `provider` attribute at all, which skips the stamp and then raises
+  `AttributeError` at `_on_snapshot`'s `name = snapshot.provider` - the same
+  failure it had before this change, and no provider in the tree can produce
+  it (each one constructs a `UsageSnapshot`).
 - **The resume-artifact threshold is still unreachable on an awake
   machine.** The scraper calls a timeout a resume artifact past
   `timeout_ms x max_attempts x RESUME_ARTIFACT_FACTOR`, which for Claude is

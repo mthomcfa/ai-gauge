@@ -115,6 +115,7 @@ def _refresh_app_stub() -> App:
     app._dispatching = False  # noqa: SLF001
     app._watchdogs = {}  # noqa: SLF001
     app._pending_manual_refresh = False  # noqa: SLF001
+    app._pending_manual_asked = False  # noqa: SLF001
     app._pending_manual_providers = []  # noqa: SLF001
     app._next_refresh_reason = "startup"  # noqa: SLF001
     app._widget = _Widget()  # noqa: SLF001
