@@ -1676,6 +1676,53 @@ def test_the_log_summariser_never_converts_a_big_integer():
     )
 
 
+def test_the_log_summariser_charges_a_big_integer_what_it_costs():
+    """The budget is shared, so every branch has to charge honestly.
+
+    The numeric branch charged a flat 8 whatever the magnitude, which is how
+    fifty 4 200-digit integers bought a 210 440-character record. Fifty
+    299-digit ones are *under* the value limit, so they are printed in full
+    and the only thing holding the record down is what they are charged:
+    measured 345 characters here, against 1 340 with a flat charge.
+    """
+    line = _raw_summary({f"k{index}": int("9" * 299) for index in range(50)})
+    assert len(line) < 600, f"{len(line)} characters"
+
+
+def test_the_log_summarisers_digit_estimate_never_under_counts():
+    """`bit_length() // 3 + 2` stands in for `len(str(value))`, which cannot
+    be asked past 4 300 digits without raising. An estimate that came in
+    *under* the true length would under-charge the budget and under-report
+    the elision, so the property is one-sided: never below.
+
+    Read off the placeholder the summariser itself emits, so it is the
+    shipped estimate being checked and not a copy of it here.
+    """
+    import re
+
+    for digits in (301, 500, 1_000, 2_048, 4_000):
+        for value in (10 ** (digits - 1), -(10 ** (digits - 1))):
+            line = _raw_summary({"n": value})
+            match = re.search(r"<int (\d+) digits>", line)
+            assert match, f"{digits} digits produced {line[:80]!r}"
+            assert int(match.group(1)) >= len(str(abs(value))), (
+                f"the estimate under-counts a {digits}-digit integer"
+            )
+
+
+def test_the_log_summariser_keeps_the_rest_of_a_payload_it_cannot_repr():
+    """The guard around `repr()` is inside the walk, so one hostile value
+    costs one value. Without it the exception unwinds to `_raw_summary`'s
+    own catch and the whole payload becomes the fallback literal - the other
+    keys, which are the diagnostic, are gone."""
+    line = _raw_summary({"k": _ReprRaises(), "useful": 1, "also": "here"})
+
+    assert '"useful": 1' in line, line
+    assert '"also": "here"' in line, line
+    assert "<unrepresentable _ReprRaises>" in line, line
+    assert "unsummarisable" not in line, "one bad value cost the whole payload"
+
+
 def test_the_log_summariser_cannot_raise():
     """It runs inside `_on_snapshot`, so anything it raises escapes into the
     scheduler. Three payloads got past `except TypeError`: an object whose

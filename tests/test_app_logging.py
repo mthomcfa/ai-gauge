@@ -553,6 +553,45 @@ def test_a_provider_the_watchdog_gave_up_on_is_not_dispatched_again():
     assert app._timer.active is True  # noqa: SLF001
 
 
+def test_only_the_parked_dispatchs_own_answer_releases_the_park(caplog):
+    """The epoch guard on the un-park, which nothing else pins.
+
+    A REST park is normally released by its worker reporting back, so this
+    line is the whole of "released by the worker, not by a timer". Without
+    the epoch test, a *stale* worker's answer - epoch N, reporting long after
+    the hourly backstop already let epoch N+1 go out - lifts a park that is
+    bounding a dispatch still in flight, and the next cadence wake starts a
+    third worker on the endpoint. That accumulation is what the backstop
+    exists to stop.
+    """
+    caplog.set_level(logging.INFO, logger="aigauge.app")
+    copilot = _Provider(_ok("copilot"), hold=True)
+    app = _app({"copilot": copilot})
+    app.refresh_now(manual=False)
+    stale_answer = copilot.pending
+    app._watchdogs["copilot"].fire()  # noqa: SLF001
+    epoch, dead_at = app._abandoned["copilot"]  # noqa: SLF001
+
+    # The backstop let that park go, a newer dispatch went out and wedged in
+    # its turn, and only now does the first worker report.
+    app._abandoned["copilot"] = (epoch + 1, dead_at)  # noqa: SLF001
+    stale_answer(_ok("copilot"))
+
+    assert "copilot" in app._abandoned, (  # noqa: SLF001
+        "an older dispatch's answer released the park bounding a newer one"
+    )
+    assert app._abandoned["copilot"] == (epoch + 1, dead_at)  # noqa: SLF001
+    assert "abandoned worker reported back" not in caplog.text
+
+    # The current dispatch's own answer does release it.
+    app._on_late_snapshot(_ok("copilot"), epoch + 1)  # noqa: SLF001
+
+    assert "copilot" not in app._abandoned, (  # noqa: SLF001
+        "the parked dispatch's own answer did not release the park"
+    )
+    assert "abandoned worker reported back" in caplog.text
+
+
 def test_an_abandoned_worker_reporting_back_makes_its_provider_eligible():
     claude = _BrowserProvider(_ok("claude"), hold=True)
     app = _app({"claude": claude})
@@ -1883,6 +1922,29 @@ def test_clear_all_browser_data_waits_for_the_account_that_is_scraping(
     claude.pending(_ok("claude"))
 
     assert purged[-1] == "claude", "the deferred clear never ran"
+    assert app._pending_data_clears == []  # noqa: SLF001
+
+
+def test_a_clear_request_takes_only_usable_ids(monkeypatch):
+    """The signal carries whatever was emitted; only strings reach a path
+    that deletes directories.
+
+    Defence in depth on the app's own dialog, and cheap: the ids are the
+    dialog's set of configured accounts, fixed ids and whatever names it
+    found in `profiles/` on disk, and `purge_profile` is an rmtree.
+    """
+    from aigauge.config import Config as RealConfig
+
+    purged: list = []
+    monkeypatch.setattr(app_module, "purge_profile", purged.append)
+    app = _app({})
+    app._config = RealConfig()  # noqa: SLF001
+
+    app._on_browser_data_clear_requested(  # noqa: SLF001
+        ["claude", "", None, 17, b"codex", ["nested"], "codex"]
+    )
+
+    assert purged == ["claude", "codex"], f"unusable ids reached purge: {purged}"
     assert app._pending_data_clears == []  # noqa: SLF001
 
 
