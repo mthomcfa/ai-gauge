@@ -148,8 +148,43 @@ def test_provider_list_is_complete(name):
     # OpenCode shipped as a provider but stayed missing from the datasheet and
     # the layout-bug template for several releases.
     text = _read(name).lower()
-    for provider in ("claude", "codex", "copilot", "openrouter", "opencode"):
+    for provider in ("claude", "codex", "copilot", "openrouter", "opencode", "azure"):
         assert provider in text, f"{name} does not mention {provider}"
+
+
+def test_security_policy_lists_every_host_the_app_contacts():
+    """The egress table is the claim a reader checks the code against.
+
+    A provider added without its host listed makes the "no telemetry, requests
+    go straight to the provider" claim unverifiable, which is the one claim a
+    security-hardening fork cannot afford to leave vague.
+    """
+    text = _read("SECURITY.md")
+    for host in (
+        "claude.ai",
+        "chatgpt.com",
+        "api.github.com",
+        "openrouter.ai",
+        "opencode.ai",
+        "login.microsoftonline.com",
+        "management.azure.com",
+    ):
+        assert host in text, f"SECURITY.md does not name the egress host {host}"
+
+
+def test_azure_docs_state_that_cost_is_gross_of_credits():
+    """The one way to misread this tile is as a credit-balance monitor.
+
+    Cost Management excludes free and prepaid credits and has no credit line to
+    subtract, so a reader who assumes otherwise will trust a number that does
+    not mean what they think. Said in the README and the datasheet, and on the
+    tile itself.
+    """
+    for name in ("README.md", "AI Gauge-datasheet.md"):
+        text = _read(name).lower()
+        assert "gross of credits" in text, f"{name} does not state this"
+    readme = _read("README.md").lower()
+    assert "sponsorship" in readme, "README does not warn about Sponsorship offers"
 
 
 def test_upstream_staging_files_are_not_addressed_to_this_repo():
