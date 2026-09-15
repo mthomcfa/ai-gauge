@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -33,6 +34,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import Counter
 from dataclasses import dataclass, field
@@ -333,8 +335,75 @@ def _post_json(url: str, body: dict[str, Any], timeout: float) -> Any:
         return json.loads(response.read().decode("utf-8"))
 
 
+def _split_server(server: str) -> urllib.parse.SplitResult | None:
+    """Parse `destinations.server`, or None when it is not a usable http URL.
+
+    A prefix test is not a host check. `http://127.0.0.1.evil.example` begins
+    with a loopback literal and resolves wherever its owner points it, and
+    `http://127.0.0.1:4096@evil.example` puts the loopback literal in the
+    userinfo, where it names a *credential* and not the destination at all.
+    """
+    try:
+        parts = urllib.parse.urlsplit(server)
+        if parts.username or parts.password or "@" in parts.netloc:
+            return None
+        if not parts.hostname:
+            return None
+        parts.port  # noqa: B018 - raises ValueError on a non-numeric port
+    except ValueError:
+        return None
+    return parts
+
+
+def _as_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """The host as an IP address, or None when it is a name rather than one."""
+    try:
+        return ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    # inet_aton shorthand: 127.1 and 2130706433 are both 127.0.0.1, and both
+    # reach the loopback interface. Only the decimal forms are expanded;
+    # anything else stays unrecognised, which callers read as "not loopback".
+    fields = host.split(".")
+    if not 1 <= len(fields) <= 4:
+        return None
+    if not all(f.isascii() and f.isdigit() for f in fields):
+        return None
+    parts = [int(f) for f in fields]
+    if any(p > 255 for p in parts[:-1]):
+        return None
+    tail_width = 4 - (len(parts) - 1)
+    if parts[-1] >= 256**tail_width:
+        return None
+    value = 0
+    for part in parts[:-1]:
+        value = (value << 8) | part
+    return ipaddress.IPv4Address((value << (8 * tail_width)) | parts[-1])
+
+
+def server_endpoint(server: str) -> str:
+    """`host:port` of `destinations.server` - where the bytes actually go.
+
+    This, not the `--model` label, is the thing an audit trail has to record:
+    the label says which model was asked for, the endpoint says who received
+    the payload.
+    """
+    parts = _split_server(server)
+    if parts is None:
+        return f"unparseable:{server}" if server else "unset"
+    port = parts.port
+    return f"{parts.hostname}:{port}" if port else str(parts.hostname)
+
+
 def _is_loopback(server: str) -> bool:
-    return server.startswith(("http://127.0.0.1", "http://localhost", "http://[::1]"))
+    parts = _split_server(server)
+    if parts is None or parts.scheme != "http":
+        return False
+    host = (parts.hostname or "").strip("[]")
+    if host == "localhost":  # urlsplit has already lowercased it
+        return True
+    address = _as_ip(host)
+    return bool(address and address.is_loopback)
 
 
 def opencode_config_path() -> Path:
@@ -351,7 +420,10 @@ def posture(policy: Policy, workspace: Path) -> list[str]:
     if not server:
         problems.append("policy names no destinations.server")
     elif not _is_loopback(server):
-        problems.append(f"destinations.server is not loopback: {server}")
+        problems.append(
+            f"destinations.server is not loopback: {server} "
+            f"(resolves to endpoint {server_endpoint(server)})"
+        )
 
     config_path = opencode_config_path()
     forbidden = policy.data.get("posture", {}).get("forbid_permission_allow", [])
@@ -496,6 +568,7 @@ def cmd_preflight(args: argparse.Namespace) -> int:
         "command": "preflight",
         "workspace": str(workspace),
         "model": args.model,
+        "server": server_endpoint(policy.server),
         "payload_sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
         "payload_bytes": len(payload.encode("utf-8")),
         "verdict": verdict,
@@ -524,6 +597,7 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
         "command": "dispatch",
         "workspace": str(workspace),
         "model": args.model,
+        "server": server_endpoint(policy.server),
         "payload_sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
         "payload_bytes": len(payload.encode("utf-8")),
         "verdict": verdict,

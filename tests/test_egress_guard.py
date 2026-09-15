@@ -204,6 +204,89 @@ def test_a_non_loopback_server_is_a_fault(tmp_path, monkeypatch):
     assert any("loopback" in p for p in eg.posture(pol, tmp_path))
 
 
+@pytest.mark.parametrize(
+    "server",
+    [
+        "http://127.0.0.1:4096",
+        "http://localhost:4096",
+        "http://LOCALHOST:4096",
+        "http://[::1]:4096",
+        "http://127.1:4096",
+        "http://[0:0:0:0:0:0:0:1]:4096",
+        "HTTP://127.0.0.1:4096",
+    ],
+)
+def test_a_real_loopback_server_is_recognised(server):
+    assert eg._is_loopback(server) is True
+
+
+@pytest.mark.parametrize(
+    "server",
+    [
+        # a suffix on a loopback literal is a public DNS name
+        "http://127.0.0.1.evil.example/api",
+        "http://localhost.evil.example/api",
+        "http://127.0.0.1.192-0-2-2.sslip.io:8765",
+        # the loopback literal is userinfo, not the host
+        "http://localhost@evil.example/api",
+        "http://127.0.0.1:4096@evil.example/",
+        "http://[::1]@evil.example/",
+        "http://127.0.0.1%40evil.example/",
+        # not plain http, not a host, not loopback
+        "https://127.0.0.1:4096",
+        "http://10.0.0.9:4096",
+        "http://0.0.0.0:4096",
+        "http:///nohost",
+        "file:///etc/passwd",
+        "",
+    ],
+)
+def test_anything_that_is_not_the_loopback_host_is_refused(server):
+    assert eg._is_loopback(server) is False
+
+
+def test_the_server_endpoint_is_the_parsed_host_and_port():
+    assert eg.server_endpoint("http://127.0.0.1:4096") == "127.0.0.1:4096"
+    assert eg.server_endpoint("http://127.0.0.1.192-0-2-2.sslip.io:8765") == (
+        "127.0.0.1.192-0-2-2.sslip.io:8765"
+    )
+    # userinfo names a credential, not a destination, so it must not be echoed
+    # back as though it were the host
+    assert "evil.example" in eg.server_endpoint("http://127.0.0.1:4096@evil.example/")
+    assert eg.server_endpoint("") == "unset"
+
+
+def test_a_lookalike_loopback_server_is_a_posture_fault(tmp_path, monkeypatch):
+    """The sslip.io case: a public name that merely begins with 127.0.0.1."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OPENCODE_SERVER_PASSWORD", "x")
+    pol = policy(destinations={"server": "http://127.0.0.1.192-0-2-2.sslip.io:8765"})
+    assert any("loopback" in p for p in eg.posture(pol, tmp_path))
+
+
+def test_the_audit_record_names_the_endpoint_that_received_the_payload(tmp_path, monkeypatch):
+    _clean_posture(tmp_path, monkeypatch)
+    pol_file = tmp_path / "p.json"
+    pol_file.write_text(
+        json.dumps(
+            {
+                "destinations": {"allow": ["openrouter/*"], "server": "http://127.0.0.1:4096"},
+                "audit": {"path": str(tmp_path / "audit.jsonl")},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys, "stdin", _FakeStdin("ghp_" + "y" * 36))
+    eg.main(
+        [
+            "--policy", str(pol_file), "--workspace", str(tmp_path),
+            "preflight", "--stdin", "--model", "openrouter/x",
+        ]
+    )
+    record = json.loads((tmp_path / "audit.jsonl").read_text(encoding="utf-8").strip())
+    assert record["server"] == "127.0.0.1:4096"
+
+
 def test_an_unauthenticated_server_is_a_fault(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
