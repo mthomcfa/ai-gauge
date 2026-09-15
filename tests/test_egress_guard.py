@@ -114,11 +114,15 @@ def test_an_unrecognised_high_entropy_blob_is_redacted_not_merely_warned():
 def test_the_report_names_a_warn_finding(capsys):
     text = "COMPANY CONFIDENTIAL - do not circulate"
     findings = eg.scan(text, policy())
-    assert any(f.action == eg.WARN for f in findings)
+    warned = [f for f in findings if f.action == eg.WARN]
+    assert warned
     eg._report(findings, policy(), stream=sys.stderr)
     err = capsys.readouterr().err
     assert "classification-banner" in err
     assert "warn" in err
+    # The per-finding line too, not only the by-rule summary: a `warn` finding
+    # that is counted but never located is most of the way back to silent.
+    assert f"at {warned[0].start}:" in err
 
 
 def test_anthropic_key_is_not_reported_as_an_openai_key():
@@ -694,10 +698,36 @@ def test_the_audit_path_is_not_followed_through_a_symlink(tmp_path):
 
 
 def test_audit_records_the_hash_and_not_the_payload(tmp_path):
+    """The name is the claim, so the test builds a record from a real payload
+    and asserts the payload is not in the line. Handing `audit()` a literal
+    `{"payload_sha256": "abc"}` asserted nothing: a mutation that appended the
+    whole raw payload to every line survived it."""
+    import hashlib
+
+    payload = "the quick brown MARKER-SECRET-VALUE jumps over"
     pol = policy(audit={"path": str(tmp_path / "audit.jsonl")})
-    eg.audit(pol, {"verdict": "blocked", "payload_sha256": "abc", "findings": []})
+    eg.audit(
+        pol,
+        {
+            "verdict": "blocked",
+            "payload_sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            "payload_bytes": len(payload.encode("utf-8")),
+            "findings": [f.as_record() for f in eg.scan(payload, pol)],
+        },
+    )
     written = (tmp_path / "audit.jsonl").read_text(encoding="utf-8")
     assert json.loads(written)["verdict"] == "blocked"
+    assert "MARKER-SECRET-VALUE" not in written
+    assert payload not in written
+
+
+def test_a_dispatch_audit_line_never_carries_the_payload(tmp_path, monkeypatch):
+    payload = "ping ops@example.org about MARKER-SECRET-VALUE"
+    code, _recorder = _dispatch(tmp_path, monkeypatch, payload)
+    assert code == 0
+    written = (tmp_path / "audit.jsonl").read_text(encoding="utf-8")
+    assert "MARKER-SECRET-VALUE" not in written
+    assert "ops@example.org" not in written
 
 
 def test_audit_appends_rather_than_truncates(tmp_path):
@@ -805,6 +835,19 @@ def test_a_base_that_is_not_a_plain_ref_is_refused(base, tmp_path):
     args = eg.build_parser().parse_args(["scan", "--include-diff", f"--base={base}"])
     with pytest.raises(SystemExit):
         eg.build_payload(args, repo)
+
+
+@pytest.mark.parametrize("base", ["--output=/tmp/x", "--ext-diff", "a;b", "$(id)"])
+def test_a_base_that_is_not_a_plain_ref_never_reaches_git(base, tmp_path, monkeypatch):
+    """The shape check is the control; `rev-parse` behind it is the second
+    line, and a test that only sees the exception cannot tell them apart."""
+    repo = _git_repo(tmp_path)
+    calls: list[tuple] = []
+    monkeypatch.setattr(eg, "_git", lambda workspace, *args: calls.append(args) or "")
+    args = eg.build_parser().parse_args(["scan", "--include-diff", f"--base={base}"])
+    with pytest.raises(SystemExit):
+        eg.build_payload(args, repo)
+    assert not any("rev-parse" in call for call in calls)
 
 
 def test_a_base_that_names_no_commit_is_refused(tmp_path):
@@ -961,6 +1004,164 @@ def test_scan_exits_zero_on_clean_input(tmp_path, monkeypatch):
 def test_dispatch_requires_a_model():
     with pytest.raises(SystemExit):
         eg.build_parser().parse_args(["dispatch", "--task", "x"])
+
+
+# --- cmd_dispatch ----------------------------------------------------------
+#
+# Nothing used to invoke cmd_dispatch. Three mutations that gut the dispatch
+# path - dropping the destination check from `_decide`, posting the raw payload
+# instead of the redacted one, and returning 0 where it blocked - all survived
+# the full suite, because the tests covering those behaviours tested a pure
+# function nothing asserted was wired in, or `_decide`'s return value rather
+# than what is posted.
+
+
+class _Recorder:
+    """Stands in for `_post_json` and remembers every call."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    def __call__(self, url, body, timeout):
+        self.calls.append((url, body))
+        return {"id": "s1", "ok": True}
+
+    @property
+    def sent_text(self) -> str:
+        for _url, body in self.calls:
+            if "parts" in body:
+                return body["parts"][0]["text"]
+        return ""
+
+
+def _dispatch(tmp_path, monkeypatch, payload, model="openrouter/x", allow=("openrouter/*",)):
+    _clean_posture(tmp_path, monkeypatch)
+    pol_file = tmp_path / "policy.json"
+    pol_file.write_text(
+        json.dumps(
+            {
+                "destinations": {"allow": list(allow), "server": "http://127.0.0.1:4096"},
+                "audit": {"path": str(tmp_path / "audit.jsonl")},
+            }
+        ),
+        encoding="utf-8",
+    )
+    recorder = _Recorder()
+    monkeypatch.setattr(eg, "_post_json", recorder)
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(payload))
+    args = eg.build_parser().parse_args(
+        [
+            "--policy", str(pol_file), "--workspace", str(tmp_path),
+            "dispatch", "--stdin", "--model", model, "--timeout", "5",
+        ]
+    )
+    return eg.cmd_dispatch(args), recorder
+
+
+def _audit_lines(tmp_path) -> list[dict]:
+    path = tmp_path / "audit.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+
+def test_dispatch_to_a_disallowed_destination_posts_nothing(tmp_path, monkeypatch):
+    code, recorder = _dispatch(tmp_path, monkeypatch, "rename the timer field", allow=["anthropic/*"])
+    assert code == 2
+    assert recorder.calls == []
+    assert _audit_lines(tmp_path)[-1]["verdict"] == "blocked"
+
+
+def test_dispatch_posts_the_redacted_text_not_the_payload(tmp_path, monkeypatch):
+    code, recorder = _dispatch(tmp_path, monkeypatch, "ping ops@example.org about it")
+    assert code == 0
+    assert recorder.sent_text
+    assert "ops@example.org" not in recorder.sent_text
+    assert "[redacted:email-address]" in recorder.sent_text
+
+
+def test_dispatch_with_a_blocking_finding_returns_two_and_posts_nothing(tmp_path, monkeypatch):
+    code, recorder = _dispatch(tmp_path, monkeypatch, "token ghp_" + "z" * 36)
+    assert code == 2
+    assert recorder.calls == []
+
+
+def test_dispatch_names_the_finding_it_redacted_before_sending(tmp_path, monkeypatch, capsys):
+    code, _recorder = _dispatch(tmp_path, monkeypatch, "ping ops@example.org about it")
+    assert code == 0
+    err = capsys.readouterr().err
+    assert "email-address" in err
+    assert "redacted before sending" in err
+
+
+def test_dispatch_writes_the_audit_line_before_the_post(tmp_path, monkeypatch):
+    """A payload on the wire with no record of it is the failure this prevents."""
+    _clean_posture(tmp_path, monkeypatch)
+    pol_file = tmp_path / "policy.json"
+    pol_file.write_text(
+        json.dumps(
+            {
+                "destinations": {"allow": ["openrouter/*"], "server": "http://127.0.0.1:4096"},
+                "audit": {"path": str(tmp_path / "audit.jsonl")},
+            }
+        ),
+        encoding="utf-8",
+    )
+    seen: list[int] = []
+
+    def post(url, body, timeout):
+        seen.append(len(_audit_lines(tmp_path)))
+        return {"id": "s1", "ok": True}
+
+    monkeypatch.setattr(eg, "_post_json", post)
+    monkeypatch.setattr(sys, "stdin", _FakeStdin("rename the timer field"))
+    args = eg.build_parser().parse_args(
+        [
+            "--policy", str(pol_file), "--workspace", str(tmp_path),
+            "dispatch", "--stdin", "--model", "openrouter/x", "--timeout", "5",
+        ]
+    )
+    assert eg.cmd_dispatch(args) == 0
+    assert seen and seen[0] >= 1, "the first POST happened before any audit line"
+    assert _audit_lines(tmp_path)[0]["stage"] == "intent"
+
+
+def test_dispatch_sends_nothing_when_the_audit_trail_cannot_be_written(tmp_path, monkeypatch):
+    _clean_posture(tmp_path, monkeypatch)
+    pol_file = tmp_path / "policy.json"
+    pol_file.write_text(
+        json.dumps(
+            {
+                "destinations": {"allow": ["openrouter/*"], "server": "http://127.0.0.1:4096"},
+                "audit": {"path": str(tmp_path / "audit.jsonl")},
+            }
+        ),
+        encoding="utf-8",
+    )
+    recorder = _Recorder()
+    monkeypatch.setattr(eg, "_post_json", recorder)
+
+    def explode(policy, record):
+        raise OSError("no such directory")
+
+    monkeypatch.setattr(eg, "audit", explode)
+    monkeypatch.setattr(sys, "stdin", _FakeStdin("rename the timer field"))
+    args = eg.build_parser().parse_args(
+        [
+            "--policy", str(pol_file), "--workspace", str(tmp_path),
+            "dispatch", "--stdin", "--model", "openrouter/x", "--timeout", "5",
+        ]
+    )
+    assert eg.cmd_dispatch(args) == 3
+    assert recorder.calls == []
+
+
+def test_dispatch_records_the_endpoint_and_the_policy_it_used(tmp_path, monkeypatch):
+    code, _recorder = _dispatch(tmp_path, monkeypatch, "rename the timer field")
+    assert code == 0
+    record = _audit_lines(tmp_path)[0]
+    assert record["server"] == "127.0.0.1:4096"
+    assert record["policy_source"].endswith("policy.json")
 
 
 def test_preflight_blocks_and_audits_without_sending(tmp_path, monkeypatch):
