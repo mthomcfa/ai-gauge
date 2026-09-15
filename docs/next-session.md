@@ -202,8 +202,12 @@ The cost is not Python. It is three things, in value order:
    The serial rule is now enforced in two places rather than one: the App
    parks a provider whose dispatch its watchdog abandoned, and
    `ClaudeProvider`, `CodexProvider` and `OpenCodeGoProvider` each refuse a
-   re-entrant refresh while `ScrapeRunner.busy()`. Both would have to be
-   undone deliberately, which is the point.
+   re-entrant refresh while `account_is_busy(<account id>)` - a module-level
+   registry in `providers/_scrape_runner.py`, keyed by account rather than
+   held on the provider object, because a settings save replaces that object.
+   (`ScrapeRunner.busy()` is the same question asked through a runner; it has
+   no caller in `src/`.) Both would have to be undone deliberately, which is
+   the point.
 3. **Fixed pre-extractor sleeps.** `wait_ms` is 3000 for Claude, 7000 for Codex,
    5000 for OpenCode — slept unconditionally before the extractor runs, even on
    a page that was ready immediately. The extractor already has a retry protocol
@@ -527,12 +531,17 @@ unnecessary source of behaviour change.
   or twice its budget has passed and the worker can be assumed dead. A
   snapshot that arrives from a dispatch the App gave up on is matched by
   epoch and closes no cycle: it joins no cycle's verdict, clears no
-  `_inflight` entry and destroys no watchdog. It *does* repaint its own tile
-  when it is the newest dispatch's answer — otherwise a provider that is
-  merely slower than its budget shows "Refresh timed out." forever while
-  answering correctly every time, and a genuine AUTH_REQUIRED is never
-  painted — and it clears that provider's retry entry only when it answered
-  OK or AUTH_REQUIRED. An older epoch, or a provider the user removed, is
+  `_inflight` entry and destroys no watchdog. It *does* repaint **and record**
+  its own tile when it is the newest dispatch's answer — otherwise a provider
+  that is merely slower than its budget shows "Refresh timed out." forever
+  while answering correctly every time, a genuine AUTH_REQUIRED is never
+  painted, and (before the recording half) the tile looked healthy above an
+  empty ratio history and a blank burn-rate row, because the only thing
+  either store had heard about that dispatch was the watchdog's synthetic
+  ERROR and both drop anything that is not OK. Recording it is not a
+  scheduling side effect: the answer still clears that provider's retry entry
+  only when it was OK or AUTH_REQUIRED, and touches no cycle, no `_inflight`
+  entry and no watchdog. An older epoch, or a provider the user removed, is
   still dropped whole. The three browser providers refuse a re-entrant
   refresh outright, keyed by **account id** in a module-level registry in
   `providers/_scrape_runner.py` rather than on the provider object, because
@@ -541,9 +550,33 @@ unnecessary source of behaviour change.
   the one case the assumed-dead ceiling lets through cannot open a second
   `QWebEngineView` on one profile either.
 
+  **A registry entry expires.** It is cleared when the scrape reports back,
+  and `HeadlessScraper` arms its own timeout so it always does — but that is
+  an invariant of another module, and `_finish` reads `self._page` twice
+  before it emits. A page whose C++ half Qt has already deleted (what
+  destroying a profile under a live scrape produces) made both reads raise
+  after `_finished` was set, so the emit never happened and the account was
+  refused for the life of the process, with nothing able to clear it —
+  module state is not clearable by a settings save, which is the point of it.
+  The diagnostics in `_finish` now give way to the signal, and an entry older
+  than the scrape's own worst case (the runner's timeout times the attempts
+  it may make, plus a minute) expires with `live scrape guard expired
+  account=… age_s=…` in the log. Inside that budget a genuinely live scrape
+  is still refused.
+
   A retry deadline that comes due while its provider is parked is not spent:
-  it is re-armed at the moment the park lifts, and a wake with nothing
-  runnable reschedules instead of opening an empty cycle.
+  it is kept, and owed no earlier than the next ordinary cadence wake.
+  Re-arming it for the instant the park lifts bought a wake of its own, worth
+  one extra dispatch an hour for a hung provider (measured 4→5 for a browser
+  one, 6→7 for a REST one) and, for the three REST providers, one more worker
+  permanently holding a slot of the global thread pool.
+
+  **No entry path opens a cycle with nothing to run.** `_begin_cycle` filters
+  out what it cannot dispatch and then returns rather than opening a cycle
+  over zero providers — which logged a start and an end for a cycle that
+  dispatched nobody and, on a *manual* refresh, re-armed the thirty-minute
+  active window and zeroed `unchanged_cycles`, because that re-arm sits after
+  the filter and never asked whether anything had survived it.
 
   A removed account's on-disk profile is deleted by the App rather than by
   the settings dialog, and only once no dispatch of that account is
@@ -553,7 +586,11 @@ unnecessary source of behaviour change.
   still owed is recorded in `config.pending_profile_purges` and drained at
   the next start, before any cookie is hydrated and before any provider
   exists, so a quit inside the deferral window no longer leaves a removed
-  account's `ForcePersistentCookies` store on disk forever.
+  account's `ForcePersistentCookies` store on disk forever. The drain checks
+  membership as well as ordering — an id that is *also* a configured account
+  is skipped, logged `purge skipped … reason=reconfigured` and dropped from
+  the list — and its opening line names a count with a bounded sample of ids
+  rather than the list itself.
 
   The heartbeat restarts a timer that is not running while nothing is in
   flight, and ends a cycle that is open with nothing in flight, nothing
@@ -644,6 +681,15 @@ unnecessary source of behaviour change.
   from a pool thread, which is the one thing this scheduler currently never
   does: every provider `on_done` only emits a queued signal. Any of these
   deserves its own change rather than a tail-end addition here.
+
+  **Every dispatch of a hung REST provider costs a slot, which is why the
+  kept retry is folded into the cadence.** An earlier draft of the retry
+  deferral re-armed a parked provider's due for the instant the park lifts;
+  measured against the round-2 tree with the same seeds that was 4→5 and 6→7
+  dispatches an hour and 15→17 worst concurrent REST workers in the 60-seed
+  six-hour fuzz. Owing the due no earlier than the next cadence wake puts all
+  three numbers back (4, 6, 15/14/15). It does not contain the leak; it just
+  stops this feature widening it.
 - **On a one-core host every REST watchdog is about six minutes.**
   `_pool_wait_slack` adds `sum(every other REST budget) / maxThreadCount` to a
   dispatch's watchdog, because the cycle hands openrouter, copilot and azure
@@ -668,14 +714,65 @@ unnecessary source of behaviour change.
   `purge_profile` synchronously for every configured account, every account on
   disk and the three fixed ids - including one whose scrape is live. That is
   the same `deleteLater()`-then-`rmtree` under a live `QuietWebEnginePage`
-  that `_run_profile_purges` exists to prevent. Left as is because it is an
-  explicit, confirmed user action behind a warning dialog, unlike a settings
-  save; the fix is to emit the id list to the App the way `removed_profile_ids`
-  now does and let `_purge_removed_profiles` defer it.
+  that `_run_profile_purges` exists to prevent, and it is the most reachable
+  way to produce the destroyed page that used to strand the live-scrape guard
+  (that half is fixed: the guard expires, and `_finish` no longer loses its
+  emit to a diagnostic). Left as is because it is an explicit, confirmed user
+  action behind a warning dialog, unlike a settings save; the fix is to emit
+  the id list to the App the way `removed_profile_ids` now does and let
+  `_purge_removed_profiles` defer it, and/or to have both purge paths ask
+  `account_is_busy()` - the signal now exists and neither caller consults it.
+- **A deferred purge makes the app write `config.json` on its own.**
+  `_run_profile_purges` records what is still owed, and it is called from
+  `App.__init__` and from the five-minute heartbeat - so while a purge is
+  deferred the app rewrites the user's settings file without the user asking,
+  which nothing else in it does. It is well guarded: `_persist_pending_profile_purges`
+  early-returns when the list is unchanged, so the steady state (an empty
+  list) writes nothing and a normal start writes nothing. What a write costs
+  is that `Config.save()` serialises the whole model, so a key an older or
+  newer build wrote that this one does not model is dropped, and a concurrent
+  hand-edit is overwritten. Worth knowing before adding a second such writer;
+  not worth a mechanism on its own. (It also means an ad-hoc harness that
+  drives `_run_profile_purges` must set `APPDATA` - an override on every OS,
+  which `tests/conftest.py` sets for the suite - or it edits the developer's
+  real config.)
+- **The log summariser's shared budget does not cover `repr()` values or
+  large numbers, and `_raw_summary` catches only `TypeError`.** The budget is
+  charged for strings, for dict keys and for elided nodes, but the numeric
+  branch charges a flat eight characters whatever the magnitude and the
+  `repr()` fallback is charged after the fact and never clipped: a 5 MB
+  `bytes` value still produces a record 9.5x the rotation, and fifty
+  4 200-digit JSON integers produce 210 KB. Separately, three inputs make the
+  walk raise something `except TypeError` does not catch - an object whose
+  `__repr__` raises, a dict key whose `__str__` raises, and a `dict` subclass
+  whose `items()` raises - and that escapes into `_on_snapshot`. None of it is
+  reachable today: browser payloads arrive through the QtWebEngine JS bridge
+  (no bytes, no integers), `json.loads` itself refuses a number of more than
+  4 300 digits, and the two REST providers that keep a verbatim server dict do
+  so only on an OK snapshot while `raw_summary=` prints only on
+  ERROR/AUTH_REQUIRED. It would bite the first time an extractor or a provider
+  returns something that is not plain JSON. Fix:
+  `budget[0] -= max(8, len(str(value)))` in the numeric branch, clip the
+  `repr()` to `_LOG_VALUE_LIMIT` the way the string branch already does, and
+  widen the `except` - a log line must never be able to raise.
+- **The dispatch epoch is matched against the name the payload carries.**
+  `_dispatch`'s `_emit` forwards the provider's own `snapshot.provider` and
+  pairs it with the dispatch's epoch; every gate downstream keys on that name.
+  Epochs advance in lockstep across a cycle, so a snapshot mislabelled with a
+  *sibling account's* id is accepted as that sibling's live answer - clearing
+  its `_inflight` entry, destroying its watchdog, joining the cycle's verdict
+  and painting its tile with another account's numbers; the late path now has
+  the same reach. Unreachable today, and checked rather than assumed:
+  `ScrapeRunner` sets `provider=self._account_id`, the browser builders take
+  `account_id=` from the App, and the three REST providers hardcode their
+  literal, so no extractor's output reaches the field. The fix belongs in one
+  place - `replace(snap, provider=_name)` in `_emit`, so the App's own notion
+  of what it dispatched is the only thing that can decide which tile is
+  touched.
 - **The resume-artifact threshold is still unreachable on an awake machine,
   and two `scraper.py` log lines still carry uncapped page text.** Both
-  pre-date this work and `webview/scraper.py` is untouched by it. The
-  threshold: the scraper calls a timeout a resume artifact past
+  pre-date this work; `webview/scraper.py` is touched by it only in `_finish`,
+  where the diagnostics now give way to the `done` signal. The threshold: the scraper calls a timeout a resume artifact past
   `timeout_ms x max_attempts x RESUME_ARTIFACT_FACTOR`, which for Claude is
   40 x 2 x 3 = 240 s, while the App's watchdog for the same provider is
   160 + 20 s - so the watchdog always wins and the classification only ever

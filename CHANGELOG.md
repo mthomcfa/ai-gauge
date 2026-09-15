@@ -83,7 +83,8 @@ numbers in the entries below are that log's, not estimates.
   Giving up ends the App's wait, not the provider's work, and the rest of this
   entry is about not pretending otherwise. Every dispatch carries an epoch, so
   an answer is matched to the dispatch that earned it: one from a dispatch the
-  App abandoned is logged and dropped, and it closes no cycle. A provider the
+  App abandoned is logged, paints and records only its own tile, and closes no
+  cycle. A provider the
   watchdog gave up on is **parked** — no cycle, retry wake, manual refresh or
   settings save dispatches it — until its worker reports back or twice its
   budget has passed and the worker can fairly be assumed dead, and the three
@@ -136,18 +137,39 @@ numbers in the entries below are that log's, not estimates.
   profile.** The "a refresh is already running" refusal read a field on the
   provider object, and saving settings — a colour-only change included —
   replaces that object. Past the point where the app stops assuming an
-  abandoned worker is still alive, nothing refused: six fake hours with a
-  wedged scrape and a save every 400 s put 28 headless views on one account's
-  single browser profile, all writing one cookie store, which is how a
-  spurious sign-out happens. The refusal is now keyed on the account, and a
-  provider object is reused when nothing about it changed.
+  abandoned worker is still alive, nothing refused. Measured on the real path
+  — the real `ClaudeProvider`, the real runner and a real
+  `_build_providers()`, with only the headless scraper faked — six fake hours
+  with a wedged scrape and a save every 400 s (55 provider rebuilds) put **29
+  headless views on one account's single browser profile**, all writing one
+  cookie store, which is how a spurious sign-out happens. With the refusal
+  keyed on the account: **one view and 11 refusals** over the same six hours.
+  A provider object is also reused when nothing about it changed.
+
+  An entry in that registry expires. It is cleared when the scrape reports
+  back, and `HeadlessScraper` arms its own timeout so it always does — but
+  that invariant lives in another module, and a `_finish` whose diagnostics
+  raised before its emit (a page whose C++ half Qt had already deleted, which
+  is what destroying a profile under a live scrape produces) skipped it. The
+  account was then refused for the life of the process, with no settings save
+  able to clear it, because not being clearable by a rebuild is the point of
+  module state. The diagnostics in `_finish` now give way to the signal, and
+  an entry older than the scrape's own worst case — the runner's timeout
+  times the attempts it may make, plus a minute — expires with a line in the
+  log.
 - **A provider that answers late is no longer stuck on "Refresh timed
   out."** Dropping a late answer whole is right for the cycle's accounting
   and wrong for the tile: a provider that is merely slower than its budget
   answered correctly every time, and a genuine "sign in again" was never
   shown. Its own tile now gets the answer when it is the newest dispatch's,
   and the fast-retry entry is cleared only if it answered OK or
-  auth-required. Nothing else moves — no cycle is closed or joined, and no
+  auth-required. It is **recorded** as well as painted: it is a real
+  observation, and the only thing the history and burn-rate stores had heard
+  about that dispatch was the watchdog's synthetic timeout, which both of
+  them drop — so a provider slower than its budget showed a healthy tile
+  above an empty ratio history and a blank burn-rate row (0 rows over twelve
+  cycles, against 12 for the same provider inside its budget). Nothing else
+  moves — no cycle is closed or joined, no scheduling of any kind, and no
   newer dispatch is touched.
 - **A profile deletion deferred past a quit is no longer lost.** Removing an
   account while a refresh of it is still out defers deleting its browser
@@ -156,12 +178,39 @@ numbers in the entries below are that log's, not estimates.
   inside that window left a removed account's persistent cookie store on disk
   with no recovery path short of "Clear all browser data". What is still owed
   is now recorded and run at the next start, before anything can open a page.
-  The stored credential was, and is, cleared immediately.
+  The stored credential was, and is, cleared immediately. The drain checks
+  membership as well as ordering: an id that is *also* a configured account —
+  which a restored backup, a synced config directory or a hand-edited undo can
+  produce, since the list now outlives the removal that wrote it — is skipped,
+  logged and dropped rather than deleting a live session. Its opening line
+  names a count with a bounded sample of ids beside it, and `purge_profile`
+  clips the id it refuses: the list is config-controlled and unbounded, and
+  echoing it whole let a poisoned `config.json` write 800 KB of records at
+  every start, one line of it 0.76× the whole 512 KiB rotation.
+
+  Note that this is also the first path on which the app rewrites its own
+  `config.json` without the user asking: `_run_profile_purges` records what is
+  still owed, so while a purge is deferred the five-minute heartbeat can write
+  the settings file. It early-returns when nothing changed, so the steady
+  state writes nothing.
 - **A fast retry owed to a provider the app has given up on is no longer
   spent for nothing.** Its deadline was consumed before the cycle filtered
   it out, so the retry vanished and — when it was the only one owed — the
   wake ran a completely empty cycle, header flicker included. The deadline is
-  now kept and re-armed for the moment that provider becomes eligible again.
+  now kept, and owed no earlier than the next ordinary cadence wake: arming
+  it for the instant the park lifts bought a wake of its own, which is one
+  extra dispatch an hour for a provider that is hung, and for the three REST
+  providers — which have no re-entrancy guard of their own — one more worker
+  holding a slot of the global thread pool.
+- **A refresh with nothing eligible no longer opens a cycle.** Every entry
+  path filters out what it cannot dispatch and then opened a complete cycle
+  over what was left, even when that was nothing: the header blinked
+  "· refreshing" with no fraction behind it and two log lines claimed a cycle
+  that dispatched nobody. A *manual* one cost more, because the active-window
+  re-arm sits after the filter and never asked whether anything survived it —
+  clicking Refresh while the only provider was parked pinned the app on the
+  fast cadence for thirty minutes and threw away the idle backoff, in
+  exchange for zero network calls.
 - **A provider that is only waiting can no longer spin the scheduler.** A
   `throttled` or `resume_artifact` answer skips the fast retry, and the skip
   used to leave an already-owed retry deadline in place — now in the past. A
@@ -240,11 +289,17 @@ numbers in the entries below are that log's, not estimates.
   5 KB. Nothing a provider page returns can name its own `error_class` any
   more either: the scraper boundary allowlists the one value it is allowed to
   set.
-- **1 099 → 1 199 tests.** Every finding from both review lanes has a
+- **1 099 → 1 216 tests.** Every finding from all three review rounds has a
   regression test, including two invariants driven over a fake clock: an hour
   of any provider behaviour buys a bounded number of cycles, and six hours of
   fuzzed cycles, watchdogs and manual refreshes never puts two scrapes of one
-  browser account in flight together.
+  browser account in flight together. The seven behaviours a mutation run
+  could still reverse with every test green — the cycle's books after a
+  skipped provider, the per-cycle replacement of the thread-pool allowances,
+  the tray update inside a repaint, the deliberate *absence* of recording in
+  a re-render, the pending-purge validator, the drain's position ahead of
+  cookie hydration, and the exact-class check that makes provider reuse safe
+  — are pinned too.
 - **Two tiles in that log were broken by configuration, not by the app.**
   OpenCode was not signed in and Copilot's PAT lacked `read:user`. Neither is
   fixed here; both now cost less, because a provider that keeps failing is no

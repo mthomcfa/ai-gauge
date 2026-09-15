@@ -703,8 +703,9 @@ class App(QObject):
         # from the one it replaced only in the state it just discarded. For a
         # browser provider that state is the `ScrapeRunner` holding a live
         # page load. The live-scrape guard is now keyed by account id in
-        # `_scrape_runner`, so this is belt to that brace; it also spares the
-        # provider its per-kind catalog work on a save that changed nothing.
+        # `_scrape_runner`, so this is belt to that brace. (It buys no other
+        # work: every provider `__init__` sets four attributes and reads its
+        # catalog, its URL and its secret per refresh.)
         previous = dict(self._providers)
         self._providers.clear()
 
