@@ -50,35 +50,58 @@ REDACT = "redact"
 WARN = "warn"
 _ACTIONS = (BLOCK, REDACT, WARN)
 
+# Every quantifier below is bounded (`{m,n}`) or possessive (`{m,}+`, Python
+# 3.11+). That is not style: an unbounded quantifier over a class that the next
+# term can also match backtracks, and `test_every_quantifier_is_bounded_or_possessive`
+# fails the build if one is added. Round 1 bounded the *path* scanner and left
+# `email-address` as `[A-Za-z0-9._%+\-]+@...`: `.`, `-`, `%` and `+` are word
+# boundaries but are inside the class, so every one of them was a fresh start
+# position that ran to the end of the token looking for an `@`. 400 000 bytes of
+# `a.-` took 122.9 s, of `x.` 185.2 s, and a plausible `svc.0-svc.1-...` list
+# 73.7 s - against the documented 10 s hook timeout, which is a payload the hook
+# cannot answer for and therefore does not block.
+#
 # Ranked most-specific-first: sk-ant- and sk-or- must be tried before the
 # generic sk- rule, or every Anthropic key is reported as an OpenAI one.
 _DETECTORS: tuple[tuple[str, str, str], ...] = (
     ("private-key", BLOCK, r"-----BEGIN (?:RSA |EC |OPENSSH |PGP |DSA )?PRIVATE KEY-----"),
-    ("anthropic-key", BLOCK, r"sk-ant-[A-Za-z0-9_\-]{16,}"),
-    ("openrouter-key", BLOCK, r"sk-or-v1-[A-Za-z0-9]{16,}"),
-    ("openai-key", BLOCK, r"sk-(?:proj-)?[A-Za-z0-9_\-]{20,}"),
+    ("anthropic-key", BLOCK, r"sk-ant-[A-Za-z0-9_\-]{16,}+"),
+    ("openrouter-key", BLOCK, r"sk-or-v1-[A-Za-z0-9]{16,}+"),
+    ("openai-key", BLOCK, r"sk-(?:proj-)?[A-Za-z0-9_\-]{20,}+"),
     ("aws-access-key", BLOCK, r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
-    ("github-token", BLOCK, r"\bgh[pousr]_[A-Za-z0-9]{36,}\b"),
+    ("github-token", BLOCK, r"\bgh[pousr]_[A-Za-z0-9]{36,1024}\b"),
     # Fine-grained PATs are the current default on github.com and match none of
     # the gh[pousr]_ shapes.
-    ("github-fine-grained-pat", BLOCK, r"(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{20,}"),
+    ("github-fine-grained-pat", BLOCK, r"(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{20,}+"),
     ("google-api-key", BLOCK, r"\bAIza[0-9A-Za-z_\-]{35}\b"),
-    ("slack-token", BLOCK, r"\bxox[baprs]-[0-9A-Za-z\-]{10,}"),
-    ("jwt", BLOCK, r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"),
+    ("slack-token", BLOCK, r"\bxox[baprs]-[0-9A-Za-z\-]{10,}+"),
     (
+        "jwt",
+        BLOCK,
+        r"\beyJ[A-Za-z0-9_\-]{10,4096}+\.[A-Za-z0-9_\-]{10,4096}+\.[A-Za-z0-9_\-]{10,4096}+",
+    ),
+    (
+        # The user and password runs exclude the delimiter that follows them, so
+        # each is possessive without changing what matches; `[^\s/@]+:[^\s/@]+@`
+        # was ambiguous in both runs and quadratic from a single `postgres://`.
         "connection-string",
         BLOCK,
-        r"\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqps?|mssql)://[^\s/@]+:[^\s/@]+@",
+        r"\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqps?|mssql)://"
+        r"[^\s/@:]{1,256}+:[^\s/@]{1,256}+@",
     ),
-    ("basic-auth-url", BLOCK, r"\bhttps?://[^\s/@:]+:[^\s/@]+@[^\s/]+"),
+    ("basic-auth-url", BLOCK, r"\bhttps?://[^\s/@:]{1,256}+:[^\s/@]{1,256}+@[^\s/]{1,256}+"),
     # A bearer header carries a live credential whatever its shape.
-    ("bearer-header", BLOCK, r"(?i)\bauthorization\s*:\s*bearer\s+[A-Za-z0-9._\-~+/=]{8,}"),
+    (
+        "bearer-header",
+        BLOCK,
+        r"(?i)\bauthorization[ \t]{0,16}:[ \t]{0,16}bearer[ \t]{1,16}[A-Za-z0-9._\-~+/=]{8,4096}+",
+    ),
     # Entra ID client secrets are ~40 characters with a '~' a few characters in.
     # SECURITY.md names this one as a secret the app itself holds.
     (
         "azure-client-secret",
         BLOCK,
-        r"(?<![A-Za-z0-9])[A-Za-z0-9._\-]{1,5}[A-Za-z0-9]~[A-Za-z0-9._\-~]{30,}",
+        r"(?<![A-Za-z0-9])[A-Za-z0-9._\-]{1,5}[A-Za-z0-9]~[A-Za-z0-9._\-~]{30,512}+",
     ),
     # This app's own stores: src/aigauge/config.py defines KEYRING_SERVICE
     # "ai-gauge" with the usernames below, and the per-provider session cookies
@@ -93,7 +116,7 @@ _DETECTORS: tuple[tuple[str, str, str], ...] = (
         "aigauge-session-cookie",
         BLOCK,
         r"(?i)\b(?:sessionkey|(?:__secure-)?next-auth\.session-token(?:\.[01])?|"
-        r"opencode-session)\b\s*[=:]\s*[\"']?[^\s\"';,]{16,}",
+        r"opencode-session)\b[ \t]{0,16}[=:][ \t]{0,16}[\"']?[^\s\"';,]{16,1024}+",
     ),
     (
         "secret-assignment",
@@ -101,10 +124,10 @@ _DETECTORS: tuple[tuple[str, str, str], ...] = (
         # Anchored on the *tail* of the name, not on a word boundary in front of
         # it: `\b` does not fire after `_`, which is why `DATABASE_PASSWORD=`,
         # `DB_PASSWORD:` and `MY_SECRET=` - the commonest shape in a .env file
-        # or a CI diff - produced no finding at all. The runs either side are
-        # bounded so that a long separator-free blob cannot make this quadratic.
+        # or a CI diff - produced no finding at all. Every run is bounded, so a
+        # long separator-free blob cannot make this quadratic.
         r"(?i)(?:password|passwd|secret|token|api[_-]?key|private[_-]?key|credential)"
-        r"[A-Za-z0-9_]{0,64}\s{0,16}[:=]\s{0,16}[\"']?[^\s\"',;]{8,}",
+        r"[A-Za-z0-9_]{0,64}\s{0,16}[:=]\s{0,16}[\"']?[^\s\"',;]{8,256}+",
     ),
     ("certificate", WARN, r"-----BEGIN CERTIFICATE-----"),
     (
@@ -113,13 +136,24 @@ _DETECTORS: tuple[tuple[str, str, str], ...] = (
         r"(?i)\b(?:strictly confidential|company confidential|proprietary and confidential|"
         r"internal use only|not for distribution|restricted distribution)\b",
     ),
-    ("email-address", REDACT, r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"),
+    (
+        # A local part is at most 64 characters (RFC 5321), so bounding it loses
+        # no address; the lookbehind puts the only start position at the start of
+        # the run, which is what makes a 400 KB run of `a.-` one failed match
+        # rather than 266 000 of them.
+        "email-address",
+        REDACT,
+        r"(?<![A-Za-z0-9._%+\-])[A-Za-z0-9._%+\-]{1,64}+@"
+        r"(?:[A-Za-z0-9\-]{1,63}+\.){1,8}[A-Za-z]{2,24}\b",
+    ),
 )
 
 # Anything that looks like a packed credential but matches no named format.
 # Hex runs sit at entropy 4.0 exactly, so the floor is above that to keep git
-# SHAs and checksums out of the report.
-_OPAQUE_TOKEN_RE = re.compile(r"\b[A-Za-z0-9+/=_\-]{32,}\b")
+# SHAs and checksums out of the report. One maximal run per token: `\b...{32,}\b`
+# had to walk back over the tail of every run that did not end on a word
+# character, and a lookbehind plus a possessive run cannot.
+_OPAQUE_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9+/=_\-])[A-Za-z0-9+/=_\-]{32,}+")
 _ENTROPY_FLOOR = 4.2
 
 # Paths whose *mention* in a payload is itself the finding, because the agent
@@ -1124,9 +1158,10 @@ def _hook(args: argparse.Namespace) -> int:
 _BYPASS_RE = re.compile(
     r"""
       (?:opencode|codex)-companion\.mjs             # the plugins' own launchers
-    | \bopencode(?:-ai)?\b[^\n]*?\b(?:run|serve|server)\b   # any flags in between
-    | (?:^|[;|&(`\n]|\$\()\s*(?:[\w.\-/\\]*[/\\])?opencode(?:-ai)?(?:@[\w.\-]+)?\b
-    | \b(?:npx|bunx|pnpx|dlx|exec|sudo|command)\s+(?:-\S+\s+)*opencode(?:-ai)?(?:@[\w.\-]+)?\b
+    | \bopencode(?:-ai)?\b[^\n]{0,200}?\b(?:run|serve|server)\b   # any flags in between
+    | (?:^|[;|&(`\n]|\$\()[ \t]{0,16}(?:[\w.\-/\\]{0,200}[/\\])?opencode(?:-ai)?(?:@[\w.\-]{1,40})?\b
+    | \b(?:npx|bunx|pnpx|dlx|exec|sudo|command)[ \t]{1,16}
+      (?:-\S{1,40}[ \t]{1,16}){0,8}opencode(?:-ai)?(?:@[\w.\-]{1,40})?\b
     """,
     re.IGNORECASE | re.VERBOSE,
 )

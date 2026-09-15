@@ -239,18 +239,163 @@ def test_a_long_separator_free_run_scans_quickly():
     assert time.monotonic() - started < 10.0
 
 
-def test_every_scanning_pattern_is_linear_on_400kb():
+# `"A" * n` is the one filler that cannot trigger a backtracking detector: a run
+# of word characters has exactly one word boundary in it. Round 1 tested with
+# that filler alone and `email-address` stayed quadratic behind it - 122.9 s on
+# 400 KB of `a.-`, 185.2 s on `x.`, 92.5 s on `%20x`, 73.7 s on a plausible
+# `svc.0-svc.1-...` identifier list. Each filler below is a separator run the
+# detector classes reach into, and the payload is the tool's own default cap.
+_ADVERSARIAL_FILLERS = {
+    "word run": "A",
+    "dot dash": "a.-",
+    "dotted": "x.",
+    "url encoded": "%20x",
+    "at signs": "@",
+    "dots": ".",
+    "dashes": "-",
+    "underscores": "_",
+    "equals": "=",
+    "colons": ":",
+    "plus": "+",
+    "slashes": "a/",
+    "email shaped": "a@b.c-",
+    "url shaped": "http://a:b",
+    "dsn shaped": "postgres://a:",
+    "assignment shaped": "password=",
+    "keyring shaped": "keyring ai-gauge x ",
+    "mixed alphabet": "aZ9._%+-@:/=~ \t\n",
+}
+
+
+def _filled(filler: str, size: int = 400_000) -> str:
+    return (filler * (size // len(filler) + 1))[:size]
+
+
+def _adversarial_payloads() -> list[tuple[str, str]]:
+    payloads = [(label, _filled(filler)) for label, filler in _ADVERSARIAL_FILLERS.items()]
+    # A payload nobody would call adversarial: a list of dotted, hyphenated
+    # service identifiers. It cost 73.7 s.
+    payloads.append(("identifier list", "-".join(f"svc.{i}" for i in range(80_000))[:400_000]))
+    return payloads
+
+
+@pytest.mark.parametrize("label, payload", _adversarial_payloads())
+def test_every_scanning_pattern_is_linear_on_400kb(label, payload):
+    """Every detector, every filler, `finditer` rather than `search`.
+
+    `search` stops at the first match, which hides the cost of the failures
+    after it; the scanner uses `finditer`, so the test has to.
+    """
     import re
     import time
 
-    payload = "A" * 400_000
     for rule, _action, pattern in eg._DETECTORS:
         started = time.monotonic()
-        re.compile(pattern).search(payload)
-        assert time.monotonic() - started < 5.0, rule
+        list(re.finditer(pattern, payload))
+        # The machine budget is 1 s; CI variance is far below the headroom
+        # between that and the 122-185 s this replaces.
+        assert time.monotonic() - started < 5.0, f"{rule} on {label}"
     started = time.monotonic()
     list(eg._OPAQUE_TOKEN_RE.finditer(payload))
-    assert time.monotonic() - started < 5.0
+    assert time.monotonic() - started < 5.0, f"opaque-token on {label}"
+    started = time.monotonic()
+    list(eg._path_like_spans(payload))
+    assert time.monotonic() - started < 5.0, f"path spans on {label}"
+    started = time.monotonic()
+    eg._bypasses_guard(payload)
+    assert time.monotonic() - started < 5.0, f"bypass regex on {label}"
+
+
+@pytest.mark.parametrize("label, payload", _adversarial_payloads())
+def test_scan_is_linear_on_400kb_of_every_filler(label, payload):
+    import time
+
+    started = time.monotonic()
+    eg.scan(payload, policy())
+    assert time.monotonic() - started < 5.0, label
+
+
+@pytest.mark.parametrize("label, payload", _adversarial_payloads())
+def test_the_hook_answers_a_400kb_prompt_inside_its_documented_timeout(
+    label, payload, tmp_path, monkeypatch
+):
+    """The wiring in the doc gives the hook `"timeout": 10`. A hook killed at
+    its timeout returns no exit 2, so the tool call proceeds unscanned."""
+    import time
+
+    event = json.dumps({"cwd": str(tmp_path), "tool_name": "Task",
+                        "tool_input": {"prompt": payload}})
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(event))
+    args = eg.build_parser().parse_args(["hook"])
+    started = time.monotonic()
+    eg.cmd_hook(args)
+    assert time.monotonic() - started < 5.0, label
+
+
+def _quantifiers(pattern: str, verbose: bool = False):
+    """Every quantifier in `pattern`, as (position, text, bounded_or_possessive)."""
+    index = 0
+    in_class = False
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "\\":
+            index += 2
+            continue
+        if in_class:
+            in_class = char != "]"
+            index += 1
+            continue
+        if char == "[":
+            in_class = True
+            index += 1
+            continue
+        if verbose and char == "#":
+            newline = pattern.find("\n", index)
+            index = len(pattern) if newline == -1 else newline + 1
+            continue
+        if char == "{":
+            close = pattern.find("}", index)
+            body = pattern[index + 1 : close] if close != -1 else ""
+            if body and all(c.isdigit() or c == "," for c in body):
+                possessive = pattern[close + 1 : close + 2] == "+"
+                yield index, "{" + body + "}", not body.endswith(",") or possessive
+                index = close + 2 if possessive else close + 1
+                continue
+            index += 1
+            continue
+        if char in "*+" and not (index and pattern[index - 1] == "("):
+            # `*+`/`++` is possessive and `*?`/`+?` lazy - both consume the next
+            # character, which is not a quantifier of its own.
+            modifier = pattern[index + 1 : index + 2]
+            yield index, char, modifier == "+"
+            index += 2 if modifier in "+?" else 1
+            continue
+        index += 1
+
+
+@pytest.mark.parametrize(
+    "label, pattern, verbose",
+    [(rule, pattern, False) for rule, _a, pattern in eg._DETECTORS]
+    + [
+        ("opaque-token", eg._OPAQUE_TOKEN_RE.pattern, False),
+        ("bypass", eg._BYPASS_RE.pattern, True),
+        ("base ref", eg._BASE_REF_RE.pattern, False),
+    ],
+)
+def test_every_quantifier_is_bounded_or_possessive(label, pattern, verbose):
+    """The class-level pin, not the instance.
+
+    A quadratic detector is a hook that cannot answer inside its timeout, which
+    is a tool call that proceeds unscanned. The timing tests above catch the
+    fillers someone thought of; this one catches the pattern nobody timed.
+    """
+    unbounded = [
+        (position, text) for position, text, ok in _quantifiers(pattern, verbose) if not ok
+    ]
+    assert not unbounded, (
+        f"{label}: unbounded quantifier(s) {unbounded} - bound it ({{m,n}}) or make it "
+        f"possessive ({{m,}}+), or a run of separators makes it quadratic"
+    )
 
 
 def test_the_payload_is_truncated_to_the_cap_before_it_is_scanned():
