@@ -621,3 +621,47 @@ def test_the_settings_dialog_no_longer_deletes_profiles_itself():
     assert "purge_profile(" not in source, (
         "the settings dialog is deleting QtWebEngine profiles again"
     )
+
+
+def test_one_dialog_session_asks_the_app_for_a_profile_once(qtbot, monkeypatch):
+    """Clearing all browser data and removing an account are two calls.
+
+    The clear goes to the App at the button and the removal list at OK, so
+    an account removed in the same dialog session travelled both routes and
+    reached `purge_profile` twice - once for a directory that was already
+    gone. Nothing broke (it is idempotent and path-guarded), but the two
+    routes are also two deferral lists in the App, and a blocked id sat on
+    both and was logged by both at every heartbeat.
+
+    The clear-all set is the whole answer: the button asks for every
+    configured account, every fixed id and every usable name in `profiles/`,
+    so a row removed before or after the click is always inside it.
+    """
+    monkeypatch.setattr(settings_dialog, "set_start_at_login", lambda enabled: None)
+    monkeypatch.setattr(
+        settings_dialog.QMessageBox,
+        "question",
+        lambda *a, **k: settings_dialog.QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(
+        settings_dialog.QMessageBox, "information", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        settings_dialog, "set_provider_cookie", lambda account_id, value: None
+    )
+    config = Config()
+    dialog = SettingsDialog(config)
+    qtbot.addWidget(dialog)
+    dialog._add_browser_account("claude")  # noqa: SLF001
+    account_id = dialog._browser_accounts[-1].id  # noqa: SLF001
+
+    emitted: list[list[str]] = []
+    dialog.browser_data_clear_requested.connect(emitted.append)
+    _button(dialog, "clear_browser_data_btn").click()
+    dialog._remove_browser_account(account_id)  # noqa: SLF001
+    dialog.apply_to(config)
+
+    assert account_id in emitted[0], "the clear did not cover the account"
+    assert dialog.removed_profile_ids == [], (
+        "the App was asked to delete a profile it had just been asked to clear"
+    )

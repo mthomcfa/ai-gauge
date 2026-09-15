@@ -2032,23 +2032,76 @@ def test_clear_all_browser_data_waits_for_the_account_that_is_scraping(
     )
 
 
-def test_an_id_on_both_deferral_lists_is_purged_once(monkeypatch):
+def test_an_id_on_both_deferral_lists_is_purged_once(monkeypatch, caplog):
     """Removing an account and clearing all browser data in one dialog
-    session puts the same id on both lists. `purge_profile` is idempotent and
-    path-guarded, so the second call was harmless - but it doubled the log
-    noise on the one record that explains where a profile went."""
+    session puts the same id on each route - as two separate calls.
+
+    The clear is emitted at the button and the removal at OK, so each one
+    drains on its own and a set shared inside a single drain covered
+    neither. It covered a *deferred* id least of all: nothing is purged for
+    it to be noted, so both lists kept it and both logged it at every
+    heartbeat - on the one record that explains where a profile went.
+
+    The id lands on exactly one list at the moment it is recorded instead,
+    and the clear is the one it lands on: both end in the same
+    `purge_profile`, and the clear's startup drain skips nothing where the
+    removal's skips a configured account.
+    """
     from aigauge.config import Config as RealConfig
 
     purged: list[str] = []
     monkeypatch.setattr(app_module, "purge_profile", purged.append)
     app = _app({})
     app._config = RealConfig()  # noqa: SLF001
-    app._pending_profile_purges = ["claude-dead"]  # noqa: SLF001
-    app._pending_data_clears = ["claude-dead", "codex-live"]  # noqa: SLF001
+    app._inflight.add("claude-dead")  # noqa: SLF001 - its scrape is still out
 
+    with caplog.at_level(logging.INFO, logger="aigauge.app"):
+        app._on_browser_data_clear_requested(["claude-dead"])  # noqa: SLF001
+        app._purge_removed_profiles(["claude-dead"])  # noqa: SLF001
+        caplog.clear()
+        app._run_profile_purges()  # noqa: SLF001 - the heartbeat's drain
+
+    deferred = [
+        record.getMessage()
+        for record in caplog.records
+        if "deferred account=claude-dead" in record.getMessage()
+    ]
+    assert len(deferred) == 1, deferred
+    assert app._pending_profile_purges == []  # noqa: SLF001
+    assert app._pending_data_clears == ["claude-dead"]  # noqa: SLF001
+    assert purged == []
+
+    app._inflight.discard("claude-dead")  # noqa: SLF001
     app._run_profile_purges()  # noqa: SLF001
+    assert purged == ["claude-dead"], purged
 
-    assert purged == ["claude-dead", "codex-live"], purged
+    # The other order, and the reason the clear is the list that wins: a
+    # deferred *removal* that is then cleared must not be skipped at the
+    # next start as an account the config still has.
+    purged.clear()
+    app._inflight.add("claude")  # noqa: SLF001
+    app._purge_removed_profiles(["claude"])  # noqa: SLF001
+    app._on_browser_data_clear_requested(["claude"])  # noqa: SLF001
+    assert app._pending_profile_purges == []  # noqa: SLF001
+    assert app._pending_data_clears == ["claude"]  # noqa: SLF001
+
+    app._inflight.discard("claude")  # noqa: SLF001
+    fresh = _app({})
+    fresh._config = RealConfig.load()  # noqa: SLF001 - the next start
+    fresh._drain_pending_purges()  # noqa: SLF001
+    assert purged == ["claude"], purged
+    assert "reason=reconfigured" not in caplog.text
+
+    # And straight off disk, which is how a `config.json` restored from a
+    # backup can present the same id on both lists at once.
+    purged.clear()
+    restored = _app({})
+    restored._config = RealConfig(  # noqa: SLF001
+        pending_profile_purges=["codex-dead"],
+        pending_data_clears=["codex-dead"],
+    )
+    restored._drain_pending_purges()  # noqa: SLF001
+    assert purged == ["codex-dead"], purged
 
 
 def test_a_clear_request_takes_only_usable_ids(monkeypatch):

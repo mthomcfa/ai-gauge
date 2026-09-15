@@ -1497,6 +1497,13 @@ class App(QObject):
                 self._pending_data_clears.append(account_id)
         configured = {account.id for account in browser_accounts(self._config)}
         for account_id in pending:
+            if account_id in self._pending_data_clears:
+                # Already owed the stronger of the two - see
+                # `_run_profile_purges`, which drops the duplicate. Tested
+                # before `configured`, or a `reason=reconfigured` line would
+                # claim a profile was kept while the clear deletes it a
+                # moment later.
+                continue
             if account_id in configured:
                 # The list is persisted now, so an entry outlives the removal
                 # that wrote it. A restored backup, a synced config directory
@@ -1571,7 +1578,8 @@ class App(QObject):
         (`purge skipped ... reason=reconfigured`), which is right for a
         removal that a restored backup has undone and wrong for this: a
         deferred clear would be dropped at the next start. So this list is a
-        second persisted one, with a drain of its own that skips nothing.
+        second persisted one, with a drain of its own that skips nothing -
+        and, for that reason, the one an id owed both ends up on.
 
         It has to be persisted. The profile that is most likely to be
         deferred is the one being scraped right now, the button's whole
@@ -1614,25 +1622,16 @@ class App(QObject):
         account_ids: list[str],
         *,
         removal: bool,
-        done: set[str] | None = None,
     ) -> list[str]:
         """Purge what is free; return what is still waiting.
 
         `removal` picks the log line only. Both lists are recorded and both
         are drained at the next start; what differs is the drain's skip rule,
-        which is why they are two lists.
-
-        `done` carries what this pass has already deleted, because one id can
-        be on both: removing an account and clearing all browser data in one
-        dialog session puts it on each. `purge_profile` is idempotent and
-        path-guarded, so the second call was harmless - it just said the same
-        thing twice in the log, which is the one place that has to stay
-        readable.
+        which is why they are two lists - and never both, which
+        `_run_profile_purges` makes true before either is worked.
         """
         waiting: list[str] = []
         for account_id in account_ids:
-            if done is not None and account_id in done:
-                continue
             blocked = self._purge_blocked_reason(account_id)
             if blocked is not None:
                 log.info(
@@ -1650,8 +1649,6 @@ class App(QObject):
                 purge_profile(account_id)
             except Exception:  # noqa: BLE001 - cleanup must not crash the app
                 log.exception("failed to purge profile for %s", account_id)
-            if done is not None:
-                done.add(account_id)
         return waiting
 
     def _run_profile_purges(self) -> None:
@@ -1671,15 +1668,33 @@ class App(QObject):
         persisted, so a quit cannot lose either, and they stay apart because
         their startup drains differ - see `_on_browser_data_clear_requested`.
 
+        Apart, and disjoint. An id can reach both - the dialog puts one on
+        each, a `config.json` restored from a backup can list it twice, and
+        the startup drain reads both - and a shared "already purged" set
+        inside this function closed only the case where it is free: a
+        *deferred* id is never purged, so nothing was ever noted for it and
+        both lists logged it at every heartbeat, on the one record that
+        explains where a profile went. The duplicate is dropped here
+        instead, before either list is worked, and the clear is the entry
+        that survives: both end in the same `purge_profile`, and the clear's
+        startup drain skips nothing where a removal's skips an account the
+        config has again.
+
         The keyring secret is cleared immediately by the dialog either way;
         this is only the on-disk profile, and deferring it costs nothing.
         """
-        done: set[str] = set()
+        if self._pending_data_clears:
+            owed_a_clear = set(self._pending_data_clears)
+            self._pending_profile_purges = [
+                account_id
+                for account_id in self._pending_profile_purges
+                if account_id not in owed_a_clear
+            ]
         self._pending_profile_purges = self._purge_or_defer(
-            self._pending_profile_purges, removal=True, done=done
+            self._pending_profile_purges, removal=True
         )
         self._pending_data_clears = self._purge_or_defer(
-            self._pending_data_clears, removal=False, done=done
+            self._pending_data_clears, removal=False
         )
         # One write, after both lists have been worked: what is owed is what
         # is left on them.

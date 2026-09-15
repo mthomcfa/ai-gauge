@@ -551,6 +551,11 @@ class SettingsDialog(QDialog):
         self._removed_browser_account_ids: list[str] = []
         # Read by App._on_settings_finished after apply_to; see apply_to.
         self.removed_profile_ids: list[str] = []
+        # What "Clear all browser data" has already handed the App in this
+        # dialog session. The button and OK are two separate calls into the
+        # App, so a removed account's id went down both routes and reached
+        # `purge_profile` twice - see apply_to.
+        self._cleared_profile_ids: set[str] = set()
         self._browser_accounts = [
             account.model_copy(deep=True) for account in browser_accounts(config)
         ]
@@ -1361,6 +1366,7 @@ class SettingsDialog(QDialog):
                 # The id can have come off the filesystem, so it is bounded
                 # here rather than trusted to be one the app generated.
                 log.exception("failed to clear the stored cookie for %.64r", account_id)
+        self._cleared_profile_ids |= account_ids
         self.browser_data_clear_requested.emit(sorted(account_ids))
         # A count only: the names are the ones the id rule rejected, which is
         # exactly the text there is no reason to put in a log line.
@@ -1780,7 +1786,19 @@ class SettingsDialog(QDialog):
         # Qt requires a profile to outlive its pages, and a page that survives
         # its profile can flush rotated session cookies back into a directory
         # that was just removed. See App._run_profile_purges.
-        self.removed_profile_ids = list(self._removed_browser_account_ids)
+        #
+        # Minus whatever "Clear all browser data" already sent. That button
+        # asks for every account's profile, so a row removed in the same
+        # dialog session is always in its set - and the two are separate
+        # calls into the App, at the click and at OK, so the id reached
+        # `purge_profile` a second time for a directory that was already
+        # gone. The clear is the stronger request of the two: its startup
+        # drain skips nothing where a removal's skips a configured account.
+        self.removed_profile_ids = [
+            account_id
+            for account_id in self._removed_browser_account_ids
+            if account_id not in self._cleared_profile_ids
+        ]
         # Copy so the saved config never aliases this dialog's working state.
         config.copilot.colors = self._provider_colors["copilot"].model_copy(deep=True)
         config.openrouter.colors = self._provider_colors["openrouter"].model_copy(
