@@ -310,19 +310,37 @@ all three.
 ### What it enforces
 
 **Destination.** `destinations.allow` is a list of globs matched against the
-`provider/model` identifier. An empty list allows nothing, so a policy has to
-name its destinations deliberately. `--model openrouter/x` against an
-Anthropic-only allowlist is refused before the payload is read.
+`provider/model` identifier, lower-cased on both sides so the same policy means
+the same thing on Windows and on POSIX. An empty list allows nothing, so a
+policy has to name its destinations deliberately, and the shipped example
+policy starts empty rather than naming a broker by wildcard. `--model
+openrouter/x` against an Anthropic-only allowlist is refused before the payload
+is gathered — which matters because `--include-diff` runs `git`, and the
+decision is therefore taken before anything is executed in the workspace.
+
+`destinations.server` is where the bytes actually go, and it is parsed rather
+than prefix-matched: userinfo, an empty host, a non-numeric port or a scheme
+other than `http` all refuse, and the host must be a loopback address or the
+literal `localhost`. A name that merely *begins* with `127.0.0.1` is a public
+DNS name and is refused. Note the glob semantics that remain: `*` crosses `/`,
+so `openrouter/*` matches `openrouter/a/b/c` as well as `openrouter/a`.
 
 **Content.** The payload is scanned for credential shapes (private keys,
-`sk-ant-`, `sk-or-`, `sk-`, AWS, GitHub, Google, Slack, JWTs, connection
-strings, basic-auth URLs), for secret-looking assignments, for classification
-banners, for PII, and for high-entropy tokens that match no named format — with
-the entropy floor set above 4.0 so git SHAs and checksums do not flood the
-report. Path rules fire on the *mention* of a denied path, so "read
-`config/.env` and tell me what's in it" is caught even though no secret is in
-the text yet. Each rule is `block`, `redact`, `warn` or `off`, overridable per
-repository.
+`sk-ant-`, `sk-or-`, `sk-`, AWS, classic and fine-grained GitHub tokens,
+Google, Slack, JWTs, connection strings, basic-auth URLs, `Authorization:
+Bearer` headers, the Entra client-secret shape, and this repo's own keyring
+entries and session cookies), for secret-looking assignments, for
+classification banners, for PII, and for high-entropy tokens that match no
+named format — with the entropy floor set above 4.0 so git SHAs and checksums
+do not flood the report. Path rules fire on the *mention* of a denied path, so
+"read `config/.env` and tell me what's in it" is caught even though no secret
+is in the text yet. Each rule is `block`, `redact`, `warn` or `off`,
+overridable per repository; the unnamed-credential catch-all defaults to
+`redact`, and `warn` prints the finding rather than passing it silently.
+
+The payload is truncated to `limits.max_payload_bytes` *before* it is scanned,
+in every command, and each says when it did so. `hook` blocks a prompt it could
+not read in full: a scanner that does not finish cannot refuse.
 
 **Posture.** Before every dispatch it re-checks that the OpenCode server is
 loopback, that `OPENCODE_SERVER_PASSWORD` is set, that the workspace is inside
@@ -331,10 +349,24 @@ an allowed root, and — this is finding A1 — that
 `external_directory` unprompted. The plugin re-applies that config on every
 server start, so this check is the thing that notices it came back.
 
-**Audit.** Every decision appends one JSON line to a `0600` file: timestamp,
-workspace, destination, SHA-256 and byte count of the payload, the rules that
-fired, and the verdict. Hashes and rule names only — the audit trail never
-contains the secret that caused the block.
+**Audit.** Every `preflight` and `dispatch` decision appends a JSON line:
+timestamp, workspace, policy source, `--model` label, the parsed `host:port` of
+`destinations.server` that received the payload, SHA-256 and byte count of the
+payload, the rules that fired, and the verdict. Hashes and rule names only —
+the audit trail never contains the secret that caused the block, and the
+per-finding handle in the local report is salted per run so it is not an oracle
+for a low-entropy value. An allowed `dispatch` writes two lines: the intent
+before the POST and the outcome after, so a dispatch that is killed still
+leaves a record of what went out. `scan` and `posture` write no audit line;
+they decide nothing and send nothing.
+
+The file is created `0600` and opened `O_NOFOLLOW` where the platform has it,
+so a symlink at the audit path cannot redirect the trail. **On Windows there is
+no POSIX mode**: `os.open(..., 0o600)` only governs the read-only attribute,
+and the file inherits its parent directory's ACL, which under the user's own
+profile is user-only by default. It is not DPAPI-encrypted or given an explicit
+DACL the way `secrets.dat` is. If the audit line cannot be written, nothing is
+sent.
 
 ### Using it
 
@@ -354,14 +386,24 @@ python tools/egress_guard.py posture
 ```
 
 Exit codes are `0` allowed, `2` blocked by policy, `3` posture or configuration
-fault, so it composes into a script or a CI step.
+fault, so it composes into a script or a CI step. A configuration fault is one
+line on stderr and no traceback: a malformed policy, a missing explicit
+`--policy`, a non-numeric limit, an unknown rule action, a `--base` that is not
+a plain ref, a missing `git`, and an audit trail that cannot be written are all
+`3`. `preflight` without `--model` is a fault too, rather than "allowed"
+without consulting the allowlist.
 
 ### Wiring it in as a hook
 
 A guard only guards what goes through it. `hook` mode plugs into Claude Code's
 `PreToolUse` so that direct invocations do not route around it — it refuses
-`Bash` commands that call `opencode-companion.mjs`, `opencode run` or
-`opencode serve`, and it scans prompts handed to sub-agents:
+`Bash` commands that invoke a delegating agent — `opencode-companion.mjs`,
+`opencode` as a command token, `npx opencode-ai`, `$(which opencode)`, a
+path-prefixed binary, and any of them with flags before `run`/`serve`/`server`
+— and it scans prompts handed to sub-agents. Over-blocking is the acceptable
+direction, so a refused command costs a retry through the guard. Every error
+path returns `2`: a hook that cannot parse its own input, or whose policy is
+malformed, must not answer "allow".
 
 ```json
 {
@@ -370,13 +412,18 @@ A guard only guards what goes through it. `hook` mode plugs into Claude Code's
       {
         "matcher": "Bash|Agent|Task",
         "hooks": [
-          { "type": "command", "command": "python tools/egress_guard.py hook", "timeout": 10 }
+          { "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/tools/egress_guard.py\" hook", "timeout": 10 }
         ]
       }
     ]
   }
 }
 ```
+
+`python3` and an absolute path on purpose: a bare `python` resolves from PATH
+and on Windows may be the Store alias stub, and a relative path only works when
+the hook's working directory happens to be the repo root. On Windows use
+`py -3` in place of `python3`.
 
 ### The enforcement layer the guard cannot be
 

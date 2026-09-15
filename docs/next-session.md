@@ -668,3 +668,60 @@ negatives by construction: a clean scan means nothing known-bad was found.
 **Nothing in the app changed.** The guard is developer tooling in `tools/`,
 stdlib-only so it runs without the app's dependencies, and no version bump goes
 with it.
+
+### What the security review of the guard found, and what is still open
+
+A review by execution of `tools/egress_guard.py` produced nine blocking
+findings. All nine are fixed on this branch, each with a driver run before and
+after: the destination check was a string prefix and a payload demonstrably
+left the machine to an off-box address while `posture` said `ok`; the
+unrecognised-credential catch-all defaulted to `warn`, and `warn` neither
+blocked, redacted nor printed; `\b` in the `secret-assignment` rule never fires
+after `_`, so `DATABASE_PASSWORD=` produced no finding; the path scanner was
+quadratic (22 s at 64 000 characters, and it did not finish at the tool's own
+400 000-byte cap) and the cap did not gate the scan; `--include-diff` executed
+the workspace's `diff.external`; `cmd_dispatch` had no test and three gutting
+mutations survived; `hook` failed open on every error path; the documented exit
+codes held on no fault path and the audit line was written after the POST.
+
+Four things are deliberately **not** fixed, and are limits of the design rather
+than defects to patch:
+
+- **Every posture input is settable by the thing being checked.**
+  `opencode_config_path()` builds its path from `$XDG_CONFIG_HOME`. Measured:
+  with that variable pointed elsewhere, a real drifted config
+  (`bash`+`webfetch`+`external_directory` = `allow`) is invisible and `posture`
+  reports ok. A missing config file and a config path that is a directory both
+  read as clean, and the object form `{"bash": {"*": "allow"}}` is not
+  recognised, because the check is an exact string test. Malformed JSON shapes
+  no longer crash out of `posture()` — they are faults now, which is what the
+  exit-code contract requires — but the gap itself is not staleness and not
+  parsing: it is that the check consults a path the delegated agent can move.
+  Closing it needs the config to be read from a location the agent cannot
+  redirect, which the guard cannot arrange on its own.
+
+- **The policy that governs the guard is a workspace file the delegated agent
+  can write.** Candidates are `--policy`, `$AIGAUGE_EGRESS_POLICY`, then
+  `<workspace>/.egress-policy.json`. Measured: a planted `.egress-policy.json`
+  with every detector `off`, `destinations.allow: ["*"]` and `audit.path`
+  `/dev/null` dispatches a GitHub token and a path to `~/.aws/credentials` with
+  exit 0. The control and its configuration share a trust boundary with the
+  thing being controlled. `dispatch` now prints and records `policy_source`, so
+  the substitution is at least visible after the fact, but **`--policy` or the
+  environment variable is the only supported source for anything unattended** —
+  a workspace file is a convenience for interactive use.
+
+- **`fnmatch` globs cross `/`.** `openrouter/*` matches `openrouter/a/b/c/d`.
+  Pin exact ids when the depth matters.
+
+- **Regex detection has false negatives by construction**, as this section
+  already says. The review confirmed it: every base64, URL-encoded, split-line
+  and zero-width variant of every credential in its corpus walks through. The
+  guard is a choke point for the plain forms, not a DLP product.
+
+Two smaller items were left as they are and are recorded here rather than
+fixed: an over-cap payload is hashed and counted in full in the audit line but
+only scanned up to the cap, and the line says so in its `refusals` field rather
+than in the hash itself; and `_scan_paths` still strips `a/` and `b/` diff
+prefixes from every path-shaped token, so a real top-level directory called `a`
+or `b` is matched by its suffix.
