@@ -67,6 +67,15 @@ class ScrapeRunner:
                     provider=self._account_id,
                     status=SnapshotStatus.ERROR,
                     error=error or "no data extracted",
+                    # The scraper labels a timeout it measured across a
+                    # machine suspend. Carrying the label through is what
+                    # lets the scheduler tell "this provider is broken" from
+                    # "this laptop was asleep".
+                    error_class=(
+                        result.get("classification")
+                        if isinstance(result, dict)
+                        else None
+                    ),
                     raw=result if isinstance(result, dict) else {},
                 )
                 self._log.warning(

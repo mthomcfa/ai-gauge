@@ -68,6 +68,44 @@ def test_scrape_runner_passes_ok_snapshot_through(fake_scraper):
     assert len(fake_scraper.instances) == 1
 
 
+def test_a_resume_artifact_reaches_the_snapshot_as_one(fake_scraper):
+    """The scraper names a timeout that was measured across a machine
+    suspend; the snapshot has to carry the label, or the scheduler above
+    cannot tell it from a provider that genuinely failed."""
+    received: list[UsageSnapshot] = []
+    rn = ScrapeRunner(
+        account_id="claude",
+        url="http://example",
+        extractor_js="",
+        build=lambda payload: _ok_snapshot(),
+        log=logging.getLogger("test"),
+    )
+    rn.run(received.append)
+
+    fake_scraper.instances[0].done.emit(
+        {"load_failed": True, "classification": "resume_artifact"}, "timeout"
+    )
+
+    assert received[0].status == SnapshotStatus.ERROR
+    assert received[0].error_class == "resume_artifact"
+
+
+def test_an_ordinary_failure_carries_no_error_class(fake_scraper):
+    received: list[UsageSnapshot] = []
+    rn = ScrapeRunner(
+        account_id="claude",
+        url="http://example",
+        extractor_js="",
+        build=lambda payload: _ok_snapshot(),
+        log=logging.getLogger("test"),
+    )
+    rn.run(received.append)
+
+    fake_scraper.instances[0].done.emit({"load_failed": True}, "timeout")
+
+    assert received[0].error_class is None
+
+
 def test_scrape_runner_retries_on_build_error(fake_scraper):
     received: list[UsageSnapshot] = []
     calls: list[dict[str, Any]] = []

@@ -46,6 +46,14 @@ def _safe_url(value: Any) -> str:
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))[:300]
 
 
+# A timeout is bounded by a QTimer, so a scrape cannot legitimately run for
+# several times its own budget. When it reports that it did, the clock moved
+# under it: the machine suspended mid-scrape. Observed on a laptop resumed
+# after two days as elapsed_s=228477 against an 80 s budget. The multiple is
+# deliberately wide so a merely slow machine is never misread as a resume.
+RESUME_ARTIFACT_FACTOR = 3.0
+
+
 class HeadlessScraper(QObject):
     """Load a page in an offscreen QWebEngineView, then evaluate JS to extract data.
 
@@ -316,6 +324,21 @@ class HeadlessScraper(QObject):
         # bug through a condition that looked like it covered everything.
         if error and not isinstance(result, dict):
             result = self._load_failure_context(error=error, elapsed_s=elapsed)
+        if error == "timeout" and self._is_resume_artifact(elapsed):
+            # Not the provider failing: the app was suspended mid-scrape and
+            # the wall clock carried on. Labelled here so the scheduler above
+            # does not count it toward that provider's error retry - every
+            # resume used to cost one spurious failure per provider.
+            budget = self._timeout_ms / 1000 * self._max_attempts
+            log.warning(
+                "scrape timeout classification=resume_artifact provider=%s "
+                "elapsed_s=%.1f budget_s=%.1f",
+                self._provider,
+                elapsed,
+                budget,
+            )
+            if isinstance(result, dict):
+                result["classification"] = "resume_artifact"
         if error and error in self._RETRYABLE_ERRORS and self._attempt < self._max_attempts:
             log.warning(
                 "scrape retry provider=%s attempt=%s/%s elapsed=%.1fs error=%s "
@@ -379,6 +402,10 @@ class HeadlessScraper(QObject):
         # Release Chromium resources after connected callbacks have had a
         # chance to clear their Python references.
         QTimer.singleShot(0, self._cleanup)
+
+    def _is_resume_artifact(self, elapsed: float) -> bool:
+        budget = (self._timeout_ms / 1000) * max(1, self._max_attempts)
+        return elapsed > budget * RESUME_ARTIFACT_FACTOR
 
     def _cleanup(self) -> None:
         try:

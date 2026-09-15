@@ -666,6 +666,40 @@ def test_a_caption_change_alone_is_not_a_cadence_change():
     assert _snapshot_signature(before) == _snapshot_signature(after)
 
 
+def test_a_changing_error_message_is_not_a_cadence_change():
+    """The signature hashed snapshot.error verbatim.
+
+    Azure's fail-closed message counts a minute down - "Waiting for the next
+    Azure fetch window (43 min)" - so it differed on every single cycle, which
+    read as "this provider changed": the 30-minute active window was re-armed
+    and _unchanged_cycles was zeroed, for every provider, by a clock. The log
+    shows the result: unchanged_cycles was 0 in 55 of 204 heartbeats and only
+    ever reached 9-12 in a few overnight stretches, so the documented idle
+    backoff almost never engaged. The status is what the cadence is about.
+    """
+    before = UsageSnapshot(
+        provider="azure",
+        status=SnapshotStatus.ERROR,
+        error="Waiting for the next Azure fetch window (43 min).",
+    )
+    after = UsageSnapshot(
+        provider="azure",
+        status=SnapshotStatus.ERROR,
+        error="Waiting for the next Azure fetch window (42 min).",
+    )
+
+    assert _snapshot_signature(before) == _snapshot_signature(after)
+
+
+def test_a_provider_that_starts_failing_is_a_cadence_change():
+    ok = UsageSnapshot(provider="claude", status=SnapshotStatus.OK)
+    broken = UsageSnapshot(
+        provider="claude", status=SnapshotStatus.ERROR, error="boom"
+    )
+
+    assert _snapshot_signature(ok) != _snapshot_signature(broken)
+
+
 def test_the_cadence_signature_still_follows_the_primary_meters():
     before = _snapshot_with(UsageMetric(label="Session", percent_used=64.0))
     after = _snapshot_with(UsageMetric(label="Session", percent_used=65.0))
@@ -785,6 +819,27 @@ def test_an_auth_required_snapshot_clears_that_providers_error_streak():
     )
 
     assert "claude" not in app._error_retry  # noqa: SLF001
+
+
+def test_a_suspend_artifact_is_not_a_failure_either():
+    """A scrape whose clock ran across a machine suspend reports `timeout`
+    with a nonsense elapsed. It is not evidence that the provider is broken,
+    and it used to arm the fast retry once per provider on every resume."""
+    app = _schedule_app_stub()
+
+    app._record_provider_outcome(  # noqa: SLF001
+        UsageSnapshot(
+            provider="claude",
+            status=SnapshotStatus.ERROR,
+            error="timeout",
+            error_class="resume_artifact",
+        )
+    )
+
+    app._schedule_next_refresh()  # noqa: SLF001
+
+    assert "claude" not in app._error_retry  # noqa: SLF001
+    assert app._timer.started_ms > 65_000  # noqa: SLF001
 
 
 def test_a_provider_waiting_on_its_own_throttle_is_not_a_failure():

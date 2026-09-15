@@ -66,6 +66,7 @@ class _LoadFailStandIn:
 
     _load_failure_context = HeadlessScraper._load_failure_context
     _finish = HeadlessScraper._finish
+    _is_resume_artifact = HeadlessScraper._is_resume_artifact
     _cleanup = lambda self: None  # noqa: E731 - no Qt objects to tear down
 
     def __init__(self):
@@ -80,6 +81,7 @@ class _LoadFailStandIn:
         self._attempt = 1
         self._render_terminated = False
         self._started_at = 0.0
+        self._timeout_ms = 25000
         self._max_attempts = 1
         self._RETRYABLE_ERRORS = ()
 
@@ -238,6 +240,53 @@ def test_every_payloadless_failure_carries_context(error, payload):
     assert result["failure"] == error
     assert result["load_error_string"] == "net::ERR_ABORTED"
     assert "elapsed_s" in result
+
+
+def test_a_timeout_measured_across_a_suspend_is_named_as_one(caplog):
+    """A laptop resumed after two days reported elapsed_s: 228477.
+
+    The scraper bounds itself with a wall-clock timer, so a scrape in flight
+    when the lid closes reports `timeout` on resume with a nonsense elapsed.
+    That was an ordinary ERROR snapshot, which then armed the fast retry - one
+    spurious failure per provider on every resume. Naming it is enough: the
+    scrape still failed, it just did not earn a retry it had not lost.
+    """
+    import logging
+
+    stand_in = _LoadFailStandIn()
+    stand_in._started_at = 0.0  # monotonic zero: elapsed is hours, not seconds
+
+    with caplog.at_level(logging.WARNING, logger="aigauge.webview.scraper"):
+        HeadlessScraper._finish(stand_in, None, "timeout")
+
+    result, _error = stand_in.finished_with
+    assert result["classification"] == "resume_artifact"
+    assert "classification=resume_artifact" in caplog.text
+
+
+def test_an_ordinary_timeout_is_not_called_a_resume_artifact():
+    import time
+
+    stand_in = _LoadFailStandIn()
+    # Timed out at its own budget, as a slow page does.
+    stand_in._started_at = time.monotonic() - 26.0
+
+    HeadlessScraper._finish(stand_in, None, "timeout")
+
+    result, _error = stand_in.finished_with
+    assert "classification" not in result
+
+
+def test_a_page_that_failed_to_load_is_never_a_resume_artifact():
+    """Only a timeout can be measured across a suspend; every other failure
+    is reported by Chromium at the moment it happens."""
+    stand_in = _LoadFailStandIn()
+    stand_in._started_at = 0.0
+
+    HeadlessScraper._finish(stand_in, None, "page failed to load")
+
+    result, _error = stand_in.finished_with
+    assert "classification" not in result
 
 
 def test_success_is_never_given_a_failure_context():

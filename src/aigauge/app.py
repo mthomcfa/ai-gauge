@@ -201,10 +201,17 @@ def _snapshot_signature(snapshot: UsageSnapshot) -> tuple:
     ``_unchanged_cycles`` and pushed the whole app back into active-cadence
     polling — for one cent, or for the clock. The label and the rounded
     percentage are what the cadence is about.
+
+    ``snapshot.error`` is absent for exactly the same reason, and it leaked
+    the same defect back in: Azure's fail-closed message counts a minute down
+    ("Waiting for the next Azure fetch window (43 min)"), so it differed on
+    every cycle and re-armed the 30-minute active window for every provider,
+    on a clock. The *status* is what the cadence is about — a provider that
+    starts failing, or stops, is a change; a failure whose wording moved is
+    not. The message itself still reaches the tile, the tooltip and the log.
     """
     return (
         snapshot.status.value,
-        snapshot.error,
         tuple(
             (
                 metric.label,

@@ -529,6 +529,13 @@ unnecessary source of behaviour change.
   `Credits (12.5/1500)` have the original shape. A stable `key` field on
   `UsageMetric`, used by `history` and `ratio`, is the repo-wide fix and was
   out of scope here.
+  **Still parked after 1.3.0+cfa.5**, deliberately: the cadence signature
+  (`app._snapshot_signature`) hashes `metric.label` for the same reason, so
+  OpenRouter's and Copilot's money-bearing labels can still count as "this
+  provider changed" and hold the app in its active window. Dropping
+  `snapshot.error` from the signature removed the worst leak (Azure's minute
+  countdown) with one clamp; the label half is the same repo-wide `key`
+  decision and does not belong bundled with a cadence fix.
 
 - **One CI job segfaulted in a native thread, once, and the cause is not
   pinned.** Run 67 on `aab1de9` died with `Fatal Python error: Segmentation
