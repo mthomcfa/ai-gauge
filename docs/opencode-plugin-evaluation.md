@@ -316,13 +316,32 @@ policy has to name its destinations deliberately, and the shipped example
 policy starts empty rather than naming a broker by wildcard. `--model
 openrouter/x` against an Anthropic-only allowlist is refused before the payload
 is gathered — which matters because `--include-diff` runs `git`, and the
-decision is therefore taken before anything is executed in the workspace.
+decision is therefore taken before git is invoked at all.
+
+`--include-diff` needs `--base <ref>` and diffs `<base>...HEAD`: two commit
+trees, never the worktree. A workspace the delegated agent can write can also
+name a command for git to run — `diff.external`, `core.pager`, `core.fsmonitor`,
+`core.hooksPath` and any `filter.<name>.clean`/`.process` — and `--include-diff`
+was all the operator had to type for it to run. The enumerable keys are emptied
+on the argv, every `GIT_*` variable is dropped from the child's environment and
+the global and system config files are pointed at the null device; but a filter
+driver can be called anything, so the names cannot be enumerated, and git runs a
+clean filter whenever it has to turn a worktree file into a blob. Diffing
+commits means it never has to. `git status` is gone with it, and with it the
+`.git/index` rewrite it forced. **Uncommitted work is therefore not in the
+payload**: commit first, or pass the text with `--task` or `--stdin`.
 
 `destinations.server` is where the bytes actually go, and it is parsed rather
 than prefix-matched: userinfo, an empty host, a non-numeric port or a scheme
 other than `http` all refuse, and the host must be a loopback address or the
 literal `localhost`. A name that merely *begins* with `127.0.0.1` is a public
-DNS name and is refused. Note the glob semantics that remain: `*` crosses `/`,
+DNS name and is refused. The pin holds at the socket too: a redirect is refused
+rather than followed, so a loopback server that answers `/session` and then
+302s the message POST cannot walk this process — and the `Authorization: Basic`
+header `posture` requires — off the box; the refusal names the host it was
+being sent to, exits 3 and records `verdict: error` in the audit trail. The
+opener carries an empty proxy handler, so `http_proxy` cannot redirect the
+loopback hop either. Note the glob semantics that remain: `*` crosses `/`,
 so `openrouter/*` matches `openrouter/a/b/c` as well as `openrouter/a`.
 
 **Content.** The payload is scanned for credential shapes (private keys,
@@ -332,15 +351,25 @@ Bearer` headers, the Entra client-secret shape, and this repo's own keyring
 entries and session cookies), for secret-looking assignments, for
 classification banners, for PII, and for high-entropy tokens that match no
 named format — with the entropy floor set above 4.0 so git SHAs and checksums
-do not flood the report. Path rules fire on the *mention* of a denied path, so
-"read `config/.env` and tell me what's in it" is caught even though no secret
-is in the text yet. Each rule is `block`, `redact`, `warn` or `off`,
-overridable per repository; the unnamed-credential catch-all defaults to
+do not flood the report. A secret-looking assignment needs a credential-shaped
+*value* as well as a credential-shaped name: quoted, or an unquoted run carrying
+a digit or a base64 character, and never a call, so `token = get_token(tenant)`
+and `secret_edit = QLineEdit()` are not findings. The keyring rule needs the
+lookup and not just the two names. Every pattern is bounded or possessive and a
+test fails the build on any that is not: an unbounded quantifier over a class
+the next term can also match is quadratic, and a hook that cannot answer inside
+its timeout does not block anything. Path rules fire on the *mention* of a
+denied path, so "read `config/.env` and tell me what's in it" is caught even
+though no secret is in the text yet. Each rule is `block`, `redact`, `warn` or
+`off`, overridable per repository; the unnamed-credential catch-all defaults to
 `redact`, and `warn` prints the finding rather than passing it silently.
 
 The payload is truncated to `limits.max_payload_bytes` *before* it is scanned,
-in every command, and each says when it did so. `hook` blocks a prompt it could
-not read in full: a scanner that does not finish cannot refuse.
+in every command, and each says when it did so — and every command refuses what
+it could not finish reading, `scan` included, with a `payload-truncated`
+blocking finding. A scanner that does not finish cannot say "clean". A cap below
+1 024 bytes is a configuration fault: `0` used to mean "no cap", which is the
+unbounded scan the cap exists to prevent.
 
 **Posture.** Before every dispatch it re-checks that the OpenCode server is
 loopback, that `OPENCODE_SERVER_PASSWORD` is set, that the workspace is inside
@@ -349,7 +378,8 @@ an allowed root, and — this is finding A1 — that
 `external_directory` unprompted. The plugin re-applies that config on every
 server start, so this check is the thing that notices it came back.
 
-**Audit.** Every `preflight` and `dispatch` decision appends a JSON line:
+**Audit.** Every `preflight` and `dispatch` decision appends a JSON line, both
+of them carrying the policy source:
 timestamp, workspace, policy source, `--model` label, the parsed `host:port` of
 `destinations.server` that received the payload, SHA-256 and byte count of the
 payload, the rules that fired, and the verdict. Hashes and rule names only —
@@ -371,12 +401,13 @@ sent.
 ### Using it
 
 ```bash
-# what is in this payload?
+# what is in this payload? (2 if it carries something, or if it is over the
+# cap and could not be scanned in full)
 git diff | python tools/egress_guard.py scan --stdin
 
 # would this be allowed, and record the decision, without sending
 python tools/egress_guard.py preflight --task "port the meter catalog" \
-    --include-diff --model openrouter/qwen/qwen3-coder
+    --include-diff --base origin/main --model openrouter/qwen/qwen3-coder
 
 # send it, if and only if policy allows
 python tools/egress_guard.py dispatch --task "..." --model openrouter/qwen/qwen3-coder
@@ -386,12 +417,15 @@ python tools/egress_guard.py posture
 ```
 
 Exit codes are `0` allowed, `2` blocked by policy, `3` posture or configuration
-fault, so it composes into a script or a CI step. A configuration fault is one
-line on stderr and no traceback: a malformed policy, a missing explicit
-`--policy`, a non-numeric limit, an unknown rule action, a `--base` that is not
-a plain ref, a missing `git`, and an audit trail that cannot be written are all
-`3`. `preflight` without `--model` is a fault too, rather than "allowed"
-without consulting the allowlist.
+fault, so it composes into a script or a CI step. A usage error — a mistyped
+subcommand or flag — is `3` as well, so a wrapper keyed on `-eq 2` cannot read a
+typo as a refusal. A configuration fault is one line on stderr and no
+traceback: a malformed policy, a missing explicit `--policy`, a non-numeric or
+too-small limit, an unknown rule action, a `--base` that is not a plain ref,
+`--include-diff` without one, a missing `git`, a redirect off the pinned host,
+and an audit trail that cannot be written are all `3`. `preflight` without
+`--model` is a fault too, rather than "allowed" without consulting the
+allowlist.
 
 ### Wiring it in as a hook
 
@@ -400,8 +434,12 @@ A guard only guards what goes through it. `hook` mode plugs into Claude Code's
 `Bash` commands that invoke a delegating agent — `opencode-companion.mjs`,
 `opencode` as a command token, `npx opencode-ai`, `$(which opencode)`, a
 path-prefixed binary, and any of them with flags before `run`/`serve`/`server`
-— and it scans prompts handed to sub-agents. Over-blocking is the acceptable
-direction, so a refused command costs a retry through the guard. Every error
+— and it refuses a Bash call that posts straight to the agent's own server,
+because the guard's dispatch path is itself two `POST`s to `/session`, so
+`curl -X POST http://127.0.0.1:4096/session/1/message -d @payload.json` skips
+the guard as surely as running the binary does. It also scans prompts handed to
+sub-agents. Over-blocking is the acceptable direction, so a refused command
+costs a retry through the guard. Every error
 path returns `2`: a hook that cannot parse its own input, or whose policy is
 malformed, must not answer "allow".
 
