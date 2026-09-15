@@ -1,8 +1,8 @@
 {
   "//": "Copy to <repo>/.egress-policy.json and edit. See docs/opencode-plugin-evaluation.md.",
   "destinations": {
-    "//allow": "Deny-by-default. Globs match the provider/model id the agent will use.",
-    "allow": ["openrouter/*", "local/*"],
+    "//allow": "Deny-by-default. Name exact provider/model ids. A broker-wide wildcard such as openrouter/* is not a destination: OpenRouter routes to whichever upstream it chooses, so the recipient becomes a routing outcome rather than a decision.",
+    "allow": [],
     "server": "http://127.0.0.1:4096"
   },
   "rules": {
@@ -22,7 +22,13 @@
       "**/.npmrc",
       "**/.aws/credentials",
       "**/.claude/.credentials.json",
-      "**/secrets/**"
+      "**/secrets/**",
+      "**/.ssh/**",
+      "**/keyrings/**",
+      "**/*.keyring",
+      "**/ai-gauge/profiles/**",
+      "**/secrets.dat",
+      "**/auth.json"
     ],
     "//workspace_roots": "Empty means any workspace. Set it to pin delegation to known trees.",
     "workspace_roots": []

@@ -24,6 +24,7 @@ without the app's dependencies.
 from __future__ import annotations
 
 import argparse
+import base64
 import fnmatch
 import hashlib
 import ipaddress
@@ -31,6 +32,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -137,6 +139,15 @@ _DEFAULT_DENY_GLOBS: tuple[str, ...] = (
     "**/.aws/credentials",
     "**/.claude/.credentials.json",
     "**/secrets/**",
+    # This repo's own stores, per SECURITY.md: the DPAPI cookie file, the
+    # per-account browser profiles that hold live session cookies, the Secret
+    # Service keyrings behind `keyring`, and the agents' own credential files.
+    "**/.ssh/**",
+    "**/keyrings/**",
+    "**/*.keyring",
+    "**/ai-gauge/profiles/**",
+    "**/secrets.dat",
+    "**/auth.json",
 )
 
 # Path-shaped runs are found by scanning for separators and expanding within a
@@ -307,10 +318,27 @@ def shannon_entropy(text: str) -> float:
     return -sum((c / n) * math.log2(c / n) for c in counts.values())
 
 
+_RUN_SALT = secrets.token_bytes(16)  # per process, held in memory, never written
+
+
+def _length_bucket(size: int) -> str:
+    for edge in (8, 16, 32, 64, 128, 256):
+        if size <= edge:
+            return f"<={edge} chars"
+    return ">256 chars"
+
+
 def _mask(matched: str) -> str:
-    """A stable, non-reversible handle for a match, so reports carry no secret."""
-    digest = hashlib.sha256(matched.encode("utf-8")).hexdigest()[:8]
-    return f"<{len(matched)} chars, sha256:{digest}>"
+    """A stable, non-reversible handle for a match, so reports carry no secret.
+
+    Salted per run. An unsalted `sha256(value)[:8]` is a dictionary-verifiable
+    oracle for a low-entropy value - an email address, a person's name, a short
+    password - and the exact character count narrows it further. The handle is
+    stable within one run, which is all a report needs, and meaningless outside
+    it.
+    """
+    digest = hashlib.sha256(_RUN_SALT + matched.encode("utf-8")).hexdigest()[:8]
+    return f"<{_length_bucket(len(matched))}, run-salted:{digest}>"
 
 
 def scan(text: str, policy: Policy) -> list[Finding]:
@@ -426,47 +454,91 @@ def _scan_paths(text: str, policy: Policy) -> list[Finding]:
         for glob in globs:
             if _glob_match(normalised, glob):
                 seen.add(normalised)
-                found.append(Finding("denied-path", action, start, end, normalised))
+                found.append(
+                    Finding("denied-path", action, start, end, _path_excerpt(normalised))
+                )
                 break
     return found
 
 
 def _glob_match(path: str, glob: str) -> bool:
-    if fnmatch.fnmatch(path, glob):
+    # Both sides lowered: fnmatch is case-sensitive on POSIX and insensitive on
+    # Windows, so `C:\Users\m\.AWS\CREDENTIALS` was denied on one platform and
+    # passed on the other. A deny list that depends on the case a path was typed
+    # in is not a deny list.
+    lowered = path.lower()
+    pattern = glob.lower()
+    if fnmatch.fnmatchcase(lowered, pattern):
         return True
     # fnmatch has no ** semantics, so "**/x" also has to match a bare "x".
-    if glob.startswith("**/") and fnmatch.fnmatch(path, glob[3:]):
+    if pattern.startswith("**/") and fnmatch.fnmatchcase(lowered, pattern[3:]):
         return True
     return False
 
 
+def _path_excerpt(path: str) -> str:
+    """The basename only. `Finding.excerpt` promises it never carries the
+    matched secret, and a full path carries the local username."""
+    name = path.rstrip("/").rsplit("/", 1)[-1]
+    return f".../{name}" if name else "..."
+
+
 def redact(text: str, findings: Iterable[Finding]) -> tuple[str, int]:
-    """Replace redact-action matches with a stable placeholder, right to left."""
-    targets = sorted((f for f in findings if f.action == REDACT), key=lambda f: f.start, reverse=True)
+    """Replace redact-action matches with a fixed placeholder, right to left.
+
+    The placeholder names the detector and nothing else. It used to carry
+    `sha256(value)[:8]`, unsalted, in the text that was *dispatched* - handing
+    the third party the redaction exists to keep the value from a
+    dictionary-verifiable oracle for it. Any hash stays in the local report,
+    where `_mask` salts it per run.
+    """
+    targets = sorted(
+        (f for f in findings if f.action == REDACT), key=lambda f: f.start, reverse=True
+    )
     out = text
     for finding in targets:
-        digest = hashlib.sha256(out[finding.start : finding.end].encode("utf-8")).hexdigest()[:8]
-        out = f"{out[: finding.start]}[redacted:{finding.rule}:{digest}]{out[finding.end :]}"
+        out = f"{out[: finding.start]}[redacted:{finding.rule}]{out[finding.end :]}"
     return out, len(targets)
 
 
 def destination_allowed(model: str, policy: Policy) -> bool:
+    # fnmatch normcases both sides, so the same allowlist matched differently on
+    # Windows and on POSIX. fnmatchcase over lowered strings is one answer
+    # everywhere. An empty or multi-line model is refused outright: the second
+    # would let one allowed id carry another one behind a newline.
+    if not model or "\n" in model or "\r" in model:
+        return False
     allowed = policy.allowed_destinations
     if not allowed:
         return False
-    return any(fnmatch.fnmatch(model, pattern) for pattern in allowed)
+    target = model.strip().lower()
+    return any(fnmatch.fnmatchcase(target, pattern.strip().lower()) for pattern in allowed)
 
 
-def _get_json(url: str, timeout: float = 5.0) -> Any:
-    request = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - loopback only
-        return json.loads(response.read().decode("utf-8"))
+def _server_auth_headers() -> dict[str, str]:
+    """Basic auth from `OPENCODE_SERVER_PASSWORD`, which posture already demands.
+
+    Without this the guard required a hardening step that made the guard itself
+    unusable - measured against a server that enforces it: `posture ok`, then
+    `dispatch failed: HTTP Error 401`. The practical resolution was to set the
+    variable and leave the server unauthenticated, which turns the check into a
+    ritual.
+    """
+    password = os.environ.get("OPENCODE_SERVER_PASSWORD")
+    if not password:
+        return {}
+    user = os.environ.get("OPENCODE_SERVER_USERNAME", "opencode")
+    token = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
+    return {"Authorization": f"Basic {token}"}
 
 
 def _post_json(url: str, body: dict[str, Any], timeout: float) -> Any:
     payload = json.dumps(body).encode("utf-8")
     request = urllib.request.Request(
-        url, data=payload, headers={"Content-Type": "application/json"}, method="POST"
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json", **_server_auth_headers()},
+        method="POST",
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - loopback only
         return json.loads(response.read().decode("utf-8"))

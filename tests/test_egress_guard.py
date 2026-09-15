@@ -179,6 +179,37 @@ def test_an_ordinary_source_path_is_not_denied():
 
 
 @pytest.mark.parametrize(
+    "path",
+    [
+        "~/.ssh/id_rsa",
+        "~/.ssh/config",
+        "%APPDATA%\\ai-gauge\\profiles\\claude\\Cookies",
+        "C:/Users/m/AppData/Roaming/ai-gauge/secrets.dat",
+        "~/.config/opencode/auth.json",
+        "~/.local/share/keyrings/login.keyring",
+        "C:\\Users\\m\\.AWS\\CREDENTIALS",  # case variant
+        "/home/u/.aws/credentials",
+    ],
+)
+def test_this_repos_own_secret_stores_are_denied(path):
+    """SECURITY.md names these; a guard shipping in this repo denied none of
+    them, and matching was case-sensitive on POSIX."""
+    assert "denied-path" in rules_hit(f"please read {path}")
+
+
+def test_a_denied_path_finding_does_not_carry_the_path(tmp_path):
+    """`Finding.excerpt` promises it never carries the matched secret. The raw
+    path carries the local username."""
+    findings = eg.scan("please read /home/mthom/.aws/credentials now", policy())
+    denied = [f for f in findings if f.rule == "denied-path"]
+    assert denied
+    for finding in denied:
+        assert "mthom" not in finding.excerpt
+        assert "/home/" not in finding.excerpt
+        assert "credentials" in finding.excerpt
+
+
+@pytest.mark.parametrize(
     "text, expected",
     [
         ("a/b", ["a/b"]),
@@ -311,7 +342,50 @@ def test_redacting_several_matches_does_not_corrupt_later_offsets():
     text = "a@x.io and b@y.io and c@z.io"
     out, count = eg.redact(text, eg.scan(text, policy()))
     assert count == 3
-    assert "@" not in out.replace("[redacted:email-address:", "")
+    assert "@" not in out.replace("[redacted:email-address]", "")
+
+
+def test_the_placeholder_sent_to_the_provider_carries_no_hash_of_the_value():
+    """An unsalted sha256 prefix of a low-entropy value is a dictionary-
+    verifiable oracle, handed to the party the redaction exists to keep it from."""
+    import hashlib
+
+    value = "alice.mcgregor@example.org"
+    text = f"contact {value} today"
+    out, _ = eg.redact(text, eg.scan(text, policy()))
+    assert out == "contact [redacted:email-address] today"
+    assert hashlib.sha256(value.encode()).hexdigest()[:8] not in out
+
+
+def test_the_local_report_handle_is_salted_per_run_and_not_an_exact_length():
+    import hashlib
+
+    value = "alice.mcgregor@example.org"
+    masked = eg._mask(value)
+    assert value not in masked
+    assert hashlib.sha256(value.encode()).hexdigest()[:8] not in masked
+    assert f"{len(value)} chars" not in masked
+    assert eg._mask(value) == masked, "stable within a run"
+
+
+def test_the_dispatch_authenticates_with_the_password_posture_demands(monkeypatch):
+    """posture requires OPENCODE_SERVER_PASSWORD; dispatch could not use it, so
+    a server that enforced it answered 401 and the check became a ritual."""
+    monkeypatch.setenv("OPENCODE_SERVER_PASSWORD", "hunter2")
+    monkeypatch.setenv("OPENCODE_SERVER_USERNAME", "opencode")
+    headers = eg._server_auth_headers()
+    assert headers["Authorization"].startswith("Basic ")
+    import base64
+
+    assert base64.b64decode(headers["Authorization"].split()[1]) == b"opencode:hunter2"
+    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD")
+    assert eg._server_auth_headers() == {}
+
+
+def test_no_unused_network_primitive_ships():
+    """In a tool whose mandate is a single pinned egress hop, an outbound HTTP
+    helper that nothing calls should not be in the file."""
+    assert not hasattr(eg, "_get_json")
 
 
 # --- destinations ----------------------------------------------------------
@@ -325,6 +399,33 @@ def test_only_allowlisted_destinations_pass():
     pol = policy(destinations={"allow": ["openrouter/*"]})
     assert eg.destination_allowed("openrouter/meta-llama/llama-3.3-70b", pol) is True
     assert eg.destination_allowed("anthropic/claude-sonnet-4.5", pol) is False
+
+
+@pytest.mark.parametrize(
+    "model, expected",
+    [
+        ("OPENROUTER/x", True),  # fnmatch normcased only on Windows before
+        ("openrouter/x", True),
+        ("", False),
+        ("openrouter/x\nanthropic/evil", False),  # one allowed id smuggling another
+        ("anthropic/x", False),
+    ],
+)
+def test_destination_matching_is_the_same_on_every_platform(model, expected):
+    pol = policy(destinations={"allow": ["openrouter/*"]})
+    assert eg.destination_allowed(model, pol) is expected
+
+
+def test_a_non_list_allowlist_is_a_fault_not_a_crash():
+    with pytest.raises(SystemExit):
+        eg.destination_allowed("openrouter/x", policy(destinations={"allow": None}))
+
+
+def test_the_shipped_example_policy_names_no_destination():
+    """A copy-and-edit starting policy must start empty: a broker-wide wildcard
+    makes the recipient a routing outcome rather than a decision."""
+    example = json.loads((REPO_ROOT / "tools" / "egress-policy.example.json").read_text("utf-8"))
+    assert example["destinations"]["allow"] == []
 
 
 # --- posture ---------------------------------------------------------------
