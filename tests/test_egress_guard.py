@@ -534,18 +534,26 @@ def test_every_quantifier_is_bounded_or_possessive(label, pattern, verbose):
 
 
 def test_the_payload_is_truncated_to_the_cap_before_it_is_scanned():
-    pol = policy(limits={"max_payload_bytes": 16})
-    scanned, was_truncated = eg.truncate("x" * 64, pol)
+    pol = policy(limits={"max_payload_bytes": 1024})
+    scanned, was_truncated = eg.truncate("x" * 4096, pol)
     assert was_truncated is True
-    assert len(scanned) == 16
+    assert len(scanned) == 1024
     assert eg.truncate("short", pol) == ("short", False)
+
+
+@pytest.mark.parametrize("cap", [0, -1, 16, 1023])
+def test_a_cap_below_the_floor_is_a_fault_not_a_disabled_scanner(cap):
+    """`0` meant "no cap", so a workspace policy could restore the unbounded
+    scan the cap exists to prevent."""
+    with pytest.raises(SystemExit):
+        policy(limits={"max_payload_bytes": cap}).max_payload_bytes
 
 
 def test_a_credential_past_the_cap_is_not_what_gets_scanned():
     """A cap that does not gate the scan bounds nothing; one that does has to
     be honest that it did not look at the rest."""
-    pol = policy(limits={"max_payload_bytes": 32})
-    scanned, was_truncated = eg.truncate("A" * 64 + " AKIAIOSFODNN7EXAMPLE", pol)
+    pol = policy(limits={"max_payload_bytes": 1024})
+    scanned, was_truncated = eg.truncate("A" * 2048 + " AKIAIOSFODNN7EXAMPLE", pol)
     assert was_truncated is True
     assert "AKIA" not in scanned
 
@@ -554,7 +562,7 @@ def test_the_hook_scans_at_most_the_cap_and_blocks_what_it_could_not_read(
     tmp_path, monkeypatch, capsys
 ):
     (tmp_path / ".egress-policy.json").write_text(
-        json.dumps({"limits": {"max_payload_bytes": 64}}), encoding="utf-8"
+        json.dumps({"limits": {"max_payload_bytes": 1024}}), encoding="utf-8"
     )
     event = {
         "cwd": str(tmp_path),
@@ -1002,8 +1010,8 @@ def test_a_clean_payload_to_an_allowed_destination_passes(tmp_path, monkeypatch)
 
 def test_an_oversized_payload_is_blocked(tmp_path, monkeypatch):
     _clean_posture(tmp_path, monkeypatch)
-    pol = policy(destinations={"allow": ["openrouter/*"]}, limits={"max_payload_bytes": 16})
-    decision = eg._decide("x" * 64, pol, tmp_path, "openrouter/x")
+    pol = policy(destinations={"allow": ["openrouter/*"]}, limits={"max_payload_bytes": 1024})
+    decision = eg._decide("x" * 4096, pol, tmp_path, "openrouter/x")
     assert decision.verdict == "blocked"
     assert any("max_payload_bytes" in r for r in decision.refusals)
 
@@ -1153,6 +1161,16 @@ def test_audit_appends_rather_than_truncates(tmp_path):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+def test_every_directory_the_audit_trail_creates_is_owner_only(tmp_path):
+    """`mkdir(parents=True, mode=0o700)` applies the mode to the last directory
+    only, so a default audit path created `~/.local/state` world-readable."""
+    target = tmp_path / "state" / "ai-gauge" / "runs" / "audit.jsonl"
+    eg.audit(policy(audit={"path": str(target)}), {"verdict": "allowed"})
+    for directory in (target.parent, target.parent.parent, target.parent.parent.parent):
+        assert directory.stat().st_mode & 0o077 == 0, directory
+
+
 def test_a_new_audit_file_is_owner_only(tmp_path):
     target = tmp_path / "audit.jsonl"
     eg.audit(policy(audit={"path": str(target)}), {"verdict": "allowed"})
@@ -1603,6 +1621,51 @@ def test_scan_exits_non_zero_on_a_blocking_finding(tmp_path, monkeypatch, capsys
     assert "aws-access-key" in capsys.readouterr().out
 
 
+def test_scan_blocks_a_payload_it_could_not_finish_reading(tmp_path, monkeypatch, capsys):
+    """`preflight`, `dispatch` and `hook` all treat truncation as a refusal;
+    `scan` printed a note and exited 0 - in the doc's own `git diff | scan
+    --stdin` example, where a diff over the cap is ordinary."""
+    pol_file = tmp_path / "policy.json"
+    pol_file.write_text(
+        json.dumps({"limits": {"max_payload_bytes": 1024}}), encoding="utf-8"
+    )
+    monkeypatch.setattr(sys, "stdin", _FakeStdin("A" * 2048 + " AKIAIOSFODNN7EXAMPLE"))
+    code = eg.main(["--policy", str(pol_file), "--workspace", str(tmp_path), "scan", "--stdin"])
+    assert code == 2
+    captured = capsys.readouterr()
+    assert "payload-truncated" in captured.out + captured.err
+    assert "blocked" in captured.err
+
+
+def test_the_truncation_finding_is_in_the_json_report_too(tmp_path, monkeypatch, capsys):
+    pol_file = tmp_path / "policy.json"
+    pol_file.write_text(
+        json.dumps({"limits": {"max_payload_bytes": 1024}}), encoding="utf-8"
+    )
+    monkeypatch.setattr(sys, "stdin", _FakeStdin("A" * 2048))
+    code = eg.main(
+        ["--policy", str(pol_file), "--workspace", str(tmp_path), "scan", "--stdin", "--json"]
+    )
+    assert code == 2
+    records = json.loads(capsys.readouterr().out)
+    assert any(record["rule"] == "payload-truncated" for record in records)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["no-such-subcommand"],
+        ["scan", "--no-such-flag"],
+        [],
+    ],
+)
+def test_a_usage_error_is_a_fault_and_not_a_refusal(argv, capsys):
+    """Exit 2 is "blocked by policy". A wrapper keyed on `-eq 2` read a typo as
+    a refusal."""
+    assert eg.main(argv) == 3
+    assert "fault:" in capsys.readouterr().err
+
+
 def test_scan_exits_zero_on_clean_input(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "stdin", _FakeStdin("just some prose"))
     assert eg.main(["--workspace", str(tmp_path), "scan", "--stdin"]) == 0
@@ -1797,3 +1860,120 @@ def test_preflight_blocks_and_audits_without_sending(tmp_path, monkeypatch):
     record = json.loads((tmp_path / "audit.jsonl").read_text(encoding="utf-8").strip())
     assert record["verdict"] == "blocked"
     assert "github-token" in {f["rule"] for f in record["findings"]}
+    # The doc says every decision line carries the policy source, and the
+    # command meant to be run *before* a dispatch is where it matters: a
+    # substituted policy is only visible after the fact through this field.
+    assert record["policy_source"] == str(pol_file)
+
+
+# --- controls with no test of their own ------------------------------------
+
+
+@pytest.mark.parametrize(
+    "server",
+    [
+        "http://127.0.0.1:4096@evil.example",
+        "http://user:pass@127.0.0.1:4096",
+        "http://127.0.0.1%[email protected]",
+    ],
+)
+def test_userinfo_never_names_the_destination(server):
+    """`127.0.0.1` in the userinfo of a URL is a credential, not a host."""
+    assert eg._split_server(server) is None
+    assert eg._is_loopback(server) is False
+
+
+def test_the_diff_never_runs_an_external_driver_even_if_one_is_configured(tmp_path, monkeypatch):
+    """`-c diff.external=` and `--no-ext-diff` are two controls; a test that
+    only sees "no sentinel" cannot tell which one is doing the work."""
+    repo = _git_repo(tmp_path)
+    seen: list[list[str]] = []
+    import subprocess as _subprocess
+
+    def record(argv, **kwargs):
+        seen.append(argv)
+        return _subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(eg.subprocess, "run", record)
+    eg.build_payload(
+        eg.build_parser().parse_args(["scan", "--include-diff", "--base", "main"]), repo
+    )
+    diffs = [argv for argv in seen if "diff" in argv]
+    assert diffs
+    for argv in diffs:
+        assert "--no-ext-diff" in argv and "--no-textconv" in argv
+        assert "diff.external=" in argv
+
+
+def test_a_base_is_checked_against_the_repository_and_not_just_its_shape(tmp_path, monkeypatch):
+    """`rev-parse --verify` is the second line behind the shape check: a ref
+    that looks fine and names nothing must not reach `git diff`."""
+    repo = _git_repo(tmp_path)
+    calls: list[tuple[str, ...]] = []
+
+    def record(workspace, *args):
+        calls.append(args)
+        if args[0] == "rev-parse":
+            raise eg.Fault("git rev-parse failed")
+        return ""
+
+    monkeypatch.setattr(eg, "_git", record)
+    with pytest.raises(SystemExit):
+        eg.build_payload(
+            eg.build_parser().parse_args(
+                ["scan", "--include-diff", "--base", "no-such-ref"]
+            ),
+            repo,
+        )
+    assert any(call[0] == "rev-parse" for call in calls)
+    assert not any(call[0] == "diff" for call in calls), "the diff ran on an unverified base"
+
+
+def test_git_is_resolved_on_the_path_before_it_is_run(tmp_path, monkeypatch):
+    """AG-09 in this repository: an absolute path from `shutil.which`, so a
+    `git` planted in the working directory is not the one that runs."""
+    monkeypatch.setattr(eg.shutil, "which", lambda name: None)
+    with pytest.raises(SystemExit):
+        eg._git(tmp_path, "diff")
+
+    resolved: list[str] = []
+    monkeypatch.setattr(eg.shutil, "which", lambda name: resolved.append(name) or "/usr/bin/git")
+    import subprocess as _subprocess
+
+    monkeypatch.setattr(
+        eg.subprocess, "run", lambda argv, **kw: _subprocess.CompletedProcess(argv, 0, "", "")
+    )
+    eg._git(tmp_path, "diff")
+    assert resolved == ["git"]
+
+
+def test_the_server_password_is_never_printed(tmp_path, monkeypatch, capsys):
+    """The password `posture` demands is the one a redirect would carry off the
+    box; it must not be in the output either."""
+    _clean_posture(tmp_path, monkeypatch)
+    monkeypatch.setenv("OPENCODE_SERVER_PASSWORD", "super-secret-server-password")
+    recorder = _Recorder()
+    monkeypatch.setattr(eg, "_post_json", recorder)
+    pol_file = tmp_path / "policy.json"
+    pol_file.write_text(
+        json.dumps(
+            {
+                "destinations": {"allow": ["openrouter/*"], "server": "http://127.0.0.1:4096"},
+                "audit": {"path": str(tmp_path / "audit.jsonl")},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys, "stdin", _FakeStdin("rename the timer field"))
+    assert eg.main(
+        [
+            "--policy", str(pol_file), "--workspace", str(tmp_path),
+            "dispatch", "--stdin", "--model", "openrouter/x",
+        ]
+    ) == 0
+    captured = capsys.readouterr()
+    assert "super-secret-server-password" not in captured.out
+    assert "super-secret-server-password" not in captured.err
+    assert "super-secret-server-password" not in (tmp_path / "audit.jsonl").read_text(
+        encoding="utf-8"
+    )

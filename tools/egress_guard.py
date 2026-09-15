@@ -48,6 +48,7 @@ from typing import Any, Iterable
 BLOCK = "block"
 REDACT = "redact"
 WARN = "warn"
+_MIN_PAYLOAD_CAP = 1024  # below this a cap is a fault, not a setting
 _ACTIONS = (BLOCK, REDACT, WARN)
 
 # Every quantifier below is bounded (`{m,n}`) or possessive (`{m,}+`, Python
@@ -345,9 +346,19 @@ class Policy:
     def max_payload_bytes(self) -> int:
         raw = self.data.get("limits", {}).get("max_payload_bytes", 0)
         try:
-            return int(raw)
+            value = int(raw)
         except (TypeError, ValueError) as exc:
             raise Fault(f"policy: limits.max_payload_bytes is not a number: {raw!r}") from exc
+        # `0` used to mean "no cap", which let a workspace policy restore the
+        # unbounded scan the cap exists to prevent - and a cap of a few bytes
+        # means every payload is refused for being unreadable. Both are
+        # configuration faults rather than settings.
+        if value < _MIN_PAYLOAD_CAP:
+            raise Fault(
+                f"policy: limits.max_payload_bytes must be at least {_MIN_PAYLOAD_CAP} "
+                f"(got {value}); 0 is not 'no cap'"
+            )
+        return value
 
     @property
     def audit_path(self) -> Path:
@@ -942,9 +953,27 @@ def _git(workspace: Path, *args: str) -> str:
     return result.stdout
 
 
+def _mkdir_owner_only(directory: Path) -> None:
+    """Create a directory chain `0700` at every level.
+
+    `mkdir(parents=True, mode=0o700)` applies the mode to the final directory
+    only, so a default audit path created `~/.local/state` world-readable and
+    `ai-gauge` beneath it owner-only.
+    """
+    missing: list[Path] = []
+    probe = directory
+    while not probe.exists():
+        missing.append(probe)
+        if probe.parent == probe:
+            break
+        probe = probe.parent
+    for parent in reversed(missing):
+        parent.mkdir(mode=0o700, exist_ok=True)
+
+
 def audit(policy: Policy, record: dict[str, Any]) -> None:
     path = policy.audit_path
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _mkdir_owner_only(path.parent)
     line = json.dumps(record, sort_keys=True) + "\n"
     # Create restricted before the first write; an existing file keeps its mode
     # (os.open only applies the mode on create). O_NOFOLLOW where the platform
@@ -1037,6 +1066,20 @@ def cmd_scan(args: argparse.Namespace) -> int:
     size = len(payload.encode("utf-8"))
     scanned, was_truncated = truncate(payload, policy)
     findings = scan(scanned, policy)
+    if was_truncated:
+        # `preflight`, `dispatch` and `hook` all treat a payload they could not
+        # finish reading as a refusal; `scan` printed a note and exited 0, in
+        # the doc's own `git diff | scan --stdin` example, where a diff over the
+        # cap is ordinary. A scanner that did not finish cannot say "clean".
+        findings.append(
+            Finding(
+                "payload-truncated",
+                BLOCK,
+                len(scanned),
+                len(scanned),
+                f"only the first {policy.max_payload_bytes} of {size} bytes were scanned",
+            )
+        )
     if args.json:
         print(json.dumps([f.as_record() for f in findings], indent=2))
     else:
@@ -1050,7 +1093,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
         _report(findings, policy, stream=sys.stdout)
     if was_truncated:
         print(
-            f"note: only the first {policy.max_payload_bytes} of {size} bytes were scanned",
+            f"blocked: only the first {policy.max_payload_bytes} of {size} bytes were scanned",
             file=sys.stderr,
         )
     return 2 if any(f.action == BLOCK for f in findings) else 0
@@ -1125,6 +1168,7 @@ def cmd_preflight(args: argparse.Namespace) -> int:
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "command": "preflight",
         "workspace": str(workspace),
+        "policy_source": policy.source,
         "model": args.model,
         "server": server_endpoint(policy.server),
         "payload_sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
@@ -1349,8 +1393,20 @@ def _add_payload_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--base", help="base ref for the diff, e.g. origin/main")
 
 
+class _Parser(argparse.ArgumentParser):
+    """An argparse parser whose usage errors are faults.
+
+    `ArgumentParser.error` exits 2, which is the documented code for "blocked
+    by policy": a wrapper keyed on `-eq 2` read a mistyped subcommand as a
+    refusal. Subparsers inherit this class, so they answer the same way.
+    """
+
+    def error(self, message: str) -> None:  # noqa: D102 - argparse's own contract
+        raise Fault(f"usage: {message} (see --help)")
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="egress_guard", description=__doc__.splitlines()[0])
+    parser = _Parser(prog="egress_guard", description=__doc__.splitlines()[0])
     parser.add_argument("--policy", help="path to a policy JSON file")
     parser.add_argument("--workspace", help="workspace root (default: cwd)")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1383,8 +1439,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
     try:
+        args = build_parser().parse_args(argv)
         return int(args.func(args))
     except Fault as fault:
         print(f"fault: {fault.message}", file=sys.stderr)
