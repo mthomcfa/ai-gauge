@@ -1502,6 +1502,83 @@ def test_a_retry_due_on_a_parked_provider_is_kept_for_when_the_park_lifts(
     assert claude.calls == 2, "the retry it kept never ran"
 
 
+def test_a_manual_refresh_with_nothing_eligible_starts_no_cycle(caplog):
+    """The retry wake stopped opening an empty cycle; the other three entry
+    paths did not.
+
+    A cycle over zero providers blinks "- refreshing" with no fraction and
+    logs a start and an end for a cycle that dispatched nobody. The manual
+    one costs more than flicker: the active-window re-arm sits after the
+    filter and never asked whether anything was left, so clicking Refresh
+    while the only provider is parked pinned the app on the fast cadence for
+    half an hour and zeroed the idle backoff for zero network calls.
+    """
+    claude = _BrowserProvider(_ok("claude"), hold=True)
+    app = _app({"claude": claude})
+
+    app.refresh_now(manual=False)
+    app._watchdogs["claude"].fire()  # noqa: SLF001 - claude is parked
+    assert "claude" in app._abandoned  # noqa: SLF001
+    app._unchanged_cycles = 7  # noqa: SLF001
+    app._active_until = datetime.now() - timedelta(minutes=1)  # noqa: SLF001
+    idle_until = app._active_until  # noqa: SLF001
+    app._widget.refreshing.clear()  # noqa: SLF001
+    app._widget.loading_calls.clear()  # noqa: SLF001
+    calls = claude.calls
+
+    with caplog.at_level(logging.INFO, logger="aigauge.app"):
+        caplog.clear()
+        app.refresh_now(manual=True)
+
+    assert claude.calls == calls, "a parked provider was dispatched"
+    assert "refresh_now nothing_eligible manual=True" in caplog.text
+    assert "refresh cycle start" not in caplog.text
+    assert app._widget.refreshing == [], "the header blinked for nothing"  # noqa: SLF001
+    assert app._widget.loading_calls == []  # noqa: SLF001
+    assert app._unchanged_cycles == 7, "the idle backoff was thrown away"  # noqa: SLF001
+    assert app._active_until == idle_until, (  # noqa: SLF001
+        "half an hour of fast cadence bought zero network calls"
+    )
+    assert app._cycle_active is False  # noqa: SLF001
+    assert app._timer.active is True, "the scheduler was left with no timer"  # noqa: SLF001
+
+
+def test_a_scheduled_refresh_with_nothing_eligible_starts_no_cycle(caplog):
+    claude = _BrowserProvider(_ok("claude"), hold=True)
+    app = _app({"claude": claude})
+
+    app.refresh_now(manual=False)
+    app._watchdogs["claude"].fire()  # noqa: SLF001 - claude is parked
+    app._widget.refreshing.clear()  # noqa: SLF001
+
+    with caplog.at_level(logging.INFO, logger="aigauge.app"):
+        caplog.clear()
+        app.refresh_now(manual=False)
+
+    assert "refresh_now nothing_eligible manual=False" in caplog.text
+    assert "refresh cycle start" not in caplog.text
+    assert app._widget.refreshing == []  # noqa: SLF001
+    assert app._cycle_active is False  # noqa: SLF001
+
+
+def test_a_per_provider_refresh_with_nothing_eligible_starts_no_cycle(caplog):
+    claude = _BrowserProvider(_ok("claude"), hold=True)
+    app = _app({"claude": claude})
+
+    app.refresh_now(manual=False)
+    app._watchdogs["claude"].fire()  # noqa: SLF001 - claude is parked
+    app._widget.refreshing.clear()  # noqa: SLF001
+    app._unchanged_cycles = 4  # noqa: SLF001
+
+    with caplog.at_level(logging.INFO, logger="aigauge.app"):
+        caplog.clear()
+        app.refresh_provider("claude")
+
+    assert "refresh_now nothing_eligible" in caplog.text
+    assert app._widget.refreshing == []  # noqa: SLF001
+    assert app._unchanged_cycles == 4  # noqa: SLF001
+
+
 def test_a_retry_wake_still_runs_the_providers_that_are_not_parked():
     claude = _BrowserProvider(_ok("claude"), hold=True)
     copilot = _Provider(_ok("copilot"))

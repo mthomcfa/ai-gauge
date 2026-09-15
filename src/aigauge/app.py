@@ -1011,6 +1011,20 @@ class App(QObject):
                     "refresh provider skipped provider=%s reason=%s", name, refusal
                 )
         names = wanted
+        if not names:
+            # Nothing runnable. A cycle over zero providers blinked
+            # "- refreshing" on the header with no fraction behind it and
+            # logged a start and an end for a cycle that dispatched nobody -
+            # and a *manual* one was worse, because the active-window re-arm
+            # below runs after the filter and never asked whether anything
+            # was left: clicking Refresh while every provider was parked
+            # pinned the app on the fast cadence for half an hour and threw
+            # away the idle backoff, in exchange for zero network calls.
+            log.info(
+                "refresh_now nothing_eligible manual=%s reason=%s", manual, reason
+            )
+            self._schedule_next_refresh()
+            return
         if manual:
             self._active_until = datetime.now() + timedelta(
                 minutes=_ACTIVE_MODE_MINUTES
