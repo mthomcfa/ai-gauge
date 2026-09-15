@@ -1482,6 +1482,21 @@ class App(QObject):
         self._widget.update_snapshot(
             snapshot, display_name_for_account(self._config, name)
         )
+        # The burn-rate row is hidden by `set_snapshot` on anything but OK, so
+        # a repaint that turns an ERROR tile back into an OK one has to ask
+        # for it again. The *estimator* is not fed: this is an observation
+        # already recorded, or a cached one re-rendered against a new
+        # denominator, and either way recording it twice would move an
+        # average that nothing new happened to.
+        try:
+            self._widget.set_ratio(
+                name,
+                self._ratio.display_estimate(name),
+                self._ratio_recent(name),
+                self._ratio.current_estimate(name),
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("widget.set_ratio failed")
         self._update_tray()
 
     def _on_snapshot(self, payload) -> None:

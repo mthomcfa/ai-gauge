@@ -1115,6 +1115,8 @@ def test_a_late_answer_from_a_slow_provider_repaints_its_tile():
     assert app._snapshots["copilot"].error == "Refresh timed out."  # noqa: SLF001
     assert app._error_retry["copilot"][0] == 1  # noqa: SLF001
     statuses = dict(app._cycle_statuses)  # noqa: SLF001
+    ratios: list[str] = []
+    app._widget.set_ratio = lambda name, *a, **k: ratios.append(name)  # noqa: SLF001
 
     late(
         UsageSnapshot(
@@ -1131,6 +1133,9 @@ def test_a_late_answer_from_a_slow_provider_repaints_its_tile():
     )
     assert app._cycle_statuses == statuses, "a late answer joined a cycle"  # noqa: SLF001
     assert app._cycle_active is False  # noqa: SLF001
+    # `set_snapshot` hides the burn-rate row on anything but OK, so a repaint
+    # back to OK has to ask for it again.
+    assert ratios == ["copilot"], "the burn-rate row stayed hidden"
 
 
 def test_a_late_auth_required_is_still_shown():
@@ -1212,7 +1217,7 @@ def test_a_late_answer_for_a_removed_provider_is_still_dropped():
     assert "copilot" not in app._snapshots, "a removed provider's tile came back"  # noqa: SLF001
 
 
-def test_a_deferred_profile_purge_survives_a_quit(monkeypatch, tmp_path):
+def test_a_deferred_profile_purge_survives_a_quit(monkeypatch):
     """The deferral list was in memory only.
 
     `App` has no `aboutToQuit` hook that flushes it, and once the account is
