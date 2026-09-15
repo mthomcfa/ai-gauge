@@ -675,11 +675,26 @@ class Config(BaseModel):
     azure: AzureConfig = Field(default_factory=AzureConfig)
     expanded_tiles: list[str] = Field(default_factory=list)
     collapsed_tiles: list[str] = Field(default_factory=list)
+    # Accounts the user removed whose on-disk browser profile is still owed a
+    # deletion because a scrape of it was in flight at the time. Kept here so
+    # the deferral survives a quit: the account is gone from
+    # `browser_accounts` by then, and nothing else at the next start looks
+    # for its directory. The ids only ever reach `purge_profile`, which
+    # refuses anything that does not resolve strictly inside
+    # `app_data_dir()/profiles`.
+    pending_profile_purges: list[str] = Field(default_factory=list)
     # When each provider kind last asked its page for every meter it renders,
     # ISO-8601 per kind. Empty (or missing) means the next refresh re-scans -
     # which is also how the Settings "Re-scan meters now" button works.
     meter_catalog_last_scan: dict[str, str] = Field(default_factory=dict)
     window: WindowState = Field(default_factory=WindowState)
+
+    @field_validator("pending_profile_purges", mode="before")
+    @classmethod
+    def _coerce_pending_purges(cls, value: object) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [item for item in value if isinstance(item, str) and item]
 
     @field_validator("meter_catalog_last_scan", mode="before")
     @classmethod

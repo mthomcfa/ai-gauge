@@ -456,6 +456,10 @@ class App(QObject):
         self._settings_old_copilot_quota: int | None = None
         self._install_lifecycle_logging()
 
+        # Anything a previous run left owed, before a cookie is hydrated into
+        # a profile and before a provider exists that could scrape it.
+        self._drain_pending_profile_purges()
+
         # Push any saved session cookies into the WebEngine profiles before any
         # scrape runs, so the headless page loads as signed-in.
         loaded = hydrate_all_from_keyring(self._config)
@@ -1167,11 +1171,46 @@ class App(QObject):
             return False
         return True
 
+    def _drain_pending_profile_purges(self) -> None:
+        """Run what a previous run left owed.
+
+        The deferral list used to be in memory only: `App` has no
+        `aboutToQuit` hook that flushes it, and once the account is gone from
+        `config.json` nothing at the next start looked for its directory -
+        the only sweep of `profiles/` on disk is the manual Settings "Clear
+        all browser data". What survived was the removed account's Chromium
+        profile, which uses `ForcePersistentCookies`, i.e. the live session
+        cookie itself, with no recovery path at all. (The keyring secret is
+        cleared by the dialog at the moment of removal either way.)
+        """
+        pending = list(getattr(self._config, "pending_profile_purges", []) or [])
+        if not pending:
+            return
+        log.info(
+            "profile purge owed from a previous run accounts=%s",
+            ",".join(pending),
+        )
+        for account_id in pending:
+            if account_id not in self._pending_profile_purges:
+                self._pending_profile_purges.append(account_id)
+        self._run_profile_purges()
+
     def _purge_removed_profiles(self, account_ids) -> None:
         for account_id in account_ids:
             if account_id not in self._pending_profile_purges:
                 self._pending_profile_purges.append(account_id)
         self._run_profile_purges()
+
+    def _persist_pending_profile_purges(self) -> None:
+        """Record what is still owed, so a quit cannot lose it."""
+        pending = list(self._pending_profile_purges)
+        if list(getattr(self._config, "pending_profile_purges", []) or []) == pending:
+            return
+        self._config.pending_profile_purges = pending
+        try:
+            self._config.save()
+        except Exception:  # noqa: BLE001 - cleanup must not crash the app
+            log.exception("failed to record the pending profile purges")
 
     def _run_profile_purges(self) -> None:
         """Delete a removed account's profile, once nothing is still using it.
@@ -1202,6 +1241,7 @@ class App(QObject):
             except Exception:  # noqa: BLE001 - cleanup must not crash the app
                 log.exception("failed to purge profile for %s", account_id)
         self._pending_profile_purges = waiting
+        self._persist_pending_profile_purges()
 
     def _pool_wait_slack(self, name: str) -> float:
         """How long this dispatch may sit in the thread pool before it starts.

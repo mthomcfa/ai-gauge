@@ -1210,3 +1210,67 @@ def test_a_late_answer_for_a_removed_provider_is_still_dropped():
     late(_ok("copilot"))
 
     assert "copilot" not in app._snapshots, "a removed provider's tile came back"  # noqa: SLF001
+
+
+def test_a_deferred_profile_purge_survives_a_quit(monkeypatch, tmp_path):
+    """The deferral list was in memory only.
+
+    `App` has no `aboutToQuit` hook that flushes it, and once the account is
+    gone from `config.json` nothing at the next start looks for its
+    directory: the only sweep of `profiles/` on disk is the manual Settings
+    "Clear all browser data". What survives is the account's Chromium
+    profile, which uses `ForcePersistentCookies` - the live session cookie
+    itself - with no recovery path at all. The keyring secret is still
+    cleared at the moment of removal; that half was always right.
+    """
+    from aigauge.config import Config as RealConfig
+
+    purged: list[str] = []
+    monkeypatch.setattr(app_module, "purge_profile", purged.append)
+    claude = _BrowserProvider(_ok("claude-ab12cd34"), hold=True)
+    app = _app({"claude-ab12cd34": claude})
+    app.refresh_now(manual=False)
+
+    app._providers.pop("claude-ab12cd34")  # noqa: SLF001
+    app._purge_removed_profiles(["claude-ab12cd34"])  # noqa: SLF001
+    assert purged == [], "the live scrape still holds the profile"
+
+    # The user quits here. Whatever is still owed must be on disk.
+    saved = RealConfig.load()
+    assert saved.pending_profile_purges == ["claude-ab12cd34"]
+
+    # Next start, before any cookie is hydrated and before any provider runs.
+    fresh = _app({})
+    fresh._config = saved  # noqa: SLF001
+    fresh._drain_pending_profile_purges()  # noqa: SLF001
+
+    assert purged == ["claude-ab12cd34"], "the purge was lost across the quit"
+    assert RealConfig.load().pending_profile_purges == [], (
+        "a purge that ran is still recorded as owed"
+    )
+
+
+def test_a_purge_that_runs_is_taken_off_the_pending_list(monkeypatch):
+    from aigauge.config import Config as RealConfig
+
+    purged: list[str] = []
+    monkeypatch.setattr(app_module, "purge_profile", purged.append)
+    app = _app({})
+
+    app._purge_removed_profiles(["codex-99999999"])  # noqa: SLF001
+
+    assert purged == ["codex-99999999"]
+    assert app._pending_profile_purges == []  # noqa: SLF001
+    assert RealConfig.load().pending_profile_purges == []
+
+
+def test_the_pending_purges_run_before_any_provider_is_built():
+    """Order matters: a provider built first can start a scrape on the very
+    profile that is owed a deletion."""
+    import inspect
+
+    source = inspect.getsource(App.__init__)
+    assert "_drain_pending_profile_purges" in source
+    assert source.index("_drain_pending_profile_purges") < source.index(
+        "self._build_providers()"
+    ), "a provider could be scraping the profile that is owed a deletion"
