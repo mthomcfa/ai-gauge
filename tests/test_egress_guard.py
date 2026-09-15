@@ -314,30 +314,128 @@ def _clean_posture(tmp_path, monkeypatch):
 def test_a_blocking_finding_blocks_the_dispatch(tmp_path, monkeypatch):
     _clean_posture(tmp_path, monkeypatch)
     pol = policy(destinations={"allow": ["openrouter/*"]})
-    verdict, _, _, _ = eg._decide("token ghp_" + "z" * 36, pol, tmp_path, "openrouter/x")
-    assert verdict == "blocked"
+    decision = eg._decide("token ghp_" + "z" * 36, pol, tmp_path, "openrouter/x")
+    assert (decision.verdict, decision.exit_code) == ("blocked", 2)
 
 
 def test_a_clean_payload_to_an_allowed_destination_passes(tmp_path, monkeypatch):
     _clean_posture(tmp_path, monkeypatch)
     pol = policy(destinations={"allow": ["openrouter/*"]})
-    verdict, _, problems, _ = eg._decide("rename the timer field", pol, tmp_path, "openrouter/x")
-    assert (verdict, problems) == ("allowed", [])
+    decision = eg._decide("rename the timer field", pol, tmp_path, "openrouter/x")
+    assert (decision.verdict, decision.problems, decision.refusals) == ("allowed", [], [])
+    assert decision.exit_code == 0
 
 
 def test_an_oversized_payload_is_blocked(tmp_path, monkeypatch):
     _clean_posture(tmp_path, monkeypatch)
     pol = policy(destinations={"allow": ["openrouter/*"]}, limits={"max_payload_bytes": 16})
-    verdict, _, problems, _ = eg._decide("x" * 64, pol, tmp_path, "openrouter/x")
-    assert verdict == "blocked"
-    assert any("max_payload_bytes" in p for p in problems)
+    decision = eg._decide("x" * 64, pol, tmp_path, "openrouter/x")
+    assert decision.verdict == "blocked"
+    assert any("max_payload_bytes" in r for r in decision.refusals)
+
+
+def test_a_refused_destination_is_a_refusal_and_not_a_posture_fault(tmp_path, monkeypatch):
+    """A wrapper keyed on `-eq 2` has to be able to tell the two apart."""
+    _clean_posture(tmp_path, monkeypatch)
+    pol = policy(destinations={"allow": ["anthropic/*"]})
+    decision = eg._decide("rename the timer field", pol, tmp_path, "openrouter/x")
+    assert decision.problems == []
+    assert any("destinations.allow" in r for r in decision.refusals)
+    assert (decision.verdict, decision.exit_code) == ("blocked", 2)
+
+
+def test_a_posture_fault_is_a_fault_and_not_a_block(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
+    pol = policy(destinations={"allow": ["openrouter/*"]})
+    decision = eg._decide("rename the timer field", pol, tmp_path, "openrouter/x")
+    assert (decision.verdict, decision.exit_code) == ("fault", 3)
 
 
 def test_the_dispatched_text_is_the_redacted_text(tmp_path, monkeypatch):
     _clean_posture(tmp_path, monkeypatch)
     pol = policy(destinations={"allow": ["openrouter/*"]})
-    _, _, _, sent = eg._decide("ping ops@example.org", pol, tmp_path, "openrouter/x")
-    assert "ops@example.org" not in sent
+    decision = eg._decide("ping ops@example.org", pol, tmp_path, "openrouter/x")
+    assert "ops@example.org" not in decision.sent
+
+
+# --- the documented exit-code contract -------------------------------------
+
+
+def _contract_policy(tmp_path, **overlay) -> Path:
+    data = {
+        "destinations": {"allow": ["openrouter/*"], "server": "http://127.0.0.1:4096"},
+        "audit": {"path": str(tmp_path / "audit.jsonl")},
+    }
+    eg._deep_update(data, overlay)
+    target = tmp_path / "policy.json"
+    target.write_text(json.dumps(data), encoding="utf-8")
+    return target
+
+
+@pytest.mark.parametrize(
+    "label, overlay",
+    [
+        ("limits.max_payload_bytes is not a number", {"limits": {"max_payload_bytes": "lots"}}),
+        ("destinations.allow is null", {"destinations": {"allow": None}}),
+        ("unknown rule action", {"rules": {"jwt": "ignore"}}),
+    ],
+)
+def test_a_malformed_policy_exits_three_without_a_traceback(
+    label, overlay, tmp_path, monkeypatch, capsys
+):
+    _clean_posture(tmp_path, monkeypatch)
+    pol_file = _contract_policy(tmp_path, **overlay)
+    monkeypatch.setattr(sys, "stdin", _FakeStdin("just some prose"))
+    code = eg.main(
+        [
+            "--policy", str(pol_file), "--workspace", str(tmp_path),
+            "preflight", "--stdin", "--model", "openrouter/x",
+        ]
+    )
+    assert code == 3, label
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_malformed_policy_json_exits_three(tmp_path, monkeypatch, capsys):
+    _clean_posture(tmp_path, monkeypatch)
+    pol_file = tmp_path / "policy.json"
+    pol_file.write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(sys, "stdin", _FakeStdin("prose"))
+    assert eg.main(["--policy", str(pol_file), "--workspace", str(tmp_path), "scan", "--stdin"]) == 3
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_a_missing_explicit_policy_file_exits_three(tmp_path, monkeypatch):
+    _clean_posture(tmp_path, monkeypatch)
+    monkeypatch.setattr(sys, "stdin", _FakeStdin("prose"))
+    missing = tmp_path / "nope.json"
+    assert eg.main(["--policy", str(missing), "--workspace", str(tmp_path), "scan", "--stdin"]) == 3
+
+
+def test_a_posture_fault_on_preflight_exits_three(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
+    pol_file = _contract_policy(tmp_path)
+    monkeypatch.setattr(sys, "stdin", _FakeStdin("prose"))
+    code = eg.main(
+        [
+            "--policy", str(pol_file), "--workspace", str(tmp_path),
+            "preflight", "--stdin", "--model", "openrouter/x",
+        ]
+    )
+    assert code == 3
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink")
+def test_the_audit_path_is_not_followed_through_a_symlink(tmp_path):
+    target = tmp_path / "elsewhere.jsonl"
+    target.write_text("", encoding="utf-8")
+    link = tmp_path / "audit.jsonl"
+    link.symlink_to(target)
+    with pytest.raises(OSError):
+        eg.audit(policy(audit={"path": str(link)}), {"verdict": "allowed"})
+    assert target.read_text(encoding="utf-8") == ""
 
 
 def test_audit_records_the_hash_and_not_the_payload(tmp_path):

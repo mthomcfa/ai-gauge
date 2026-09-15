@@ -16,7 +16,8 @@ Run from the repo root:
     git diff | python tools/egress_guard.py scan --stdin
     python tools/egress_guard.py posture
 
-Exit codes: 0 allowed, 2 blocked by policy, 3 posture or configuration fault.
+Exit codes: 0 allowed, 2 blocked by policy, 3 posture or configuration fault
+(which includes an audit trail that cannot be written: nothing is sent).
 Stdlib only, so it runs from a bare interpreter on Windows, macOS and Linux
 without the app's dependencies.
 """
@@ -125,6 +126,19 @@ _DEFAULT_POLICY: dict[str, Any] = {
 }
 
 
+class Fault(SystemExit):
+    """A configuration or posture fault: exit 3, one line, no traceback.
+
+    It subclasses `SystemExit` so that anything already written to expect a
+    `SystemExit` from the policy layer keeps working, and so that `main` can
+    turn it into the documented exit code instead of a stack trace.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(3)
+        self.message = message
+
+
 @dataclass(frozen=True)
 class Finding:
     rule: str
@@ -147,26 +161,38 @@ class Policy:
         for candidate, label in _policy_candidates(explicit, workspace):
             if candidate is None or not candidate.is_file():
                 continue
+            try:
+                overlay = json.loads(candidate.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+                raise Fault(f"policy: cannot read {candidate}: {exc}") from exc
+            if not isinstance(overlay, dict):
+                raise Fault(f"policy: {candidate} is not a JSON object")
             merged = json.loads(json.dumps(_DEFAULT_POLICY))
-            _deep_update(merged, json.loads(candidate.read_text(encoding="utf-8")))
+            _deep_update(merged, overlay)
             return cls(merged, label)
         if explicit:
-            raise SystemExit(f"policy file not found: {explicit}")
+            raise Fault(f"policy file not found: {explicit}")
         return cls()
 
     def action_for(self, rule: str, default: str) -> str:
-        override = self.data.get("rules", {}).get(rule)
+        rules = self.data.get("rules") or {}
+        if not isinstance(rules, dict):
+            raise Fault("policy: rules must be an object of rule -> action")
+        override = rules.get(rule)
         if override is None:
             return default
         if override == "off":
             return "off"
         if override not in _ACTIONS:
-            raise SystemExit(f"policy: rule {rule!r} has unknown action {override!r}")
+            raise Fault(f"policy: rule {rule!r} has unknown action {override!r}")
         return override
 
     @property
     def allowed_destinations(self) -> list[str]:
-        return list(self.data.get("destinations", {}).get("allow", []))
+        raw = self.data.get("destinations", {}).get("allow", [])
+        if not isinstance(raw, list):
+            raise Fault("policy: destinations.allow must be a list of globs")
+        return [str(item) for item in raw]
 
     @property
     def server(self) -> str:
@@ -174,15 +200,25 @@ class Policy:
 
     @property
     def deny_globs(self) -> list[str]:
-        return list(self.data.get("paths", {}).get("deny", []))
+        raw = self.data.get("paths", {}).get("deny", [])
+        if not isinstance(raw, list):
+            raise Fault("policy: paths.deny must be a list of globs")
+        return [str(item) for item in raw]
 
     @property
     def workspace_roots(self) -> list[str]:
-        return list(self.data.get("paths", {}).get("workspace_roots", []))
+        raw = self.data.get("paths", {}).get("workspace_roots", [])
+        if not isinstance(raw, list):
+            raise Fault("policy: paths.workspace_roots must be a list of paths")
+        return [str(item) for item in raw]
 
     @property
     def max_payload_bytes(self) -> int:
-        return int(self.data.get("limits", {}).get("max_payload_bytes", 0))
+        raw = self.data.get("limits", {}).get("max_payload_bytes", 0)
+        try:
+            return int(raw)
+        except (TypeError, ValueError) as exc:
+            raise Fault(f"policy: limits.max_payload_bytes is not a number: {raw!r}") from exc
 
     @property
     def audit_path(self) -> Path:
@@ -429,8 +465,11 @@ def posture(policy: Policy, workspace: Path) -> list[str]:
     forbidden = policy.data.get("posture", {}).get("forbid_permission_allow", [])
     if config_path.is_file() and forbidden:
         try:
-            permissions = json.loads(config_path.read_text(encoding="utf-8")).get("permission", {})
-        except (json.JSONDecodeError, OSError) as exc:
+            parsed = json.loads(config_path.read_text(encoding="utf-8"))
+            permissions = parsed.get("permission", {}) if isinstance(parsed, dict) else {}
+            if not isinstance(permissions, dict):
+                permissions = {}
+        except Exception as exc:  # an unreadable config is a fault, not a crash
             problems.append(f"cannot read {config_path}: {exc}")
         else:
             drifted = [key for key in forbidden if permissions.get(key) == "allow"]
@@ -484,15 +523,14 @@ def _git(workspace: Path, *args: str) -> str:
 
 def audit(policy: Policy, record: dict[str, Any]) -> None:
     path = policy.audit_path
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     line = json.dumps(record, sort_keys=True) + "\n"
-    # Create restricted before the first write; an existing file keeps its mode.
-    if not path.exists():
-        handle = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
-        with os.fdopen(handle, "a", encoding="utf-8") as fh:
-            fh.write(line)
-        return
-    with path.open("a", encoding="utf-8") as fh:
+    # Create restricted before the first write; an existing file keeps its mode
+    # (os.open only applies the mode on create). O_NOFOLLOW where the platform
+    # has it, so a symlink planted at the audit path cannot redirect the trail.
+    flags = os.O_CREAT | os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+    handle = os.open(path, flags, 0o600)
+    with os.fdopen(handle, "a", encoding="utf-8") as fh:
         fh.write(line)
 
 
@@ -507,17 +545,47 @@ def _report(findings: list[Finding], policy: Policy, stream=sys.stderr) -> None:
         print(f"    at {finding.start}: {finding.rule} {finding.excerpt}", file=stream)
 
 
-def _decide(
-    payload: str, policy: Policy, workspace: Path, model: str | None
-) -> tuple[str, list[Finding], list[str], str]:
+@dataclass
+class Decision:
+    """What the guard decided, and which documented exit code says so.
+
+    `problems` and `refusals` are kept apart because they mean different things
+    to a caller: a posture or configuration fault is "the guard could not do
+    its job" (exit 3), a refusal is "the guard did its job and said no"
+    (exit 2). A wrapper keyed on `-eq 2` must not read the first as the second.
+    """
+
+    verdict: str  # "allowed" | "blocked" | "fault"
+    findings: list[Finding]
+    problems: list[str]  # posture / configuration -> exit 3
+    refusals: list[str]  # policy said no -> exit 2
+    sent: str  # the redacted text, i.e. what would actually be dispatched
+
+    @property
+    def exit_code(self) -> int:
+        return {"allowed": 0, "blocked": 2, "fault": 3}[self.verdict]
+
+    @property
+    def faults(self) -> list[str]:
+        """Everything worth printing, faults first."""
+        return [*self.problems, *self.refusals]
+
+
+def _decide(payload: str, policy: Policy, workspace: Path, model: str | None) -> Decision:
     problems = posture(policy, workspace)
+    refusals: list[str] = []
 
     size = len(payload.encode("utf-8"))
     if policy.max_payload_bytes and size > policy.max_payload_bytes:
-        problems.append(f"payload is {size} bytes, over limits.max_payload_bytes")
+        refusals.append(
+            f"payload is {size} bytes, over limits.max_payload_bytes "
+            f"({policy.max_payload_bytes})"
+        )
 
-    if model is not None and not destination_allowed(model, policy):
-        problems.append(
+    if model is None:
+        problems.append("no --model given, so no destination could be checked")
+    elif not destination_allowed(model, policy):
+        refusals.append(
             f"destination {model!r} is not in destinations.allow "
             f"({policy.allowed_destinations or 'empty - nothing is allowed'})"
         )
@@ -526,9 +594,11 @@ def _decide(
     redacted, _ = redact(payload, findings)
 
     blocked = [f for f in findings if f.action == BLOCK]
-    if blocked or problems:
-        return "blocked", findings, problems, redacted
-    return "allowed", findings, problems, redacted
+    if problems:
+        return Decision("fault", findings, problems, refusals, redacted)
+    if blocked or refusals:
+        return Decision("blocked", findings, problems, refusals, redacted)
+    return Decision("allowed", findings, problems, refusals, redacted)
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
@@ -561,7 +631,7 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace or os.getcwd())
     policy = Policy.load(args.policy, workspace)
     payload = build_payload(args, workspace)
-    verdict, findings, problems, _ = _decide(payload, policy, workspace, args.model)
+    decision = _decide(payload, policy, workspace, args.model)
 
     record = {
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -571,51 +641,76 @@ def cmd_preflight(args: argparse.Namespace) -> int:
         "server": server_endpoint(policy.server),
         "payload_sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
         "payload_bytes": len(payload.encode("utf-8")),
-        "verdict": verdict,
-        "findings": [f.as_record() for f in findings],
-        "posture": problems,
+        "verdict": decision.verdict,
+        "findings": [f.as_record() for f in decision.findings],
+        "posture": decision.problems,
+        "refusals": decision.refusals,
     }
-    audit(policy, record)
 
     print(f"policy: {policy.source}")
-    print(f"verdict: {verdict}")
-    for problem in problems:
+    print(f"verdict: {decision.verdict}")
+    for problem in decision.faults:
         print(f"  fault  {problem}", file=sys.stderr)
-    _report(findings, policy, stream=sys.stderr)
-    return 0 if verdict == "allowed" else 2
+    _report(decision.findings, policy, stream=sys.stderr)
+    try:
+        audit(policy, record)
+    except OSError as exc:
+        print(f"fault: the audit trail could not be written ({exc})", file=sys.stderr)
+        return 3
+    return decision.exit_code
 
 
 def cmd_dispatch(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace or os.getcwd())
     policy = Policy.load(args.policy, workspace)
     payload = build_payload(args, workspace)
-    verdict, findings, problems, redacted = _decide(payload, policy, workspace, args.model)
+    decision = _decide(payload, policy, workspace, args.model)
 
     started = time.time()
     record: dict[str, Any] = {
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "command": "dispatch",
         "workspace": str(workspace),
+        "policy_source": policy.source,
         "model": args.model,
         "server": server_endpoint(policy.server),
         "payload_sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
         "payload_bytes": len(payload.encode("utf-8")),
-        "verdict": verdict,
-        "findings": [f.as_record() for f in findings],
-        "posture": problems,
+        "verdict": decision.verdict,
+        "findings": [f.as_record() for f in decision.findings],
+        "posture": decision.problems,
+        "refusals": decision.refusals,
     }
 
-    if verdict != "allowed":
-        audit(policy, record)
+    print(f"policy: {policy.source}", file=sys.stderr)
+    if decision.verdict != "allowed":
         print("verdict: blocked - nothing was sent", file=sys.stderr)
-        for problem in problems:
+        for problem in decision.faults:
             print(f"  fault  {problem}", file=sys.stderr)
-        _report(findings, policy, stream=sys.stderr)
-        return 2
+        _report(decision.findings, policy, stream=sys.stderr)
+        # An unwritable audit path is a configuration fault in both directions:
+        # the refusal still stands, but the operator is told the code means
+        # "the guard could not finish its job", not "policy said no".
+        try:
+            audit(policy, record)
+        except OSError as exc:
+            print(f"fault: the audit trail could not be written ({exc})", file=sys.stderr)
+            return 3
+        return decision.exit_code
 
-    sent = redacted
+    sent = decision.sent
     record["sent_sha256"] = hashlib.sha256(sent.encode("utf-8")).hexdigest()
     record["sent_bytes"] = len(sent.encode("utf-8"))
+
+    # The audit line goes down BEFORE the POST. A dispatch that is killed, or
+    # whose audit write fails, must not be a payload on the wire with no record
+    # of it; if the trail cannot be written, nothing is sent.
+    try:
+        audit(policy, dict(record, stage="intent"))
+    except OSError as exc:
+        print(f"blocked: the audit trail could not be written ({exc})", file=sys.stderr)
+        print("nothing was sent", file=sys.stderr)
+        return 3
 
     try:
         session = _post_json(f"{policy.server}/session", {"title": args.title}, args.timeout)
@@ -631,14 +726,24 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
         record["verdict"] = "error"
         record["error"] = str(exc)
         record["elapsed_s"] = round(time.time() - started, 3)
-        audit(policy, record)
+        _audit_best_effort(policy, dict(record, stage="result"))
         print(f"dispatch failed: {exc}", file=sys.stderr)
         return 3
 
     record["elapsed_s"] = round(time.time() - started, 3)
-    audit(policy, record)
+    _audit_best_effort(policy, dict(record, stage="result"))
+    _report(decision.findings, policy, stream=sys.stderr)
     print(json.dumps(response, indent=2))
     return 0
+
+
+def _audit_best_effort(policy: Policy, record: dict[str, Any]) -> None:
+    """Record the outcome. The payload is already on the wire by this point, so
+    a failure here is reported rather than turned into a refusal."""
+    try:
+        audit(policy, record)
+    except OSError as exc:
+        print(f"warning: outcome not recorded in the audit trail ({exc})", file=sys.stderr)
 
 
 def cmd_hook(args: argparse.Namespace) -> int:
@@ -731,7 +836,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    return int(args.func(args))
+    try:
+        return int(args.func(args))
+    except Fault as fault:
+        print(f"fault: {fault.message}", file=sys.stderr)
+        return 3
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:  # a fault is a one-line message, never a traceback
+        print(f"fault: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 3
 
 
 if __name__ == "__main__":
