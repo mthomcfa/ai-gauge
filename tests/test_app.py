@@ -507,6 +507,9 @@ def _schedule_app_stub() -> App:
     app._active_until = datetime.now() - timedelta(minutes=1)  # noqa: SLF001
     app._unchanged_cycles = 5  # noqa: SLF001
     app._error_retry = {}  # noqa: SLF001
+    # A retry wake asks whether each due provider is parked before it spends
+    # that provider's deadline on a dispatch it cannot make.
+    app._abandoned = {}  # noqa: SLF001
     app._providers = {"claude": object(), "codex": object()}  # noqa: SLF001
     app._next_refresh_reason = "startup"  # noqa: SLF001
     app._timer = _Timer()  # noqa: SLF001

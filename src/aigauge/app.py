@@ -1414,16 +1414,48 @@ class App(QObject):
                 ",".join(self._refresh_queue) or "-",
             )
             return
+        # A provider the App parked cannot run now. Spending its due here
+        # meant the retry vanished - the streak stayed, the deadline became
+        # None, and nothing ran until the next full cadence cycle - and when
+        # it was the only due name the wake bought a complete *empty* cycle:
+        # the timer stopped, `set_refreshing(True, total=0)` and
+        # `mark_loading({})` reached the widget, and `refresh cycle start ...
+        # providers=` was logged for nothing. The due is kept instead, re-armed
+        # at the moment the park lifts - not left in the past, which would pin
+        # every later wake at the timer's 1 000 ms floor.
+        runnable: list[str] = []
+        now = time.monotonic()
+        for name in due:
+            parked = self._abandoned.get(name)
+            if parked is None or now >= parked[1]:
+                # Past the ceiling the entry is stale; _dispatch_refusal is
+                # what expires and logs it, one line per park.
+                runnable.append(name)
+                continue
+            lifts_in = max(1.0, parked[1] - now)
+            errors, _due = self._error_retry.get(name, (0, None))
+            self._error_retry[name] = (
+                errors,
+                datetime.now() + timedelta(seconds=lifts_in),
+            )
+            log.info(
+                "refresh retry deferred provider=%s reason=abandoned in_s=%.0f",
+                name,
+                lifts_in,
+            )
+        if not runnable:
+            log.info("refresh retry wake found nothing it could run")
+            self._schedule_next_refresh()
+            return
         # Spend the due here, at dispatch, rather than waiting for an answer
         # to clear it. An answer that does not clear the entry - a throttle, a
         # resume artifact, a provider removed between the wake and the
-        # dispatch - would otherwise leave a past due in place, and a past due
-        # pins every later wake at the timer's 1 000 ms floor. The streak
+        # dispatch - would otherwise leave a past due in place. The streak
         # survives, because that is what bounds the 1/2/4-minute ladder.
-        for name in due:
+        for name in runnable:
             errors, _due = self._error_retry.get(name, (0, None))
             self._error_retry[name] = (errors, None)
-        self._begin_cycle(due, manual=False, reason="error_retry")
+        self._begin_cycle(runnable, manual=False, reason="error_retry")
 
     def _repaint_snapshot(self, snapshot: UsageSnapshot) -> None:
         """Show a snapshot again. The tile only - never the cycle.

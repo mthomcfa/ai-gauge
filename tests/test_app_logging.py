@@ -1274,3 +1274,78 @@ def test_the_pending_purges_run_before_any_provider_is_built():
     assert source.index("_drain_pending_profile_purges") < source.index(
         "self._build_providers()"
     ), "a provider could be scraping the profile that is owed a deletion"
+
+
+def test_a_retry_due_on_a_parked_provider_is_kept_for_when_the_park_lifts(
+    monkeypatch, caplog
+):
+    """The due was spent before the cycle filtered, so a provider that was
+    due *and* parked lost its retry entirely: the streak stayed, the deadline
+    became None, and nothing ran until the next full cadence cycle. When it
+    was the only due name the wake also bought a complete empty cycle - the
+    timer stopped, `set_refreshing(True, total=0)` and `mark_loading({})`
+    reached the widget, and `refresh cycle start ... providers=` was logged
+    for nothing.
+    """
+    clock = {"t": 0.0}
+    monkeypatch.setattr(
+        app_module, "time", SimpleNamespace(monotonic=lambda: clock["t"])
+    )
+    claude = _BrowserProvider(_ok("claude"), hold=True)
+    app = _app({"claude": claude})
+
+    app.refresh_now(manual=False)
+    watchdog = app._watchdogs["claude"]  # noqa: SLF001
+    budget_s = (watchdog.interval_ms or 0) / 1000.0
+    watchdog.fire()
+    assert "claude" in app._abandoned  # noqa: SLF001
+
+    app._error_retry["claude"] = (1, datetime.now() - timedelta(seconds=1))  # noqa: SLF001
+    app._next_refresh_reason = "error_retry"  # noqa: SLF001
+    cycles = len(app._widget.loading_calls)  # noqa: SLF001
+
+    with caplog.at_level(logging.INFO, logger="aigauge"):
+        caplog.clear()
+        app._on_refresh_timer()  # noqa: SLF001
+
+    assert claude.calls == 1, "a parked provider was dispatched"
+    assert len(app._widget.loading_calls) == cycles, "an empty cycle ran"  # noqa: SLF001
+    assert "refresh cycle start" not in caplog.text
+    assert "refresh retry deferred provider=claude reason=abandoned" in caplog.text
+    errors, due = app._error_retry["claude"]  # noqa: SLF001
+    assert errors == 1, "the streak was lost"
+    assert due is not None, "the due was spent on a provider that could not run"
+    # Owed again exactly when the park lifts - not in the past, which would
+    # pin every later wake at the timer's 1 000 ms floor.
+    lifts_in = 2 * budget_s
+    assert datetime.now() < due <= datetime.now() + timedelta(seconds=lifts_in + 2)
+    assert app._timer.active is True, "the scheduler was left with no timer"  # noqa: SLF001
+
+    # The park lifts, the wall clock reaches the deadline it kept, and the
+    # retry is what runs.
+    clock["t"] = lifts_in + 1
+    app._error_retry["claude"] = (errors, datetime.now())  # noqa: SLF001
+    app._next_refresh_reason = "error_retry"  # noqa: SLF001
+    app._on_refresh_timer()  # noqa: SLF001
+
+    assert claude.calls == 2, "the retry it kept never ran"
+
+
+def test_a_retry_wake_still_runs_the_providers_that_are_not_parked():
+    claude = _BrowserProvider(_ok("claude"), hold=True)
+    copilot = _Provider(_ok("copilot"))
+    app = _app({"claude": claude, "copilot": copilot})
+
+    app.refresh_now(manual=False)
+    app._watchdogs["claude"].fire()  # noqa: SLF001 - claude is parked
+    claude_calls = claude.calls
+    app._error_retry["claude"] = (1, datetime.now() - timedelta(seconds=1))  # noqa: SLF001
+    app._error_retry["copilot"] = (1, datetime.now() - timedelta(seconds=1))  # noqa: SLF001
+    app._next_refresh_reason = "error_retry"  # noqa: SLF001
+    copilot_calls = copilot.calls
+
+    app._on_refresh_timer()  # noqa: SLF001
+
+    assert copilot.calls == copilot_calls + 1, "the runnable provider was skipped"
+    assert claude.calls == claude_calls, "the parked one was dispatched"
+    assert app._error_retry["claude"][1] is not None, "its due was spent anyway"  # noqa: SLF001
