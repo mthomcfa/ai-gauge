@@ -2153,3 +2153,156 @@ def test_an_answer_is_stamped_with_the_name_the_app_dispatched(caplog):
     assert "claude-bbbb" not in relabelled[0], (
         "the payload's own string reached the log"
     )
+
+
+def test_the_snapshot_error_record_is_bounded_where_it_is_written(caplog):
+    """The clip and the missing truth test are pinned at the log call.
+
+    `_error_for_log` is bounded and total on its own, and a test that calls
+    it directly says so - but the two things the change is for live at the
+    `log` call: that `snapshot.error` goes through the helper at all, and
+    that the payload argument is no longer fronted by the call's own
+    `if snapshot.raw`. Three mutations that put the old call site back
+    survived the whole suite while only the helpers were driven. Measured
+    through `_on_snapshot`, a 2 020 000-character error carrying 20 000
+    newlines writes a 2 020 065-character record with 20 000 forged lines in
+    the old form and 368 characters with none in this one; the payload below
+    is smaller for the suite's sake and separates the two the same way.
+    """
+    app = _app({"copilot": _Provider(_ok("copilot"))})
+    forged = "E" * 100 + "\nWARNING aigauge.app: forged line provider=evil\r\n"
+    forged = forged * 200
+
+    for status in (SnapshotStatus.ERROR, SnapshotStatus.AUTH_REQUIRED):
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="aigauge.app"):
+            app._on_snapshot(  # noqa: SLF001
+                UsageSnapshot(
+                    provider="copilot", status=status, error=forged, raw={}
+                )
+            )
+        record = next(
+            message
+            for message in (rec.getMessage() for rec in caplog.records)
+            if message.startswith(f"snapshot {status.value}")
+        )
+        assert len(record) < 1_000, (
+            f"the {status.value} record cost the log {len(record)} characters"
+        )
+        assert "\n" not in record and "\r" not in record, (
+            f"the {status.value} record carries {record.count(chr(10))} forged "
+            "lines"
+        )
+
+    # The clip is the log line only: the tile, the tray tooltip and the error
+    # dialog read `snapshot.error` and still get the string whole.
+    assert app._snapshots["copilot"].error == forged
+
+
+def test_a_payload_that_refuses_to_be_measured_still_paints_its_tile(caplog):
+    """`if snapshot.raw` at the call site ran the payload's `__len__`.
+
+    Both helpers on that record are guarded end to end now, but the truth
+    test that used to stand in front of one of them was not, and it ran
+    before either guard - so a `dict` subclass that refuses to be measured
+    raised out of `_on_snapshot` before the tile was painted, the history
+    recorded or the cycle advanced. `snapshot.raw` on the browser providers
+    is the extractor's own dict, so the payload chooses the type.
+    """
+
+    class _LenRaises(dict):
+        def __len__(self):
+            raise RuntimeError("this mapping refuses to be measured")
+
+    app = _app({"copilot": _Provider(_ok("copilot"))})
+
+    with caplog.at_level(logging.WARNING, logger="aigauge.app"):
+        app._on_snapshot(  # noqa: SLF001
+            UsageSnapshot(
+                provider="copilot",
+                status=SnapshotStatus.ERROR,
+                error="boom",
+                raw=_LenRaises(a=1),
+            )
+        )
+
+    assert [snapshot.provider for snapshot in app._widget.snapshots] == [  # noqa: SLF001
+        "copilot"
+    ], "the tile was never painted"
+    record = next(
+        message
+        for message in (rec.getMessage() for rec in caplog.records)
+        if message.startswith("snapshot error")
+    )
+    assert "raw_summary=<unsummarisable _LenRaises>" in record, record
+    assert len(record) < 1_000, f"{len(record)} characters"
+
+
+def test_a_queued_manual_refresh_still_speaks_for_the_user():
+    """A person's Refresh, queued behind a live cycle, still marks the tile.
+
+    `_pending_manual_asked` is a sticky OR because both directions matter:
+    a settings save landing inside a cycle must not speak for the user when
+    it runs, and the tray's "Refresh now" landing inside the same cycle must.
+    Only the first was covered, so setting the flag to a flat `False` - which
+    silently drops the hint for every queued manual refresh - survived the
+    whole suite. The queued route is the ordinary one for that menu item:
+    the widget's button is disabled for the cycle, so the tray is what a user
+    reaches mid-cycle, which is exactly when a tile looks stale.
+    """
+    copilot = _Provider(_ok("copilot"), hold=True)
+    app = _app({"copilot": copilot})
+    app.refresh_now(manual=False)
+    app._watchdogs["copilot"].fire()  # noqa: SLF001 - park copilot
+    app._widget.status_hints.clear()  # noqa: SLF001
+
+    app._inflight.add("claude")  # noqa: SLF001 - a cycle is in flight
+    app.refresh_now(manual=True)  # the tray's "Refresh now"
+    app._inflight.discard("claude")  # noqa: SLF001
+    assert app._pending_manual_refresh is True  # noqa: SLF001
+    assert app._widget.status_hints == [], (  # noqa: SLF001
+        "the hint was written when the request was queued, not when it ran"
+    )
+
+    app._run_pending_manual()  # noqa: SLF001
+
+    assert app._widget.status_hints == [  # noqa: SLF001
+        ("copilot", "Waiting for the previous refresh to finish.")
+    ], "a queued manual refresh left the parked tile silent"
+
+
+def test_a_dispatch_with_no_recorded_kind_parks_by_the_live_answer(
+    monkeypatch, caplog
+):
+    """The kind map is a cache in front of the provider, not the only copy.
+
+    `_dispatch_browser` is written at dispatch and pruned with the other
+    per-dispatch maps, so the watchdog normally finds its own row. The
+    fallback is what happens when it does not - and defaulting it to the
+    REST rule is the very defect the map exists to fix, for any name whose
+    row was lost: an hour-long park under `rest_backstop`, its on-disk
+    profile waiting 60 minutes for deletion rather than 10. Nothing pinned
+    the fallback, so a default of `False` survived the whole suite.
+    """
+    caplog.set_level(logging.WARNING, logger="aigauge.app")
+    clock = {"t": 0.0}
+    monkeypatch.setattr(
+        app_module, "time", SimpleNamespace(monotonic=lambda: clock["t"])
+    )
+    claude = _BrowserProvider(_ok("claude-ab12cd34"), hold=True)
+    claude.refresh_budget_seconds = 240.0
+    app = _app({"claude-ab12cd34": claude})
+    app.refresh_now(manual=False)
+    watchdog = app._watchdogs["claude-ab12cd34"]  # noqa: SLF001
+    budget_s = (watchdog.interval_ms or 0) / 1000.0
+
+    app._dispatch_browser.pop("claude-ab12cd34")  # noqa: SLF001 - the row is gone
+    watchdog.fire()
+
+    _epoch, dead_at = app._abandoned["claude-ab12cd34"]  # noqa: SLF001
+    assert dead_at - clock["t"] == 2 * budget_s, (
+        f"parked for {dead_at - clock['t']:.0f}s, not twice its {budget_s:.0f}s "
+        "budget"
+    )
+    assert "ceiling=browser_2x" in caplog.text
+    assert "ceiling=rest_backstop" not in caplog.text
