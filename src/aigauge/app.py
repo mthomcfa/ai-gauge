@@ -1527,20 +1527,48 @@ class App(QObject):
         scrape was still running - live in neither `_inflight` nor
         `_watchdogs`.
 
-        The answer is dropped rather than painted: it was produced by a
-        dispatch the App gave up on, possibly against a configuration the user
-        has since changed, and F14 already drops a snapshot whose provider is
-        gone for the same reason. What it does tell us is that the worker
-        finally let go, which is what un-parks the provider.
+        It closes no cycle, joins no cycle's verdict, clears no `_inflight`
+        entry and destroys no watchdog - all of that belongs to whatever
+        dispatch is current. What it does tell us is that the worker finally
+        let go, which is what un-parks the provider.
+
+        The *tile* is a different question. Dropping the answer whole was
+        right for an answer produced against a configuration the user has
+        since changed, and wrong for the case it actually hits: a provider
+        that is simply slower than its budget. That tile kept "Refresh timed
+        out." forever while the provider answered correctly every time, and a
+        genuine AUTH_REQUIRED - the one status that tells the user to sign in
+        again - was never painted. So a late answer is painted when it is the
+        newest dispatch's, which is exactly when there is nothing fresher to
+        paint over, and its retry entry is cleared only when it answered OK
+        or AUTH_REQUIRED. A late failure keeps the streak the watchdog
+        earned.
         """
         name = snapshot.provider
+        current = self._dispatch_epoch.get(name)
+        # Newest-dispatch-only: an older epoch would paint over a dispatch
+        # that is still out, and the newer answer would then be overwritten
+        # by data older than itself.
+        painted = current == epoch and name in self._providers
         log.info(
-            "refresh provider late provider=%s epoch=%s current=%s status=%s - dropped",
+            "refresh provider late provider=%s epoch=%s current=%s status=%s - %s",
             name,
             epoch,
-            self._dispatch_epoch.get(name, "-"),
+            current if current is not None else "-",
             snapshot.status.value,
+            "tile repainted" if painted else "dropped",
         )
+        if painted:
+            self._repaint_snapshot(
+                _preserve_error_metrics(snapshot, self._snapshots.get(name))
+            )
+            if snapshot.status in (
+                SnapshotStatus.OK,
+                SnapshotStatus.AUTH_REQUIRED,
+            ):
+                # It answered. A retry the watchdog armed is no longer owed -
+                # but a late *failure* keeps it, because that is a failure.
+                self._error_retry.pop(name, None)
         abandoned = self._abandoned.get(name)
         if abandoned is not None and abandoned[0] == epoch:
             self._abandoned.pop(name, None)

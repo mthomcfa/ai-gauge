@@ -505,13 +505,19 @@ def test_the_stuck_providers_late_snapshot_cannot_touch_a_second_cycle():
     assert app._inflight == {"codex"}  # noqa: SLF001
     codex_watchdog = app._watchdogs["codex"]  # noqa: SLF001
 
+    statuses = dict(app._cycle_statuses)  # noqa: SLF001
+
     # The abandoned scrape finally answers, mid-second-provider.
     first_callback(_ok("claude"))
 
     assert app._inflight == {"codex"}, "a late answer cleared someone else"  # noqa: SLF001
     assert app._watchdogs.get("codex") is codex_watchdog  # noqa: SLF001
     assert app._cycle_active is True, "a late answer closed a live cycle"  # noqa: SLF001
-    assert app._snapshots["claude"].status == SnapshotStatus.ERROR  # noqa: SLF001
+    assert app._cycle_statuses == statuses, "a late answer changed the verdict"  # noqa: SLF001
+    # Its own tile does get the answer: claude's newest dispatch is still
+    # epoch 1, so there is nothing fresher to paint over, and the alternative
+    # is "Refresh timed out." on a provider that answered.
+    assert app._snapshots["claude"].status == SnapshotStatus.OK  # noqa: SLF001
 
 
 def test_a_provider_the_watchdog_gave_up_on_is_not_dispatched_again():
@@ -1089,3 +1095,118 @@ def test_the_heartbeat_still_ends_a_cycle_with_nothing_left_to_run():
     app._log_heartbeat()  # noqa: SLF001
 
     assert app._cycle_active is False, "the wedged cycle was left open"  # noqa: SLF001
+
+
+def test_a_late_answer_from_a_slow_provider_repaints_its_tile():
+    """Dropping a late answer whole mislabels the provider it hits most.
+
+    The drop is right for the accounting - that dispatch is over, and its
+    cycle has closed. It is wrong for the tile: a provider that is merely
+    slower than its budget answered correctly, and the tile kept "Refresh
+    timed out." forever while its error streak survived into a retry it did
+    not need.
+    """
+    copilot = _Provider(_ok("copilot"), hold=True)
+    app = _app({"copilot": copilot})
+
+    app.refresh_now(manual=False)
+    late = copilot.pending
+    app._watchdogs["copilot"].fire()  # noqa: SLF001
+    assert app._snapshots["copilot"].error == "Refresh timed out."  # noqa: SLF001
+    assert app._error_retry["copilot"][0] == 1  # noqa: SLF001
+    statuses = dict(app._cycle_statuses)  # noqa: SLF001
+
+    late(
+        UsageSnapshot(
+            provider="copilot",
+            status=SnapshotStatus.OK,
+            metrics=[UsageMetric("Session", 77.0)],
+        )
+    )
+
+    assert app._snapshots["copilot"].status is SnapshotStatus.OK  # noqa: SLF001
+    assert app._snapshots["copilot"].metrics[0].percent_used == 77.0  # noqa: SLF001
+    assert "copilot" not in app._error_retry, (  # noqa: SLF001
+        "a provider that answered kept the streak its watchdog gave it"
+    )
+    assert app._cycle_statuses == statuses, "a late answer joined a cycle"  # noqa: SLF001
+    assert app._cycle_active is False  # noqa: SLF001
+
+
+def test_a_late_auth_required_is_still_shown():
+    """The one status that tells the user to sign in again was never
+    painted when it arrived past the watchdog."""
+    copilot = _Provider(_ok("copilot"), hold=True)
+    app = _app({"copilot": copilot})
+
+    app.refresh_now(manual=False)
+    late = copilot.pending
+    app._watchdogs["copilot"].fire()  # noqa: SLF001
+
+    late(
+        UsageSnapshot(
+            provider="copilot",
+            status=SnapshotStatus.AUTH_REQUIRED,
+            error="Sign in to GitHub again.",
+        )
+    )
+
+    assert app._snapshots["copilot"].status is SnapshotStatus.AUTH_REQUIRED  # noqa: SLF001
+    assert app._snapshots["copilot"].error == "Sign in to GitHub again."  # noqa: SLF001
+    assert "copilot" not in app._error_retry  # noqa: SLF001
+
+
+def test_a_late_error_keeps_the_streak_the_watchdog_earned():
+    copilot = _Provider(_ok("copilot"), hold=True)
+    app = _app({"copilot": copilot})
+
+    app.refresh_now(manual=False)
+    late = copilot.pending
+    app._watchdogs["copilot"].fire()  # noqa: SLF001
+    owed = app._error_retry["copilot"]  # noqa: SLF001
+
+    late(_error("copilot", "still broken"))
+
+    assert app._snapshots["copilot"].error == "still broken"  # noqa: SLF001
+    assert app._error_retry["copilot"] == owed, (  # noqa: SLF001
+        "a late failure cleared the retry a failure had earned"
+    )
+
+
+def test_a_late_answer_from_an_older_epoch_repaints_nothing():
+    """Only the newest dispatch's answer may reach the tile. An older one
+    would paint over a dispatch that is still out, and the newer answer would
+    then be overwritten by data older than itself."""
+    claude = _BrowserProvider(_ok("claude"), hold=True)
+    app = _app({"claude": claude})
+
+    app.refresh_now(manual=False)
+    first = claude.pending
+    app._watchdogs["claude"].fire()  # noqa: SLF001
+    app._abandoned.clear()  # noqa: SLF001 - the assumed-dead ceiling passes
+    app.refresh_now(manual=True)
+    assert app._dispatch_epoch["claude"] == 2  # noqa: SLF001
+    watchdog = app._watchdogs["claude"]  # noqa: SLF001
+    tile = app._snapshots["claude"]  # noqa: SLF001
+
+    first(_ok("claude"))  # epoch 1, at last
+
+    assert app._inflight == {"claude"}, "an older epoch cleared a live dispatch"  # noqa: SLF001
+    assert app._watchdogs.get("claude") is watchdog, "it destroyed the watchdog"  # noqa: SLF001
+    assert app._snapshots["claude"] is tile, "it painted over a newer dispatch"  # noqa: SLF001
+    assert app._cycle_active is True  # noqa: SLF001
+
+
+def test_a_late_answer_for_a_removed_provider_is_still_dropped():
+    copilot = _Provider(_ok("copilot"), hold=True)
+    app = _app({"copilot": copilot})
+
+    app.refresh_now(manual=False)
+    late = copilot.pending
+    app._watchdogs["copilot"].fire()  # noqa: SLF001
+    app._providers.pop("copilot")  # noqa: SLF001 - what _build_providers does
+    app._snapshots.pop("copilot")  # noqa: SLF001
+
+    late(_ok("copilot"))
+
+    assert "copilot" not in app._snapshots, "a removed provider's tile came back"  # noqa: SLF001
