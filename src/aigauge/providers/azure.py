@@ -1879,8 +1879,13 @@ def _auth_required(message: str) -> UsageSnapshot:
     )
 
 
-def _error(message: str) -> UsageSnapshot:
-    return UsageSnapshot(provider="azure", status=SnapshotStatus.ERROR, error=message)
+def _error(message: str, *, error_class: str | None = None) -> UsageSnapshot:
+    return UsageSnapshot(
+        provider="azure",
+        status=SnapshotStatus.ERROR,
+        error=message,
+        error_class=error_class,
+    )
 
 
 def _exception_summary(exc: BaseException) -> str:
@@ -2024,7 +2029,14 @@ class AzureProvider(Provider):
             if state.aggregate is not None:
                 serve_cache()
             else:
-                on_done(_error("An Azure fetch is already in progress."))
+                # Not a failure the scheduler should retry: a fetch is
+                # already out and its answer is about to arrive.
+                on_done(
+                    _error(
+                        "An Azure fetch is already in progress.",
+                        error_class="throttled",
+                    )
+                )
             return
 
         allowed_at = next_allowed_at(state)
@@ -2058,9 +2070,13 @@ class AzureProvider(Provider):
                 "classification=throttled_no_cache next_fetch_in_s=%s",
                 int((allowed_at - now).total_seconds()),
             )
+            # The gate failing closed is not a provider failure. Counted as
+            # one it earned the app a fast retry for a provider that is
+            # deliberately not fetching, every cycle, for up to an hour.
             on_done(
                 _error(
-                    f"Waiting for the next Azure fetch window ({minutes} min)."
+                    f"Waiting for the next Azure fetch window ({minutes} min).",
+                    error_class="throttled",
                 )
             )
             return

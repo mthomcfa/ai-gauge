@@ -61,9 +61,15 @@ LOGIN_URLS = {
 _ACTIVE_MODE_MINUTES = 30
 _ERROR_RETRY_MINUTES = 1
 # A provider that is simply broken must not be retried every minute forever.
-# After this many consecutive failing cycles the fast retry stops and the
-# normal cadence takes over.
-_ERROR_FAST_RETRY_CYCLES = 3
+# After this many consecutive failures the fast retry stops for that provider
+# and the normal cadence takes over. The wait doubles between attempts, so
+# the three are at 1, 2 and 4 minutes.
+_ERROR_FAST_RETRY_ATTEMPTS = 3
+# Failures that are not the provider failing, and must not earn a fast retry:
+#   throttled       - the provider is deliberately not fetching yet (Azure's
+#                     fail-closed hourly gate, or a fetch already in flight)
+#   resume_artifact - a scrape whose clock ran across a machine suspend
+_NO_FAST_RETRY_ERROR_CLASSES = ("throttled", "resume_artifact")
 _HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000
 _LOG_VALUE_LIMIT = 300
 # How long a provider may hold a refresh before the App declares it lost.
@@ -317,7 +323,8 @@ class App(QObject):
         self._cycle_signatures: dict[str, tuple] = {}
         self._last_cycle_signatures: dict[str, tuple] | None = None
         self._unchanged_cycles = 0
-        self._consecutive_error_cycles = 0
+        # provider -> (consecutive errors, when its own retry is due)
+        self._error_retry: dict[str, tuple[int, datetime | None]] = {}
         self._active_until = datetime.now() + timedelta(minutes=_ACTIVE_MODE_MINUTES)
         self._current_refresh_manual = False
         self._pending_manual_refresh = False
@@ -327,6 +334,7 @@ class App(QObject):
         self._cycle_started_at: float | None = None
         self._cycle_reason = "startup"
         self._cycle_statuses: dict[str, SnapshotStatus] = {}
+        self._cycle_partial = False
         self._dispatch_times: dict[str, float] = {}
         self._next_refresh_reason = "startup"
         self._settings_dialog: SettingsDialog | None = None
@@ -406,7 +414,7 @@ class App(QObject):
         # Auto-refresh timer
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
-        self._timer.timeout.connect(lambda: self.refresh_now(manual=False))
+        self._timer.timeout.connect(self._on_refresh_timer)
         self._restart_timer()
 
         # Always start with a refresh — fresh installs see provider tiles in
@@ -465,7 +473,7 @@ class App(QObject):
             "queue": ",".join(self._refresh_queue),
             "next_refresh_s": self._next_refresh_seconds(),
             "unchanged_cycles": self._unchanged_cycles,
-            "error_cycles": self._consecutive_error_cycles,
+            "error_cycles": self._error_retry_for_log(),
         }
 
     def _log_lifecycle_event(self, event: str) -> None:
@@ -561,6 +569,11 @@ class App(QObject):
             if tile_id not in desired_tiles:
                 self._widget.remove_tile(tile_id)
                 self._snapshots.pop(tile_id, None)
+        self._error_retry = {
+            name: state
+            for name, state in self._error_retry.items()
+            if name in self._providers
+        }
 
     def _restart_timer(self) -> None:
         self._timer.stop()
@@ -648,50 +661,92 @@ class App(QObject):
                     earliest = target
         return earliest
 
-    def _record_cycle_outcome(self) -> None:
-        """Count consecutive failing cycles, so the fast retry can be bounded.
+    def _record_provider_outcome(self, snapshot: UsageSnapshot) -> None:
+        """Advance or clear one provider's error streak.
 
-        The reset is the load-bearing half. Without it a provider that failed
-        a few times and later recovered would never earn a fast retry again
-        for the life of the process - the bound would be permanent rather than
-        a backoff.
+        Per provider, not per cycle. The old counter was cycle-wide: any
+        ERROR snapshot anywhere meant the *next cycle* ran in a minute, for
+        everyone. 124 of 137 cycles in 4.5 days of desktop log contained at
+        least one ERROR or AUTH_REQUIRED - OpenCode alone never succeeded once
+        - so a third of all cycles started within two minutes of the previous
+        one and five healthy providers were re-scraped for one broken tile.
+        The bound then bit the wrong way round: past three failing cycles
+        nobody got a fast retry, and since no cycle was ever clean the counter
+        never reset, so a genuinely transient failure on a *different*
+        provider got nothing.
+
+        AUTH_REQUIRED is deliberately not a failure: signing in is the user's
+        move, and retrying it quickly only burns page loads. Nor is a failure
+        the provider marked as something other than its own (see
+        _NO_FAST_RETRY_ERROR_CLASSES).
         """
-        if any(
-            snap.status == SnapshotStatus.ERROR
-            for snap in self._snapshots.values()
-        ):
-            self._consecutive_error_cycles += 1
+        name = snapshot.provider
+        if snapshot.status != SnapshotStatus.ERROR:
+            # OK clears the streak; so does AUTH_REQUIRED, which is a state,
+            # not a fault to back off from.
+            self._error_retry.pop(name, None)
+            return
+        if snapshot.error_class in _NO_FAST_RETRY_ERROR_CLASSES:
+            log.info(
+                "refresh retry skipped provider=%s error_class=%s",
+                name,
+                snapshot.error_class,
+            )
+            return
+        errors = self._error_retry.get(name, (0, None))[0] + 1
+        if errors <= _ERROR_FAST_RETRY_ATTEMPTS:
+            # 1, 2, 4 minutes. A flat minute is what the log caught in the
+            # act: an offline burst re-scraped every provider every minute
+            # while Claude alone needs a median of 18.5 s of browser time.
+            delay = timedelta(minutes=_ERROR_RETRY_MINUTES * (2 ** (errors - 1)))
+            due: datetime | None = datetime.now() + delay
         else:
-            self._consecutive_error_cycles = 0
+            due = None
+        self._error_retry[name] = (errors, due)
+
+    def _error_retry_for_log(self) -> str:
+        if not self._error_retry:
+            return "-"
+        return ",".join(
+            f"{name}:{errors}"
+            for name, (errors, _due) in sorted(self._error_retry.items())
+        )
+
+    def _due_error_providers(self, now: datetime | None = None) -> list[str]:
+        """Providers whose own fast retry has come due, in queue order."""
+        moment = now or datetime.now()
+        return self._ordered(
+            name
+            for name, (_errors, due) in self._error_retry.items()
+            if due is not None and due <= moment
+        )
 
     def _error_retry_time(self, now: datetime | None = None) -> datetime | None:
-        """Soonest recovery refresh after a provider error.
+        """Soonest recovery refresh owed to any single provider.
 
-        This used to require the errored snapshot to still carry stale
-        metrics, which meant the *worse* case got the slower retry: a provider
-        that had never succeeded this run showed nothing at all and then waited
-        a full interval, while one showing a stale-but-plausible number was
-        retried within the minute.
+        The fast retry used to require the errored snapshot to still carry
+        stale metrics, which meant the *worse* case got the slower retry: a
+        provider that had never succeeded this run showed nothing at all and
+        then waited a full interval, while one showing a stale-but-plausible
+        number was retried within the minute.
 
         That is exactly the shape of a cold start. Claude's settings page
         resolves eight endpoints before it requests usage, and on a fresh
         launch none of them are cached, so the first scrape can exceed its
         budget. The retry a minute later runs against a warm cache and
-        succeeds - but until then every restart showed a broken tile for a full
-        refresh interval, at precisely the moment a user is most likely to be
-        looking at the app.
-
-        AUTH_REQUIRED is deliberately excluded: it needs the user to sign in,
-        so retrying it quickly only burns page loads.
+        succeeds - but until then every restart showed a broken tile for a
+        full refresh interval, at precisely the moment a user is most likely
+        to be looking at the app.
         """
-        if self._consecutive_error_cycles > _ERROR_FAST_RETRY_CYCLES:
+        moment = now or datetime.now()
+        due_times = [
+            due
+            for name, (_errors, due) in self._error_retry.items()
+            if due is not None and name in self._providers
+        ]
+        if not due_times:
             return None
-        if not any(
-            snap.status == SnapshotStatus.ERROR
-            for snap in self._snapshots.values()
-        ):
-            return None
-        return (now or datetime.now()) + timedelta(minutes=_ERROR_RETRY_MINUTES)
+        return max(min(due_times), moment)
 
     # ----- Refresh -----
 
@@ -723,6 +778,7 @@ class App(QObject):
         self._cycle_statuses = {}
         self._cycle_started_at = time.monotonic()
         self._cycle_reason = reason
+        self._cycle_partial = len(names) < len(self._providers)
         self._cycle_active = True
         self._refresh_queue = list(names)
         log.info(
@@ -879,6 +935,25 @@ class App(QObject):
             )
         )
 
+    def _on_refresh_timer(self) -> None:
+        """The scheduled wake. A retry wake refreshes only what is owed one."""
+        due = (
+            self._due_error_providers()
+            if self._next_refresh_reason == "error_retry"
+            else []
+        )
+        if not due:
+            self.refresh_now(manual=False)
+            return
+        if self._inflight or self._refresh_queue:
+            log.info(
+                "refresh_now ignored inflight=%s queue=%s",
+                ",".join(sorted(self._inflight)) or "-",
+                ",".join(self._refresh_queue) or "-",
+            )
+            return
+        self._begin_cycle(due, manual=False, reason="error_retry")
+
     def _on_snapshot(self, snapshot: UsageSnapshot) -> None:
         name = snapshot.provider
         was_inflight = name in self._inflight
@@ -911,6 +986,7 @@ class App(QObject):
         self._snapshots[snapshot.provider] = snapshot
         self._cycle_signatures[snapshot.provider] = _snapshot_signature(snapshot)
         self._cycle_statuses[snapshot.provider] = snapshot.status
+        self._record_provider_outcome(snapshot)
         if snapshot.status == SnapshotStatus.ERROR:
             log.warning(
                 "snapshot error provider=%s error=%s raw_keys=%s raw_summary=%s",
@@ -980,10 +1056,16 @@ class App(QObject):
                 minutes=_ACTIVE_MODE_MINUTES
             )
             self._unchanged_cycles = 0
-        elif not self._current_refresh_manual:
+        elif not self._current_refresh_manual and not self._cycle_partial:
+            # A retry cycle polls one provider; "nothing changed" there says
+            # nothing about whether the app is idle.
             self._unchanged_cycles += 1
-        self._record_cycle_outcome()
-        self._last_cycle_signatures = dict(self._cycle_signatures)
+        # Merge rather than replace: a partial cycle must not erase the
+        # baseline for the providers it did not visit.
+        self._last_cycle_signatures = {
+            **(self._last_cycle_signatures or {}),
+            **self._cycle_signatures,
+        }
         started_at = self._cycle_started_at
         log.info(
             "refresh cycle end duration_s=%.1f changed=%s errors=%s auth_required=%s",
@@ -1009,9 +1091,19 @@ class App(QObject):
             QTimer.singleShot(0, self._run_pending_manual)
 
     def _cycle_changed(self) -> bool:
+        """Did any provider this cycle visited report something new?
+
+        Compared per provider, because a cycle no longer has to be the whole
+        queue: a per-provider retry visits one tile, and comparing its single
+        signature against the previous full cycle's map would read as "changed"
+        every time.
+        """
         if self._last_cycle_signatures is None:
             return True
-        return self._cycle_signatures != self._last_cycle_signatures
+        return any(
+            self._last_cycle_signatures.get(name) != signature
+            for name, signature in self._cycle_signatures.items()
+        )
 
     def _update_tray(self) -> None:
         lines: list[str] = []

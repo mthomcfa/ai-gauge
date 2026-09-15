@@ -175,7 +175,8 @@ def _app(providers: dict[str, _Provider]) -> App:
     app._cycle_signatures = {}  # noqa: SLF001
     app._last_cycle_signatures = None  # noqa: SLF001
     app._unchanged_cycles = 0  # noqa: SLF001
-    app._consecutive_error_cycles = 0  # noqa: SLF001
+    app._error_retry = {}  # noqa: SLF001
+    app._cycle_partial = False  # noqa: SLF001
     app._cycle_active = False  # noqa: SLF001
     app._cycle_started_at = None  # noqa: SLF001
     app._cycle_reason = "startup"  # noqa: SLF001
@@ -438,6 +439,51 @@ def test_the_watchdog_budget_follows_the_providers_own_bound():
     assert _refresh_budget_seconds(CopilotProvider) == 60
 
 
+def test_a_retry_wake_refreshes_only_the_providers_that_are_due(caplog):
+    """The wake a failing provider earns is its own, not everyone's.
+
+    Under the cycle-wide retry the whole queue ran again every minute - in
+    the user's log that meant re-scraping Claude (median 18.5 s, p90 48 s of
+    browser time) because OpenCode was not signed in.
+    """
+    claude = _Provider(_error("claude"))
+    codex = _Provider(_ok("codex"))
+    app = _app({"claude": claude, "codex": codex})
+
+    _run_cycle(app, manual=False)
+    assert claude.calls == 1 and codex.calls == 1
+    # Its retry is owed now.
+    app._error_retry["claude"] = (1, datetime.now() - timedelta(seconds=1))  # noqa: SLF001
+    app._next_refresh_reason = "error_retry"  # noqa: SLF001
+
+    with caplog.at_level(logging.INFO, logger="aigauge.app"):
+        app._on_refresh_timer()  # noqa: SLF001
+
+    assert (
+        "refresh cycle start manual=False reason=error_retry providers=claude"
+        in caplog.text
+    )
+    assert claude.calls == 2
+    assert codex.calls == 1, "a healthy provider was refreshed on someone else's retry"
+
+
+def test_a_retry_cycle_does_not_advance_the_idle_backoff():
+    """_unchanged_cycles is about "is this app idle", and a cycle that polled
+    one provider cannot answer that."""
+    claude = _Provider(_error("claude"))
+    codex = _Provider(_ok("codex"))
+    app = _app({"claude": claude, "codex": codex})
+    _run_cycle(app, manual=False)
+    _run_cycle(app, manual=False)
+    before = app._unchanged_cycles  # noqa: SLF001
+
+    app._error_retry["claude"] = (1, datetime.now() - timedelta(seconds=1))  # noqa: SLF001
+    app._next_refresh_reason = "error_retry"  # noqa: SLF001
+    app._on_refresh_timer()  # noqa: SLF001
+
+    assert app._unchanged_cycles == before  # noqa: SLF001
+
+
 def test_the_heartbeat_carries_the_error_retry_state(caplog):
     """`error_cycles` was computed in `_lifecycle_context` and then dropped by
     the format string, so the one counter that explains a 1-minute cadence
@@ -452,4 +498,11 @@ def test_the_heartbeat_carries_the_error_retry_state(caplog):
         for rec in caplog.records
         if rec.getMessage().startswith("heartbeat uptime_s=")
     )
-    assert "error_cycles=" in line
+    assert "error_cycles=-" in line
+
+    app._error_retry["claude"] = (2, datetime.now())  # noqa: SLF001
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="aigauge.app"):
+        app._log_heartbeat()  # noqa: SLF001
+
+    assert "error_cycles=claude:2" in caplog.text

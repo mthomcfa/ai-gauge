@@ -1461,6 +1461,29 @@ def test_the_in_flight_flag_alone_refuses_a_second_dispatch(monkeypatch, config)
     provider.refresh(captured.append)
     assert len(dispatched) == 1, "a second live fetch was dispatched"
     assert "already in progress" in (captured[0].error or "")
+    # Marked so the App-level scheduler does not read a fetch that is already
+    # out as a provider failure worth retrying in a minute.
+    assert captured[0].error_class == "throttled"
+
+
+@responses.activate
+def test_the_closed_window_snapshot_is_marked_as_a_wait_not_a_failure(
+    monkeypatch, config
+):
+    """The gate fails closed: inside the hourly window with nothing cached and
+    nothing remembered, refresh() returns an ERROR naming the wait rather than
+    fetching. The App used to count that as a provider failure, which put the
+    whole app on the one-minute error cadence for a provider that is
+    deliberately not fetching - for up to an hour at a time."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    state = az.state_for(SUB)
+    state.last_fetch_at = datetime.now() - timedelta(minutes=5)
+    captured: list = []
+
+    az.AzureProvider(config).refresh(captured.append)
+
+    assert "Waiting for the next Azure fetch window" in (captured[0].error or "")
+    assert captured[0].error_class == "throttled"
 
 
 @responses.activate

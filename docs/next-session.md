@@ -173,8 +173,8 @@ speculative.
 | --- | --- | --- |
 | `webview/verify.py` → Claude check | A `/login` anchor is a hard veto, while `providers/claude.py`'s `isLoggedOut` ANDs it with absent usage text. Verify is stricter than the extractor, in the direction of the reported sign-in loop. | Loosening sign-in semantics without evidence risks the opposite failure: a bad session verifying, then erroring forever. |
 | `menubar.py` → `_provider_max_percent` | Short-circuits on a metric labelled `session`, while `gauge.provider_max_percent` takes the worst metric. The two can disagree for the same provider. | Pre-existing and documented in the module. The tag-filter half was fixed in PR #6; this divergence predates it. |
-| `webview/scraper.py` → timeout | Wall-clock, so it does not account for system sleep. A laptop resumed after two days reported `elapsed_s: 228477` and fired a stale scrape per provider. | Cosmetic in effect — the resumed cycle fails and recovers — but it produces one spurious failure per provider on every resume, and nonsense elapsed values in the log. |
-| `app.py` → `_error_retry_time` | The fast retry is **cycle-wide, not per-provider**. One permanently-failing provider makes every cycle count as failing, so healthy providers get refreshed every minute too until the bound engages — and once it has engaged (the counter never resets, because no cycle is ever clean), a genuinely transient failure on a *different* provider gets no fast retry at all. | Inherited shape: the pre-existing `_stale_error_retry_time` was cycle-wide too. The blast radius grew because any error now triggers it rather than only errors carrying stale metrics. Bounded at three cycles, so the cost is finite. Per-provider retry is the right fix and a bigger change than a close-out warranted. |
+| `webview/scraper.py` → timeout | Wall-clock, so it does not account for system sleep. A laptop resumed after two days reported `elapsed_s: 228477` and fired a stale scrape per provider. | **Half-fixed in 1.3.0+cfa.5**: a `timeout` whose measured elapsed exceeds the whole scrape budget by a wide margin is logged as `classification=resume_artifact` and does not count toward that provider's error retry. The timing itself is unchanged — the scrape still fails on resume; it just no longer buys the app a fast retry it did not earn. |
+| `app.py` → `_error_retry_time` | The fast retry was **cycle-wide, not per-provider**. One permanently-failing provider made every cycle count as failing, so healthy providers got refreshed every minute too until the bound engaged — and once it had (the counter never reset, because no cycle was ever clean), a genuinely transient failure on a *different* provider got no fast retry at all. | **Fixed in 1.3.0+cfa.5.** `_consecutive_error_cycles` / `_error_retry_time` are now a per-provider map `{name: (consecutive_errors, next_due_at)}`: an ERROR schedules that provider's own retry at 1, 2 and 4 minutes and then falls back to the normal cadence, OK or AUTH_REQUIRED clears it, and a wake that is only a retry refreshes **only the due providers** (`reason=error_retry`). The desktop log is what forced it: 124 of 137 cycles carried at least one ERROR or AUTH_REQUIRED, and 32% of cycles started within two minutes of the previous one. |
 | `webview/api_capture.py` → `sketch` | Numbers survive redaction verbatim, so a numeric account ID in a response would reach the log. Strings and UUIDs are reduced to length markers. | Deliberate: the quota values *are* numbers. Redacting them would defeat the capture. Local-only, and the user controls the log. |
 
 ---
@@ -499,12 +499,25 @@ unnecessary source of behaviour change.
   Reader is what the check needs, but nothing retries it sooner. Stamping only
   a successful read, or retrying discovery at the next window while keeping
   the rest cached, is the fix and was not made here.
-- **The App-level in-flight scheduler has no watchdog.** `app.py` clears
-  `_inflight` only when a snapshot arrives, and `_schedule_next_refresh`,
-  `refresh_now` and `refresh_provider` all return early while it is non-empty.
-  The Azure provider bounds its own worst case now, but a provider that never
-  calls back still stalls the cycle. `AzureProvider`'s own `in_flight` flag
-  does have one (`IN_FLIGHT_STALE_AFTER`).
+- ~~**The App-level in-flight scheduler has no watchdog.**~~ **Fixed in
+  1.3.0+cfa.5.** Every dispatch arms a single-shot timer for that provider's
+  own budget plus slack — the browser providers derive it from the scraper
+  timeout times the attempts they may make, `AzureProvider` reports its
+  `REFRESH_DEADLINE_SECONDS`, and a plain REST provider gets a flat 60 s. On
+  expiry the App logs it, synthesises an ERROR snapshot for that provider and
+  the queue carries on; a snapshot that arrives after its watchdog repaints
+  its tile and cannot close a second cycle. The heartbeat also restarts a
+  timer that is not running while nothing is in flight.
+- **The per-provider retry does not cover Azure's remembered error.** Inside
+  its hourly window Azure re-serves `state.last_error` on every refresh. That
+  snapshot is a real failure and carries no `error_class`, so it still earns
+  three fast retries — each of which only re-serves the same remembered error,
+  at no network cost. Bounded and cheap, so it was left alone; marking a
+  *re-served* error would mean mutating the stored snapshot.
+- **A partial (retry) cycle does not advance `_unchanged_cycles`.** It cannot:
+  a cycle that polled one provider says nothing about whether the app is idle.
+  The consequence is that a long run of retry cycles neither advances nor
+  resets the idle backoff, so the backoff is decided entirely by full cycles.
 - **The tile and tray tooltips rely on `snapshot.error` being clean at
   source.** `_exception_summary` is what keeps a request URL out of it;
   `widget.py` renders the string as-is, and only `app.py`'s log lines and the
