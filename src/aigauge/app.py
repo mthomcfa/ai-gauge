@@ -1080,6 +1080,9 @@ class App(QObject):
         per-provider retry - so the log line that opens a cycle cannot
         disagree with what actually ran.
         """
+        # What the caller asked for, before anything is filtered out of it.
+        # This is what decides whether the cycle is *partial* - see below.
+        requested = len(names)
         # A provider the App has given up on but whose worker is still out
         # there is not dispatched again - by this cycle or any other. Filter
         # before the cycle's own totals are computed, so its progress and its
@@ -1125,7 +1128,19 @@ class App(QObject):
         self._cycle_started_at = time.monotonic()
         self._cycle_reason = reason
         self._cycle_names = set(names)
-        self._cycle_partial = len(names) < len(self._providers)
+        # "Partial" is a property of the *request*: a retry wake or a
+        # per-provider refresh polls a subset, and "nothing changed" there
+        # says nothing about whether the app is idle. It is not a property of
+        # what the park filter removed. Reading it off the filtered list made
+        # every cycle inside an hour-long REST park partial, which froze
+        # `_unchanged_cycles` and with it the idle backoff, so a hung
+        # endpoint pinned the app on the five-minute active cadence for as
+        # long as it stayed hung: measured over six fake hours, a healthy
+        # sibling of one wedged REST provider was dispatched 54 times where
+        # the same run without the wedged provider dispatched it 12 - a
+        # remote server multiplying this app's request rate against every
+        # other provider's host.
+        self._cycle_partial = requested < len(self._providers)
         self._cycle_active = True
         log.info(
             "refresh cycle start manual=%s reason=%s providers=%s",

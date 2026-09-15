@@ -138,8 +138,13 @@ def _timer_class(clock: _Clock):
     return _ClockTimer
 
 
-@pytest.fixture()
-def clock(monkeypatch):
+def _install_clock(monkeypatch) -> _Clock:
+    """Point the App's Qt surface at a fresh fake clock.
+
+    A helper as well as a fixture because a test that compares two six-hour
+    runs needs a second clock: the fake one advances, so the same instance
+    cannot start twice.
+    """
     clk = _Clock()
     timer_cls = _timer_class(clk)
     monkeypatch.setattr(app_module, "QTimer", timer_cls)
@@ -155,7 +160,12 @@ def clock(monkeypatch):
     )
     monkeypatch.setattr(az, "datetime", _FakeDatetime)
     clk.timer_cls = timer_cls
-    yield clk
+    return clk
+
+
+@pytest.fixture()
+def clock(monkeypatch):
+    yield _install_clock(monkeypatch)
 
 
 def _build_app(clock: _Clock, providers: dict, config: Config) -> App:
@@ -612,3 +622,85 @@ def test_a_rest_worker_that_reports_back_late_un_parks_its_provider(clock):
     )
     clock.run_until(1800.0)  # half an hour: well inside the hour backstop
     assert len(rest.dispatches) > 1, "an un-parked provider was never refreshed"
+
+
+class _HealthyProvider:
+    """A REST provider that answers OK immediately, and counts the asking."""
+
+    uses_browser = False
+
+    def __init__(self, name: str, *, clock: _Clock) -> None:
+        self.name = name
+        self._clock = clock
+        self.dispatches: list[float] = []
+
+    def refresh(self, on_done) -> None:
+        self.dispatches.append(self._clock.t)
+        on_done(UsageSnapshot(provider=self.name, status=SnapshotStatus.OK))
+
+
+def _healthy_sibling_run(monkeypatch, *, wedged: bool) -> tuple[int, int]:
+    """Six fake hours at the shipped cadence; how often the healthy one ran."""
+    clk = _install_clock(monkeypatch)
+    config = Config()  # the shipped cadence: 5 minutes active, 60 idle
+    healthy = _HealthyProvider("openrouter", clock=clk)
+    providers: dict = {"openrouter": healthy}
+    if wedged:
+        providers["copilot"] = _WedgedProvider(
+            "copilot", uses_browser=False, budget=60.0, clock=clk
+        )
+    app = _build_app(clk, providers, config)
+    # Outside the 30-minute active window from the first moment, so what this
+    # measures is the idle backoff rather than the active cadence.
+    app._active_until = clk.now()  # noqa: SLF001
+    app.refresh_now(manual=False)
+    clk.run_until(6 * 3600.0)
+    return len(healthy.dispatches), app._unchanged_cycles  # noqa: SLF001
+
+
+def test_a_parked_provider_does_not_freeze_the_idle_backoff(monkeypatch):
+    """One hung endpoint must not raise everybody else's request rate.
+
+    `_end_cycle` only advances `_unchanged_cycles` for a cycle that is not
+    partial, and `_adaptive_refresh_minutes` derives the idle interval from
+    it. While "partial" was read off the *filtered* name list, every cycle
+    inside an hour-long REST park counted as partial, the backoff never
+    climbed, and the app stayed on the five-minute active cadence for as long
+    as the endpoint stayed hung. Measured over these six fake hours before
+    the fix: 54 dispatches of the healthy sibling against 12 for the same run
+    with no wedged provider in it - a 4.5x increase in scrapes of every other
+    provider's host, caused by a third provider's server misbehaving.
+
+    Partial is a property of the request (a retry wake, a per-provider
+    refresh), so a full scheduled cycle stays full however many names the
+    park filter takes out of it.
+    """
+    wedged_count, wedged_unchanged = _healthy_sibling_run(monkeypatch, wedged=True)
+    control_count, control_unchanged = _healthy_sibling_run(monkeypatch, wedged=False)
+
+    # Not equality: a cycle carrying the wedged provider stays open until its
+    # watchdog gives up, which pushes each cadence wake out by that wait and
+    # costs the run its last dispatch.
+    assert control_count - 1 <= wedged_count <= control_count, (
+        f"a parked provider changed a healthy sibling's rate: {wedged_count} "
+        f"dispatches in six hours against {control_count} with nothing parked"
+    )
+    assert wedged_unchanged >= control_unchanged - 1, (
+        f"the idle backoff stalled at {wedged_unchanged} unchanged cycles "
+        f"against {control_unchanged} with nothing parked"
+    )
+
+
+def test_a_full_cycle_is_not_partial_because_one_provider_is_parked(clock):
+    """The property the rate depends on, pinned directly."""
+    app, rest, browser = _wedged_app(clock)
+    app._abandoned["copilot"] = (1, clock.t + 3600.0)  # noqa: SLF001
+
+    app.refresh_now(manual=False)
+    clock.run_until(1.0)  # the browser queue is drained on a zero-delay wake
+
+    assert rest.dispatches == [], "a parked provider was dispatched"
+    assert browser.dispatches, "the cycle ran nobody"
+    assert app._cycle_partial is False, (  # noqa: SLF001
+        "a full scheduled cycle counted as partial because a name was parked"
+    )
