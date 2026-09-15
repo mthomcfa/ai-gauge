@@ -8,6 +8,14 @@ import pytest
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
+# Imported at collection time, on purpose: the scrape runner pulls in
+# QtWebEngineWidgets, which Qt requires to be imported before the first
+# QCoreApplication exists. A full run satisfies that by accident (test_app.py
+# is collected first and imports it), but a single file run through a qtbot
+# test would otherwise import it from the autouse fixture below, after the
+# QApplication, and every test in the file errors at setup.
+from aigauge.providers import _scrape_runner as _scrape_runner_module  # noqa: E402
+
 
 @pytest.fixture(autouse=True)
 def isolated_appdata(tmp_path, monkeypatch):
@@ -29,8 +37,6 @@ def no_leaked_live_scrapes():
     failed on the macOS runner alone - so the reset lives here, not in the
     file that happened to notice.
     """
-    from aigauge.providers import _scrape_runner
-
-    _scrape_runner._ACTIVE_ACCOUNTS.clear()  # noqa: SLF001
+    _scrape_runner_module._ACTIVE_ACCOUNTS.clear()  # noqa: SLF001
     yield
-    _scrape_runner._ACTIVE_ACCOUNTS.clear()  # noqa: SLF001
+    _scrape_runner_module._ACTIVE_ACCOUNTS.clear()  # noqa: SLF001
