@@ -310,6 +310,24 @@ _LOG_KEY_LEN_LIMIT = 60
 _LOG_SUMMARY_BUDGET = 4000
 
 
+def _error_for_log(error: object) -> str:
+    """A snapshot's error string, bounded and on one line.
+
+    The tile, the tray tooltip and the error dialog render `snapshot.error`
+    in full and are a different question; this is the log record, which
+    shares a 512 KiB x 3 rotation with every other diagnostic. Most providers
+    build the string from a fixed literal, but Copilot's and OpenRouter's
+    transport failures carry `str(exc)` from `requests`, so neither its
+    length nor its line breaks are the app's to assume: a 2 MB error measured
+    4.73x the whole rotation in one record, with 20 000 embedded newlines
+    that each read like a log line of their own.
+    """
+    text = _redact_azure_ids(str(error or ""))
+    if len(text) > _LOG_VALUE_LIMIT:
+        text = text[:_LOG_VALUE_LIMIT] + "..."
+    return text.replace("\r", " ").replace("\n", " ")
+
+
 def _key_text(raw_key) -> str:
     """A dict key as a string, from a payload that chose the keys.
 
@@ -425,16 +443,25 @@ def _raw_keys_for_log(raw: dict | None) -> str:
     keys is a megabyte-long record against a 512 KiB x 3 rotation, which
     discards the diagnostic history the line exists to build.
     """
-    if not raw:
+    # Guarded end to end, like `_raw_summary` beside it: this one is
+    # evaluated in the *same* `log.warning(...)` call, so anything it raises
+    # raises out of `_on_snapshot` before the other one is ever reached. The
+    # walk was guarded per key, but `bool(raw)` runs the payload's `__len__`
+    # and iterating it runs its `__iter__`, and a `dict` subclass can refuse
+    # either.
+    try:
+        if not raw:
+            return "[]"
+        keys = sorted(_key_text(key) for key in raw)
+        shown = [key[:_LOG_KEY_LEN_LIMIT] for key in keys[:_LOG_DICT_KEY_LIMIT]]
+        if len(keys) > _LOG_DICT_KEY_LIMIT:
+            shown.append(f"... {len(keys) - _LOG_DICT_KEY_LIMIT} more")
+        return repr(shown)
+    except Exception:  # noqa: BLE001 - a log line must never raise
         return "[]"
-    keys = sorted(_key_text(key) for key in raw)
-    shown = [key[:_LOG_KEY_LEN_LIMIT] for key in keys[:_LOG_DICT_KEY_LIMIT]]
-    if len(keys) > _LOG_DICT_KEY_LIMIT:
-        shown.append(f"... {len(keys) - _LOG_DICT_KEY_LIMIT} more")
-    return repr(shown)
 
 
-def _raw_summary(raw: dict) -> str:
+def _raw_summary(raw: dict | None) -> str:
     # `except Exception`, because a log line must never be able to raise:
     # this one runs inside `_on_snapshot`, and an object whose `__repr__`
     # raises, a key whose `__str__` raises or a `dict` subclass whose
@@ -444,9 +471,16 @@ def _raw_summary(raw: dict) -> str:
     # escape hatch gave the whole payload back on the one path that had
     # already gone wrong.
     try:
+        # Inside the guard, because `bool(raw)` is itself a call into the
+        # payload: the empty test used to sit at the call site, where a
+        # `__len__` that raises took the whole log line with it.
+        if not raw:
+            return "{}"
         return json.dumps(_summarize_for_log(raw), sort_keys=True, default=str)
     except Exception:  # noqa: BLE001
-        return f"<unsummarisable {type(raw).__name__}>"
+        # The class name is the payload's too, and nothing bounds a class
+        # name: a 1 MB one produced a 1 000 017-character "bounded" literal.
+        return f"<unsummarisable {type(raw).__name__[:_LOG_KEY_LEN_LIMIT]}>"
 
 
 def _preserve_error_metrics(
@@ -1973,17 +2007,17 @@ class App(QObject):
             log.warning(
                 "snapshot error provider=%s error=%s raw_keys=%s raw_summary=%s",
                 snapshot.provider,
-                _redact_azure_ids(snapshot.error or ""),
+                _error_for_log(snapshot.error),
                 _raw_keys_for_log(snapshot.raw),
-                _raw_summary(snapshot.raw) if snapshot.raw else "{}",
+                _raw_summary(snapshot.raw),
             )
         elif snapshot.status == SnapshotStatus.AUTH_REQUIRED:
             log.info(
                 "snapshot auth_required provider=%s error=%s raw_keys=%s raw_summary=%s",
                 snapshot.provider,
-                _redact_azure_ids(snapshot.error or ""),
+                _error_for_log(snapshot.error),
                 _raw_keys_for_log(snapshot.raw),
-                _raw_summary(snapshot.raw) if snapshot.raw else "{}",
+                _raw_summary(snapshot.raw),
             )
         try:
             self._history.record_snapshot(snapshot)

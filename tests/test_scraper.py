@@ -452,6 +452,49 @@ def test_a_page_cannot_write_a_megabyte_into_one_log_record(
         assert "more" in line, "the key list was truncated without saying so"
 
 
+def test_the_scrapers_key_walk_cannot_raise_and_its_class_name_is_bounded():
+    """`_result_keys_for_log` reaches the result's own keys.
+
+    `_clip(key, ...)` ran the key's `__bool__` and `__str__` unguarded, where
+    app.py deliberately routes the same walk through a guard - so one key
+    that refuses to be printed cost the whole `scrape ok` record, which
+    `_finish` then replaces with "the diagnostics could not be read". The
+    non-dict branch printed `type(result).__name__` whole, and a class name
+    is not bounded by anything: measured 1 000 000 characters, now 60.
+    """
+    from aigauge.webview.scraper import _result_keys_for_log
+
+    class _KeyStrRaises:
+        def __str__(self):
+            raise ValueError("this key refuses to be printed")
+
+        def __hash__(self):
+            return 11
+
+    assert isinstance(_result_keys_for_log({_KeyStrRaises(): 1}), str)
+    huge = type("N" * 1_000_000, (), {})()
+    assert len(_result_keys_for_log(huge)) == 60
+
+
+def test_the_scrapers_load_error_string_is_bounded(caplog):
+    """Chromium's `errorString` is a Qt string-table message - 49 characters
+    for an HTTP failure against a real QtWebEngine, not the server's reason
+    phrase - so this closes an assumption rather than a hole. It is still
+    the largest argument on `scrape fail` with no cap of its own: forced to
+    500 000 characters it produced a 500 353-character record, 0.95x the
+    whole rotation."""
+    stand_in = _stand_in_with_title("short")
+    stand_in._last_load_error_string = "E" * 500_000  # noqa: SLF001
+
+    with caplog.at_level(logging.INFO, logger="aigauge.scraper"):
+        caplog.clear()
+        HeadlessScraper._finish(stand_in, None, "page failed to load")
+
+    assert caplog.records, "the failure logged nothing at all"
+    worst = max(len(record.getMessage()) for record in caplog.records)
+    assert worst < 2_000, f"one record was {worst} characters"
+
+
 def test_the_scrapers_url_field_is_bounded_too():
     """`_safe_url` is the other page-controlled field on those lines."""
     from aigauge.webview.scraper import _safe_url

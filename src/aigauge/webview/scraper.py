@@ -58,6 +58,14 @@ _LOG_TITLE_LIMIT = 200
 # deliberately free of app imports.
 _LOG_KEY_LEN_LIMIT = 60
 _LOG_KEY_COUNT_LIMIT = 50
+# Chromium's own `errorString`. Measured against real QtWebEngine it is a Qt
+# string-table message, not the server's reason phrase - 49 characters for an
+# HTTP failure, 20 for `net::ERR_UNSAFE_PORT` - so this bound costs nothing
+# today. It closes the assumption rather than a hole: forcing the field to
+# 500 000 characters produced a 500 353-character `scrape fail` record,
+# 0.95x the whole rotation, and it is the largest argument on that record
+# with no cap of its own.
+_LOG_ERROR_LIMIT = 300
 
 
 def _clip(text: Any, limit: int) -> str:
@@ -65,11 +73,28 @@ def _clip(text: Any, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + "..."
 
 
+def _key_text(raw_key: Any) -> str:
+    """A key as a string, from a result whose keys the page chose.
+
+    `str()` runs the key's own `__str__`, and `_clip` runs its `__bool__`
+    first. app.py routes the same walk through a guard of this shape; this
+    module had `_clip(key, ...)` directly, so one key that refuses to be
+    printed replaced the whole `scrape ok` record with "the diagnostics
+    could not be read".
+    """
+    try:
+        return str(raw_key)
+    except Exception:  # noqa: BLE001 - a log line must never raise
+        return "<key>"
+
+
 def _result_keys_for_log(result: Any) -> str:
     """The extractor's top-level key names, bounded like app.py's."""
     if not isinstance(result, dict):
-        return type(result).__name__
-    keys = sorted(_clip(key, _LOG_KEY_LEN_LIMIT) for key in result)
+        # The class name is the payload's too, and nothing bounds a class
+        # name: clipped to the same limit as a key.
+        return type(result).__name__[:_LOG_KEY_LEN_LIMIT]
+    keys = sorted(_key_text(key)[:_LOG_KEY_LEN_LIMIT] for key in result)
     shown = keys[:_LOG_KEY_COUNT_LIMIT]
     if len(keys) > _LOG_KEY_COUNT_LIMIT:
         shown.append(f"... {len(keys) - _LOG_KEY_COUNT_LIMIT} more")
@@ -238,7 +263,7 @@ class HeadlessScraper(QObject):
                 self._last_load_url,
                 self._last_load_error_code,
                 self._last_load_error_domain,
-                self._last_load_error_string,
+                _clip(self._last_load_error_string, _LOG_ERROR_LIMIT),
                 self._last_load_is_error_page,
             )
 
@@ -425,7 +450,7 @@ class HeadlessScraper(QObject):
                     self._last_load_url,
                     self._last_load_error_code,
                     self._last_load_error_domain,
-                    self._last_load_error_string,
+                    _clip(self._last_load_error_string, _LOG_ERROR_LIMIT),
                     self._last_load_is_error_page,
                     _clip(self._page.title(), _LOG_TITLE_LIMIT),
                     self._max_progress,
