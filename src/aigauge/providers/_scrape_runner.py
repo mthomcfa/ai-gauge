@@ -137,8 +137,9 @@ class ScrapeRunner:
         """Is a scrape of this account still loading a page?
 
         ``_handle`` discards the account before it answers, so this is False
-        for exactly as long as there is no live ``HeadlessScraper`` for it. A
-        provider asks before starting another: `webview.profile.get_profile`
+        for as long as there is no live ``HeadlessScraper`` for it - and for a
+        scrape that never reported at all, once its own worst case has passed
+        (see `account_is_busy`). A provider asks before starting another: `webview.profile.get_profile`
         returns one cached ``QWebEngineProfile`` per account, so two live
         scrapers are two ``QWebEngineView``s writing one cookie store. The
         answer is per account, not per runner, so it survives the settings
@@ -147,13 +148,14 @@ class ScrapeRunner:
         return account_is_busy(self._account_id)
 
     def _scrape_budget_seconds(self) -> float:
-        """The longest one attempt of this scrape can legitimately take.
+        """The longest this scrape can legitimately take.
 
-        The scraper's own timeout bounds each transport attempt and an
-        extractor rerun happens inside it, so this is the figure the browser
+        The scraper's own timeout bounds each transport attempt, an extractor
+        rerun happens inside that timeout, and the runner may rebuild the
+        scraper once per build attempt - so this is the figure the browser
         providers publish as `refresh_budget_seconds` and the App arms its
-        watchdog from - derived here rather than restated, so the guard's
-        expiry cannot drift away from the bound the scrape really enforces.
+        watchdog from, derived here rather than restated so the guard's expiry
+        cannot drift away from the bound the scrape really enforces.
         """
         try:
             budget = (

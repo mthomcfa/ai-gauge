@@ -3,6 +3,11 @@
 State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#16,
 610 tests passing, all five providers reading.
 
+> **Updated 2026-09-15** by the refresh-cadence work (`1.3.0+cfa.5`,
+> 1 216 tests). Its residuals are folded into
+> [§8.3](#83-known-soft-spots-in-what-was-built) rather than given a section
+> of their own, because they are the same scheduler.
+>
 > **Updated 2026-09-10** by the Microsoft/Azure work (`1.2.0+cfa.4`, 907 tests).
 > Its own parked items are in [§8](#8-parked-from-the-microsoftazure-work).
 > Before it, `1.1.0+cfa.3` moved the Claude/Codex label definitions out of the
