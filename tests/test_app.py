@@ -934,7 +934,7 @@ def test_which_providers_are_browser_backed_is_pinned():
         assert cls.uses_browser is False, f"{cls.__name__} joined the serial queue"
 
 
-def test_a_browser_provider_refuses_a_refresh_while_one_is_running():
+def test_a_browser_provider_refuses_a_refresh_while_one_is_running(monkeypatch):
     """The last line of defence for one profile, one scrape.
 
     The App parks a provider its watchdog gave up on, but it cannot park it
@@ -946,31 +946,40 @@ def test_a_browser_provider_refuses_a_refresh_while_one_is_running():
     the account: two writers to one cookie store. It refuses instead, and
     says so with an error class the scheduler does not read as a failure.
     """
-    from aigauge.providers.claude import ClaudeProvider
-    from aigauge.providers.codex import CodexProvider
-    from aigauge.providers.opencode_go import OpenCodeGoProvider
+    import aigauge.providers.claude as claude_module
+    import aigauge.providers.codex as codex_module
+    import aigauge.providers.opencode_go as opencode_module
 
     config = Config()
-    providers = [
-        ClaudeProvider(parent=None, account_id="claude", config=config),
-        CodexProvider(parent=None, account_id="codex", config=config),
-        OpenCodeGoProvider(config, parent=None),
+    cases = [
+        (claude_module, claude_module.ClaudeProvider(
+            parent=None, account_id="claude", config=config)),
+        (codex_module, codex_module.CodexProvider(
+            parent=None, account_id="codex", config=config)),
+        (opencode_module, opencode_module.OpenCodeGoProvider(config, parent=None)),
     ]
-    for provider in providers:
+    for module, provider in cases:
+        # Stand in for ScrapeRunner so a regression fails the assertion below
+        # instead of constructing a real QWebEngineView.
+        built: list = []
+        monkeypatch.setattr(
+            module, "ScrapeRunner", lambda **kwargs: built.append(kwargs) or
+            SimpleNamespace(run=lambda on_done: None, busy=lambda: True)
+        )
         busy_runner = SimpleNamespace(busy=lambda: True)
         provider._runner = busy_runner  # noqa: SLF001
         answers: list[UsageSnapshot] = []
 
         provider.refresh(answers.append)
 
-        assert len(answers) == 1, f"{type(provider).__name__} did not answer"
+        name = type(provider).__name__
+        assert built == [], f"{name} started a second scrape on one profile"
+        assert len(answers) == 1, f"{name} did not answer"
         assert answers[0].status == SnapshotStatus.ERROR
         assert answers[0].error_class == "throttled", (
             "a provider that is already working is not a provider that failed"
         )
-        assert provider._runner is busy_runner, (  # noqa: SLF001
-            f"{type(provider).__name__} started a second scrape on one profile"
-        )
+        assert provider._runner is busy_runner  # noqa: SLF001
 
 
 def test_a_throttled_answer_clears_a_retry_that_was_already_owed():
