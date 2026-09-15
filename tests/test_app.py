@@ -1708,6 +1708,23 @@ def test_the_whole_snapshot_error_log_call_is_total():
     huge = type("D" * 1_000_000, (dict,), {"items": _ItemsRaises.items})(a=1)
     assert len(_raw_summary(huge)) < 200
 
+    # And the third argument, the one this release added. `UsageSnapshot` is
+    # a plain dataclass, so `error: str | None` is a hint and not a check:
+    # `error or ""` runs the object's `__bool__` and `str()` runs its
+    # `__str__`, both outside any guard, on the record the release is named
+    # for being total.
+    class _BoolRaises(str):
+        def __bool__(self):
+            raise RuntimeError("this error refuses to be truth-tested")
+
+    class _StrRaises(str):
+        def __str__(self):
+            raise RuntimeError("this error refuses to be printed")
+
+    for error in (_BoolRaises("x"), _StrRaises("x"), None, "", "plain"):
+        assert isinstance(_error_for_log(error), str)
+    assert _error_for_log(_StrRaises("x")) == "<unprintable error>"
+
 
 def test_an_error_string_costs_the_log_one_bounded_line():
     """`snapshot.error` is the fourth provider-influenced argument on that
@@ -1726,6 +1743,42 @@ def test_an_error_string_costs_the_log_one_bounded_line():
     assert len(line) <= _LOG_VALUE_LIMIT + 3
     assert "\n" not in line and "\r" not in line
     assert _error_for_log(None) == "" and _error_for_log("plain") == "plain"
+
+
+def test_the_error_clip_runs_before_the_redaction(monkeypatch):
+    """Four regex passes over an unbounded string, to keep 300 characters.
+
+    `_redact_azure_ids` is a scalpel for Azure resource paths and it ran
+    over the whole `snapshot.error` before anything clipped it - on the GUI
+    thread, inside `_on_snapshot`, for a string whose length is `str(exc)`
+    from `requests`. The order is the other way round now, with a margin so
+    an identifier that straddles the limit is redacted rather than cut in
+    half: what the redaction sees is bounded, what it returns is clipped.
+    """
+    import aigauge.app as app_module
+    from aigauge.app import _LOG_VALUE_LIMIT, _error_for_log
+
+    seen: list[int] = []
+
+    def _spy(text):
+        seen.append(len(text))
+        return text
+
+    monkeypatch.setattr(app_module, "_redact_azure_ids", _spy)
+    line = _error_for_log("X" * 2_000_000)
+
+    assert seen and max(seen) < 1_000, (
+        f"the redaction pass was handed {max(seen)} characters to produce "
+        f"{_LOG_VALUE_LIMIT}"
+    )
+    assert len(line) == _LOG_VALUE_LIMIT + 3
+
+    # A subscription id that begins inside the limit is still redacted, which
+    # is what the margin is for.
+    guid = "12345678-1234-1234-1234-123456789abc"
+    monkeypatch.undo()
+    padded = "y" * (_LOG_VALUE_LIMIT - 20) + "/subscriptions/" + guid + "/x"
+    assert guid not in _error_for_log(padded)
 
 
 def test_the_log_summariser_charges_a_big_integer_what_it_costs():

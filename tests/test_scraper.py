@@ -476,6 +476,36 @@ def test_the_scrapers_key_walk_cannot_raise_and_its_class_name_is_bounded():
     assert len(_result_keys_for_log(huge)) == 60
 
 
+def test_the_scrapers_key_walk_survives_a_result_that_refuses_to_be_walked(
+    caplog,
+):
+    """Guarded end to end, the way app.py's twin is.
+
+    `_key_text` covers a key that refuses to be printed; the `for key in
+    result` walk itself runs the payload's `__iter__`, and a `dict` subclass
+    can refuse that too - so the same refusal still escaped, `_finish`
+    caught it, and the whole `scrape ok` record of a scrape that had worked
+    was replaced by "the diagnostics could not be read". app.py's
+    `_raw_keys_for_log` answers `[]` for the identical payload.
+    """
+    from aigauge.webview.scraper import _result_keys_for_log
+
+    class _IterRaises(dict):
+        def __iter__(self):
+            raise RuntimeError("this result refuses to be iterated")
+
+    assert _result_keys_for_log(_IterRaises(a=1)) == "[]"
+
+    # And through the real `_finish`, which is where it cost the record.
+    stand_in = _stand_in_with_title("short")
+    with caplog.at_level(logging.INFO, logger="aigauge.scraper"):
+        caplog.clear()
+        HeadlessScraper._finish(stand_in, _IterRaises(a=1), "")
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(message.startswith("scrape ok") for message in messages), messages
+
+
 def test_the_scrapers_load_error_string_is_bounded(caplog):
     """Chromium's `errorString` is a Qt string-table message - 49 characters
     for an HTTP failure against a real QtWebEngine, not the server's reason

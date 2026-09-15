@@ -89,16 +89,27 @@ def _key_text(raw_key: Any) -> str:
 
 
 def _result_keys_for_log(result: Any) -> str:
-    """The extractor's top-level key names, bounded like app.py's."""
-    if not isinstance(result, dict):
-        # The class name is the payload's too, and nothing bounds a class
-        # name: clipped to the same limit as a key.
-        return type(result).__name__[:_LOG_KEY_LEN_LIMIT]
-    keys = sorted(_key_text(key)[:_LOG_KEY_LEN_LIMIT] for key in result)
-    shown = keys[:_LOG_KEY_COUNT_LIMIT]
-    if len(keys) > _LOG_KEY_COUNT_LIMIT:
-        shown.append(f"... {len(keys) - _LOG_KEY_COUNT_LIMIT} more")
-    return str(shown)
+    """The extractor's top-level key names, bounded like app.py's.
+
+    Guarded end to end, like app.py's `_raw_keys_for_log`: `_key_text`
+    covers a key that refuses to be printed, but the walk itself runs the
+    payload's `__iter__` and a `dict` subclass can refuse that too. The
+    caller catches what escapes and replaces the whole `scrape ok` record
+    with "the diagnostics could not be read", so one refusing payload cost
+    the diagnostics of a scrape that had worked.
+    """
+    try:
+        if not isinstance(result, dict):
+            # The class name is the payload's too, and nothing bounds a class
+            # name: clipped to the same limit as a key.
+            return type(result).__name__[:_LOG_KEY_LEN_LIMIT]
+        keys = sorted(_key_text(key)[:_LOG_KEY_LEN_LIMIT] for key in result)
+        shown = keys[:_LOG_KEY_COUNT_LIMIT]
+        if len(keys) > _LOG_KEY_COUNT_LIMIT:
+            shown.append(f"... {len(keys) - _LOG_KEY_COUNT_LIMIT} more")
+        return str(shown)
+    except Exception:  # noqa: BLE001 - a log line must never raise
+        return "[]"
 
 
 # A timeout is bounded by a QTimer, so a scrape cannot legitimately run for

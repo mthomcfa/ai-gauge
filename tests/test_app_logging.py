@@ -2306,3 +2306,83 @@ def test_a_dispatch_with_no_recorded_kind_parks_by_the_live_answer(
     )
     assert "ceiling=browser_2x" in caplog.text
     assert "ceiling=rest_backstop" not in caplog.text
+
+
+def test_an_error_object_that_refuses_to_print_still_paints_its_tile(caplog):
+    """The last argument on that record that could raise out of the paint.
+
+    `_raw_keys_for_log` and `_raw_summary` are total; `_error_for_log` - the
+    helper this release added, on the record it is named for making total -
+    ran `error or ""` and then `str(error)` outside any guard. Both are the
+    payload's own methods: `UsageSnapshot` is a plain dataclass, so the
+    annotation is a hint and a provider object that refuses either took
+    `_on_snapshot` with it before the tile was painted or the cycle advanced.
+    """
+
+    class _StrRaises(str):
+        def __str__(self):
+            raise RuntimeError("this error refuses to be printed")
+
+    class _BoolRaises(str):
+        def __bool__(self):
+            raise RuntimeError("this error refuses to be truth-tested")
+
+    for hostile in (_StrRaises("x"), _BoolRaises("x")):
+        app = _app({"copilot": _Provider(_ok("copilot"))})
+        with caplog.at_level(logging.WARNING, logger="aigauge.app"):
+            caplog.clear()
+            app._on_snapshot(  # noqa: SLF001
+                UsageSnapshot(
+                    provider="copilot",
+                    status=SnapshotStatus.ERROR,
+                    error=hostile,
+                    raw={},
+                )
+            )
+        assert [snap.provider for snap in app._widget.snapshots] == [  # noqa: SLF001
+            "copilot"
+        ], f"{type(hostile).__name__} stopped the tile being painted"
+        record = next(
+            message
+            for message in (rec.getMessage() for rec in caplog.records)
+            if message.startswith("snapshot error")
+        )
+        assert "error=<unprintable error>" in record, record
+
+
+def test_a_newline_inside_a_short_id_cannot_forge_a_log_record(
+    monkeypatch, caplog
+):
+    """The id coercion bounds type and length, not characters.
+
+    Four records print ids through `_clip_for_log`, and this release added
+    two of them. A 53-character id carrying two newlines - well inside the
+    64-character bound the validator enforces - read as three records in the
+    file: the real one, a forged `ERROR aigauge.app: balance=0.00
+    key=sk-ant-x` and a forged `CRITICAL aigauge.app: signed out`. It needs
+    a hand-edited `config.json`, and it lands in the app's own log rather
+    than anywhere a user acts on, but the fix was invented next door -
+    `_error_for_log` flattens for exactly this reason.
+    """
+    from aigauge.config import Config as RealConfig
+
+    monkeypatch.setattr(app_module, "purge_profile", lambda account_id: None)
+    forged = "a\nERROR aigauge.app: balance=0.00 key=sk-ant-x\nWARN x"
+    assert len(forged) <= 64, "the validator would have dropped this id"
+    app = _app({})
+    app._config = RealConfig(  # noqa: SLF001
+        pending_profile_purges=[forged, "z"],
+        pending_data_clears=[forged, "y"],
+    )
+    app._inflight.add(forged)  # noqa: SLF001 - so the deferral lines run too
+
+    with caplog.at_level(logging.INFO, logger="aigauge"):
+        app._drain_pending_purges()  # noqa: SLF001
+
+    assert caplog.records, "the drain logged nothing at all"
+    forged_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "\n" in record.getMessage() or "\r" in record.getMessage()
+    ]
+    assert forged_lines == [], forged_lines

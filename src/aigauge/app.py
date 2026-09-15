@@ -158,7 +158,14 @@ _LOG_ID_SAMPLE = 3
 
 def _clip_for_log(value: object) -> str:
     text = str(value)
-    return text if len(text) <= _LOG_ID_LIMIT else text[:_LOG_ID_LIMIT] + "..."
+    if len(text) > _LOG_ID_LIMIT:
+        text = text[:_LOG_ID_LIMIT] + "..."
+    # Flattened for the reason `_error_for_log` flattens: the coercion bounds
+    # an id's type and its length, not its characters, so a 53-character id
+    # carrying two newlines read as three records in the file - a forged
+    # ERROR line naming a balance and a key, and a forged CRITICAL "signed
+    # out". Four records print ids this way and this PR added two of them.
+    return text.replace("\r", " ").replace("\n", " ")
 
 
 def _ids_for_log(ids: list[str]) -> str:
@@ -308,6 +315,10 @@ _LOG_KEY_LEN_LIMIT = 60
 # deep with a fan-out of 20 measured 2.2 MB and an api-capture-shaped one
 # 4.77 MB - 9x the entire 512 KiB x 3 rotation, from one ERROR scrape.
 _LOG_SUMMARY_BUDGET = 4000
+# How much past the value limit the redaction pass is allowed to see. Long
+# enough for any single identifier it matches - a GUID is 36 characters, its
+# compact form 32 - so clipping first cannot leave half of one in the record.
+_LOG_REDACT_MARGIN = 200
 
 
 def _error_for_log(error: object) -> str:
@@ -321,11 +332,26 @@ def _error_for_log(error: object) -> str:
     length nor its line breaks are the app's to assume: a 2 MB error measured
     4.73x the whole rotation in one record, with 20 000 embedded newlines
     that each read like a log line of their own.
+
+    Guarded end to end like the two helpers it is evaluated beside:
+    `UsageSnapshot` is a plain dataclass, so `error: str | None` is a hint
+    and not a check, and `error or ""` runs the object's `__bool__` and
+    `str()` runs its `__str__`. This was the one argument of that record
+    that could still raise out of `_on_snapshot`.
     """
-    text = _redact_azure_ids(str(error or ""))
-    if len(text) > _LOG_VALUE_LIMIT:
-        text = text[:_LOG_VALUE_LIMIT] + "..."
-    return text.replace("\r", " ").replace("\n", " ")
+    try:
+        # Clipped before the redaction, not after: `_redact_azure_ids` is
+        # four regex passes and it ran over the whole unbounded string on the
+        # GUI thread to produce 300 characters. The margin is what keeps an
+        # identifier straddling the limit redacted rather than cut in half.
+        text = _redact_azure_ids(
+            str(error or "")[: _LOG_VALUE_LIMIT + _LOG_REDACT_MARGIN]
+        )
+        if len(text) > _LOG_VALUE_LIMIT:
+            text = text[:_LOG_VALUE_LIMIT] + "..."
+        return text.replace("\r", " ").replace("\n", " ")
+    except Exception:  # noqa: BLE001 - a log line must never raise
+        return "<unprintable error>"
 
 
 def _key_text(raw_key) -> str:
