@@ -1334,7 +1334,7 @@ def _hook(args: argparse.Namespace) -> int:
     # does not name its tool still must not smuggle a direct invocation past.
     if tool == "Bash" or "command" in tool_input:
         command = str(tool_input.get("command", ""))
-        if _bypasses_guard(command):
+        if _bypasses_guard(command, policy.server):
             print(
                 "Blocked: dispatch external agents through tools/egress_guard.py, "
                 "which scans the payload and pins the destination.",
@@ -1382,8 +1382,49 @@ _BYPASS_RE = re.compile(
 )
 
 
-def _bypasses_guard(command: str) -> bool:
-    return bool(_BYPASS_RE.search(command))
+# The guard's own dispatch path is a two-call REST conversation with the agent's
+# server, documented in this very PR: `POST /session`, then
+# `POST /session/<id>/message`. The bypass regex hunted for the *binary*, so a
+# Bash call that speaks that API directly skipped the guard entirely - which is
+# what `test_hook_refuses_a_direct_dispatch_that_would_skip_the_guard` is named
+# for. Over-blocking is the accepted direction here: a refused Bash call costs a
+# retry through the guard, an unrecognised one costs the guard's whole purpose.
+_AGENT_ENDPOINT_RE = re.compile(
+    r"(?:(?:127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0)(?::\d{1,5})?|:\d{2,5})/session\b",
+    re.IGNORECASE,
+)
+_HTTP_CLIENT_RE = re.compile(
+    r"\b(?:curl|wget|wget2|httpie|xh|http|https|nc|ncat|telnet|socat"
+    r"|Invoke-WebRequest|Invoke-RestMethod|irm|iwr)\b"
+    r"|\bpython[0-9.]{0,4}\b[^\n]{0,160}?[ \t]-c\b"
+    r"|\bnode\b[^\n]{0,160}?[ \t]-e\b"
+    r"|\b(?:perl|ruby|php)\b[^\n]{0,160}?[ \t]-e\b",
+    re.IGNORECASE,
+)
+
+
+def _posts_to_the_agent_server(command: str, server: str = "") -> bool:
+    endpoint = server_endpoint(server) if server else ""
+    if endpoint.startswith("unparseable") or endpoint == "unset":
+        endpoint = ""
+    port = endpoint.rsplit(":", 1)[1] if ":" in endpoint else ""
+    loopback = ""
+    if port.isdigit():
+        loopback = rf"(?:127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0):{port}\b"
+    for line in command.splitlines():
+        if not _HTTP_CLIENT_RE.search(line):
+            continue
+        if _AGENT_ENDPOINT_RE.search(line):
+            return True
+        if endpoint and endpoint.lower() in line.lower():
+            return True
+        if loopback and re.search(loopback, line, re.IGNORECASE):
+            return True
+    return False
+
+
+def _bypasses_guard(command: str, server: str = "") -> bool:
+    return bool(_BYPASS_RE.search(command)) or _posts_to_the_agent_server(command, server)
 
 
 def _add_payload_args(parser: argparse.ArgumentParser) -> None:

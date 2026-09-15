@@ -514,6 +514,8 @@ def _quantifiers(pattern: str, verbose: bool = False):
     + [
         ("opaque-token", eg._OPAQUE_TOKEN_RE.pattern, False),
         ("bypass", eg._BYPASS_RE.pattern, True),
+        ("agent endpoint", eg._AGENT_ENDPOINT_RE.pattern, False),
+        ("http client", eg._HTTP_CLIENT_RE.pattern, False),
         ("base ref", eg._BASE_REF_RE.pattern, False),
     ],
 )
@@ -1512,6 +1514,49 @@ def test_a_good_base_still_produces_a_diff(tmp_path):
 )
 def test_hook_refuses_a_direct_dispatch_that_would_skip_the_guard(command):
     assert eg._bypasses_guard(command) is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "curl -s -X POST http://127.0.0.1:4096/session -d '{}'",
+        "curl -X POST http://127.0.0.1:4096/session/1/message -d @payload.json",
+        "curl --data-binary @diff.txt http://localhost:4096/session/1/message",
+        "wget --post-file=payload.json http://127.0.0.1:4096/session/1/message",
+        'python3 -c "import urllib.request;'
+        "urllib.request.urlopen('http://127.0.0.1:4096/session',b'{}')\"",
+        "http POST :4096/session/1/message < payload.json",
+        "cat payload.json | curl -X POST http://[::1]:4096/session/1/message -d @-",
+        "Invoke-RestMethod -Uri http://127.0.0.1:4096/session -Method Post",
+        "node -e \"fetch('http://127.0.0.1:4096/session', {method:'POST'})\"",
+    ],
+)
+def test_hook_refuses_a_direct_post_to_the_agents_own_server(command):
+    """The guard's dispatch path is a two-call REST conversation with that
+    server, documented in this PR. The regex hunted for the binary, so a Bash
+    call that speaks the API directly skipped the guard entirely."""
+    assert eg._bypasses_guard(command, "http://127.0.0.1:4096") is True
+
+
+def test_a_post_to_the_configured_server_is_refused_on_any_port():
+    """The policy's own `destinations.server`, not only the default port."""
+    assert eg._bypasses_guard(
+        "curl -X POST http://127.0.0.1:51823/session -d @payload.json",
+        "http://127.0.0.1:51823",
+    ) is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "curl https://api.openrouter.ai/v1/models",
+        "curl -sSL https://example.org/install.sh",
+        "wget https://example.org/data.csv",
+        "python -m http.server 8000",
+    ],
+)
+def test_an_ordinary_http_call_that_is_not_to_the_agent_is_left_alone(command):
+    assert eg._bypasses_guard(command, "http://127.0.0.1:4096") is False
 
 
 @pytest.mark.parametrize(
