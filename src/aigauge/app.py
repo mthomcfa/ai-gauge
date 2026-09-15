@@ -129,6 +129,30 @@ def _refresh_budget_seconds(provider) -> float:
     return budget
 
 
+# What a config-controlled id list may cost the log. `pending_profile_purges`
+# is the one field this release adds to `config.json`, it is drained before
+# anything else at startup, and neither its length nor its entries are
+# bounded: a poisoned file carrying two 200 000-character ids wrote 800 KB of
+# records, of which one line was 0.76x the whole 512 KiB rotation - the same
+# anti-forensic outcome the `raw_summary=` cap closes, on the one path that
+# runs before the app has done anything else.
+_LOG_ID_LIMIT = 64
+_LOG_ID_SAMPLE = 3
+
+
+def _clip_for_log(value: object) -> str:
+    text = str(value)
+    return text if len(text) <= _LOG_ID_LIMIT else text[:_LOG_ID_LIMIT] + "..."
+
+
+def _ids_for_log(ids: list[str]) -> str:
+    """A bounded sample of an id list. The count travels beside it."""
+    sample = ",".join(_clip_for_log(one) for one in ids[:_LOG_ID_SAMPLE])
+    if len(ids) > _LOG_ID_SAMPLE:
+        sample = f"{sample},+{len(ids) - _LOG_ID_SAMPLE} more"
+    return sample
+
+
 def _make_dot_tray_icon(color: str | None = None) -> QIcon:
     """Tray dot in the given band colour (grey when there is nothing to show).
 
@@ -1186,13 +1210,36 @@ class App(QObject):
         pending = list(getattr(self._config, "pending_profile_purges", []) or [])
         if not pending:
             return
+        # A count, and a bounded sample of the ids: the list is
+        # config-controlled and nothing bounds it, so echoing it whole let a
+        # poisoned `config.json` erase the log ring at every start.
         log.info(
-            "profile purge owed from a previous run accounts=%s",
-            ",".join(pending),
+            "profile purge owed from a previous run count=%s accounts=%s",
+            len(pending),
+            _ids_for_log(pending),
         )
+        configured = {account.id for account in browser_accounts(self._config)}
         for account_id in pending:
+            if account_id in configured:
+                # The list is persisted now, so an entry outlives the removal
+                # that wrote it. A restored backup, a synced config directory
+                # or a hand-edited undo of a removal puts the same id in both
+                # lists, and purging it would delete the live session cookie
+                # store of an account the user still has - the tile goes to
+                # "sign in again" at the next refresh with nothing to explain
+                # it. Not reachable through the UI, where generated ids are
+                # `kind-<uuid4>` and the fixed ones cannot be removed; the
+                # config file disagreeing with itself is worth the warning.
+                log.warning(
+                    "purge skipped account=%s reason=reconfigured",
+                    _clip_for_log(account_id),
+                )
+                continue
             if account_id not in self._pending_profile_purges:
                 self._pending_profile_purges.append(account_id)
+        # Runs even when every entry was skipped: it is what rewrites the
+        # list, so a reconfigured id is dropped rather than asked again at
+        # every start.
         self._run_profile_purges()
 
     def _purge_removed_profiles(self, account_ids) -> None:

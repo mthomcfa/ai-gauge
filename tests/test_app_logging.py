@@ -23,7 +23,7 @@ from types import SimpleNamespace
 import pytest
 
 import aigauge.app as app_module
-from aigauge.app import App
+from aigauge.app import App, app_data_dir
 from aigauge.config import Config
 from aigauge.models import SnapshotStatus, UsageMetric, UsageSnapshot
 
@@ -1331,6 +1331,83 @@ def test_a_deferred_profile_purge_survives_a_quit(monkeypatch):
     assert RealConfig.load().pending_profile_purges == [], (
         "a purge that ran is still recorded as owed"
     )
+
+
+def test_the_drain_does_not_purge_an_account_that_is_configured_again(
+    monkeypatch, caplog
+):
+    """The drain reasons about ordering and not about membership.
+
+    The list is persisted now, so an entry can outlive the removal that wrote
+    it: a restored backup, a synced config directory or a hand-edited undo
+    puts the same id in `pending_profile_purges` and in `browser_accounts`,
+    and the next start deleted the live session cookie store of an account
+    the user still has - no confirmation, and a tile that asks them to sign
+    in again with nothing to explain why.
+    """
+    from aigauge.config import BrowserAccount, Config as RealConfig
+
+    purged: list[str] = []
+    monkeypatch.setattr(app_module, "purge_profile", purged.append)
+    app = _app({})
+    app._config = RealConfig(  # noqa: SLF001
+        browser_accounts=[BrowserAccount(id="claude-ab12cd34", kind="claude")],
+        pending_profile_purges=["claude-ab12cd34", "codex-99999999"],
+    )
+
+    with caplog.at_level(logging.INFO, logger="aigauge.app"):
+        app._drain_pending_profile_purges()  # noqa: SLF001
+
+    assert purged == ["codex-99999999"], "a configured account's profile was deleted"
+    assert "purge skipped account=claude-ab12cd34 reason=reconfigured" in caplog.text
+    assert app._pending_profile_purges == []  # noqa: SLF001
+    assert app._config.pending_profile_purges == [], (  # noqa: SLF001
+        "a skipped id stayed on the list and would be asked again every start"
+    )
+
+
+def test_the_startup_drain_line_is_bounded_by_a_hostile_config(monkeypatch, caplog):
+    """`pending_profile_purges` is config-controlled and nothing bounds it.
+
+    Echoing the list verbatim let a poisoned `config.json` write 800 KB of
+    records at every start - one line 0.76x the whole 512 KiB rotation -
+    which erases the diagnostics a compromise would otherwise leave behind.
+    The line names a count and a bounded sample instead.
+    """
+    from aigauge.config import Config as RealConfig
+    from aigauge.webview.profile import purge_profile
+
+    hostile = (
+        ["../../OUTSIDE", "a" * 200_000, "claude\x00/../../OUTSIDE", "%2e%2e%2fx"]
+        + [f"codex-{index:08d}" for index in range(4996)]
+    )
+    app = _app({})
+    app._config = RealConfig(pending_profile_purges=hostile)  # noqa: SLF001
+    assert len(app._config.pending_profile_purges) == 5000  # noqa: SLF001
+    outside = app_data_dir().parent / "treasure.txt"
+    outside.write_text("decoy")
+
+    with caplog.at_level(logging.INFO, logger="aigauge"):
+        # The real purge, so the refusal lines are the real ones too.
+        monkeypatch.setattr(app_module, "purge_profile", purge_profile)
+        app._drain_pending_profile_purges()  # noqa: SLF001
+
+    opening = next(
+        rec.getMessage()
+        for rec in caplog.records
+        if rec.getMessage().startswith("profile purge owed")
+    )
+    assert "count=5000" in opening
+    assert len(opening) < 500, "the whole list reached the log"
+    refusals = [
+        rec.getMessage()
+        for rec in caplog.records
+        if "refusing unsafe account id" in rec.getMessage()
+    ]
+    assert refusals, "the traversal payloads were never actually refused"
+    assert max(len(rec.getMessage()) for rec in caplog.records) < 500
+    assert outside.read_text() == "decoy", "the purge escaped the profiles root"
+    assert app._config.pending_profile_purges == []  # noqa: SLF001
 
 
 def test_a_purge_that_runs_is_taken_off_the_pending_list(monkeypatch):
