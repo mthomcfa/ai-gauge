@@ -86,7 +86,9 @@ def purge_profile(account_id: str) -> None:
     try:
         target = webview_profile_dir(account_id)
     except ValueError:
-        log.warning("purge_profile: refusing unsafe account id %r", account_id)
+        # Clipped: the id comes from `config.json`, which bounds neither its
+        # length nor the list's, and a refusal must not cost the log ring.
+        log.warning("purge_profile: refusing unsafe account id %.64r", account_id)
         return
     profiles_root = (app_data_dir() / "profiles").resolve()
     resolved = target.resolve()

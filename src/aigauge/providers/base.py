@@ -17,6 +17,11 @@ class Provider(ABC):
 
     name: str = ""
     display_name: str = ""
+    # True for the QtWebEngine-backed providers. They are refreshed strictly
+    # one at a time: QtWebEngine is GUI-thread-only and each scrape holds a
+    # profile. Everything else is a handful of HTTPS calls on a thread pool
+    # and can run alongside them.
+    uses_browser: bool = False
 
     @abstractmethod
     def refresh(self, on_done: Callable[[UsageSnapshot], None]) -> None:

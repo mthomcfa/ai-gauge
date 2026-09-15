@@ -155,9 +155,28 @@ def test_remove_secondary_account_clears_cookie(qtbot, monkeypatch):
 
     assert removed == [(account_id, None)]
 
-def test_remove_account_purges_profile_dir(qtbot, monkeypatch):
+def test_remove_account_clears_its_secret_and_hands_the_profile_to_the_app(
+    qtbot, monkeypatch
+):
+    """The dialog no longer deletes the profile directory itself.
+
+    `purge_profile` releases the cached `QWebEngineProfile` and rmtree's its
+    directory, and a settings save can remove an account while its scrape is
+    still out. Qt requires a profile to outlive its pages, and a page that
+    survives its profile can flush rotated session cookies back into the
+    directory that was just removed - so only the App, which knows what is in
+    flight, may run it. See App._run_profile_purges.
+
+    The stored credential is still cleared here and now: it is a keyring
+    entry, nothing holds it open, and it is the part that matters.
+    """
     monkeypatch.setattr(settings_dialog, "set_start_at_login", lambda enabled: None)
-    monkeypatch.setattr(settings_dialog, "set_provider_cookie", lambda key, value: None)
+    cleared: list[tuple] = []
+    monkeypatch.setattr(
+        settings_dialog,
+        "set_provider_cookie",
+        lambda key, value: cleared.append((key, value)),
+    )
     config = Config()
     dialog = SettingsDialog(config)
     qtbot.addWidget(dialog)
@@ -174,7 +193,9 @@ def test_remove_account_purges_profile_dir(qtbot, monkeypatch):
     dialog._remove_browser_account(account_id)  # noqa: SLF001
     dialog.apply_to(config)
 
-    assert not profile_dir.exists()
+    assert (account_id, None) in cleared
+    assert dialog.removed_profile_ids == [account_id]
+    assert profile_dir.exists(), "the dialog deleted a profile the App may be using"
 
 
 def test_fade_when_inactive_setting_applies(qtbot, monkeypatch):

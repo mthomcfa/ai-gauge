@@ -6,6 +6,305 @@
 > earlier `0.6.4` entry predates that convention and **is not** upstream's
 > `v0.6.4`, which is different code.
 
+## 1.3.0+cfa.5 - 2026-09-15
+
+The refresh cycle. Four and a half days of a real desktop log — 137 cycles,
+2026-09-10 to 09-15 — were read before any of this was written, and the
+numbers in the entries below are that log's, not estimates.
+
+### Changed
+
+- **The error fast-retry is per provider.** It was cycle-wide: any ERROR
+  snapshot anywhere meant the *next cycle* ran in one minute, for every
+  provider. 124 of the 137 cycles contained at least one ERROR or
+  AUTH_REQUIRED — OpenCode never succeeded once in the whole run, 95 auth
+  failures and 38 errors — so a third of all cycles started within two minutes
+  of the previous one and five healthy providers were re-scraped because of one
+  broken tile. Claude alone costs a median of 18.5 s and a p90 of 48 s of
+  browser time per scrape, so the app was very nearly always refreshing. Then
+  the bound bit the wrong way round: past three failing cycles *nobody* got a
+  fast retry, and since no cycle was ever clean the counter never reset, so a
+  genuinely transient failure elsewhere got nothing.
+
+  Each provider now carries its own consecutive-error count and its own due
+  time. An ERROR schedules that provider's retry at 1, 2 then 4 minutes and
+  then falls back to the normal cadence; OK clears it; AUTH_REQUIRED clears it
+  too, because signing in is the user's move and retrying it quickly only
+  burns page loads. A wake that is only a retry refreshes **only the providers
+  that are due**, not the whole queue.
+
+- **The cheap providers no longer queue behind the browsers.** Copilot,
+  OpenRouter and Azure are plain HTTPS calls on a thread pool; only the
+  refresh queue made them wait. Cycles ran a median of 48 s, a p90 of 79 s and
+  a maximum of 100 s, nearly all of it browser time, with Copilot's payload —
+  about a second's work — landing near the end of each one. They are now
+  dispatched together at cycle start. The browser providers stay strictly
+  serial: QtWebEngine is GUI-thread-only and each scrape holds a profile.
+  Copilot also joins OpenRouter and Azure at the head of the queue.
+
+- **The cadence signature follows the snapshot's status, not its error text.**
+  Azure's fail-closed message counts a minute down — "Waiting for the next
+  Azure fetch window (43 min)" — so it differed on every cycle, which read as
+  "this provider changed", re-armed the 30-minute active window and zeroed the
+  idle backoff for every provider, on a clock. `unchanged_cycles` was 0 in 55
+  of 204 heartbeats and only ever reached 9–12 overnight, so the documented
+  idle backoff almost never engaged. The message still reaches the tile, the
+  tooltip and the log; it just no longer decides how often the app polls.
+
+### Added
+
+- **The scheduler logs what it does.** It logged nothing at all, so the cycles
+  in that desktop log had to be *inferred* from runs of provider activity
+  separated by 45 s of quiet, and "I clicked Refresh and nothing happened" was
+  unprovable either way. There are now lines for the start of a cycle (manual,
+  reason, providers), its end (duration, changed, errors, auth_required), the
+  next scheduled wake **and the reason that chose it** (active, idle,
+  error_retry, reset_pull_forward, manual), a queued or ignored manual
+  refresh, and a start/done pair per provider turn. The heartbeat prints the
+  per-provider retry state, which was computed and then dropped by its own
+  format string. Azure's cached path and OpenRouter's healthy path were
+  `debug`, which the file handler drops — between live fetches neither
+  provider left any trace at all — and are now `info`.
+
+- **A watchdog on every dispatch, and an epoch to go with it.** `_inflight`
+  was cleared only by an arriving snapshot, and the scheduler returns early
+  while it is non-empty, so one provider that never called back stopped every
+  future refresh until the app was restarted. Each dispatch now has a deadline
+  taken from the provider itself — the browser providers derive it from their
+  scraper timeout times the attempts they may make, Azure reports its real
+  worst case (its page-loop deadline **plus** the fixed calls that sit outside
+  that budget, because `REFRESH_DEADLINE_SECONDS` is a floor on a refresh's
+  ceiling rather than the ceiling), and a REST provider gets a flat 60 s plus
+  an allowance for time spent queued on the shared thread pool, since its
+  deadline starts at dispatch and its work starts when a pool thread frees up.
+  After that the App gives up on that provider, records the failure and
+  carries on.
+
+  Giving up ends the App's wait, not the provider's work, and the rest of this
+  entry is about not pretending otherwise. Every dispatch carries an epoch, so
+  an answer is matched to the dispatch that earned it: one from a dispatch the
+  App abandoned is logged, paints and records only its own tile, and closes no
+  cycle. A provider the
+  watchdog gave up on is **parked** — no cycle, retry wake, manual refresh or
+  settings save dispatches it — until its worker reports back or twice its
+  budget has passed and the worker can fairly be assumed dead, and the three
+  browser providers refuse a re-entrant refresh outright, so the one case that
+  ceiling lets through still cannot open a second `QWebEngineView` on an
+  account's one profile. Without this, a provider that stopped answering
+  accumulated live scrapes: up to 19 of one provider in a six-hour simulation,
+  all sharing one cookie store.
+
+  A cycle also accounts only for what it dispatched; a snapshot from a
+  provider outside it repaints its tile without joining that cycle's progress,
+  error count or "changed" verdict.
+
+  The heartbeat restarts a refresh timer that is not running, and ends a cycle
+  that is open with nothing in flight, nothing queued and no watchdog left.
+
+- **A visible refreshing state.** The header said `· active next now` for the
+  whole cycle: `set_refreshing` wrote "refreshing…" and the 1 Hz label tick
+  overwrote it within the second, while the countdown it rewrote from was
+  stale and already in the past. The refreshing state is now durable, counts
+  the cycle off ("· refreshing 2/6"), and scheduled cycles mark their tiles
+  too — lightly, since nobody asked for them — where before a scheduled
+  refresh showed nothing at all. The tray updates per snapshot rather than at
+  cycle end, so the dot and its tooltip stop being a whole cycle behind the
+  tiles.
+
+### Fixed
+
+- **A manual refresh during a cycle is no longer discarded.** `refresh_now`
+  and `refresh_provider` both returned early while anything was in flight, the
+  Refresh button is disabled for the whole cycle, and the tray menu's "Refresh
+  now" was therefore a no-op — at exactly the moment a tile looks stale, which
+  is usually mid-cycle. Saving settings mid-cycle had the same hole. The
+  request is queued and runs once when the cycle closes.
+- **A snapshot for a provider you just removed no longer re-creates its
+  tile.** A settings save rebuilds the providers while a refresh is still out,
+  and the late snapshot came back through `ensure_tile`.
+- **Changing the Copilot quota or the OpenRouter budget mid-refresh no longer
+  throws that refresh away.** Both re-render the cached snapshot immediately
+  so the new denominator shows without waiting for a network call, and both
+  did it by handing the scheduler a snapshot with no dispatch identity. The
+  scheduler read it as that dispatch's answer: it cleared the in-flight
+  entry, destroyed the watchdog, wrote `refresh provider done … status=ok`
+  for a dispatch that had not answered, recorded the cached value as the
+  cycle's result and could close the cycle — after which the refresh the
+  settings save itself starts could put a second worker beside the first,
+  and the real answer was discarded as late. A re-render is now a repaint:
+  it touches the tile and nothing else.
+- **A settings save no longer lets a second browser scrape onto one
+  profile.** The "a refresh is already running" refusal read a field on the
+  provider object, and saving settings — a colour-only change included —
+  replaces that object. Past the point where the app stops assuming an
+  abandoned worker is still alive, nothing refused. Measured on the real path
+  — the real `ClaudeProvider`, the real runner and a real
+  `_build_providers()`, with only the headless scraper faked — six fake hours
+  with a wedged scrape and a save every 400 s (55 provider rebuilds) put **29
+  headless views on one account's single browser profile**, all writing one
+  cookie store, which is how a spurious sign-out happens. With the refusal
+  keyed on the account: **one view and 11 refusals** over the same six hours.
+  A provider object is also reused when nothing about it changed.
+
+  An entry in that registry expires. It is cleared when the scrape reports
+  back, and `HeadlessScraper` arms its own timeout so it always does — but
+  that invariant lives in another module, and a `_finish` whose diagnostics
+  raised before its emit (a page whose C++ half Qt had already deleted, which
+  is what destroying a profile under a live scrape produces) skipped it. The
+  account was then refused for the life of the process, with no settings save
+  able to clear it, because not being clearable by a rebuild is the point of
+  module state. The diagnostics in `_finish` now give way to the signal, and
+  an entry older than the scrape's own worst case — the runner's timeout
+  times the attempts it may make, plus a minute — expires with a line in the
+  log.
+- **A provider that answers late is no longer stuck on "Refresh timed
+  out."** Dropping a late answer whole is right for the cycle's accounting
+  and wrong for the tile: a provider that is merely slower than its budget
+  answered correctly every time, and a genuine "sign in again" was never
+  shown. Its own tile now gets the answer when it is the newest dispatch's,
+  and the fast-retry entry is cleared only if it answered OK or
+  auth-required. It is **recorded** as well as painted: it is a real
+  observation, and the only thing the history and burn-rate stores had heard
+  about that dispatch was the watchdog's synthetic timeout, which both of
+  them drop — so a provider slower than its budget showed a healthy tile
+  above an empty ratio history and a blank burn-rate row (0 rows over twelve
+  cycles, against 12 for the same provider inside its budget). Nothing else
+  moves — no cycle is closed or joined, no scheduling of any kind, and no
+  newer dispatch is touched.
+- **A profile deletion deferred past a quit is no longer lost.** Removing an
+  account while a refresh of it is still out defers deleting its browser
+  profile, because Qt cannot free a profile under a live page. The list was
+  in memory only and the account is gone from the config by then, so quitting
+  inside that window left a removed account's persistent cookie store on disk
+  with no recovery path short of "Clear all browser data". What is still owed
+  is now recorded and run at the next start, before anything can open a page.
+  The stored credential was, and is, cleared immediately. The drain checks
+  membership as well as ordering: an id that is *also* a configured account —
+  which a restored backup, a synced config directory or a hand-edited undo can
+  produce, since the list now outlives the removal that wrote it — is skipped,
+  logged and dropped rather than deleting a live session. Its opening line
+  names a count with a bounded sample of ids beside it, and `purge_profile`
+  clips the id it refuses: the list is config-controlled and unbounded, and
+  echoing it whole let a poisoned `config.json` write 800 KB of records at
+  every start, one line of it 0.76× the whole 512 KiB rotation.
+
+  Note that this is also the first path on which the app rewrites its own
+  `config.json` without the user asking: `_run_profile_purges` records what is
+  still owed, so while a purge is deferred the five-minute heartbeat can write
+  the settings file. It early-returns when nothing changed, so the steady
+  state writes nothing.
+- **A fast retry owed to a provider the app has given up on is no longer
+  spent for nothing.** Its deadline was consumed before the cycle filtered
+  it out, so the retry vanished and — when it was the only one owed — the
+  wake ran a completely empty cycle, header flicker included. The deadline is
+  now kept, and owed no earlier than the next ordinary cadence wake: arming
+  it for the instant the park lifts bought a wake of its own, which is one
+  extra dispatch an hour for a provider that is hung, and for the three REST
+  providers — which have no re-entrancy guard of their own — one more worker
+  holding a slot of the global thread pool.
+- **A refresh with nothing eligible no longer opens a cycle.** Every entry
+  path filters out what it cannot dispatch and then opened a complete cycle
+  over what was left, even when that was nothing: the header blinked
+  "· refreshing" with no fraction behind it and two log lines claimed a cycle
+  that dispatched nobody. A *manual* one cost more, because the active-window
+  re-arm sits after the filter and never asked whether anything survived it —
+  clicking Refresh while the only provider was parked pinned the app on the
+  fast cadence for thirty minutes and threw away the idle backoff, in
+  exchange for zero network calls.
+- **A provider that is only waiting can no longer spin the scheduler.** A
+  `throttled` or `resume_artifact` answer skips the fast retry, and the skip
+  used to leave an already-owed retry deadline in place — now in the past. A
+  past deadline is clamped to *now*, the wake timer has a 1 000 ms floor, and
+  the wake produces the same answer: a self-sustaining refresh cycle at about
+  1 Hz for as long as the wait lasts. Driving the real Azure provider for an
+  hour measured 3 541 cycles where 12 were intended, by two ordinary routes —
+  an offline burst followed by a settings change on an Azure query field, and
+  a watchdog giving up on a wedged fetch with no user action at all. It costs
+  no extra requests, but it writes about 3.8 MB an hour into a log that keeps
+  1.5 MiB, so `ai-gauge.log` — the file the error dialog asks you to attach —
+  was overwritten every eight minutes. A retry deadline is now spent when it
+  is dispatched rather than when an answer happens to clear it.
+- **A settings save that removes a queued provider no longer stalls the
+  app.** Removing a provider that was still queued behind a running browser
+  scrape left the cycle open forever: the timer stopped, the Refresh button
+  disabled, the heartbeat's recovery blocked, and a queued manual refresh
+  stranded, until a restart. Only the tray menu could get out of it.
+- **A retry wake that finds nothing due no longer refreshes everything.** The
+  due test is exact, and a Qt coarse timer may fire a few milliseconds early,
+  so the wake one provider's retry bought could fall through to a full cycle —
+  the cycle-wide retry this release removes.
+- **A removed account's browser profile is deleted by the app, not by the
+  settings dialog, and not while a refresh of it is still out.** Deleting a
+  QtWebEngine profile under a live page is unsupported by Qt, and the
+  surviving page can write rotated session cookies back into the directory
+  that was just removed. The stored credential is still cleared immediately.
+- **Watchdog timers are destroyed, not just stopped.** Each one was parented
+  to the app object, so 2 000 dispatches left 2 000 live timers in a process
+  designed to run for weeks.
+- **A timeout measured across a machine suspend is not counted as a provider
+  failure.** A laptop resumed after two days reported `elapsed_s=228477`
+  against an 80 s budget; every resume cost one spurious failure per provider,
+  and each of those armed the fast retry. Such a timeout is logged as
+  `classification=resume_artifact` and skipped by the retry. The scrape still
+  fails — the timing itself is unchanged.
+
+### Notes
+
+- **Azure's own throttle is untouched.** Its fail-closed "waiting for the next
+  fetch window" and "a fetch is already in progress" snapshots now carry a
+  one-word error class so the scheduler does not read a provider that is
+  deliberately not fetching as a provider that failed. The hourly floor, the
+  backoff and the cache are exactly as they were.
+- **`BrowserAccount.enabled` is still not honoured, deliberately.** An
+  earlier draft of this release made `_enabled_providers` and
+  `_build_providers` read the field. Nothing in the app writes it: the
+  settings dialog sets it once when adding an account, and the only other
+  writer is the config migration, which stamps `bool(providers.<kind>)` when
+  it inserts a missing fixed account. A config migrated while
+  `providers.claude` was false would therefore carry `enabled: false`
+  forever, and the Settings checkbox - which flips `providers.claude`, not
+  this - could never undo it. Reading a field nothing writes turns that
+  checkbox into a permanent no-op, so the change was reverted. The field is
+  still parsed, so an existing `config.json` loads unchanged.
+- **Metric labels still count toward the cadence.** OpenRouter's
+  `Today ($3.10/$5.00)` and Copilot's `Credits (12.5/1500)` can still read as
+  a change. Hashing a stable `key` instead is the same repo-wide decision that
+  `history` and `ratio` are waiting on, and it does not belong bundled with a
+  cadence fix.
+- **Log lines a provider chooses the contents of are bounded.** Promoting
+  OpenRouter's healthy path from `debug` to `info` put an unbounded list of
+  response key *names* — chosen by the server — into a rotating 512 KiB × 3
+  log on every refresh, where one hostile response is a megabyte-long record
+  and three discard the whole diagnostic history. Both OpenRouter lines now
+  print the first twenty names, clipped, plus the true count. Both fields of
+  the snapshot lines are capped too, and the second of them needed more than
+  a key cap: `raw_summary` bounded the number of keys, the length of values
+  and the depth, but not the length of a key *name* and not the total, and
+  those per-node caps multiply - fifty keys at each of three levels is
+  125 000 nodes. Measured against `snapshot.raw` as a browser extractor
+  returns it: 2.2 MB for a fan-out of 20, and 4.77 MB for an api-capture
+  shape that stays inside `api_capture.js`'s own limits - 9x the whole
+  rotation, from one ERROR scrape. It now clips key names and spends one
+  shared character budget across the walk, which puts the same payloads under
+  5 KB. Nothing a provider page returns can name its own `error_class` any
+  more either: the scraper boundary allowlists the one value it is allowed to
+  set.
+- **1 099 → 1 216 tests.** Every finding from all three review rounds has a
+  regression test, including two invariants driven over a fake clock: an hour
+  of any provider behaviour buys a bounded number of cycles, and six hours of
+  fuzzed cycles, watchdogs and manual refreshes never puts two scrapes of one
+  browser account in flight together. The seven behaviours a mutation run
+  could still reverse with every test green — the cycle's books after a
+  skipped provider, the per-cycle replacement of the thread-pool allowances,
+  the tray update inside a repaint, the deliberate *absence* of recording in
+  a re-render, the pending-purge validator, the drain's position ahead of
+  cookie hydration, and the exact-class check that makes provider reuse safe
+  — are pinned too.
+- **Two tiles in that log were broken by configuration, not by the app.**
+  OpenCode was not signed in and Copilot's PAT lacked `read:user`. Neither is
+  fixed here; both now cost less, because a provider that keeps failing is no
+  longer everyone's problem.
+
 ## 1.2.0+cfa.4 - 2026-09-10
 
 Adds a **Microsoft** section: Azure, Foundry, and Copilot under one heading.

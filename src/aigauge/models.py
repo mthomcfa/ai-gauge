@@ -32,4 +32,10 @@ class UsageSnapshot:
     metrics: list[UsageMetric] = field(default_factory=list)
     fetched_at: datetime = field(default_factory=datetime.now)
     error: str | None = None
+    # Why this snapshot failed, in one word, for the scheduler only.
+    # ``None`` means an ordinary failure: retry it. A named class marks a
+    # failure the scheduler must not treat as one - a provider deliberately
+    # waiting on its own throttle, or a timeout measured across a machine
+    # suspend. Never shown to the user; the message in ``error`` is.
+    error_class: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)

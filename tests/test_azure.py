@@ -8,6 +8,7 @@ column map. A fixture written as a convenient dict would test nothing.
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -788,6 +789,26 @@ def test_second_refresh_within_the_hour_serves_the_cache(monkeypatch, config):
 
 
 @responses.activate
+def test_serving_the_cache_is_visible_in_the_log(monkeypatch, config, caplog):
+    """The common Azure path was invisible.
+
+    Within the hourly window refresh() serves the cached aggregate and logged
+    it at debug, which the file handler drops - so 4.5 days of a real log had
+    no Azure line at all between live fetches and "the Azure tile never moves"
+    could not be told apart from "Azure never ran".
+    """
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    provider = az.AzureProvider(config)
+    _run(provider, monkeypatch)
+
+    with caplog.at_level(logging.INFO, logger="aigauge.providers.azure"):
+        _run(provider, monkeypatch)
+
+    assert "classification=throttled_serving_cache" in caplog.text
+
+
+@responses.activate
 def test_changing_the_row_count_re_renders_from_the_cache(monkeypatch, config):
     """"Top rows shown" changes nothing about the question asked, only how
     many of the answer's rows are named. Treating it like the rest of the
@@ -1440,6 +1461,29 @@ def test_the_in_flight_flag_alone_refuses_a_second_dispatch(monkeypatch, config)
     provider.refresh(captured.append)
     assert len(dispatched) == 1, "a second live fetch was dispatched"
     assert "already in progress" in (captured[0].error or "")
+    # Marked so the App-level scheduler does not read a fetch that is already
+    # out as a provider failure worth retrying in a minute.
+    assert captured[0].error_class == "throttled"
+
+
+@responses.activate
+def test_the_closed_window_snapshot_is_marked_as_a_wait_not_a_failure(
+    monkeypatch, config
+):
+    """The gate fails closed: inside the hourly window with nothing cached and
+    nothing remembered, refresh() returns an ERROR naming the wait rather than
+    fetching. The App used to count that as a provider failure, which put the
+    whole app on the one-minute error cadence for a provider that is
+    deliberately not fetching - for up to an hour at a time."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    state = az.state_for(SUB)
+    state.last_fetch_at = datetime.now() - timedelta(minutes=5)
+    captured: list = []
+
+    az.AzureProvider(config).refresh(captured.append)
+
+    assert "Waiting for the next Azure fetch window" in (captured[0].error or "")
+    assert captured[0].error_class == "throttled"
 
 
 @responses.activate

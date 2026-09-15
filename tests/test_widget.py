@@ -523,6 +523,72 @@ def test_refresh_state_shows_now_when_next_refresh_is_due(qtbot):
     assert widget.cadence_label.text() == "· idle next now"
 
 
+def test_the_refreshing_header_survives_the_one_second_tick(qtbot):
+    """The refreshing state used to last at most one second.
+
+    set_refreshing wrote "refreshing…" into the header, and the 1 Hz tick that
+    keeps the age and countdown live rewrote both labels from _last_fetch_at
+    and _next_refresh_at with no regard for it. Because _schedule_next_refresh
+    early-returns while a cycle is in flight, _next_refresh_at was stale and
+    in the past - so the header read "· active next now" for the whole cycle,
+    which the log says ran for a median of 48 s and a p90 of 79 s.
+    """
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.set_refresh_state(
+        active=True, minutes=5, next_at=datetime.now() - timedelta(seconds=1)
+    )
+
+    widget.set_refreshing(True, total=6)
+    widget._refresh_header_labels()  # noqa: SLF001 - what the 1 Hz tick calls
+
+    assert widget.age_label.text() == "refreshing…"
+    assert "refreshing" in widget.cadence_label.text()
+    assert "next now" not in widget.cadence_label.text()
+
+
+def test_the_header_counts_the_cycle_off_as_it_goes(qtbot):
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+
+    widget.set_refreshing(True, total=6)
+    widget.set_refresh_progress(2, 6)
+
+    assert widget.cadence_label.text() == "· refreshing 2/6"
+
+
+def test_the_countdown_comes_back_when_the_cycle_ends(qtbot):
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.set_refresh_state(
+        active=True,
+        minutes=5,
+        next_at=datetime.now() + timedelta(minutes=3, seconds=5),
+    )
+
+    widget.set_refreshing(True, total=2)
+    widget.set_refreshing(False)
+
+    assert widget.cadence_label.text() == "· active next 4m"
+
+
+def test_a_scheduled_cycle_marks_its_tiles_without_blanking_them(qtbot):
+    """Scheduled cycles showed nothing at all: mark_loading was manual-only,
+    so the only evidence of a refresh was numbers changing one at a time."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_ok_snapshot("claude"), "Claude")
+
+    widget.mark_loading({"claude": "Claude"}, subtle=True)
+
+    tile = widget._tiles["claude"]  # noqa: SLF001
+    assert tile._refreshing is True  # noqa: SLF001
+    # Still populated: a scheduled refresh must not blank a tile that has data.
+    assert tile._latest_snapshot is not None  # noqa: SLF001
+    # And more legible than the manual dim, which is a deliberate 0.55.
+    assert tile._opacity_anim.endValue() > 0.55  # noqa: SLF001
+
+
 def test_widget_uses_fixed_width_despite_extreme_saved_size(qtbot):
     config = Config()
     config.window.width = 5000

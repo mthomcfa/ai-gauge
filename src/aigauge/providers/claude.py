@@ -14,7 +14,7 @@ from ._common import (
     is_security_verification_page,
     page_text,
 )
-from ._scrape_runner import ScrapeRunner
+from ._scrape_runner import ScrapeRunner, account_is_busy
 from .catalog import (
     MeterCatalog,
     adopt_rows,
@@ -776,9 +776,23 @@ def _build_snapshot(
     )
 
 
+# The scrape's own bound, named once so the App-level watchdog can be derived
+# from it rather than guessed at: each transport attempt is capped by the
+# scraper's timeout, and ScrapeRunner may rebuild the scraper.
+SCRAPE_TIMEOUT_MS = 40000
+SCRAPE_TRANSPORT_ATTEMPTS = 2
+SCRAPE_BUILD_ATTEMPTS = 2
+
+
 class ClaudeProvider(Provider):
     name = "claude"
     display_name = "Claude"
+    uses_browser = True
+    # What the App-level watchdog allows this provider before it declares the
+    # refresh lost: the scraper's own timeout x every attempt it may make.
+    refresh_budget_seconds = (
+        SCRAPE_TIMEOUT_MS / 1000 * SCRAPE_TRANSPORT_ATTEMPTS * SCRAPE_BUILD_ATTEMPTS
+    )
 
     def __init__(
         self,
@@ -792,6 +806,27 @@ class ClaudeProvider(Provider):
         self._runner: ScrapeRunner | None = None  # held to prevent GC
 
     def refresh(self, on_done: Callable[[UsageSnapshot], None]) -> None:
+        if account_is_busy(self._account_id):
+            # The App's watchdog ends its own wait; it does not end the
+            # scrape. Starting a second one here would put a second
+            # QWebEngineView on the single cached QWebEngineProfile for this
+            # account - two writers to one cookie store, which is how a
+            # spurious sign-out happens, and two page loads against the
+            # provider from one desktop app. `throttled` because this is not
+            # the provider failing: it is the provider already working.
+            log.warning(
+                "provider refresh refused provider=%s reason=already_running",
+                self._account_id,
+            )
+            on_done(
+                UsageSnapshot(
+                    provider=self._account_id,
+                    status=SnapshotStatus.ERROR,
+                    error="A refresh is already running.",
+                    error_class="throttled",
+                )
+            )
+            return
         catalog = load_catalog("claude")
         # The scan is per provider *kind*, not per account: the meters are a
         # property of Claude's page, so the first account to refresh after the
@@ -871,9 +906,9 @@ class ClaudeProvider(Provider):
             # while the page was still showing "Loading...".
             wait_ms=3000,
             max_extractor_reruns=20,
-            timeout_ms=40000,
-            transport_max_attempts=2,
-            build_max_attempts=2,
+            timeout_ms=SCRAPE_TIMEOUT_MS,
+            transport_max_attempts=SCRAPE_TRANSPORT_ATTEMPTS,
+            build_max_attempts=SCRAPE_BUILD_ATTEMPTS,
             # Discovery, not yet load-bearing: the gauge still reads the DOM.
             # This records the SHAPE of the JSON the page fetches so a field
             # mapping can be written from a real account without guessing, and

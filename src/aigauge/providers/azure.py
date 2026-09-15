@@ -135,6 +135,21 @@ REFRESH_DEADLINE_SECONDS = 90.0
 # budgets, forecast) is outside the budget by design, so this is a floor on a
 # refresh's real ceiling - measured at 46 - rather than the ceiling itself.
 MAX_ARM_REQUESTS_PER_REFRESH = 40
+# The fixed calls that sit *outside* _RequestBudget, counted: token,
+# subscription, the first cost page, the metric retry, the first marketplace
+# page, budgets, forecast, and one spare. They cannot repeat, so they are not
+# a loop to guard - but they are still wall clock one refresh can spend, which
+# is what an App-level watchdog has to allow for.
+MAX_FIXED_REQUESTS_PER_REFRESH = 8
+# One refresh's real ceiling, and what the App's watchdog must not fire
+# inside: the page loops' own deadline, the fixed calls around them, and one
+# more request timeout because _RequestBudget.spend() checks *before* a
+# request - the one already in flight when the deadline passes still runs to
+# its own timeout.
+REFRESH_WORST_CASE_SECONDS = (
+    REFRESH_DEADLINE_SECONDS
+    + (MAX_FIXED_REQUESTS_PER_REFRESH + 1) * REQUEST_TIMEOUT
+)
 # A ceiling on what one response can cost us in memory and time. A period with
 # 50 000 daily ResourceId x ServiceName rows is already outside this tile's
 # design; past this the total is a subtotal and says so.
@@ -1879,8 +1894,13 @@ def _auth_required(message: str) -> UsageSnapshot:
     )
 
 
-def _error(message: str) -> UsageSnapshot:
-    return UsageSnapshot(provider="azure", status=SnapshotStatus.ERROR, error=message)
+def _error(message: str, *, error_class: str | None = None) -> UsageSnapshot:
+    return UsageSnapshot(
+        provider="azure",
+        status=SnapshotStatus.ERROR,
+        error=message,
+        error_class=error_class,
+    )
 
 
 def _exception_summary(exc: BaseException) -> str:
@@ -1901,6 +1921,13 @@ def _exception_summary(exc: BaseException) -> str:
 class AzureProvider(Provider):
     name = "azure"
     display_name = "Microsoft · Azure"
+    # What the App's watchdog is told to allow. NOT REFRESH_DEADLINE_SECONDS:
+    # that bounds the page loops only (see MAX_ARM_REQUESTS_PER_REFRESH), so
+    # it is a floor on a refresh's real ceiling rather than the ceiling, and a
+    # watchdog reading it would fire inside a refresh that is still
+    # legitimately running - manufacturing the failure it exists to catch,
+    # and re-dispatching into the in_flight gate.
+    refresh_budget_seconds = REFRESH_WORST_CASE_SECONDS
 
     def __init__(self, config: Config, pool=None):
         self._config = config
@@ -2020,13 +2047,24 @@ class AzureProvider(Provider):
             if state.aggregate is not None:
                 serve_cache()
             else:
-                on_done(_error("An Azure fetch is already in progress."))
+                # Not a failure the scheduler should retry: a fetch is
+                # already out and its answer is about to arrive.
+                on_done(
+                    _error(
+                        "An Azure fetch is already in progress.",
+                        error_class="throttled",
+                    )
+                )
             return
 
         allowed_at = next_allowed_at(state)
         if allowed_at is not None and now < allowed_at:
             if state.aggregate is not None:
-                log.debug(
+                # info, not debug: this is the ordinary Azure path - the
+                # hourly floor means most refreshes end here - and at debug it
+                # never reached the file, so the log showed nothing at all
+                # between live fetches.
+                log.info(
                     "provider api diagnosis provider=azure "
                     "classification=throttled_serving_cache next_fetch_in_s=%s",
                     int((allowed_at - now).total_seconds()),
@@ -2050,9 +2088,13 @@ class AzureProvider(Provider):
                 "classification=throttled_no_cache next_fetch_in_s=%s",
                 int((allowed_at - now).total_seconds()),
             )
+            # The gate failing closed is not a provider failure. Counted as
+            # one it earned the app a fast retry for a provider that is
+            # deliberately not fetching, every cycle, for up to an hour.
             on_done(
                 _error(
-                    f"Waiting for the next Azure fetch window ({minutes} min)."
+                    f"Waiting for the next Azure fetch window ({minutes} min).",
+                    error_class="throttled",
                 )
             )
             return

@@ -301,6 +301,52 @@ def test_fetch_key_info_returns_data():
 
 
 @responses.activate
+def test_a_healthy_openrouter_refresh_is_visible_in_the_log(caplog):
+    """OpenRouter used to be completely silent at INFO.
+
+    Every healthy line was log.debug, which the file handler drops, so its
+    turn in a cycle could only be inferred from the gap between the provider
+    lines either side of it - about 5-10 s of unexplained quiet per cycle in
+    the user's log.
+    """
+    import logging
+
+    from aigauge.providers.openrouter import (
+        _fetch_activity,
+        _fetch_credits,
+        _fetch_key_info,
+    )
+
+    responses.add(
+        responses.GET,
+        f"{OPENROUTER_API}/credits",
+        json={"data": {"total_credits": 50.0, "total_usage": 10.0}},
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        f"{OPENROUTER_API}/key",
+        json={"data": {"usage": 10.0, "usage_daily": 1.0}},
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        f"{OPENROUTER_API}/activity",
+        json={"data": []},
+        status=200,
+    )
+
+    with caplog.at_level(logging.INFO, logger="aigauge.providers.openrouter"):
+        _fetch_credits("sk-or-test")
+        _fetch_key_info("sk-or-test")
+        _fetch_activity("sk-or-test")
+
+    assert "classification=credits_ok" in caplog.text
+    assert "classification=key_ok" in caplog.text
+    assert "classification=activity_ok" in caplog.text
+
+
+@responses.activate
 def test_fetch_activity_returns_error_on_404():
     """Activity failures must surface as a string error so the snapshot can
     show a visible 'Top models unavailable' row."""
@@ -580,3 +626,46 @@ def test_refresh_surfaces_activity_failure_as_visible_row(monkeypatch):
     ]
     assert len(err_rows) == 1
     assert "500" in (err_rows[0].note or "")
+
+
+@responses.activate
+@pytest.mark.parametrize("endpoint", ["credits", "key"])
+def test_a_hostile_payload_cannot_flood_the_log(caplog, endpoint):
+    """`payload_keys` is a list of key names openrouter.ai chooses, and this
+    release promoted the line from debug - which the file handler drops - to
+    info, which it writes.
+
+    The logger is a `RotatingFileHandler(maxBytes=512*1024, backupCount=2)`.
+    A response of 5 000 keys of 200 characters each is one INFO record of
+    about a megabyte: three of them discard the whole diagnostic history, and
+    ai-gauge.log is the artifact SECURITY.md names for diagnosing a provider
+    failure and the error dialog invites users to attach to a bug report. It
+    is the same log-flood surface the 1.0.0+cfa.1 audit addendum closed for
+    `window.__ag_api`.
+    """
+    import logging
+
+    from aigauge.providers.openrouter import _fetch_credits, _fetch_key_info
+
+    payload = {f"{'k' * 200}{index}": index for index in range(5000)}
+    responses.add(
+        responses.GET,
+        f"{OPENROUTER_API}/{endpoint}",
+        json={"data": payload},
+        status=200,
+    )
+
+    with caplog.at_level(logging.INFO, logger="aigauge"):
+        if endpoint == "credits":
+            _fetch_credits("sk-or-test")
+        else:
+            _fetch_key_info("sk-or-test")
+
+    line = next(
+        record.getMessage()
+        for record in caplog.records
+        if "payload_keys=" in record.getMessage()
+    )
+    assert len(line) < 2000, f"one log record was {len(line)} bytes"
+    # The count is still reported, so the line remains diagnostic.
+    assert "key_count=5000" in line
