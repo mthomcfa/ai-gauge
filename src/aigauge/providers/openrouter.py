@@ -12,12 +12,32 @@ from ..models import SnapshotStatus, UsageMetric, UsageSnapshot
 from .base import Provider
 
 OPENROUTER_API = "https://openrouter.ai/api/v1"
+# The key NAMES in a response are chosen by openrouter.ai, unbounded in both
+# count and length, and these lines are written to the file handler on every
+# healthy refresh. That handler is a RotatingFileHandler of 512 KiB x 3
+# (logging_setup.py), so one hostile response of 5 000 long keys is a
+# megabyte-long record and three of them discard the user's whole diagnostic
+# history - the same anti-forensic outcome the 1.0.0+cfa.1 audit addendum
+# closed for window.__ag_api. The names are what makes the line diagnostic, so
+# they are capped rather than dropped, and the true count is printed beside
+# them.
+_LOG_KEYS_LIMIT = 20
+_LOG_KEY_LEN_LIMIT = 40
 log = logging.getLogger("aigauge.providers.openrouter")
 
 MODEL_BREAKDOWN_TAG = "model_breakdown"
 ACTIVITY_LABEL = "Models"
 MAX_MODEL_BREAKDOWN_ROWS = 6
 MODEL_DISPLAY_MAX_LEN = 20
+
+
+def _bounded_payload_keys(data: object) -> tuple[list[str], int]:
+    """The first few key names, each clipped, plus how many there really are."""
+    if not isinstance(data, dict):
+        return [], 0
+    keys = sorted(str(key) for key in data)
+    shown = [key[:_LOG_KEY_LEN_LIMIT] for key in keys[:_LOG_KEYS_LIMIT]]
+    return shown, len(keys)
 
 
 def _headers(api_key: str) -> dict[str, str]:
@@ -33,6 +53,10 @@ def _next_local_midnight() -> datetime:
     return datetime(tomorrow.year, tomorrow.month, tomorrow.day)
 
 
+# The three healthy-path diagnosis lines below are info, not debug: the file
+# handler is set to INFO, so at debug OpenRouter contributed nothing at all to
+# the log and its turn in a refresh cycle could only be inferred from the gap
+# between the providers either side of it.
 def _fetch_credits(api_key: str) -> dict | None:
     """Returns the credits payload. Raises HTTPError on any non-200 response.
 
@@ -48,11 +72,13 @@ def _fetch_credits(api_key: str) -> dict | None:
     r.raise_for_status()
     payload = r.json()
     data = payload.get("data") if isinstance(payload, dict) else None
-    log.debug(
+    keys, count = _bounded_payload_keys(data)
+    log.info(
         "provider api diagnosis provider=openrouter "
-        "classification=credits_ok status=%s payload_keys=%s",
+        "classification=credits_ok status=%s payload_keys=%s key_count=%s",
         r.status_code,
-        sorted(data.keys()) if isinstance(data, dict) else [],
+        keys,
+        count,
     )
     return data
 
@@ -66,11 +92,13 @@ def _fetch_key_info(api_key: str) -> dict:
     r.raise_for_status()
     payload = r.json()
     data = payload.get("data", payload) if isinstance(payload, dict) else {}
-    log.debug(
+    keys, count = _bounded_payload_keys(data)
+    log.info(
         "provider api diagnosis provider=openrouter "
-        "classification=key_ok status=%s payload_keys=%s",
+        "classification=key_ok status=%s payload_keys=%s key_count=%s",
         r.status_code,
-        sorted(data.keys()) if isinstance(data, dict) else [],
+        keys,
+        count,
     )
     return data
 
@@ -124,7 +152,7 @@ def _fetch_activity(
             type(payload).__name__,
         )
         return [], "/activity response shape unexpected"
-    log.debug(
+    log.info(
         "provider api diagnosis provider=openrouter "
         "classification=activity_ok status=%s rows=%d date=%s",
         r.status_code,

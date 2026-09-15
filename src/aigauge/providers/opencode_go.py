@@ -10,7 +10,7 @@ from PyQt6.QtCore import QObject
 from ..config import Config, validate_opencode_usage_url
 from ..models import SnapshotStatus, UsageMetric, UsageSnapshot
 from ._common import is_security_verification_page
-from ._scrape_runner import ScrapeRunner
+from ._scrape_runner import ScrapeRunner, account_is_busy
 from .base import Provider
 from .diagnostics import log_page_diagnosis
 
@@ -238,9 +238,22 @@ def _build_snapshot(payload: dict[str, Any]) -> UsageSnapshot:
     )
 
 
+# The scrape's own bound, named once so the App-level watchdog can be derived
+# from it. OpenCode leaves timeout_ms at the scraper default.
+SCRAPE_TIMEOUT_MS = 25000
+SCRAPE_TRANSPORT_ATTEMPTS = 1
+SCRAPE_BUILD_ATTEMPTS = 2
+
+
 class OpenCodeGoProvider(Provider):
     name = "opencode_go"
     display_name = "OpenCode"
+    uses_browser = True
+    # What the App-level watchdog allows this provider before it declares the
+    # refresh lost: the scraper's own timeout x every attempt it may make.
+    refresh_budget_seconds = (
+        SCRAPE_TIMEOUT_MS / 1000 * SCRAPE_TRANSPORT_ATTEMPTS * SCRAPE_BUILD_ATTEMPTS
+    )
 
     def __init__(self, config: Config, parent: QObject | None = None):
         self._parent = parent
@@ -248,6 +261,27 @@ class OpenCodeGoProvider(Provider):
         self._runner: ScrapeRunner | None = None
 
     def refresh(self, on_done: Callable[[UsageSnapshot], None]) -> None:
+        if account_is_busy("opencode_go"):
+            # The App's watchdog ends its own wait; it does not end the
+            # scrape. Starting a second one here would put a second
+            # QWebEngineView on the single cached QWebEngineProfile for this
+            # account - two writers to one cookie store, which is how a
+            # spurious sign-out happens, and two page loads against the
+            # provider from one desktop app. `throttled` because this is not
+            # the provider failing: it is the provider already working.
+            log.warning(
+                "provider refresh refused provider=%s reason=already_running",
+                "opencode_go",
+            )
+            on_done(
+                UsageSnapshot(
+                    provider="opencode_go",
+                    status=SnapshotStatus.ERROR,
+                    error="A refresh is already running.",
+                    error_class="throttled",
+                )
+            )
+            return
         self._runner = ScrapeRunner(
             account_id="opencode_go",
             url=usage_url(self._config),
@@ -255,8 +289,8 @@ class OpenCodeGoProvider(Provider):
             build=_build_snapshot,
             log=log,
             wait_ms=5000,
-            transport_max_attempts=1,
-            build_max_attempts=2,
+            transport_max_attempts=SCRAPE_TRANSPORT_ATTEMPTS,
+            build_max_attempts=SCRAPE_BUILD_ATTEMPTS,
             parent=self._parent,
         )
         self._runner.run(on_done)

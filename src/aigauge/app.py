@@ -3,9 +3,11 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import math
 import os
 import subprocess
 import sys
+import time
 from dataclasses import replace
 from datetime import datetime, timedelta
 
@@ -48,6 +50,7 @@ from .ratio_dialog import RatioHistoryDialog
 from .settings_dialog import SettingsDialog
 from .webview.cookies import hydrate_all_from_keyring
 from .webview.login_window import LoginWindow
+from .webview.profile import purge_profile
 from .widget import UsageWidget
 
 log = logging.getLogger("aigauge.app")
@@ -60,11 +63,94 @@ LOGIN_URLS = {
 _ACTIVE_MODE_MINUTES = 30
 _ERROR_RETRY_MINUTES = 1
 # A provider that is simply broken must not be retried every minute forever.
-# After this many consecutive failing cycles the fast retry stops and the
-# normal cadence takes over.
-_ERROR_FAST_RETRY_CYCLES = 3
+# After this many consecutive failures the fast retry stops for that provider
+# and the normal cadence takes over. The wait doubles between attempts, so
+# the three are at 1, 2 and 4 minutes.
+_ERROR_FAST_RETRY_ATTEMPTS = 3
+# Failures that are not the provider failing, and must not earn a fast retry:
+#   throttled       - the provider is deliberately not fetching yet (Azure's
+#                     fail-closed hourly gate, or a fetch already in flight)
+#   resume_artifact - a scrape whose clock ran across a machine suspend
+_NO_FAST_RETRY_ERROR_CLASSES = ("throttled", "resume_artifact")
+# A Qt::CoarseTimer rounds its expiry and may fire early. Without a tolerance
+# the wake a provider's retry bought can find nothing due and fall through.
+_RETRY_WAKE_TOLERANCE_SECONDS = 2
 _HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000
 _LOG_VALUE_LIMIT = 300
+# How long a provider may hold a refresh before the App declares it lost.
+# Browser providers name their own bound (the scraper timeout times the
+# attempts it may make); a REST provider is a handful of HTTPS calls with
+# request timeouts of their own, so it gets a flat ceiling.
+_REST_REFRESH_BUDGET_SECONDS = 60.0
+# Enough slack that a provider finishing right at its own bound reports
+# normally rather than racing the watchdog.
+_WATCHDOG_SLACK_SECONDS = 20.0
+# How long after the watchdog gave up a provider stays parked, as a multiple
+# of the budget that expired. Until then its worker is presumed still out
+# there - a browser scrape holding the one cached QWebEngineProfile for that
+# account - and re-dispatching would put a second one on it. Past it the
+# worker is assumed dead, because parking a provider forever is its own
+# failure mode.
+_ABANDONED_CEILING_FACTOR = 2.0
+
+
+def _pool_capacity() -> int:
+    """How many REST refreshes can actually run at once.
+
+    `QThreadPool.globalInstance().maxThreadCount()` is the ideal thread count,
+    which is 1 on a single-core host and 2 on plenty of laptops.
+    """
+    try:
+        from PyQt6.QtCore import QThreadPool
+
+        return max(1, int(QThreadPool.globalInstance().maxThreadCount()))
+    except Exception:  # noqa: BLE001 - a budget is not worth crashing over
+        return 1
+
+
+def _refresh_budget_seconds(provider) -> float:
+    """The watchdog budget for one provider, taken from the provider itself.
+
+    Reading it off the provider keeps the App's deadline from drifting away
+    from the bound the provider actually enforces - a watchdog that fires
+    inside a refresh that is still legitimately running would manufacture
+    failures rather than catch them.
+    """
+    try:
+        budget = float(getattr(provider, "refresh_budget_seconds", 0) or 0)
+    except (TypeError, ValueError):
+        budget = 0.0
+    # isfinite, not just > 0: int(inf * 1000) raises OverflowError, and it
+    # would raise inside _arm_watchdog - which runs *before* _dispatch's
+    # try/except around provider.refresh, so the name would be left in
+    # _inflight with neither a dispatch nor a watchdog.
+    if not math.isfinite(budget) or budget <= 0:
+        return _REST_REFRESH_BUDGET_SECONDS
+    return budget
+
+
+# What a config-controlled id list may cost the log. `pending_profile_purges`
+# is the one field this release adds to `config.json`, it is drained before
+# anything else at startup, and neither its length nor its entries are
+# bounded: a poisoned file carrying two 200 000-character ids wrote 800 KB of
+# records, of which one line was 0.76x the whole 512 KiB rotation - the same
+# anti-forensic outcome the `raw_summary=` cap closes, on the one path that
+# runs before the app has done anything else.
+_LOG_ID_LIMIT = 64
+_LOG_ID_SAMPLE = 3
+
+
+def _clip_for_log(value: object) -> str:
+    text = str(value)
+    return text if len(text) <= _LOG_ID_LIMIT else text[:_LOG_ID_LIMIT] + "..."
+
+
+def _ids_for_log(ids: list[str]) -> str:
+    """A bounded sample of an id list. The count travels beside it."""
+    sample = ",".join(_clip_for_log(one) for one in ids[:_LOG_ID_SAMPLE])
+    if len(ids) > _LOG_ID_SAMPLE:
+        sample = f"{sample},+{len(ids) - _LOG_ID_SAMPLE} more"
+    return sample
 
 
 def _make_dot_tray_icon(color: str | None = None) -> QIcon:
@@ -86,12 +172,20 @@ def _make_dot_tray_icon(color: str | None = None) -> QIcon:
 
 
 def _enabled_providers(config: Config) -> tuple[str, ...]:
+    # `BrowserAccount.enabled` is deliberately NOT consulted here. See
+    # config.BrowserAccount: nothing in the app ever writes the field, and the
+    # migration can stamp it false permanently, so reading it turned the
+    # Settings provider checkbox into a no-op the user could never undo. The
+    # `providers.<kind>` toggle is the only switch.
+    accounts = browser_accounts(config)
     out: list[str] = [
         account.id
-        for account in browser_accounts(config)
+        for account in accounts
         if getattr(config.providers, account.kind, False)
     ]
-    if not out:
+    # The fallback is for a legacy config that has no browser_accounts list at
+    # all.
+    if not accounts:
         providers = getattr(config, "providers", None)
         if getattr(providers, "claude", False):
             out.append("claude")
@@ -112,8 +206,14 @@ def _enabled_providers(config: Config) -> tuple[str, ...]:
 # fill while a Claude/Codex scrape is still loading a page. Azure is cheap in
 # the same sense - a handful of JSON calls - and it self-throttles to one live
 # fetch per hour internally, so putting it early costs the API nothing even
-# when the cycle-wide error fast-retry is running every minute.
-_REFRESH_FIRST = ("openrouter", "azure")
+# when an error fast-retry is running every minute.
+#
+# Copilot is five plain HTTPS calls and it used to sit *behind* the browser
+# scrapes, because _build_providers inserts browser accounts first. In 4.5
+# days of a real desktop log that cost it the whole browser queue: cycles ran
+# a median of 48 s (p90 79 s) and Copilot's payload line landed near the end
+# of every one of them, for a provider that answers in about a second.
+_REFRESH_FIRST = ("openrouter", "azure", "copilot")
 
 
 def _refresh_provider_order(providers: dict[str, Provider]) -> list[str]:
@@ -157,10 +257,17 @@ def _snapshot_signature(snapshot: UsageSnapshot) -> tuple:
     ``_unchanged_cycles`` and pushed the whole app back into active-cadence
     polling — for one cent, or for the clock. The label and the rounded
     percentage are what the cadence is about.
+
+    ``snapshot.error`` is absent for exactly the same reason, and it leaked
+    the same defect back in: Azure's fail-closed message counts a minute down
+    ("Waiting for the next Azure fetch window (43 min)"), so it differed on
+    every cycle and re-armed the 30-minute active window for every provider,
+    on a clock. The *status* is what the cadence is about — a provider that
+    starts failing, or stops, is a change; a failure whose wording moved is
+    not. The message itself still reaches the tile, the tooltip and the log.
     """
     return (
         snapshot.status.value,
-        snapshot.error,
         tuple(
             (
                 metric.label,
@@ -177,18 +284,41 @@ def _snapshot_signature(snapshot: UsageSnapshot) -> tuple:
 
 
 _LOG_DICT_KEY_LIMIT = 50
+# A key *name* is a field name, not a value. Clipping it keeps a bounded list
+# of bounded strings even when the names themselves came off a provider page.
+_LOG_KEY_LEN_LIMIT = 60
+# And a cap on the whole record, because the per-node caps multiply. Fifty
+# keys at each of three levels is 125 000 nodes, so a payload nested four
+# deep with a fan-out of 20 measured 2.2 MB and an api-capture-shaped one
+# 4.77 MB - 9x the entire 512 KiB x 3 rotation, from one ERROR scrape.
+_LOG_SUMMARY_BUDGET = 4000
 
 
-def _summarize_for_log(value, *, depth: int = 0):
-    if depth > 3:
+def _summarize_for_log(value, *, depth: int = 0, budget: list[int] | None = None):
+    """A page-controlled payload, cut down to something a log line can hold.
+
+    `budget` is one shared character allowance for the whole summary, spent
+    as the walk emits key names and values. Per-node caps alone do not bound
+    the record: they bound each node and let the node *count* multiply.
+    """
+    if budget is None:
+        budget = [_LOG_SUMMARY_BUDGET]
+    if depth > 3 or budget[0] <= 0:
+        # An elided node still costs five characters on the line, so it is
+        # charged for: otherwise a wide-and-shallow payload buys unbounded
+        # ellipses with a budget it never spends.
+        budget[0] -= 5
         return "..."
     if isinstance(value, str):
-        return (
+        text = (
             value
             if len(value) <= _LOG_VALUE_LIMIT
             else value[:_LOG_VALUE_LIMIT] + "..."
         )
+        budget[0] -= len(text)
+        return text
     if isinstance(value, (int, float, bool)) or value is None:
+        budget[0] -= 8
         return value
     if isinstance(value, dict):
         # Lists were already bounded; dictionaries were not. A page-controlled
@@ -197,19 +327,53 @@ def _summarize_for_log(value, *, depth: int = 0):
         # diagnostics - the log is the one artifact that makes a provider
         # failure explainable, so losing it is the expensive part.
         items = sorted(value.items(), key=lambda item: str(item[0]))
-        summarized = {
-            str(k): _summarize_for_log(v, depth=depth + 1)
-            for k, v in items[:_LOG_DICT_KEY_LIMIT]
-        }
-        if len(items) > _LOG_DICT_KEY_LIMIT:
-            summarized["..."] = f"{len(items) - _LOG_DICT_KEY_LIMIT} more keys"
+        summarized = {}
+        dropped = len(items) - _LOG_DICT_KEY_LIMIT
+        for raw_key, item in items[:_LOG_DICT_KEY_LIMIT]:
+            if budget[0] <= 0:
+                dropped = len(items) - len(summarized)
+                break
+            key = str(raw_key)[:_LOG_KEY_LEN_LIMIT]
+            budget[0] -= len(key) + 4
+            summarized[key] = _summarize_for_log(
+                item, depth=depth + 1, budget=budget
+            )
+        if dropped > 0:
+            summarized["..."] = f"{dropped} more keys"
         return summarized
     if isinstance(value, (list, tuple)):
-        summarized = [_summarize_for_log(v, depth=depth + 1) for v in value[:5]]
-        if len(value) > 5:
-            summarized.append(f"... {len(value) - 5} more")
+        summarized = []
+        for item in value[:5]:
+            if budget[0] <= 0:
+                break
+            summarized.append(
+                _summarize_for_log(item, depth=depth + 1, budget=budget)
+            )
+        if len(value) > len(summarized):
+            summarized.append(f"... {len(value) - len(summarized)} more")
         return summarized
-    return repr(value)
+    text = repr(value)
+    budget[0] -= len(text)
+    return text
+
+
+def _raw_keys_for_log(raw: dict | None) -> str:
+    """The key names of a provider payload, bounded.
+
+    A flat list of the top-level names, so a layout change is diagnosable
+    from the log without reading the nested `_raw_summary` beside it.
+    `snapshot.raw` on the browser providers is the extractor's own dict -
+    page data - so both are capped: one payload with tens of thousands of
+    keys is a megabyte-long record against a 512 KiB x 3 rotation, which
+    discards the diagnostic history the line exists to build.
+    """
+    if not raw:
+        return "[]"
+    keys = sorted(str(key) for key in raw)
+    shown = [key[:_LOG_KEY_LEN_LIMIT] for key in keys[:_LOG_DICT_KEY_LIMIT]]
+    if len(keys) > _LOG_DICT_KEY_LIMIT:
+        shown.append(f"... {len(keys) - _LOG_DICT_KEY_LIMIT} more")
+    return repr(shown)
 
 
 def _raw_summary(raw: dict) -> str:
@@ -279,13 +443,46 @@ class App(QObject):
         self._cycle_signatures: dict[str, tuple] = {}
         self._last_cycle_signatures: dict[str, tuple] | None = None
         self._unchanged_cycles = 0
-        self._consecutive_error_cycles = 0
+        # provider -> (consecutive errors, when its own retry is due)
+        self._error_retry: dict[str, tuple[int, datetime | None]] = {}
         self._active_until = datetime.now() + timedelta(minutes=_ACTIVE_MODE_MINUTES)
         self._current_refresh_manual = False
         self._pending_manual_refresh = False
+        self._pending_manual_providers: list[str] = []
+        self._watchdogs: dict[str, QTimer] = {}
+        self._cycle_active = False
+        self._cycle_started_at: float | None = None
+        self._cycle_reason = "startup"
+        self._cycle_statuses: dict[str, SnapshotStatus] = {}
+        self._cycle_total = 0
+        self._cycle_partial = False
+        self._dispatch_times: dict[str, float] = {}
+        # provider -> the number of the dispatch now outstanding. A snapshot
+        # is matched against it, so an answer from a dispatch the App has
+        # already given up on cannot be read as the current one.
+        self._dispatch_epoch: dict[str, int] = {}
+        # provider -> (the epoch the watchdog abandoned, when its worker may
+        # be assumed dead). While an entry is live the provider is not
+        # dispatched again by anything.
+        self._abandoned: dict[str, tuple[int, float]] = {}
+        # The REST providers this cycle handed to the thread pool, with their
+        # budgets: what a dispatch may spend waiting for a pool thread.
+        self._pool_wait_budgets: dict[str, float] = {}
+        # Accounts the user removed whose on-disk profile is waiting for a
+        # live scrape to let go of it. See _run_profile_purges.
+        self._pending_profile_purges: list[str] = []
+        # The names this cycle is accounting for. A snapshot from outside it
+        # repaints its tile without joining its progress or its verdict.
+        self._cycle_names: set[str] = set()
+        self._dispatching = False
+        self._next_refresh_reason = "startup"
         self._settings_dialog: SettingsDialog | None = None
         self._settings_old_copilot_quota: int | None = None
         self._install_lifecycle_logging()
+
+        # Anything a previous run left owed, before a cookie is hydrated into
+        # a profile and before a provider exists that could scrape it.
+        self._drain_pending_profile_purges()
 
         # Push any saved session cookies into the WebEngine profiles before any
         # scrape runs, so the headless page loads as signed-in.
@@ -360,7 +557,7 @@ class App(QObject):
         # Auto-refresh timer
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
-        self._timer.timeout.connect(lambda: self.refresh_now(manual=False))
+        self._timer.timeout.connect(self._on_refresh_timer)
         self._restart_timer()
 
         # Always start with a refresh — fresh installs see provider tiles in
@@ -419,7 +616,7 @@ class App(QObject):
             "queue": ",".join(self._refresh_queue),
             "next_refresh_s": self._next_refresh_seconds(),
             "unchanged_cycles": self._unchanged_cycles,
-            "error_cycles": self._consecutive_error_cycles,
+            "error_cycles": self._error_retry_for_log(),
         }
 
     def _log_lifecycle_event(self, event: str) -> None:
@@ -427,7 +624,8 @@ class App(QObject):
             context = self._lifecycle_context()
             log.info(
                 "%s uptime_s=%s ui_mode=%s widget_visible=%s providers=%s "
-                "inflight=%s queue=%s next_refresh_s=%s unchanged_cycles=%s",
+                "inflight=%s queue=%s next_refresh_s=%s unchanged_cycles=%s "
+                "error_cycles=%s",
                 event,
                 context["uptime_s"],
                 context["ui_mode"],
@@ -437,6 +635,7 @@ class App(QObject):
                 context["queue"],
                 context["next_refresh_s"],
                 context["unchanged_cycles"],
+                context["error_cycles"],
             )
         except Exception:  # noqa: BLE001
             log.exception("%s logging failed", event)
@@ -445,6 +644,50 @@ class App(QObject):
 
     def _log_heartbeat(self) -> None:
         self._log_lifecycle_event("heartbeat")
+        self._recover_dead_timer()
+        # A profile whose scrape was abandoned is only released when that
+        # worker reports back or its ceiling passes; the heartbeat is what
+        # notices the second of those.
+        if self._pending_profile_purges:
+            self._run_profile_purges()
+
+    def _recover_dead_timer(self) -> None:
+        """Restart a scheduler that stopped scheduling.
+
+        `_schedule_next_refresh` returns without starting the timer while
+        anything is in flight, so any path that loses a cycle leaves the app
+        with no timer at all: refreshes stop, the header freezes, and only a
+        restart fixes it. The heartbeat is the one timer still running, so it
+        is what notices.
+        """
+        if self._inflight or self._refresh_queue:
+            return
+        if self._cycle_active:
+            if self._watchdogs:
+                # A dispatch is still bounded; its watchdog will end it.
+                return
+            # Nothing in flight, nothing queued, no watchdog left, and a cycle
+            # that still calls itself open. This is the one state that cannot
+            # recover on its own - there is no timer, because
+            # _schedule_next_refresh was never reached - and it was also the
+            # one state this method declined to act in.
+            log.warning(
+                "refresh cycle was wedged (active with nothing in flight); ending it"
+            )
+            self._end_cycle()
+            return
+        if not self._providers:
+            # With no provider configured at all, refresh_now returns before
+            # it touches the timer, so rescheduling here only logs a warning
+            # every five minutes forever.
+            return
+        try:
+            if self._timer.isActive():
+                return
+        except RuntimeError:
+            return
+        log.warning("refresh timer was not running; rescheduling")
+        self._schedule_next_refresh()
 
     def _log_about_to_quit(self) -> None:
         self._log_lifecycle_event("qt aboutToQuit")
@@ -453,55 +696,99 @@ class App(QObject):
         self._log_lifecycle_event("python atexit")
 
     def _build_providers(self) -> None:
-        # Tear down any existing providers (no shared state to clean up beyond refs)
+        # Tear down any existing providers (no shared state to clean up beyond
+        # refs), but keep the object when nothing about it changed. This runs
+        # on *every* settings save, a colour-only one included, and every
+        # provider reads `self._config` live - so a rebuilt instance differs
+        # from the one it replaced only in the state it just discarded. For a
+        # browser provider that state is the `ScrapeRunner` holding a live
+        # page load. The live-scrape guard is now keyed by account id in
+        # `_scrape_runner`, so this is belt to that brace. (It buys no other
+        # work: every provider `__init__` sets four attributes and reads its
+        # catalog, its URL and its secret per refresh.)
+        previous = dict(self._providers)
         self._providers.clear()
+
+        def _kept(key: str, kind: type):
+            existing = previous.get(key)
+            return existing if type(existing) is kind else None
+
         desired_tiles: set[str] = set()
         for account in browser_accounts(self._config):
             if not getattr(self._config.providers, account.kind, False):
                 continue
             desired_tiles.add(account.id)
             if account.kind == "claude":
-                self._providers[account.id] = ClaudeProvider(
+                self._providers[account.id] = _kept(
+                    account.id, ClaudeProvider
+                ) or ClaudeProvider(
                     parent=self,
                     account_id=account.id,
                     config=self._config,
                 )
             elif account.kind == "codex":
-                self._providers[account.id] = CodexProvider(
+                self._providers[account.id] = _kept(
+                    account.id, CodexProvider
+                ) or CodexProvider(
                     parent=self,
                     account_id=account.id,
                     config=self._config,
                 )
             self._widget.ensure_tile(account.id, display_name_for_account(self._config, account.id))
         if self._config.providers.copilot:
-            self._providers["copilot"] = CopilotProvider(self._config)
+            self._providers["copilot"] = _kept(
+                "copilot", CopilotProvider
+            ) or CopilotProvider(self._config)
             desired_tiles.add("copilot")
             self._widget.ensure_tile("copilot", "Copilot")
         if getattr(self._config.providers, "azure", False):
-            self._providers["azure"] = AzureProvider(self._config)
+            self._providers["azure"] = _kept("azure", AzureProvider) or AzureProvider(
+                self._config
+            )
             desired_tiles.add("azure")
             self._widget.ensure_tile("azure", "Microsoft · Azure")
         if self._config.providers.openrouter:
-            self._providers["openrouter"] = OpenRouterProvider(self._config)
+            self._providers["openrouter"] = _kept(
+                "openrouter", OpenRouterProvider
+            ) or OpenRouterProvider(self._config)
             desired_tiles.add("openrouter")
             self._widget.ensure_tile("openrouter", "OpenRouter")
         if self._config.providers.opencode_go:
-            self._providers["opencode_go"] = OpenCodeGoProvider(self._config, parent=self)
+            self._providers["opencode_go"] = _kept(
+                "opencode_go", OpenCodeGoProvider
+            ) or OpenCodeGoProvider(self._config, parent=self)
             desired_tiles.add("opencode_go")
             self._widget.ensure_tile("opencode_go", "OpenCode")
         for tile_id in list(self._widget._tiles):  # noqa: SLF001
             if tile_id not in desired_tiles:
                 self._widget.remove_tile(tile_id)
                 self._snapshots.pop(tile_id, None)
+        self._error_retry = {
+            name: state
+            for name, state in self._error_retry.items()
+            if name in self._providers
+        }
+        # Same pruning for the other per-provider maps, so a removed provider
+        # leaves nothing behind. A name still in flight or still parked keeps
+        # its entries: its dispatch is what they bound.
+        keep = set(self._providers) | self._inflight | set(self._abandoned)
+        for mapping in (self._dispatch_times, self._dispatch_epoch):
+            for name in [n for n in mapping if n not in keep]:
+                mapping.pop(name, None)
+        for name in [n for n in self._watchdogs if n not in keep]:
+            self._cancel_watchdog(name)
 
     def _restart_timer(self) -> None:
         self._timer.stop()
         self._schedule_next_refresh()
 
-    def _schedule_next_refresh(self) -> None:
-        if self._inflight or self._refresh_queue:
-            return
-        now = datetime.now()
+    def _cadence_refresh_time(self, now: datetime) -> tuple[datetime, str, int]:
+        """When the next *cadence* wake is owed, before any retry pulls it in.
+
+        Separate from `_schedule_next_refresh` because a deferred retry needs
+        the same answer: a due that cannot be run yet is folded onto this
+        moment rather than buying a wake of its own.
+        """
         max_minutes = max(1, self._config.refresh_interval_minutes)
         active = now < self._active_until
         minutes = _adaptive_refresh_minutes(
@@ -511,6 +798,7 @@ class App(QObject):
             max_minutes=max_minutes,
         )
         next_refresh_at = now + timedelta(minutes=minutes)
+        reason = "active" if active else "idle"
         # Don't let an idle backoff stretch past a known reset — otherwise the
         # panel keeps showing 100% for tens of minutes after the limit has
         # actually rolled over. Pull the refresh forward so we re-read shortly
@@ -518,13 +806,23 @@ class App(QObject):
         soon_after_reset = self._earliest_reset_refresh_time()
         if soon_after_reset is not None and soon_after_reset < next_refresh_at:
             next_refresh_at = soon_after_reset
+            reason = "reset_pull_forward"
             minutes = max(
                 1,
-                int((next_refresh_at - datetime.now()).total_seconds() // 60) or 1,
+                int((next_refresh_at - now).total_seconds() // 60) or 1,
             )
+        return next_refresh_at, reason, minutes
+
+    def _schedule_next_refresh(self) -> None:
+        if self._inflight or self._refresh_queue:
+            return
+        now = datetime.now()
+        active = now < self._active_until
+        next_refresh_at, reason, minutes = self._cadence_refresh_time(now)
         error_retry = self._error_retry_time(now)
         if error_retry is not None and error_retry < next_refresh_at:
             next_refresh_at = error_retry
+            reason = "error_retry"
             minutes = max(
                 1,
                 int((next_refresh_at - datetime.now()).total_seconds() // 60) or 1,
@@ -533,7 +831,18 @@ class App(QObject):
             1000,
             int((next_refresh_at - datetime.now()).total_seconds() * 1000),
         )
+        self._next_refresh_reason = reason
         self._timer.start(delay_ms)
+        # The one line that makes an unexplained refresh explainable: the log
+        # showed 32% of cycles starting within two minutes of the previous one
+        # and no way to tell a fast retry from a reset pull-forward.
+        log.info(
+            "refresh scheduled in_s=%s reason=%s active=%s unchanged_cycles=%s",
+            delay_ms // 1000,
+            reason,
+            active,
+            self._unchanged_cycles,
+        )
         self._widget.set_refresh_state(
             active=active,
             minutes=minutes,
@@ -566,57 +875,156 @@ class App(QObject):
                     earliest = target
         return earliest
 
-    def _record_cycle_outcome(self) -> None:
-        """Count consecutive failing cycles, so the fast retry can be bounded.
+    def _record_provider_outcome(self, snapshot: UsageSnapshot) -> None:
+        """Advance or clear one provider's error streak.
 
-        The reset is the load-bearing half. Without it a provider that failed
-        a few times and later recovered would never earn a fast retry again
-        for the life of the process - the bound would be permanent rather than
-        a backoff.
+        Per provider, not per cycle. The old counter was cycle-wide: any
+        ERROR snapshot anywhere meant the *next cycle* ran in a minute, for
+        everyone. 124 of 137 cycles in 4.5 days of desktop log contained at
+        least one ERROR or AUTH_REQUIRED - OpenCode alone never succeeded once
+        - so a third of all cycles started within two minutes of the previous
+        one and five healthy providers were re-scraped for one broken tile.
+        The bound then bit the wrong way round: past three failing cycles
+        nobody got a fast retry, and since no cycle was ever clean the counter
+        never reset, so a genuinely transient failure on a *different*
+        provider got nothing.
+
+        AUTH_REQUIRED is deliberately not a failure: signing in is the user's
+        move, and retrying it quickly only burns page loads. Nor is a failure
+        the provider marked as something other than its own (see
+        _NO_FAST_RETRY_ERROR_CLASSES).
+
+        One consequence worth stating: "three retries and then the normal
+        cadence" is a bound on a *run* of errors, not on a provider. Any
+        non-ERROR status pops the entry, so a provider alternating
+        AUTH_REQUIRED and ERROR - OpenCode's exact pattern in the desktop log,
+        95 auth failures and 38 errors, never a success - refills the ladder
+        each time. Measured, that is about one extra dispatch per cycle for
+        that provider while the healthy ones drop from 17 an hour to 10, so it
+        is not an amplification; it is just not the bound the sentence above
+        sounds like.
         """
-        if any(
-            snap.status == SnapshotStatus.ERROR
-            for snap in self._snapshots.values()
-        ):
-            self._consecutive_error_cycles += 1
+        name = snapshot.provider
+        if snapshot.status != SnapshotStatus.ERROR:
+            # OK clears the streak; so does AUTH_REQUIRED, which is a state,
+            # not a fault to back off from.
+            self._error_retry.pop(name, None)
+            return
+        if snapshot.error_class in _NO_FAST_RETRY_ERROR_CLASSES:
+            log.info(
+                "refresh retry skipped provider=%s error_class=%s",
+                name,
+                snapshot.error_class,
+            )
+            # A wait is not a pending retry. Leaving an already-owed entry in
+            # place left its `due` in the past; `_error_retry_time` clamps a
+            # past due to *now*, `_schedule_next_refresh` floors the delay at
+            # 1 000 ms, and the wake produces the same answer - a 1 Hz cycle
+            # loop for as long as the throttle lasts, measured at 3 543 cycles
+            # in an hour against an Azure hourly gate.
+            self._error_retry.pop(name, None)
+            return
+        errors = self._error_retry.get(name, (0, None))[0] + 1
+        if errors <= _ERROR_FAST_RETRY_ATTEMPTS:
+            # 1, 2, 4 minutes. A flat minute is what the log caught in the
+            # act: an offline burst re-scraped every provider every minute
+            # while Claude alone needs a median of 18.5 s of browser time.
+            delay = timedelta(minutes=_ERROR_RETRY_MINUTES * (2 ** (errors - 1)))
+            due: datetime | None = datetime.now() + delay
         else:
-            self._consecutive_error_cycles = 0
+            due = None
+        self._error_retry[name] = (errors, due)
+
+    def _error_retry_for_log(self) -> str:
+        if not self._error_retry:
+            return "-"
+        return ",".join(
+            f"{name}:{errors}"
+            for name, (errors, _due) in sorted(self._error_retry.items())
+        )
+
+    def _due_error_providers(self, now: datetime | None = None) -> list[str]:
+        """Providers whose own fast retry has come due, in queue order."""
+        moment = now or datetime.now()
+        return self._ordered(
+            name
+            for name, (_errors, due) in self._error_retry.items()
+            if due is not None and due <= moment
+        )
 
     def _error_retry_time(self, now: datetime | None = None) -> datetime | None:
-        """Soonest recovery refresh after a provider error.
+        """Soonest recovery refresh owed to any single provider.
 
-        This used to require the errored snapshot to still carry stale
-        metrics, which meant the *worse* case got the slower retry: a provider
-        that had never succeeded this run showed nothing at all and then waited
-        a full interval, while one showing a stale-but-plausible number was
-        retried within the minute.
+        The fast retry used to require the errored snapshot to still carry
+        stale metrics, which meant the *worse* case got the slower retry: a
+        provider that had never succeeded this run showed nothing at all and
+        then waited a full interval, while one showing a stale-but-plausible
+        number was retried within the minute.
 
         That is exactly the shape of a cold start. Claude's settings page
         resolves eight endpoints before it requests usage, and on a fresh
         launch none of them are cached, so the first scrape can exceed its
         budget. The retry a minute later runs against a warm cache and
-        succeeds - but until then every restart showed a broken tile for a full
-        refresh interval, at precisely the moment a user is most likely to be
-        looking at the app.
-
-        AUTH_REQUIRED is deliberately excluded: it needs the user to sign in,
-        so retrying it quickly only burns page loads.
+        succeeds - but until then every restart showed a broken tile for a
+        full refresh interval, at precisely the moment a user is most likely
+        to be looking at the app.
         """
-        if self._consecutive_error_cycles > _ERROR_FAST_RETRY_CYCLES:
+        moment = now or datetime.now()
+        due_times = [
+            due
+            for name, (_errors, due) in self._error_retry.items()
+            if due is not None and name in self._providers
+        ]
+        if not due_times:
             return None
-        if not any(
-            snap.status == SnapshotStatus.ERROR
-            for snap in self._snapshots.values()
-        ):
-            return None
-        return (now or datetime.now()) + timedelta(minutes=_ERROR_RETRY_MINUTES)
+        return max(min(due_times), moment)
 
     # ----- Refresh -----
 
-    def refresh_now(self, manual: bool = True) -> None:
-        if not self._providers:
-            return
-        if self._inflight or self._refresh_queue:
+    def _display_names(self, names: list[str]) -> dict[str, str]:
+        return {
+            name: {
+                "copilot": "Copilot",
+                "openrouter": "OpenRouter",
+                "azure": "Microsoft · Azure",
+            }.get(name, display_name_for_account(self._config, name))
+            for name in names
+        }
+
+    def _begin_cycle(self, names: list[str], *, manual: bool, reason: str) -> None:
+        """Start one refresh cycle over ``names``, in queue order.
+
+        The single entry point for every cycle - manual, scheduled or a
+        per-provider retry - so the log line that opens a cycle cannot
+        disagree with what actually ran.
+        """
+        # A provider the App has given up on but whose worker is still out
+        # there is not dispatched again - by this cycle or any other. Filter
+        # before the cycle's own totals are computed, so its progress and its
+        # verdict are about what actually ran.
+        wanted: list[str] = []
+        for name in names:
+            refusal = self._dispatch_refusal(name)
+            if refusal is None:
+                wanted.append(name)
+            else:
+                log.info(
+                    "refresh provider skipped provider=%s reason=%s", name, refusal
+                )
+        names = wanted
+        if not names:
+            # Nothing runnable. A cycle over zero providers blinked
+            # "- refreshing" on the header with no fraction behind it and
+            # logged a start and an end for a cycle that dispatched nobody -
+            # and a *manual* one was worse, because the active-window re-arm
+            # below runs after the filter and never asked whether anything
+            # was left: clicking Refresh while every provider was parked
+            # pinned the app on the fast cadence for half an hour and threw
+            # away the idle backoff, in exchange for zero network calls.
+            log.info(
+                "refresh_now nothing_eligible manual=%s reason=%s", manual, reason
+            )
+            self._schedule_next_refresh()
             return
         if manual:
             self._active_until = datetime.now() + timedelta(
@@ -626,79 +1034,644 @@ class App(QObject):
         self._timer.stop()
         self._current_refresh_manual = manual
         self._cycle_signatures = {}
-        self._widget.set_refreshing(True)
-        self._refresh_queue = _refresh_provider_order(self._providers)
-        if manual:
-            self._widget.mark_loading(
-                {
-                    name: {
-                        "copilot": "Copilot",
-                        "openrouter": "OpenRouter",
-                        "azure": "Microsoft · Azure",
-                    }.get(name, display_name_for_account(self._config, name))
-                    for name in self._refresh_queue
-                }
+        self._cycle_statuses = {}
+        self._cycle_total = len(names)
+        self._cycle_started_at = time.monotonic()
+        self._cycle_reason = reason
+        self._cycle_names = set(names)
+        self._cycle_partial = len(names) < len(self._providers)
+        self._cycle_active = True
+        log.info(
+            "refresh cycle start manual=%s reason=%s providers=%s",
+            manual,
+            reason,
+            ",".join(names),
+        )
+        self._widget.set_refreshing(True, total=len(names))
+        # Both kinds of cycle mark their tiles now. A scheduled one is marked
+        # more lightly - nobody asked for it - but it is marked, because the
+        # alternative was a 48 s median cycle with no visible sign at all.
+        self._widget.mark_loading(self._display_names(names), subtle=not manual)
+        # The browser providers keep the serial queue; everything else goes
+        # out at once. A provider that answers from inside this loop would
+        # otherwise find an empty queue and close the cycle before the rest of
+        # the batch had even been dispatched, so the loop holds the cycle open
+        # until it is done.
+        concurrent = [name for name in names if not self._uses_browser(name)]
+        self._refresh_queue = [name for name in names if self._uses_browser(name)]
+        # What each of those may spend waiting for a pool thread, before its
+        # own work even starts. See _pool_wait_slack.
+        self._pool_wait_budgets = {
+            name: _refresh_budget_seconds(self._providers.get(name))
+            for name in concurrent
+        }
+        self._dispatching = True
+        try:
+            for name in concurrent:
+                self._dispatch(name)
+        finally:
+            self._dispatching = False
+        self._advance_cycle()
+
+    def refresh_now(self, manual: bool = True) -> None:
+        if not self._providers:
+            return
+        if self._inflight or self._refresh_queue:
+            if manual:
+                # The widget's Refresh button is disabled for the whole cycle,
+                # so the reachable path is the tray menu's "Refresh now" - and
+                # it silently did nothing, at exactly the moment a tile looks
+                # stale, which is usually mid-cycle. Settings-save went the
+                # same way: apply, then a refresh_now that no-opped.
+                self._pending_manual_refresh = True
+                log.info(
+                    "refresh_now queued inflight=%s queue=%s",
+                    ",".join(sorted(self._inflight)) or "-",
+                    ",".join(self._refresh_queue) or "-",
+                )
+                return
+            # A *scheduled* wake landing inside a cycle needs no queueing:
+            # the cycle it landed in already covers every provider.
+            log.info(
+                "refresh_now ignored inflight=%s queue=%s",
+                ",".join(sorted(self._inflight)) or "-",
+                ",".join(self._refresh_queue) or "-",
             )
-        self._start_next_refresh()
+            return
+        self._begin_cycle(
+            _refresh_provider_order(self._providers),
+            manual=manual,
+            reason="manual" if manual else self._next_refresh_reason,
+        )
 
     def refresh_provider(self, provider: str) -> None:
         if provider not in self._providers:
             return
         if self._inflight or self._refresh_queue:
+            if provider not in self._pending_manual_providers:
+                self._pending_manual_providers.append(provider)
+            log.info(
+                "refresh_provider queued provider=%s inflight=%s queue=%s",
+                provider,
+                ",".join(sorted(self._inflight)) or "-",
+                ",".join(self._refresh_queue) or "-",
+            )
             return
-        self._active_until = datetime.now() + timedelta(minutes=_ACTIVE_MODE_MINUTES)
-        self._unchanged_cycles = 0
-        self._timer.stop()
-        self._current_refresh_manual = True
-        self._cycle_signatures = {}
-        self._widget.set_refreshing(True)
-        self._refresh_queue = [provider]
-        self._widget.mark_loading(
-            {provider: display_name_for_account(self._config, provider)}
-        )
-        self._start_next_refresh()
+        self._begin_cycle([provider], manual=True, reason="manual")
+
+    def _ordered(self, names) -> list[str]:
+        """The configured providers in ``names``, in canonical queue order."""
+        wanted = set(names)
+        return [
+            name
+            for name in _refresh_provider_order(self._providers)
+            if name in wanted
+        ]
+
+    def _run_pending_manual(self) -> None:
+        full = self._pending_manual_refresh
+        wanted = list(self._pending_manual_providers)
+        names = self._ordered(wanted)
+        self._pending_manual_refresh = False
+        self._pending_manual_providers = []
+        if full:
+            log.info("refresh pending manual running scope=all")
+            self.refresh_now(manual=True)
+        elif names:
+            log.info("refresh pending manual running scope=%s", ",".join(names))
+            self._begin_cycle(names, manual=True, reason="manual")
+        elif wanted:
+            # _ordered() filters against _providers, so a settings save that
+            # removed the provider the user had just asked to refresh left
+            # neither branch running and no line at all - indistinguishable
+            # from the request never having been made.
+            log.info("refresh pending manual dropped scope=%s", ",".join(wanted))
+
+    def _uses_browser(self, name: str) -> bool:
+        return bool(getattr(self._providers.get(name), "uses_browser", False))
+
+    def _browser_in_flight(self) -> bool:
+        return any(self._uses_browser(name) for name in self._inflight)
 
     def _start_next_refresh(self) -> None:
-        if self._inflight or not self._refresh_queue:
+        if not self._refresh_queue:
+            return
+        # Only the browser queue is serial. A REST provider still in flight
+        # must not hold up the next scrape.
+        if self._browser_in_flight():
             return
         name = self._refresh_queue.pop(0)
+        refusal = self._dispatch_refusal(name)
+        if refusal is not None:
+            # Usually a settings save removed this one while it was queued.
+            # Re-entering _start_next_refresh here returned on the empty-queue
+            # guard when the dropped name was the last entry, leaving
+            # _cycle_active true with nothing in flight: the timer stopped,
+            # the heartbeat's recovery blocked on _cycle_active, the Refresh
+            # button disabled, and any queued manual refresh stranded.
+            # _advance_cycle does both jobs - next provider, or close the
+            # cycle.
+            log.info("refresh provider skipped provider=%s reason=%s", name, refusal)
+            self._cycle_names.discard(name)
+            self._cycle_total = max(len(self._cycle_statuses), self._cycle_total - 1)
+            self._advance_cycle()
+            return
+        self._dispatch(name)
+
+    def _dispatch_refusal(self, name: str) -> str | None:
+        """Why this provider must not be dispatched now, or None.
+
+        The single gate every path goes through - a scheduled cycle, a retry
+        wake, a manual refresh, a settings save - so a provider cannot be sent
+        out twice by one of them while another thinks it is idle.
+        """
+        if self._providers.get(name) is None:
+            return "not_configured"
+        if name in self._inflight:
+            return "already_in_flight"
+        if self._is_abandoned(name):
+            return "abandoned"
+        return None
+
+    def _is_abandoned(self, name: str) -> bool:
+        """Is a dispatch the watchdog gave up on still presumed to be running?
+
+        The watchdog ends the App's *wait*; it does not cancel the provider's
+        work. A browser provider is still loading a page on the one cached
+        QWebEngineProfile for that account (webview/profile.py returns one per
+        provider), and ClaudeProvider.refresh rebuilds its runner
+        unconditionally - so a second dispatch means two QWebEngineViews
+        writing one cookie store, which is how a spurious sign-out happens,
+        and N times the load on the provider from one desktop app.
+
+        The entry clears when the abandoned worker finally reports back, or
+        when twice its budget has passed and it can fairly be called dead.
+        """
+        entry = self._abandoned.get(name)
+        if entry is None:
+            return False
+        epoch, assumed_dead_at = entry
+        if time.monotonic() >= assumed_dead_at:
+            log.warning(
+                "refresh provider abandoned worker assumed dead provider=%s epoch=%s",
+                name,
+                epoch,
+            )
+            self._abandoned.pop(name, None)
+            return False
+        return True
+
+    def _drain_pending_profile_purges(self) -> None:
+        """Run what a previous run left owed.
+
+        The deferral list used to be in memory only: `App` has no
+        `aboutToQuit` hook that flushes it, and once the account is gone from
+        `config.json` nothing at the next start looked for its directory -
+        the only sweep of `profiles/` on disk is the manual Settings "Clear
+        all browser data". What survived was the removed account's Chromium
+        profile, which uses `ForcePersistentCookies`, i.e. the live session
+        cookie itself, with no recovery path at all. (The keyring secret is
+        cleared by the dialog at the moment of removal either way.)
+        """
+        pending = list(getattr(self._config, "pending_profile_purges", []) or [])
+        if not pending:
+            return
+        # A count, and a bounded sample of the ids: the list is
+        # config-controlled and nothing bounds it, so echoing it whole let a
+        # poisoned `config.json` erase the log ring at every start.
+        log.info(
+            "profile purge owed from a previous run count=%s accounts=%s",
+            len(pending),
+            _ids_for_log(pending),
+        )
+        configured = {account.id for account in browser_accounts(self._config)}
+        for account_id in pending:
+            if account_id in configured:
+                # The list is persisted now, so an entry outlives the removal
+                # that wrote it. A restored backup, a synced config directory
+                # or a hand-edited undo of a removal puts the same id in both
+                # lists, and purging it would delete the live session cookie
+                # store of an account the user still has - the tile goes to
+                # "sign in again" at the next refresh with nothing to explain
+                # it. Not reachable through the UI, where generated ids are
+                # `kind-<uuid4>` and the fixed ones cannot be removed; the
+                # config file disagreeing with itself is worth the warning.
+                log.warning(
+                    "purge skipped account=%s reason=reconfigured",
+                    _clip_for_log(account_id),
+                )
+                continue
+            if account_id not in self._pending_profile_purges:
+                self._pending_profile_purges.append(account_id)
+        # Runs even when every entry was skipped: it is what rewrites the
+        # list, so a reconfigured id is dropped rather than asked again at
+        # every start.
+        self._run_profile_purges()
+
+    def _purge_removed_profiles(self, account_ids) -> None:
+        for account_id in account_ids:
+            if account_id not in self._pending_profile_purges:
+                self._pending_profile_purges.append(account_id)
+        self._run_profile_purges()
+
+    def _persist_pending_profile_purges(self) -> None:
+        """Record what is still owed, so a quit cannot lose it."""
+        pending = list(self._pending_profile_purges)
+        if list(getattr(self._config, "pending_profile_purges", []) or []) == pending:
+            return
+        self._config.pending_profile_purges = pending
+        try:
+            self._config.save()
+        except Exception:  # noqa: BLE001 - cleanup must not crash the app
+            log.exception("failed to record the pending profile purges")
+
+    def _run_profile_purges(self) -> None:
+        """Delete a removed account's profile, once nothing is still using it.
+
+        `purge_profile` calls `deleteLater()` on the cached
+        `QWebEngineProfile` and then rmtree's its directory. A settings save
+        can remove an account while its refresh is still out - F14's own
+        comment names that scenario - and Qt requires a profile to outlive its
+        pages, so destroying it under a live `QuietWebEnginePage` is a
+        use-after-free. The surviving page can also flush rotated session
+        cookies back into the directory that was just deleted, which puts a
+        removed account's live credential back on disk.
+
+        The keyring secret is cleared immediately by the dialog either way;
+        this is only the on-disk profile, and deferring it costs nothing.
+        """
+        waiting: list[str] = []
+        for account_id in self._pending_profile_purges:
+            if account_id in self._inflight or self._is_abandoned(account_id):
+                log.info(
+                    "profile purge deferred account=%s reason=refresh_in_flight",
+                    account_id,
+                )
+                waiting.append(account_id)
+                continue
+            try:
+                purge_profile(account_id)
+            except Exception:  # noqa: BLE001 - cleanup must not crash the app
+                log.exception("failed to purge profile for %s", account_id)
+        self._pending_profile_purges = waiting
+        self._persist_pending_profile_purges()
+
+    def _pool_wait_slack(self, name: str) -> float:
+        """How long this dispatch may sit in the thread pool before it starts.
+
+        `_arm_watchdog` starts its clock at dispatch, but a REST provider's
+        `work()` starts when a `QThreadPool` thread frees up - and the cycle
+        now hands openrouter, copilot and azure to the pool in one burst. On a
+        host whose ideal thread count is 1 or 2 the last runnable waits behind
+        the others while its own budget is already running, so the watchdog
+        would fire inside a refresh that has not exceeded its own bound. The
+        providers are not asked to report when they start (three separate
+        `_run_async` implementations, and the Provider API is one callback),
+        so the allowance is explicit here instead.
+        """
+        budgets = self._pool_wait_budgets
+        if name not in budgets:
+            return 0.0
+        ahead = sum(budget for other, budget in budgets.items() if other != name)
+        return ahead / _pool_capacity()
+
+    def _dispatch(self, name: str) -> None:
         provider = self._providers.get(name)
         if provider is None:
-            QTimer.singleShot(0, self._start_next_refresh)
             return
+        refusal = self._dispatch_refusal(name)
+        if refusal is not None:
+            # Belt and braces: every caller asks first, and this is what makes
+            # "one dispatch per provider at a time" a property of the method
+            # rather than of its callers.
+            log.warning(
+                "refresh provider not dispatched provider=%s reason=%s",
+                name,
+                refusal,
+            )
+            return
+        epoch = self._dispatch_epoch.get(name, 0) + 1
+        self._dispatch_epoch[name] = epoch
         self._inflight.add(name)
+        now = time.monotonic()
+        self._dispatch_times[name] = now
+        log.info(
+            "refresh provider start provider=%s epoch=%s queued_s=%.1f",
+            name,
+            epoch,
+            max(0.0, now - (self._cycle_started_at or now)),
+        )
+        self._arm_watchdog(name, provider, epoch)
 
-        def _emit(snap: UsageSnapshot, _name=name):
-            self._signals.snapshot_ready.emit(snap)
+        # The epoch travels with the answer, so a snapshot can be matched to
+        # the dispatch it answers rather than to whatever is in flight for
+        # that name when it lands.
+        def _emit(snap: UsageSnapshot, _epoch=epoch):
+            self._signals.snapshot_ready.emit((snap, _epoch))
 
         try:
             provider.refresh(_emit)
         except Exception as exc:  # noqa: BLE001
             self._signals.snapshot_ready.emit(
-                UsageSnapshot(
-                    provider=name,
-                    status=SnapshotStatus.ERROR,
-                    # str(exc) on a transport failure carries the request URL,
-                    # and this string reaches the tile, the tray tooltip and
-                    # the error dialog. Same redaction the log line below uses.
-                    error=_redact_azure_ids(str(exc)),
+                (
+                    UsageSnapshot(
+                        provider=name,
+                        status=SnapshotStatus.ERROR,
+                        # str(exc) on a transport failure carries the request
+                        # URL, and this string reaches the tile, the tray
+                        # tooltip and the error dialog. Same redaction the log
+                        # line below uses.
+                        error=_redact_azure_ids(str(exc)),
+                    ),
+                    epoch,
                 )
             )
 
-    def _on_snapshot(self, snapshot: UsageSnapshot) -> None:
+    def _arm_watchdog(self, name: str, provider: Provider, epoch: int = 0) -> None:
+        """Bound one dispatch, so a provider that never answers cannot stall
+        the cycle - and with it every future refresh."""
+        self._cancel_watchdog(name)
+        budget = (
+            _refresh_budget_seconds(provider)
+            + _WATCHDOG_SLACK_SECONDS
+            + self._pool_wait_slack(name)
+        )
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(
+            lambda n=name, b=budget, e=epoch: self._on_watchdog(n, b, e)
+        )
+        timer.start(int(budget * 1000))
+        self._watchdogs[name] = timer
+
+    def _cancel_watchdog(self, name: str) -> None:
+        self._retire_watchdog(self._watchdogs.pop(name, None))
+
+    @staticmethod
+    def _retire_watchdog(timer) -> None:
+        """Stop a watchdog *and* destroy it.
+
+        `QTimer(self)` parents the C++ object to `App`, so dropping the Python
+        reference frees nothing: 2 000 armed-and-stopped watchdogs left 2 000
+        live QObjects. At ~180 dispatches a day in a tray app designed to run
+        for weeks that is unbounded growth, and it slows every child-event
+        walk on `App`.
+        """
+        if timer is None:
+            return
+        try:
+            timer.stop()
+            timer.deleteLater()
+        except RuntimeError:
+            pass
+
+    def _on_watchdog(self, name: str, budget: float, epoch: int = 0) -> None:
+        self._retire_watchdog(self._watchdogs.pop(name, None))
+        if name not in self._inflight:
+            return
+        if epoch and self._dispatch_epoch.get(name) != epoch:
+            # A watchdog outliving the dispatch it was armed for.
+            return
+        log.warning(
+            "refresh provider watchdog provider=%s epoch=%s budget_s=%.0f - giving up",
+            name,
+            epoch,
+            budget,
+        )
+        # The App stops waiting; the provider does not stop working. Park the
+        # name until that worker reports back or can be assumed dead, so no
+        # cycle, retry wake, manual refresh or settings save starts a second
+        # one alongside it.
+        assumed_dead_in = _ABANDONED_CEILING_FACTOR * budget
+        self._abandoned[name] = (epoch, time.monotonic() + assumed_dead_in)
+        log.warning(
+            "refresh provider abandoned provider=%s epoch=%s eligible_again_in_s=%.0f",
+            name,
+            epoch,
+            assumed_dead_in,
+        )
+        self._signals.snapshot_ready.emit(
+            (
+                UsageSnapshot(
+                    provider=name,
+                    status=SnapshotStatus.ERROR,
+                    error="Refresh timed out.",
+                ),
+                epoch,
+            )
+        )
+
+    def _on_refresh_timer(self) -> None:
+        """The scheduled wake. A retry wake refreshes only what is owed one."""
+        if self._next_refresh_reason != "error_retry":
+            self.refresh_now(manual=False)
+            return
+        # A Qt::CoarseTimer rounds its expiry and may fire a few milliseconds
+        # before the due it was armed for, so the due test gets a tolerance.
+        due = self._due_error_providers(
+            datetime.now() + timedelta(seconds=_RETRY_WAKE_TOLERANCE_SECONDS)
+        )
+        if not due:
+            # The wake was bought by one provider's retry and that retry is no
+            # longer owed - the provider recovered, or a settings save removed
+            # it. Falling through to refresh_now() re-ran the whole queue,
+            # which is the cycle-wide retry this release removed: one flapping
+            # provider cost every other provider a full extra cycle.
+            log.info("refresh retry wake found nothing due")
+            self._schedule_next_refresh()
+            return
+        if self._inflight or self._refresh_queue:
+            log.info(
+                "refresh_now ignored inflight=%s queue=%s",
+                ",".join(sorted(self._inflight)) or "-",
+                ",".join(self._refresh_queue) or "-",
+            )
+            return
+        # A provider the App parked cannot run now. Spending its due here
+        # meant the retry vanished - the streak stayed, the deadline became
+        # None, and nothing ran until the next full cadence cycle - and when
+        # it was the only due name the wake bought a complete *empty* cycle:
+        # the timer stopped, `set_refreshing(True, total=0)` and
+        # `mark_loading({})` reached the widget, and `refresh cycle start ...
+        # providers=` was logged for nothing. The due is kept instead, re-armed
+        # at the moment the park lifts - not left in the past, which would pin
+        # every later wake at the timer's 1 000 ms floor.
+        runnable: list[str] = []
+        now = time.monotonic()
+        for name in due:
+            parked = self._abandoned.get(name)
+            if parked is None or now >= parked[1]:
+                # Past the ceiling the entry is stale; _dispatch_refusal is
+                # what expires and logs it, one line per park.
+                runnable.append(name)
+                continue
+            lifts_in = max(1.0, parked[1] - now)
+            # Owed no earlier than the next cadence wake, so the kept due
+            # folds into a cycle that was going to run anyway instead of
+            # buying a wake at the instant the park lifts. That wake was one
+            # extra dispatch per hour for a provider that is hung - measured
+            # at 5 rather than 4 for a browser provider and 7 rather than 6
+            # for a REST one - and the three REST providers have no
+            # re-entrancy guard of their own, so each extra dispatch is
+            # another worker holding a slot of the *global* QThreadPool for
+            # as long as the endpoint stays slow.
+            cadence_at, _reason, _minutes = self._cadence_refresh_time(
+                datetime.now()
+            )
+            due_at = max(
+                datetime.now() + timedelta(seconds=lifts_in), cadence_at
+            )
+            errors, _due = self._error_retry.get(name, (0, None))
+            self._error_retry[name] = (errors, due_at)
+            log.info(
+                "refresh retry deferred provider=%s reason=abandoned in_s=%.0f "
+                "lifts_in_s=%.0f",
+                name,
+                max(0.0, (due_at - datetime.now()).total_seconds()),
+                lifts_in,
+            )
+        if not runnable:
+            log.info("refresh retry wake found nothing it could run")
+            self._schedule_next_refresh()
+            return
+        # Spend the due here, at dispatch, rather than waiting for an answer
+        # to clear it. An answer that does not clear the entry - a throttle, a
+        # resume artifact, a provider removed between the wake and the
+        # dispatch - would otherwise leave a past due in place. The streak
+        # survives, because that is what bounds the 1/2/4-minute ladder.
+        for name in runnable:
+            errors, _due = self._error_retry.get(name, (0, None))
+            self._error_retry[name] = (errors, None)
+        self._begin_cycle(runnable, manual=False, reason="error_retry")
+
+    def _repaint_snapshot(
+        self, snapshot: UsageSnapshot, *, record: bool = False
+    ) -> None:
+        """Show a snapshot again: the tile, and with ``record`` the stores.
+
+        Never the cycle, either way - no `_inflight` entry, no watchdog, no
+        progress counter, no verdict.
+
+        A settings save re-renders Copilot's or OpenRouter's cached payload
+        against the new denominator, so the tile shows it immediately rather
+        than after the next refresh. That is a repaint, not a dispatch
+        answer, and it used to go through `_on_snapshot` with no epoch -
+        which applies the epoch gate only when one is present, so the
+        re-render took the live-answer path. It discarded `_inflight`,
+        destroyed the watchdog, wrote a `refresh provider done ... status=ok`
+        line for a dispatch that had not answered, recorded the cached value
+        as that cycle's result and could close the cycle; the real worker was
+        then in neither `_inflight` nor `_watchdogs` nor `_abandoned`, its
+        answer was dropped as late, and the `refresh_now(manual=True)` the
+        settings save runs two lines later started a second one beside it.
+        Measured on the one provider class with no re-entrancy guard of its
+        own: two live REST workers, and the fresh answer thrown away.
+        """
+        name = snapshot.provider
+        if name not in self._providers:
+            return
+        self._snapshots[name] = snapshot
+        if record:
+            # A late answer is a new observation, and the only thing the
+            # stores heard about that dispatch was the watchdog's synthetic
+            # `Refresh timed out.` - which both of them drop, because neither
+            # records anything that is not OK. Painting it and not recording
+            # it gave a provider that answers correctly but slower than its
+            # budget a healthy tile with an empty ratio history and a
+            # permanently blank burn-rate row: measured at 0 rows over twelve
+            # cycles where a provider inside its budget contributes 12.
+            #
+            # A settings re-render passes record=False and means it: that
+            # payload is a cached observation already recorded, re-rendered
+            # against a new denominator, and recording it again would move an
+            # average nothing new happened to.
+            try:
+                self._history.record_snapshot(snapshot)
+            except Exception:  # noqa: BLE001
+                log.exception("history.record_snapshot failed")
+            try:
+                self._ratio.record_snapshot(snapshot)
+            except Exception:  # noqa: BLE001
+                log.exception("ratio.record_snapshot failed")
+        self._widget.update_snapshot(
+            snapshot, display_name_for_account(self._config, name)
+        )
+        # The burn-rate row is hidden by `set_snapshot` on anything but OK, so
+        # a repaint that turns an ERROR tile back into an OK one has to ask
+        # for it again.
+        try:
+            self._widget.set_ratio(
+                name,
+                self._ratio.display_estimate(name),
+                self._ratio_recent(name),
+                self._ratio.current_estimate(name),
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("widget.set_ratio failed")
+        self._update_tray()
+
+    def _on_snapshot(self, payload) -> None:
+        if isinstance(payload, tuple):
+            snapshot, epoch = payload
+        else:
+            # Not a dispatch answer: a settings save re-rendering a cached
+            # snapshot with a new denominator. There is no epoch to match.
+            snapshot, epoch = payload, None
+        name = snapshot.provider
+        if epoch is None and name in self._inflight:
+            # Belt and braces for any future caller that reaches here without
+            # an epoch while that provider's dispatch is still out. A repaint
+            # must not be read as its answer. See _repaint_snapshot.
+            self._repaint_snapshot(snapshot)
+            return
+        if epoch is not None and not (
+            name in self._inflight and self._dispatch_epoch.get(name) == epoch
+        ):
+            self._on_late_snapshot(snapshot, epoch)
+            return
+        was_inflight = name in self._inflight
+        self._inflight.discard(name)
+        self._cancel_watchdog(name)
+        dispatched_at = self._dispatch_times.pop(name, None)
+        if was_inflight:
+            log.info(
+                "refresh provider done provider=%s elapsed_s=%.1f status=%s",
+                name,
+                (time.monotonic() - dispatched_at) if dispatched_at else 0.0,
+                snapshot.status.value,
+            )
+        if name not in self._providers:
+            # A settings save can remove a provider while its refresh is still
+            # out. Storing the late snapshot re-created the tile that
+            # _build_providers had just deleted, so a provider the user had
+            # turned off came back until the next cycle.
+            log.info(
+                "refresh provider dropped provider=%s status=%s reason=not_configured",
+                name,
+                snapshot.status.value,
+            )
+            self._advance_cycle()
+            return
         snapshot = _preserve_error_metrics(
             snapshot,
             self._snapshots.get(snapshot.provider),
         )
         self._snapshots[snapshot.provider] = snapshot
-        self._cycle_signatures[snapshot.provider] = _snapshot_signature(snapshot)
-        self._inflight.discard(snapshot.provider)
+        # A cycle accounts for what it dispatched. A snapshot from a provider
+        # it never asked - a per-provider retry running while something else
+        # reports - used to count toward its progress, its `errors=` line and
+        # its `changed` verdict.
+        in_cycle = self._cycle_active and name in self._cycle_names
+        if in_cycle:
+            self._cycle_signatures[snapshot.provider] = _snapshot_signature(snapshot)
+            self._cycle_statuses[snapshot.provider] = snapshot.status
+        self._record_provider_outcome(snapshot)
         if snapshot.status == SnapshotStatus.ERROR:
             log.warning(
                 "snapshot error provider=%s error=%s raw_keys=%s raw_summary=%s",
                 snapshot.provider,
                 _redact_azure_ids(snapshot.error or ""),
-                sorted(snapshot.raw.keys()) if snapshot.raw else [],
+                _raw_keys_for_log(snapshot.raw),
                 _raw_summary(snapshot.raw) if snapshot.raw else "{}",
             )
         elif snapshot.status == SnapshotStatus.AUTH_REQUIRED:
@@ -706,7 +1679,7 @@ class App(QObject):
                 "snapshot auth_required provider=%s error=%s raw_keys=%s raw_summary=%s",
                 snapshot.provider,
                 _redact_azure_ids(snapshot.error or ""),
-                sorted(snapshot.raw.keys()) if snapshot.raw else [],
+                _raw_keys_for_log(snapshot.raw),
                 _raw_summary(snapshot.raw) if snapshot.raw else "{}",
             )
         try:
@@ -728,29 +1701,179 @@ class App(QObject):
             )
         except Exception:  # noqa: BLE001
             log.exception("widget.set_ratio failed")
+        if in_cycle:
+            # The cycle's own total, not one recomputed from the queue: while
+            # the REST batch is going out, the providers not yet dispatched
+            # are in neither set and the header would count down to a
+            # denominator that moves.
+            self._widget.set_refresh_progress(
+                len(self._cycle_statuses), self._cycle_total
+            )
+        # Per snapshot, not per cycle: the tray dot and its tooltip used to be
+        # a whole cycle behind the tiles, which is minutes on a failing cycle.
+        self._update_tray()
 
+        self._advance_cycle()
+
+    def _on_late_snapshot(self, snapshot: UsageSnapshot, epoch: int) -> None:
+        """An answer from a dispatch that is no longer the current one.
+
+        Keying on the provider name alone had no dispatch identity: when a
+        scrape the watchdog had abandoned finally answered, the *new*
+        dispatch's `_inflight` entry made the stale answer look current, so it
+        cancelled the new dispatch's watchdog and closed the cycle while that
+        scrape was still running - live in neither `_inflight` nor
+        `_watchdogs`.
+
+        It closes no cycle, joins no cycle's verdict, clears no `_inflight`
+        entry and destroys no watchdog - all of that belongs to whatever
+        dispatch is current. What it does tell us is that the worker finally
+        let go, which is what un-parks the provider.
+
+        The *tile* is a different question. Dropping the answer whole was
+        right for an answer produced against a configuration the user has
+        since changed, and wrong for the case it actually hits: a provider
+        that is simply slower than its budget. That tile kept "Refresh timed
+        out." forever while the provider answered correctly every time, and a
+        genuine AUTH_REQUIRED - the one status that tells the user to sign in
+        again - was never painted. So a late answer is painted when it is the
+        newest dispatch's, which is exactly when there is nothing fresher to
+        paint over, and its retry entry is cleared only when it answered OK
+        or AUTH_REQUIRED. A late failure keeps the streak the watchdog
+        earned.
+
+        It is recorded as well as painted. The observation is genuinely new -
+        the only thing `HistoryStore` and `RatioStore` heard about this
+        dispatch was the watchdog's synthetic ERROR, which both of them drop -
+        so a provider slower than its budget otherwise showed a healthy tile
+        above an empty ratio history and a blank burn-rate row. Recording it
+        is not a scheduling side effect: the cycle, the epoch and the
+        watchdogs still belong to whatever dispatch is current.
+        """
+        name = snapshot.provider
+        current = self._dispatch_epoch.get(name)
+        # Newest-dispatch-only: an older epoch would paint over a dispatch
+        # that is still out, and the newer answer would then be overwritten
+        # by data older than itself.
+        painted = current == epoch and name in self._providers
+        log.info(
+            "refresh provider late provider=%s epoch=%s current=%s status=%s - %s",
+            name,
+            epoch,
+            current if current is not None else "-",
+            snapshot.status.value,
+            "tile repainted" if painted else "dropped",
+        )
+        if painted:
+            # Recorded as well as painted: it is a real observation, and no
+            # other one was ever recorded for this dispatch. It still joins
+            # no cycle, clears no `_inflight` entry and destroys no watchdog -
+            # paint and record, but no scheduling side effects.
+            self._repaint_snapshot(
+                _preserve_error_metrics(snapshot, self._snapshots.get(name)),
+                record=True,
+            )
+            if snapshot.status in (
+                SnapshotStatus.OK,
+                SnapshotStatus.AUTH_REQUIRED,
+            ):
+                # It answered. A retry the watchdog armed is no longer owed -
+                # but a late *failure* keeps it, because that is a failure.
+                self._error_retry.pop(name, None)
+        abandoned = self._abandoned.get(name)
+        if abandoned is not None and abandoned[0] == epoch:
+            self._abandoned.pop(name, None)
+            log.info(
+                "refresh provider abandoned worker reported back provider=%s epoch=%s",
+                name,
+                epoch,
+            )
+            self._run_profile_purges()
+
+    def _advance_cycle(self) -> None:
+        """Dispatch the next provider, or close the cycle when none is left."""
+        if not self._cycle_active:
+            # A snapshot that arrived outside a cycle - a re-render from a
+            # settings change, or a provider reporting late - repaints its
+            # tile and nothing more. It must not close a cycle that is not
+            # running or re-arm the timer behind the scheduler's back.
+            return
+        if self._dispatching:
+            # Still handing out this cycle's work; a synchronous answer must
+            # not be read as "everything is done".
+            return
         if self._refresh_queue:
             QTimer.singleShot(0, self._start_next_refresh)
-        else:
-            changed = self._cycle_changed()
-            if changed:
-                self._active_until = datetime.now() + timedelta(
-                    minutes=_ACTIVE_MODE_MINUTES
-                )
-                self._unchanged_cycles = 0
-            elif not self._current_refresh_manual:
-                self._unchanged_cycles += 1
-            self._record_cycle_outcome()
-            self._last_cycle_signatures = dict(self._cycle_signatures)
-            self._current_refresh_manual = False
-            self._widget.set_refreshing(False)
-            self._update_tray()
-            self._schedule_next_refresh()
+            return
+        if self._inflight:
+            return
+        self._end_cycle()
+
+    def _end_cycle(self) -> None:
+        self._cycle_active = False
+        changed = self._cycle_changed()
+        if changed:
+            self._active_until = datetime.now() + timedelta(
+                minutes=_ACTIVE_MODE_MINUTES
+            )
+            self._unchanged_cycles = 0
+        elif not self._current_refresh_manual and not self._cycle_partial:
+            # A retry cycle polls one provider; "nothing changed" there says
+            # nothing about whether the app is idle.
+            #
+            # The guard is deliberately asymmetric: a partial cycle cannot
+            # *advance* the backoff but a partial cycle whose one tile moved
+            # still zeroes it and re-arms the active window above, so a
+            # provider that flaps ERROR to OK on its retry cadence -
+            # OpenRouter had 22 such errors in 4.5 days - holds the whole app
+            # in active mode. Symmetry would be worse: a real change is a real
+            # change, whoever noticed it.
+            self._unchanged_cycles += 1
+        # Merge rather than replace: a partial cycle must not erase the
+        # baseline for the providers it did not visit.
+        self._last_cycle_signatures = {
+            **(self._last_cycle_signatures or {}),
+            **self._cycle_signatures,
+        }
+        started_at = self._cycle_started_at
+        log.info(
+            "refresh cycle end duration_s=%.1f changed=%s errors=%s auth_required=%s",
+            (time.monotonic() - started_at) if started_at else 0.0,
+            changed,
+            sum(
+                1
+                for status in self._cycle_statuses.values()
+                if status == SnapshotStatus.ERROR
+            ),
+            sum(
+                1
+                for status in self._cycle_statuses.values()
+                if status == SnapshotStatus.AUTH_REQUIRED
+            ),
+        )
+        self._cycle_started_at = None
+        self._current_refresh_manual = False
+        self._widget.set_refreshing(False)
+        self._update_tray()
+        self._run_profile_purges()
+        self._schedule_next_refresh()
+        if self._pending_manual_refresh or self._pending_manual_providers:
+            QTimer.singleShot(0, self._run_pending_manual)
 
     def _cycle_changed(self) -> bool:
+        """Did any provider this cycle visited report something new?
+
+        Compared per provider, because a cycle no longer has to be the whole
+        queue: a per-provider retry visits one tile, and comparing its single
+        signature against the previous full cycle's map would read as "changed"
+        every time.
+        """
         if self._last_cycle_signatures is None:
             return True
-        return self._cycle_signatures != self._last_cycle_signatures
+        return any(
+            self._last_cycle_signatures.get(name) != signature
+            for name, signature in self._cycle_signatures.items()
+        )
 
     def _update_tray(self) -> None:
         lines: list[str] = []
@@ -989,6 +2112,9 @@ class App(QObject):
         if accepted:
             dlg.apply_to(self._config)
             self._build_providers()
+            self._purge_removed_profiles(
+                getattr(dlg, "removed_profile_ids", None) or []
+            )
             self._widget.apply_gauge_colors()
             # Colour-only changes must not wait for the next network refresh.
             self._update_tray()
@@ -1070,7 +2196,7 @@ class App(QObject):
         from .providers.copilot import _build_snapshot
 
         try:
-            self._on_snapshot(_build_snapshot(cached.raw, quota))
+            self._repaint_snapshot(_build_snapshot(cached.raw, quota))
         except Exception:  # noqa: BLE001
             log.exception("failed to re-render copilot snapshot with new quota")
 
@@ -1086,7 +2212,7 @@ class App(QObject):
             for name, cost in (raw.get("top_models") or [])
         ]
         try:
-            self._on_snapshot(
+            self._repaint_snapshot(
                 _build_snapshot(
                     raw.get("credits"),
                     raw.get("key", {}) or {},

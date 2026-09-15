@@ -641,3 +641,41 @@ def test_bad_budget_no_longer_discards_openrouter_gauge_colours():
     )
     c = Config.load()
     assert c.openrouter.colors.green_max == 10
+
+
+def test_the_pending_purge_list_coerces_instead_of_carrying_junk():
+    """The list is a delete list read at startup, from a file the app also
+    treats as hostile everywhere else in this module.
+
+    `purge_profile` is the defence that matters - it refuses anything that
+    does not resolve strictly inside `profiles/` - but the coercion is what
+    keeps a non-string from reaching it at all, and a validator nothing tests
+    is a validator a future edit can delete.
+    """
+    assert Config(pending_profile_purges={"a": 1}).pending_profile_purges == []
+    assert Config(pending_profile_purges="claude").pending_profile_purges == []
+    assert Config(pending_profile_purges=None).pending_profile_purges == []
+    assert Config(
+        pending_profile_purges=[
+            "claude-ab12cd34",
+            "",
+            None,
+            True,
+            3,
+            1.5,
+            b"codex",
+            ["nested"],
+            {"k": "v"},
+            "codex-99999999",
+        ]
+    ).pending_profile_purges == ["claude-ab12cd34", "codex-99999999"]
+
+
+def test_the_pending_purge_list_survives_a_round_trip_through_the_file():
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        json.dumps({"pending_profile_purges": ["claude-ab12cd34", 7, ""]}),
+        encoding="utf-8",
+    )
+
+    assert Config.load().pending_profile_purges == ["claude-ab12cd34"]
