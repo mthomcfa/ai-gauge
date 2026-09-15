@@ -686,9 +686,13 @@ class App(QObject):
             reason,
             ",".join(names),
         )
-        self._widget.set_refreshing(True)
-        if manual:
-            self._widget.mark_loading(self._display_names(self._refresh_queue))
+        self._widget.set_refreshing(True, total=len(self._refresh_queue))
+        # Both kinds of cycle mark their tiles now. A scheduled one is marked
+        # more lightly - nobody asked for it - but it is marked, because the
+        # alternative was a 48 s median cycle with no visible sign at all.
+        self._widget.mark_loading(
+            self._display_names(self._refresh_queue), subtle=not manual
+        )
         self._start_next_refresh()
 
     def refresh_now(self, manual: bool = True) -> None:
@@ -820,6 +824,14 @@ class App(QObject):
             )
         except Exception:  # noqa: BLE001
             log.exception("widget.set_ratio failed")
+        if self._cycle_active:
+            self._widget.set_refresh_progress(
+                len(self._cycle_statuses),
+                len(self._cycle_statuses) + len(self._inflight) + len(self._refresh_queue),
+            )
+        # Per snapshot, not per cycle: the tray dot and its tooltip used to be
+        # a whole cycle behind the tiles, which is minutes on a failing cycle.
+        self._update_tray()
 
         self._advance_cycle()
 

@@ -41,15 +41,21 @@ class _Timer:
 class _Widget:
     def __init__(self):
         self.loading_calls = []
+        self.loading_kwargs = []
         self.refreshing = []
         self.refresh_state_calls = []
+        self.progress = []
         self.visible = True
 
-    def set_refreshing(self, refreshing):
+    def set_refreshing(self, refreshing, *, total=None):
         self.refreshing.append(refreshing)
 
-    def mark_loading(self, providers):
+    def set_refresh_progress(self, done, total=None):
+        self.progress.append((done, total))
+
+    def mark_loading(self, providers, *, subtle=False):
         self.loading_calls.append(providers)
+        self.loading_kwargs.append({"subtle": subtle})
 
     def set_refresh_state(self, *, active, minutes, next_at=None):
         self.refresh_state_calls.append(
@@ -177,14 +183,30 @@ def test_manual_refresh_marks_tiles_loading():
     assert app._unchanged_cycles == 0  # noqa: SLF001
 
 
-def test_scheduled_refresh_keeps_existing_tiles_visible():
+def test_scheduled_refresh_marks_its_tiles_more_quietly():
+    """A scheduled cycle used to show nothing at all - mark_loading was
+    manual-only - so with cycles running a median of 48 s the only evidence a
+    refresh was happening was tiles changing one at a time while the header
+    said "next now"."""
     app = _refresh_app_stub()
 
     app.refresh_now(manual=False)
 
-    assert app._widget.loading_calls == []  # noqa: SLF001
+    assert app._widget.loading_calls == [  # noqa: SLF001
+        {"claude": "Claude", "codex": "Codex"}
+    ]
+    assert app._widget.loading_kwargs == [{"subtle": True}]  # noqa: SLF001
     assert app._refresh_queue == ["claude", "codex"]  # noqa: SLF001
+    # A scheduled cycle must not re-arm the active window or zero the backoff.
     assert app._unchanged_cycles == 3  # noqa: SLF001
+
+
+def test_manual_refresh_dims_its_tiles_outright():
+    app = _refresh_app_stub()
+
+    app.refresh_now(manual=True)
+
+    assert app._widget.loading_kwargs == [{"subtle": False}]  # noqa: SLF001
 
 
 def test_refresh_order_prioritizes_openrouter_without_reordering_tiles():
@@ -782,6 +804,7 @@ def test_the_snapshot_error_log_line_redacts_azure_identifiers(qapp, caplog):
     app._ratio_recent = lambda provider: []  # noqa: SLF001
     app._refresh_queue = ["claude"]  # noqa: SLF001
     app._start_next_refresh = lambda: None  # noqa: SLF001
+    app._update_tray = lambda: None  # noqa: SLF001
 
     sub = "11111111-2222-3333-4444-555555555555"
     snapshot = UsageSnapshot(
@@ -799,6 +822,71 @@ def test_the_snapshot_error_log_line_redacts_azure_identifiers(qapp, caplog):
 
     assert sub not in caplog.text
     assert "<guid>" in caplog.text
+
+
+def _mid_cycle_app(widget) -> App:
+    app = App.__new__(App)
+    app._snapshots = {}  # noqa: SLF001
+    app._cycle_signatures = {}  # noqa: SLF001
+    app._cycle_statuses = {}  # noqa: SLF001
+    app._cycle_active = True  # noqa: SLF001
+    app._cycle_started_at = None  # noqa: SLF001
+    app._dispatch_times = {}  # noqa: SLF001
+    app._inflight = {"claude"}  # noqa: SLF001
+    app._refresh_queue = ["codex"]  # noqa: SLF001
+    app._providers = {"claude": object(), "codex": object()}  # noqa: SLF001
+    app._config = Config()  # noqa: SLF001
+    app._widget = widget  # noqa: SLF001
+    app._history = SimpleNamespace(record_snapshot=lambda snap: None)  # noqa: SLF001
+    app._ratio = SimpleNamespace(  # noqa: SLF001
+        record_snapshot=lambda snap: None,
+        display_estimate=lambda provider: None,
+        current_estimate=lambda provider: None,
+    )
+    app._ratio_recent = lambda provider: []  # noqa: SLF001
+    app._start_next_refresh = lambda: None  # noqa: SLF001
+    return app
+
+
+class _TrayWidget(_SnapshotWidget):
+    def __init__(self):
+        super().__init__()
+        self.progress = []
+
+    def set_refresh_progress(self, done, total=None):
+        self.progress.append((done, total))
+
+
+def test_the_tray_keeps_up_with_the_tiles(qapp):
+    """_update_tray ran only at the end of a cycle, so the tray dot and its
+    tooltip were a whole cycle behind the tiles - a median of 48 s, and
+    minutes on a failing cycle."""
+    widget = _TrayWidget()
+    app = _mid_cycle_app(widget)
+    tray_calls = []
+    app._update_tray = lambda: tray_calls.append(1)  # noqa: SLF001
+
+    app._on_snapshot(  # noqa: SLF001
+        UsageSnapshot(
+            provider="claude",
+            status=SnapshotStatus.OK,
+            metrics=[UsageMetric("Session", 50.0)],
+        )
+    )
+
+    assert tray_calls, "the tray waited for the end of the cycle"
+
+
+def test_the_header_is_told_how_far_through_the_cycle_it_is(qapp):
+    widget = _TrayWidget()
+    app = _mid_cycle_app(widget)
+    app._update_tray = lambda: None  # noqa: SLF001
+
+    app._on_snapshot(  # noqa: SLF001
+        UsageSnapshot(provider="claude", status=SnapshotStatus.OK)
+    )
+
+    assert widget.progress == [(1, 2)], "the header was not counted forward"
 
 
 def test_a_snapshot_for_a_provider_the_user_removed_is_dropped(qapp):

@@ -899,6 +899,7 @@ class _ProviderTile(QFrame):
         # Refresh-in-progress dim. Animates between 1.0 and 0.55 so the user
         # sees a brief breath when refresh starts/completes instead of a snap.
         self._refreshing = False
+        self._refresh_subtle = False
         self._opacity_effect = QGraphicsOpacityEffect(self)
         self._opacity_effect.setOpacity(1.0)
         self.setGraphicsEffect(self._opacity_effect)
@@ -954,11 +955,21 @@ class _ProviderTile(QFrame):
         if self._latest_snapshot is not None:
             self.set_snapshot(self._latest_snapshot)
 
-    def set_refreshing(self, refreshing: bool) -> None:
-        if self._refreshing == refreshing:
+    def set_refreshing(self, refreshing: bool, *, subtle: bool = False) -> None:
+        """Dim while this tile's provider is being refreshed.
+
+        ``subtle`` is the scheduled-cycle marker. A scheduled refresh used to
+        show nothing at all - mark_loading was manual-only - so the only
+        evidence of a cycle was values changing one at a time, at
+        unpredictable offsets. The manual dim stays at 0.55 because the user
+        just asked for it and is watching; an unattended one only needs to be
+        visible enough to explain the movement.
+        """
+        if self._refreshing == refreshing and self._refresh_subtle == subtle:
             return
         self._refreshing = refreshing
-        target = 0.55 if refreshing else 1.0
+        self._refresh_subtle = subtle
+        target = (0.82 if subtle else 0.55) if refreshing else 1.0
         self._opacity_anim.stop()
         self._opacity_anim.setStartValue(self._opacity_effect.opacity())
         self._opacity_anim.setEndValue(target)
@@ -1258,6 +1269,9 @@ class UsageWidget(QWidget):
         self._refresh_mode: str | None = None
         self._refresh_interval_minutes: int | None = None
         self._next_refresh_at: datetime | None = None
+        self._refreshing = False
+        self._refresh_done = 0
+        self._refresh_total = 0
         self._collapsed = config.window.collapsed
         self._always_on_top_suspensions = 0
 
@@ -1509,18 +1523,22 @@ class UsageWidget(QWidget):
         if tile is not None:
             tile.set_ratio(estimate, recent, live)
 
-    def mark_loading(self, providers: dict[str, str]) -> None:
+    def mark_loading(self, providers: dict[str, str], *, subtle: bool = False) -> None:
         """Signal a refresh is in progress without wiping prior data.
 
         Tiles that already have a snapshot stay populated and just dim; tiles
         that have never received data keep their skeleton state. Each tile
         un-dims as its individual snapshot arrives in ``update_snapshot``.
+
+        ``subtle`` marks a scheduled cycle: the same per-tile signal, lighter,
+        and without resetting an empty tile to its skeleton - nobody asked for
+        that refresh, so it must not look like a reload.
         """
         for provider, display_name in providers.items():
             tile = self.ensure_tile(provider, display_name)
-            if self._snapshots.get(provider) is None:
+            if not subtle and self._snapshots.get(provider) is None:
                 tile.set_snapshot(None)
-            tile.set_refreshing(True)
+            tile.set_refreshing(True, subtle=subtle)
         self._refresh_collapsed_summary()
         self._tile_layout.invalidate()
         self._tile_container.updateGeometry()
@@ -1562,13 +1580,24 @@ class UsageWidget(QWidget):
             self.resize(target_width, target_height)
 
 
-    def set_refreshing(self, refreshing: bool) -> None:
+    def set_refreshing(self, refreshing: bool, *, total: int | None = None) -> None:
+        self._refreshing = refreshing
+        self._refresh_done = 0
+        self._refresh_total = total or 0
         self.refresh_btn.setEnabled(not refreshing)
-        if refreshing:
-            self.age_label.setText("refreshing…")
-            self.cadence_label.setText("· refreshing")
-            self.cadence_label.setToolTip("Refresh is currently running.")
-        self._refresh_collapsed_summary()
+        self._refresh_header_labels()
+
+    def set_refresh_progress(self, done: int, total: int | None = None) -> None:
+        """How far through the cycle we are, for the header's "refreshing 2/6".
+
+        A cycle ran for a median of 48 s in the user's log while the header
+        said "next now"; a count is the difference between "it is working" and
+        "it is stuck".
+        """
+        self._refresh_done = max(0, done)
+        if total:
+            self._refresh_total = total
+        self._refresh_header_labels()
 
     def set_refresh_state(
         self,
@@ -1592,11 +1621,35 @@ class UsageWidget(QWidget):
         self._refresh_collapsed_summary()
 
     def _refresh_age_label(self) -> None:
-        text = "" if self._last_fetch_at is None else _format_age(self._last_fetch_at)
+        if self._refreshing:
+            # The 1 Hz tick used to overwrite this within a second of the
+            # cycle starting, so the app said "next now" for the whole refresh.
+            text = "refreshing…"
+        else:
+            text = (
+                "" if self._last_fetch_at is None else _format_age(self._last_fetch_at)
+            )
         self.age_label.setText(text)
         self._collapsed_age_label.setText(text)
 
     def _refresh_cadence_label(self) -> None:
+        if self._refreshing:
+            progress = (
+                f" {min(self._refresh_done, self._refresh_total)}/{self._refresh_total}"
+                if self._refresh_total
+                else ""
+            )
+            text = f"· refreshing{progress}"
+            tooltip = "Refresh is currently running."
+            self.cadence_label.setText(text)
+            self._collapsed_cadence_label.setText(text)
+            self.cadence_label.setToolTip(tooltip)
+            self._collapsed_cadence_label.setToolTip(tooltip)
+            self.cadence_label.setStyleSheet("color:#9ca3af; font-size:10px;")
+            self._collapsed_cadence_label.setStyleSheet(
+                "color:#9ca3af; font-size:10px;"
+            )
+            return
         if self._refresh_mode is None or self._next_refresh_at is None:
             self.cadence_label.setText("")
             self.cadence_label.setToolTip("")
