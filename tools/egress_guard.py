@@ -978,18 +978,40 @@ def cmd_hook(args: argparse.Namespace) -> int:
 
     A guard only guards what goes through it, so this refuses Bash calls that
     invoke a delegating agent directly, and scans prompts handed to sub-agents.
+
+    Every error path blocks. A hook that crashes, or that answers 0 because it
+    could not parse its own input, is a hook that let the call through: empty
+    stdin, a JSON array, a truncated event and a malformed workspace policy all
+    used to allow, and one of them raised an AttributeError traceback.
     """
     try:
-        event = json.loads(sys.stdin.read() or "{}")
-    except json.JSONDecodeError:
-        return 0
+        return _hook(args)
+    except (Exception, SystemExit) as exc:
+        print(
+            f"Blocked: the egress guard could not evaluate this call ({exc}).",
+            file=sys.stderr,
+        )
+        return 2
+
+
+def _hook(args: argparse.Namespace) -> int:
+    raw = sys.stdin.read()
+    if not raw.strip():
+        raise ValueError("no hook event on stdin")
+    event = json.loads(raw)
+    if not isinstance(event, dict):
+        raise ValueError("the hook event is not a JSON object")
 
     workspace = Path(event.get("cwd") or os.getcwd())
     policy = Policy.load(args.policy, workspace)
     tool = event.get("tool_name", "")
-    tool_input = event.get("tool_input", {}) or {}
+    tool_input = event.get("tool_input", {})
+    if tool_input is None or not isinstance(tool_input, dict):
+        raise ValueError(f"tool_input is {type(tool_input).__name__}, not an object")
 
-    if tool == "Bash":
+    # Keyed on the presence of a command rather than on tool_name: an event that
+    # does not name its tool still must not smuggle a direct invocation past.
+    if tool == "Bash" or "command" in tool_input:
         command = str(tool_input.get("command", ""))
         if _bypasses_guard(command):
             print(
@@ -1022,8 +1044,19 @@ def cmd_hook(args: argparse.Namespace) -> int:
     return 0
 
 
+# Over-blocking is the acceptable direction here: a refused Bash call costs a
+# retry through the guard, an unrecognised one costs the guard's whole purpose.
+# The old pattern required `run`/`serve` to follow `opencode` immediately, so
+# `opencode --print-logs run`, `npx opencode-ai run`, `$(which opencode) run`
+# and a bare `opencode server` all walked through.
 _BYPASS_RE = re.compile(
-    r"opencode-companion\.mjs|\bopencode\s+(?:run|serve)\b|codex-companion\.mjs", re.IGNORECASE
+    r"""
+      (?:opencode|codex)-companion\.mjs             # the plugins' own launchers
+    | \bopencode(?:-ai)?\b[^\n]*?\b(?:run|serve|server)\b   # any flags in between
+    | (?:^|[;|&(`\n]|\$\()\s*(?:[\w.\-/\\]*[/\\])?opencode(?:-ai)?(?:@[\w.\-]+)?\b
+    | \b(?:npx|bunx|pnpx|dlx|exec|sudo|command)\s+(?:-\S+\s+)*opencode(?:-ai)?(?:@[\w.\-]+)?\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
 
 

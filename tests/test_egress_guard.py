@@ -745,9 +745,75 @@ def test_hook_refuses_a_direct_dispatch_that_would_skip_the_guard(command):
     assert eg._bypasses_guard(command) is True
 
 
-@pytest.mark.parametrize("command", ["git diff", "python -m pytest", "node tools/build.mjs"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "npx opencode-ai run x",
+        "npx -y opencode-ai@latest run x",
+        "bunx opencode-ai run x",
+        "opencode --print-logs run x",
+        "$(which opencode) run x",
+        "oc=opencode; $oc run x",
+        "opencode server",
+        "/usr/local/bin/opencode run x",
+        "cd /srv && opencode run x",
+        "opencode auth login",
+    ],
+)
+def test_hook_refuses_the_ordinary_invocation_forms_too(command):
+    """`run`/`serve` had to follow `opencode` immediately, so any flag between
+    them walked through, as did the npm package name."""
+    assert eg._bypasses_guard(command) is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git diff",
+        "python -m pytest",
+        "node tools/build.mjs",
+        "grep -r opencode docs/",
+        "cat docs/opencode-plugin-evaluation.md",
+    ],
+)
 def test_hook_leaves_ordinary_commands_alone(command):
     assert eg._bypasses_guard(command) is False
+
+
+@pytest.mark.parametrize(
+    "label, stdin_text",
+    [
+        ("empty stdin", ""),
+        ("whitespace only", "   \n"),
+        ("not JSON at all", "hello there"),
+        ("a JSON array", "[1,2,3]"),
+        ("truncated JSON", '{"tool_name": "Bash", "tool_in'),
+        ("null tool_input", '{"tool_name": "Bash", "tool_input": null}'),
+        ("tool_input is a string", '{"tool_name": "Bash", "tool_input": "rm -rf /"}'),
+    ],
+)
+def test_hook_fails_closed_on_malformed_input(label, stdin_text, monkeypatch):
+    """A guard that crashes, or that answers 0 because it could not parse its
+    own input, is a guard that let the call through."""
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(stdin_text))
+    assert eg.cmd_hook(eg.build_parser().parse_args(["hook"])) == 2, label
+
+
+def test_hook_fails_closed_on_a_malformed_workspace_policy(tmp_path, monkeypatch):
+    (tmp_path / ".egress-policy.json").write_text("{not json", encoding="utf-8")
+    event = {
+        "cwd": str(tmp_path),
+        "tool_name": "Agent",
+        "tool_input": {"prompt": "use AKIAIOSFODNN7EXAMPLE to reach the bucket"},
+    }
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(json.dumps(event)))
+    assert eg.cmd_hook(eg.build_parser().parse_args(["hook"])) == 2
+
+
+def test_hook_checks_a_command_even_when_the_event_does_not_name_its_tool(monkeypatch):
+    event = {"tool_input": {"command": "opencode run 'summarise this repo'"}}
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(json.dumps(event)))
+    assert eg.cmd_hook(eg.build_parser().parse_args(["hook"])) == 2
 
 
 def test_hook_blocks_a_subagent_prompt_carrying_a_credential(tmp_path, monkeypatch, capsys):
