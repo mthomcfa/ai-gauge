@@ -4,7 +4,7 @@ State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#1
 610 tests passing, all five providers reading.
 
 > **Updated 2026-09-15** by the hardening follow-up (`1.3.1+cfa.6`,
-> 1 239 tests), which closed most of what the refresh-cadence work left in
+> 1 259 tests), which closed most of what the refresh-cadence work left in
 > [§8.3](#83-known-soft-spots-in-what-was-built): the REST park, the
 > "Clear all browser data" purge, the dispatch epoch's name, the log
 > summariser and the scraper's uncapped log lines. What is still open there
@@ -683,9 +683,11 @@ unnecessary source of behaviour change.
   that name, live or late - or until `_REST_PARK_BACKSTOP_SECONDS` (one
   hour), whichever is first; the browser providers keep the 2x ceiling,
   because the account-keyed live-scrape registry catches the one case it
-  lets through. Six fake hours against a wedged REST worker: **50 dispatches
-  before, 6 after**, no two closer than 3 680 s, with the browser sibling
-  unchanged at 26 and 28. The `abandoned` log line names the rule that
+  lets through. Six fake hours against a wedged REST worker with the app in
+  its active five-minute cadence: **50 dispatches before, 6 after**, no two
+  closer than 3 680 s, with the browser sibling unchanged at 26 and 28. An
+  idle app is 11 and 6 over the same six hours, and 28 and 24 over a day,
+  because its own backoff already spaces the cycles out. The `abandoned` log line names the rule that
   applied (`ceiling=browser_2x` / `ceiling=rest_backstop`). This was safe to
   do only because all three REST providers always call `on_done` unless
   `work()` never returns - Copilot's and OpenRouter's `_run_async` wrap

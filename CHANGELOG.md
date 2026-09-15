@@ -9,9 +9,12 @@
 ## 1.3.1+cfa.6 - 2026-09-15
 
 The residuals of the refresh-cadence release, and two coercions on
-`config.json`. No refresh semantics change for a healthy provider: what
-moves is the park on a hung REST worker, where profile deletion is decided,
-and what a log line is allowed to cost.
+`config.json`. A healthy provider's cadence does not change: over six fake
+hours beside a wedged REST provider it is dispatched 11 times where the same
+run with nothing wedged dispatches it 12, and over a day 29 against 30. What
+moves is the park on a hung REST worker, where profile deletion is decided
+and recorded, the name an answer is filed under, and what a log line is
+allowed to cost.
 
 ### Changed
 
@@ -23,8 +26,13 @@ and what a log line is allowed to cost.
   `timeout` is per socket operation rather than a total, so a server that
   drips a byte just inside it holds a `QThreadPool` worker for as long as it
   likes — and every park expiry started another one on the same endpoint.
-  Six fake hours against a wedged REST worker: **50 dispatches under the old
-  rule, 6 under this one**, no two closer than 3 680 s. Each of those 50 is a
+  Six fake hours against a wedged REST worker, with the app in its active
+  five-minute cadence — something on screen is moving, which is when the app
+  is busiest and the accumulation is worst: **50 dispatches under the old
+  rule, 6 under this one**, no two closer than 3 680 s. An *idle* app backs
+  off to an hourly cadence of its own, so the same six hours are 11 and 6
+  there, and over 24 hours 28 and 24: the bound matters most exactly when
+  the app is working hardest. Each of those 50 is a
   slot of the *global* pool, which fills (1 of 1, 2 of 2, 4 of 4, 8 of 8),
   after which all three REST tiles are dead for the life of the process. The
   park now lasts until the worker reports back — any snapshot for that name,
@@ -73,6 +81,49 @@ and what a log line is allowed to cost.
 
 ### Fixed
 
+- **A parked provider no longer freezes the idle backoff.** `_begin_cycle`
+  filtered the parked names out and *then* decided whether the cycle was
+  partial, so every cycle inside an hour-long REST park counted as one —
+  and `_end_cycle` will not advance `_unchanged_cycles` for a partial cycle,
+  which is what `_adaptive_refresh_minutes` derives the idle interval from.
+  One hung endpoint therefore pinned the whole app on the five-minute active
+  cadence for as long as it stayed hung, multiplying the scrapes of *other*
+  providers' hosts: a healthy sibling went from 12 dispatches in six fake
+  hours to **54**, and with every tile's number moving every three hours —
+  the realistic case, because each move zeroes the counter — from 68 in a
+  day (2.83/h) to **154** (6.42/h). Partial is now decided from what the
+  cycle was *asked* for, which is what `_end_cycle`'s comment always said it
+  meant: a retry wake or a per-provider refresh. The numbers go back to 11,
+  29 and 67, against controls of 12, 30 and 68.
+- **A park uses the rule the dispatch went out under.** `_on_watchdog` asked
+  `_providers` whether the name is a browser provider, and a settings save
+  that removes an account drops its provider object while the scrape is
+  still out — so a *browser* account removed mid-scrape was parked for an
+  hour under `ceiling=rest_backstop`. Its on-disk profile, which holds the
+  session cookie, then waited 60 minutes for deletion instead of 10, the
+  same account re-added was refused for the rest of that hour, and the log
+  line named the wrong rule. The kind is recorded with the epoch at dispatch
+  and pruned with it.
+- **The rest of that log call cannot raise or bloat either.**
+  `_raw_keys_for_log` is evaluated in the same `log.warning` as
+  `_raw_summary` and guarded only per key, the call site's own
+  `if snapshot.raw` ran the payload's `__len__`, and both "bounded literal"
+  fallbacks embed a class name the payload chose (1 MB in, 1 000 017
+  characters out; now 77 in app.py and 60 in the scraper). `snapshot.error`
+  on that record is clipped to 300 characters with its newlines flattened: a
+  2 MB error made one 2 480 074-character record — 4.73x the whole rotation
+  — carrying 20 000 lines that each read like a real one. The tile, the tray
+  tooltip and the error dialog still get the string whole. `scrape fail`'s
+  `load_error_string` is clipped the same way; measured against a real
+  QtWebEngine it is a Qt string-table message rather than the server's, so
+  that one closes an assumption rather than a hole.
+- **Smaller ones.** A settings save no longer writes "Waiting for the
+  previous refresh to finish." onto a parked tile — it refreshes without the
+  user having asked, exactly like a scheduled cycle. An id on both deferral
+  lists reaches `purge_profile` once rather than twice. "Clear all browser
+  data" counts the `profiles/` directories whose names the id rule rejects —
+  `purge_profile` always refused them, silently — and says how many were
+  left alone, without naming them.
 - **Neither purge path asked whether a scrape was live.** Both now consult
   `account_is_busy()` from `providers/_scrape_runner.py` as well as
   `_inflight` and the abandoned-dispatch park. It is the only one of the
@@ -110,8 +161,10 @@ and what a log line is allowed to cost.
   them. `_raw_summary` now catches `Exception` — a log line must never be
   able to raise — and its fallback is a bounded literal, where `repr(raw)`
   handed back the whole payload on the one path that had already gone wrong.
-  The existing adversarial payloads are unmoved at a worst record of 4 283
-  characters. None of it is reachable today; it bites the first time an
+  The existing adversarial payloads are unmoved at a worst record of 4 803
+  characters (`_nested(20, 4)`; an earlier draft of this entry, and the
+  message of commit `21bd5be`, said 4 283 — the claim was right and the
+  number was not, on both trees). None of it is reachable today; it bites the first time an
   extractor or a provider returns something that is not plain JSON.
 - **The scraper's log lines clip the text the page chose.** `title=%r` at
   four call sites and `result_keys=%s` at one had no length cap, and the
@@ -144,10 +197,14 @@ and what a log line is allowed to cost.
 
 ### Notes
 
-- **1 216 → 1 239 tests.** Including six fake hours of a wedged REST worker
+- **1 216 → 1 259 tests.** Including six fake hours of a wedged REST worker
   against a browser sibling, an hour-long park ridden out over eleven cadence
   wakes, a mislabelled answer that must not touch its sibling's dispatch, and
-  the three payloads that used to raise out of `_on_snapshot`.
+  the three payloads that used to raise out of `_on_snapshot`. Twenty of them
+  are this release's own review: the idle backoff measured with a provider
+  parked and without, a removed browser account's park, the epoch guard on
+  the un-park, a deferred clear carried across a quit, and the payloads that
+  refuse to be iterated, measured or repr'd.
 - **The REST socket itself is still unbounded.** This bounds how many workers
   a hung endpoint can accumulate, not how long one of them lives. A total
   response deadline — `stream=True` plus an elapsed check while reading — is
