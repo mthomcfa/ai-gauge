@@ -1424,10 +1424,9 @@ class App(QObject):
 
         Neither list used to be in memory only: nothing flushes them at
         `aboutToQuit` - the App has that connection, but it only logs - and
-        once an account is gone from
-        `config.json` nothing at the next start looked for its directory -
-        the only sweep of `profiles/` on disk is the manual Settings "Clear
-        all browser data". What survived was a Chromium profile that uses
+        once an account is gone from `config.json` nothing at the next start
+        looked for its directory, because the only sweep of `profiles/` on
+        disk is the manual Settings "Clear all browser data". What survived was a Chromium profile that uses
         `ForcePersistentCookies`, i.e. the live session cookie itself, with
         no recovery path at all. (The keyring secret is cleared by the dialog
         at the moment of the removal or the click either way, which is why
