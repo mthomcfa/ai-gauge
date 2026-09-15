@@ -312,8 +312,17 @@ def test_browser_account_enabled_is_not_a_switch():
     assert "codex" in enabled
 
 
-def test_a_legacy_config_with_no_accounts_still_gets_its_tiles():
-    """The fallback exists for a config written before browser_accounts did."""
+def test_a_legacy_config_with_no_accounts_is_still_listed_as_enabled():
+    """The name used to promise tiles, and only `_enabled_providers` was
+    checked.
+
+    `_build_providers` has no counterpart to this fallback: with
+    `browser_accounts == []` it builds copilot alone, so the tray and the
+    menu-bar item would iterate two names that can never have a snapshot.
+    That state is unreachable through `Config.load()` - the migration always
+    re-inserts both fixed accounts - which is why the fallback is left as it
+    is; the test should not claim more than it checks.
+    """
     config = Config()
     config.browser_accounts = []
 
@@ -898,6 +907,31 @@ def test_a_hostile_payload_cannot_flood_the_snapshot_log_line():
     assert "more" in line, "the count of what was left out is the diagnostic bit"
     assert _raw_keys_for_log(None) == "[]"
     assert _raw_keys_for_log({"a": 1}) == "['a']"
+
+
+def test_which_providers_are_browser_backed_is_pinned():
+    """Nothing asserted this, so flipping `ClaudeProvider.uses_browser` to
+    False passed the whole suite - while the app would then dispatch Claude
+    alongside Codex, two `QWebEngineView`s on two profiles at once, on the
+    GUI thread. That is precisely what the concurrent-REST change was scoped
+    not to do, and `_uses_browser` is the only thing that keeps the browser
+    queue serial.
+
+    The reverse matters too: a REST provider mislabelled as browser-backed
+    would be dragged into the serial queue and lose the whole point of
+    dispatching the cheap ones together.
+    """
+    from aigauge.providers.azure import AzureProvider
+    from aigauge.providers.claude import ClaudeProvider
+    from aigauge.providers.codex import CodexProvider
+    from aigauge.providers.copilot import CopilotProvider
+    from aigauge.providers.opencode_go import OpenCodeGoProvider
+    from aigauge.providers.openrouter import OpenRouterProvider
+
+    for cls in (ClaudeProvider, CodexProvider, OpenCodeGoProvider):
+        assert cls.uses_browser is True, f"{cls.__name__} lost its browser queue"
+    for cls in (CopilotProvider, OpenRouterProvider, AzureProvider):
+        assert cls.uses_browser is False, f"{cls.__name__} joined the serial queue"
 
 
 def test_a_browser_provider_refuses_a_refresh_while_one_is_running():

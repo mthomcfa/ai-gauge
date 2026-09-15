@@ -789,6 +789,39 @@ def test_a_queued_per_provider_refresh_that_cannot_run_says_so(caplog):
     assert "refresh pending manual dropped scope=codex" in caplog.text
 
 
+def test_a_retry_cycle_does_not_erase_the_baseline_for_everyone_else():
+    """`_last_cycle_signatures` is merged, not replaced.
+
+    Replacing it passed the whole suite. It is what stops a partial cycle -
+    one provider, on its own retry - from wiping the baseline for every
+    provider it did not visit: with the baseline gone, the next *full* cycle
+    reads as "changed" for all of them, re-arms the 30-minute active window
+    and zeroes the idle backoff. On a provider that fails on a cadence, that
+    is the backoff never engaging.
+    """
+    claude = _Provider(_ok("claude"))
+    codex = _Provider(_ok("codex"))
+    app = _app({"claude": claude, "codex": codex})
+
+    _run_cycle(app, manual=False)  # baseline for both
+    _run_cycle(app, manual=False)  # identical: the backoff starts counting
+    before = app._unchanged_cycles  # noqa: SLF001
+    assert before >= 1
+
+    # A retry cycle visits claude alone.
+    app._error_retry["claude"] = (1, datetime.now() - timedelta(seconds=1))  # noqa: SLF001
+    app._next_refresh_reason = "error_retry"  # noqa: SLF001
+    app._on_refresh_timer()  # noqa: SLF001
+
+    # ...and then an ordinary full cycle, reporting exactly what it did before.
+    app._next_refresh_reason = "idle"  # noqa: SLF001
+    _run_cycle(app, manual=False)
+
+    assert app._unchanged_cycles == before + 1, (  # noqa: SLF001
+        "a one-provider retry erased the baseline for everyone else"
+    )
+
+
 def test_the_heartbeat_carries_the_error_retry_state(caplog):
     """`error_cycles` was computed in `_lifecycle_context` and then dropped by
     the format string, so the one counter that explains a 1-minute cadence
