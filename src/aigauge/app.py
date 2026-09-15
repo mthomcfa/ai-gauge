@@ -70,6 +70,9 @@ _ERROR_FAST_RETRY_ATTEMPTS = 3
 #                     fail-closed hourly gate, or a fetch already in flight)
 #   resume_artifact - a scrape whose clock ran across a machine suspend
 _NO_FAST_RETRY_ERROR_CLASSES = ("throttled", "resume_artifact")
+# A Qt::CoarseTimer rounds its expiry and may fire early. Without a tolerance
+# the wake a provider's retry bought can find nothing due and fall through.
+_RETRY_WAKE_TOLERANCE_SECONDS = 2
 _HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000
 _LOG_VALUE_LIMIT = 300
 # How long a provider may hold a refresh before the App declares it lost.
@@ -701,6 +704,13 @@ class App(QObject):
                 name,
                 snapshot.error_class,
             )
+            # A wait is not a pending retry. Leaving an already-owed entry in
+            # place left its `due` in the past; `_error_retry_time` clamps a
+            # past due to *now*, `_schedule_next_refresh` floors the delay at
+            # 1 000 ms, and the wake produces the same answer - a 1 Hz cycle
+            # loop for as long as the throttle lasts, measured at 3 543 cycles
+            # in an hour against an Azure hourly gate.
+            self._error_retry.pop(name, None)
             return
         errors = self._error_retry.get(name, (0, None))[0] + 1
         if errors <= _ERROR_FAST_RETRY_ATTEMPTS:
@@ -898,7 +908,19 @@ class App(QObject):
             return
         name = self._refresh_queue.pop(0)
         if self._providers.get(name) is None:
-            QTimer.singleShot(0, self._start_next_refresh)
+            # A settings save removed this one while it was queued. Re-entering
+            # _start_next_refresh here returned on the empty-queue guard when
+            # the dropped name was the last entry, leaving _cycle_active true
+            # with nothing in flight: the timer stopped, the heartbeat's
+            # recovery blocked on _cycle_active, the Refresh button disabled,
+            # and any queued manual refresh stranded. _advance_cycle does both
+            # jobs - next provider, or close the cycle.
+            log.info(
+                "refresh provider dropped provider=%s reason=not_configured",
+                name,
+            )
+            self._cycle_total = max(len(self._cycle_statuses), self._cycle_total - 1)
+            self._advance_cycle()
             return
         self._dispatch(name)
 
@@ -945,16 +967,28 @@ class App(QObject):
         self._watchdogs[name] = timer
 
     def _cancel_watchdog(self, name: str) -> None:
-        timer = self._watchdogs.pop(name, None)
+        self._retire_watchdog(self._watchdogs.pop(name, None))
+
+    @staticmethod
+    def _retire_watchdog(timer) -> None:
+        """Stop a watchdog *and* destroy it.
+
+        `QTimer(self)` parents the C++ object to `App`, so dropping the Python
+        reference frees nothing: 2 000 armed-and-stopped watchdogs left 2 000
+        live QObjects. At ~180 dispatches a day in a tray app designed to run
+        for weeks that is unbounded growth, and it slows every child-event
+        walk on `App`.
+        """
         if timer is None:
             return
         try:
             timer.stop()
+            timer.deleteLater()
         except RuntimeError:
             pass
 
     def _on_watchdog(self, name: str, budget: float) -> None:
-        self._watchdogs.pop(name, None)
+        self._retire_watchdog(self._watchdogs.pop(name, None))
         if name not in self._inflight:
             return
         log.warning(
@@ -972,13 +1006,22 @@ class App(QObject):
 
     def _on_refresh_timer(self) -> None:
         """The scheduled wake. A retry wake refreshes only what is owed one."""
-        due = (
-            self._due_error_providers()
-            if self._next_refresh_reason == "error_retry"
-            else []
+        if self._next_refresh_reason != "error_retry":
+            self.refresh_now(manual=False)
+            return
+        # A Qt::CoarseTimer rounds its expiry and may fire a few milliseconds
+        # before the due it was armed for, so the due test gets a tolerance.
+        due = self._due_error_providers(
+            datetime.now() + timedelta(seconds=_RETRY_WAKE_TOLERANCE_SECONDS)
         )
         if not due:
-            self.refresh_now(manual=False)
+            # The wake was bought by one provider's retry and that retry is no
+            # longer owed - the provider recovered, or a settings save removed
+            # it. Falling through to refresh_now() re-ran the whole queue,
+            # which is the cycle-wide retry this release removed: one flapping
+            # provider cost every other provider a full extra cycle.
+            log.info("refresh retry wake found nothing due")
+            self._schedule_next_refresh()
             return
         if self._inflight or self._refresh_queue:
             log.info(
@@ -987,6 +1030,15 @@ class App(QObject):
                 ",".join(self._refresh_queue) or "-",
             )
             return
+        # Spend the due here, at dispatch, rather than waiting for an answer
+        # to clear it. An answer that does not clear the entry - a throttle, a
+        # resume artifact, a provider removed between the wake and the
+        # dispatch - would otherwise leave a past due in place, and a past due
+        # pins every later wake at the timer's 1 000 ms floor. The streak
+        # survives, because that is what bounds the 1/2/4-minute ladder.
+        for name in due:
+            errors, _due = self._error_retry.get(name, (0, None))
+            self._error_retry[name] = (errors, None)
         self._begin_cycle(due, manual=False, reason="error_retry")
 
     def _on_snapshot(self, snapshot: UsageSnapshot) -> None:

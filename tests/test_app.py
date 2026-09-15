@@ -878,6 +878,122 @@ def test_a_provider_waiting_on_its_own_throttle_is_not_a_failure():
     assert app._timer.started_ms > 65_000  # noqa: SLF001
 
 
+def test_a_throttled_answer_clears_a_retry_that_was_already_owed():
+    """The early return for a no-fast-retry class left the old `due` behind.
+
+    The test above starts from an empty `_error_retry`, so its assertion
+    holds trivially. A provider arrives here with an entry: a real failure is
+    what armed one. `_error_retry_time` clamps a `due` that has passed to
+    *now*, `_schedule_next_refresh` floors the delay at 1 000 ms, and the wake
+    produces the same throttled answer - a 1 Hz cycle loop for as long as the
+    throttle lasts.
+    """
+    app = _schedule_app_stub()
+    app._providers["azure"] = object()  # noqa: SLF001
+    app._error_retry["azure"] = (  # noqa: SLF001
+        1,
+        datetime.now() - timedelta(seconds=1),
+    )
+
+    app._record_provider_outcome(  # noqa: SLF001
+        UsageSnapshot(
+            provider="azure",
+            status=SnapshotStatus.ERROR,
+            error="Waiting for the next Azure fetch window (43 min).",
+            error_class="throttled",
+        )
+    )
+    app._schedule_next_refresh()  # noqa: SLF001
+
+    assert "azure" not in app._error_retry  # noqa: SLF001
+    assert app._timer.started_ms > 65_000, "the scheduler was left on a 1 s loop"  # noqa: SLF001
+
+
+def test_a_retry_wake_consumes_the_due_it_ran_on():
+    """A due is spent when it is dispatched, not when an answer clears it.
+
+    Waiting for the answer means any answer that does not clear the entry -
+    a throttle, a resume artifact, a provider removed between the wake and
+    the dispatch - leaves a past due in place, and a past due pins the next
+    wake at the timer floor.
+    """
+    app = _schedule_app_stub()
+    app._providers = {"claude": object()}  # noqa: SLF001
+    app._error_retry["claude"] = (  # noqa: SLF001
+        2,
+        datetime.now() - timedelta(seconds=1),
+    )
+    app._next_refresh_reason = "error_retry"  # noqa: SLF001
+    begun = []
+    app._begin_cycle = lambda names, **kw: begun.append(list(names))  # noqa: SLF001
+
+    app._on_refresh_timer()  # noqa: SLF001
+
+    assert begun == [["claude"]]
+    errors, due = app._error_retry["claude"]  # noqa: SLF001
+    assert errors == 2, "the streak is what bounds the ladder; it must survive"
+    assert due is None, "the due was still owed after the wake that spent it"
+
+
+def test_a_retry_wake_that_finds_nothing_due_does_not_become_a_full_cycle():
+    """`_due_error_providers` tests `due <= now`. A Qt::CoarseTimer rounds its
+    expiry and may fire a few milliseconds early, and the error may have been
+    cleared between arming the timer and the wake. Falling through to
+    `refresh_now` re-ran the whole queue - the cycle-wide retry this release
+    removed.
+    """
+    app = _schedule_app_stub()
+    app._providers = {"claude": object(), "codex": object()}  # noqa: SLF001
+    app._next_refresh_reason = "error_retry"  # noqa: SLF001
+    begun = []
+    app._begin_cycle = lambda names, **kw: begun.append(list(names))  # noqa: SLF001
+
+    # Nothing is owed at all: the provider recovered after the timer armed.
+    app._on_refresh_timer()  # noqa: SLF001
+    assert begun == []
+    assert app._timer.started_ms is not None, "the scheduler was left unarmed"
+
+    # A due 20 ms out is this wake's, not a reason to refresh everyone.
+    app._error_retry["claude"] = (  # noqa: SLF001
+        1,
+        datetime.now() + timedelta(milliseconds=20),
+    )
+    app._next_refresh_reason = "error_retry"  # noqa: SLF001
+    app._on_refresh_timer()  # noqa: SLF001
+    assert begun == [["claude"]]
+
+
+def test_the_watchdog_timers_do_not_accumulate(qapp):
+    """`_arm_watchdog` builds a `QTimer(self)`; `_cancel_watchdog` stopped it
+    and dropped the Python reference, but the C++ object stays parented to
+    `App` for the life of the process. At ~180 dispatches a day in a tray app
+    designed to run for weeks, that is tens of thousands of live QObjects.
+    """
+    from PyQt6.QtCore import QCoreApplication, QEvent, QObject, QTimer
+
+    app = App.__new__(App)
+    QObject.__init__(app)
+    app._config = Config()  # noqa: SLF001
+    app._inflight = set()  # noqa: SLF001
+    app._watchdogs = {}  # noqa: SLF001
+    app._abandoned = {}  # noqa: SLF001
+    app._dispatch_epoch = {}  # noqa: SLF001
+    app._pool_wait_budgets = {}  # noqa: SLF001
+    provider = SimpleNamespace(uses_browser=False, refresh_budget_seconds=60.0)
+    app._providers = {"copilot": provider}  # noqa: SLF001
+
+    for _ in range(200):
+        for name in ("copilot", "openrouter", "azure", "claude", "codex", "opencode_go"):
+            app._arm_watchdog(name, provider)  # noqa: SLF001
+            app._cancel_watchdog(name)  # noqa: SLF001
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+    assert app._watchdogs == {}  # noqa: SLF001
+    assert len(app.findChildren(QTimer)) < 50, (
+        "watchdog timers are accumulating as children of App"
+    )
+
+
 def test_the_app_can_actually_be_constructed(qapp, tmp_path, monkeypatch):
     """Constructs the real App, which nothing else here does.
 

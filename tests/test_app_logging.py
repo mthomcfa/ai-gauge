@@ -46,6 +46,7 @@ class _FakeQTimer:
         self.interval_ms: int | None = None
         self.callbacks: list = []
         self.active = False
+        self.deleted = False
         self.timeout = self
 
     def connect(self, callback):
@@ -61,6 +62,9 @@ class _FakeQTimer:
 
     def stop(self):
         self.active = False
+
+    def deleteLater(self):
+        self.deleted = True
 
     def isActive(self):
         return self.active
@@ -414,6 +418,63 @@ def test_a_provider_that_never_calls_back_does_not_stall_the_cycle(caplog):
     assert codex.calls == 1, "the queue did not continue past the stuck provider"
     assert app._inflight == set()  # noqa: SLF001
     assert app._cycle_active is False  # noqa: SLF001
+
+
+def test_a_provider_removed_mid_cycle_still_closes_the_cycle(caplog):
+    """A settings save removes a provider that is still queued behind a
+    running browser scrape.
+
+    `_start_next_refresh` popped the dropped name and re-entered itself; when
+    it was the last entry the re-entry returned on the empty-queue guard
+    *without* closing the cycle. `_cycle_active` then stayed True forever:
+    the timer was stopped by `_begin_cycle`, `_recover_dead_timer` early-
+    returns on `_cycle_active`, `set_refreshing(False)` was never called so
+    the widget's Refresh button stayed disabled, and a queued manual refresh
+    was stranded. Only the tray menu could restart the app - the exact stall
+    the watchdog was written to abolish.
+    """
+    claude = _BrowserProvider(_ok("claude"), hold=True)
+    codex = _BrowserProvider(_ok("codex"), hold=True)
+    app = _app({"claude": claude, "codex": codex})
+
+    app.refresh_now(manual=False)
+    assert app._refresh_queue == ["codex"]  # noqa: SLF001
+    app.refresh_now(manual=True)  # the settings save's refresh, queued
+    app._providers.pop("codex")  # noqa: SLF001 - what _build_providers does
+
+    with caplog.at_level(logging.INFO, logger="aigauge.app"):
+        claude.pending(_ok("claude"))
+
+    assert "refresh cycle end" in caplog.text, "the cycle never closed"
+    assert False in app._widget.refreshing, "Refresh stayed disabled"  # noqa: SLF001
+    # and the queued manual refresh was not stranded
+    assert claude.calls == 2
+    claude.pending(_ok("claude"))
+    assert app._cycle_active is False  # noqa: SLF001
+    assert app._timer.active is True, "the scheduler was left with no timer"  # noqa: SLF001
+    assert app._widget.refreshing[-1] is False  # noqa: SLF001
+
+
+def test_a_clean_cycle_disarms_every_watchdog_it_armed():
+    """Nothing pinned that a normal completion cancels the timer: making
+    `_cancel_watchdog` a no-op passed the whole suite, which would leave a
+    provider's watchdog to fire long after it answered."""
+    providers = {
+        "claude": _BrowserProvider(_ok("claude"), hold=True),
+        "copilot": _Provider(_ok("copilot"), hold=True),
+    }
+    app = _app(providers)
+
+    app.refresh_now(manual=False)
+    armed = [timer for timer in _FakeQTimer.armed if timer.interval_ms]
+    assert armed, "no watchdog was armed"
+
+    providers["copilot"].pending(_ok("copilot"))
+    providers["claude"].pending(_ok("claude"))
+
+    assert app._watchdogs == {}  # noqa: SLF001
+    assert not any(timer.active for timer in armed), "a watchdog is still armed"
+    assert all(timer.deleted for timer in armed), "a watchdog was never destroyed"
 
 
 def test_the_stuck_providers_late_snapshot_does_not_close_a_second_cycle():
