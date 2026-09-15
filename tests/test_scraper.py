@@ -1,3 +1,5 @@
+import logging
+
 import pytest
 
 from aigauge.webview.scraper import HeadlessScraper
@@ -344,3 +346,61 @@ def test_claude_asks_for_a_longer_hydration_budget_than_the_default():
     assert "max_extractor_reruns=" in source, "Claude must raise the default budget"
     default = inspect.signature(HeadlessScraper.__init__).parameters
     assert default["max_extractor_reruns"].default == 5, "default must stay conservative"
+
+
+class _DeadPageStandIn(_LoadFailStandIn):
+    """A scrape whose page Qt has already destroyed under it.
+
+    `purge_profile` calls `deleteLater()` on the cached profile, and Qt
+    requires a profile to outlive its pages - so reading the page of a scrape
+    that was live at that moment raises the RuntimeError PyQt uses for a
+    wrapper whose C++ half is gone.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        class _Dead:
+            def url(self):
+                raise RuntimeError(
+                    "wrapped C/C++ object of type QuietWebEnginePage has been deleted"
+                )
+
+            def title(self):
+                raise RuntimeError(
+                    "wrapped C/C++ object of type QuietWebEnginePage has been deleted"
+                )
+
+        self._page = _Dead()
+
+
+def test_a_scrape_whose_page_is_gone_still_reports_back(caplog):
+    """`done` is what releases the account's live-scrape guard and hands the
+    snapshot back. It used to be the casualty of a diagnostic: the failure
+    context and the `scrape fail` line both read `self._page`, and a page
+    destroyed under a live scrape made `_finish` raise before its emit -
+    after setting `_finished`, so the timeout's own call did nothing either.
+    The account then stayed busy for the life of the process."""
+    stand_in = _DeadPageStandIn()
+
+    with caplog.at_level(logging.WARNING, logger="aigauge"):
+        HeadlessScraper._finish(stand_in, None, "timeout")
+
+    assert stand_in.finished_with is not None, "done was never emitted"
+    result, reported = stand_in.finished_with
+    assert reported == "timeout"
+    assert result["load_failed"] is True and result["failure"] == "timeout", (
+        "the payloadless failure lost its shape as well as its detail"
+    )
+    assert "diagnostics could not be read" in caplog.text
+
+
+def test_a_successful_scrape_survives_a_page_that_cannot_be_read(caplog):
+    """The same for the OK path: the `scrape ok` line reads the page too, and
+    a payload that was extracted must not be lost to a log format."""
+    stand_in = _DeadPageStandIn()
+
+    with caplog.at_level(logging.WARNING, logger="aigauge"):
+        HeadlessScraper._finish(stand_in, {"usage": 42}, "")
+
+    assert stand_in.finished_with == ({"usage": 42}, "")

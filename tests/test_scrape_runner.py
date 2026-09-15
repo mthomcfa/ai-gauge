@@ -1,4 +1,5 @@
 import logging
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -375,3 +376,81 @@ def test_one_accounts_scrape_does_not_make_another_busy(fake_scraper):
 
     assert runner_module.account_is_busy("claude-aaaa1111") is True
     assert runner_module.account_is_busy("claude-bbbb2222") is False
+
+
+def test_a_scrape_whose_done_is_lost_does_not_park_the_account_forever(
+    fake_scraper, monkeypatch, caplog
+):
+    """The guard rests on an invariant in another module: `HeadlessScraper`
+    arms its own timeout, so `done` is emitted whatever the page does. A
+    `_finish` that raises before its emit - a page whose C++ half Qt has
+    already deleted, which is what purging a profile under a live page
+    produces - breaks it, and module state does not heal at a settings save
+    the way the old per-instance flag did. So the entry expires."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(
+        runner_module, "time", SimpleNamespace(monotonic=lambda: clock["t"])
+    )
+    rn = ScrapeRunner(
+        account_id="claude-ab12cd34",
+        url="http://example",
+        extractor_js="",
+        build=lambda payload: _ok_snapshot(),
+        log=logging.getLogger("test"),
+        timeout_ms=40000,
+        transport_max_attempts=2,
+        build_max_attempts=2,
+    )
+    rn.run([].append)
+    assert runner_module.account_is_busy("claude-ab12cd34") is True
+
+    # `done` never arrives. Inside the budget the account is still refused:
+    # the scrape may genuinely still be loading a page on that profile.
+    budget = 40.0 * 2 * 2
+    clock["t"] += budget
+    assert runner_module.account_is_busy("claude-ab12cd34") is True, (
+        "a live scrape inside its own budget was called dead"
+    )
+
+    clock["t"] += runner_module._ACTIVE_GUARD_SLACK_SECONDS + 1  # noqa: SLF001
+    with caplog.at_level(logging.WARNING, logger="aigauge"):
+        caplog.clear()
+        assert runner_module.account_is_busy("claude-ab12cd34") is False
+
+    assert "live scrape guard expired account=claude-ab12cd34" in caplog.text
+    assert "age_s=221" in caplog.text
+    # Logged once: the entry is gone, so the next ask is silent.
+    caplog.clear()
+    assert runner_module.account_is_busy("claude-ab12cd34") is False
+    assert caplog.text == ""
+
+
+def test_the_guard_expires_on_the_budget_the_scrape_really_enforces():
+    """Derived from the runner's own timeout and attempts - the same figure
+    the browser providers publish and the App arms its watchdog from - so the
+    expiry cannot drift away from the bound the scrape enforces."""
+    from aigauge.providers.claude import ClaudeProvider
+
+    rn = ScrapeRunner(
+        account_id="claude",
+        url="http://example",
+        extractor_js="",
+        build=lambda payload: _ok_snapshot(),
+        log=logging.getLogger("test"),
+        timeout_ms=40000,
+        transport_max_attempts=2,
+        build_max_attempts=2,
+    )
+    assert rn._scrape_budget_seconds() == ClaudeProvider.refresh_budget_seconds  # noqa: SLF001
+
+    unusable = ScrapeRunner(
+        account_id="claude",
+        url="http://example",
+        extractor_js="",
+        build=lambda payload: _ok_snapshot(),
+        log=logging.getLogger("test"),
+        timeout_ms="not a number",  # type: ignore[arg-type]
+    )
+    assert unusable._scrape_budget_seconds() == 240.0, (  # noqa: SLF001
+        "an unusable timeout must not make the guard expire immediately"
+    )

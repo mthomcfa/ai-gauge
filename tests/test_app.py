@@ -976,11 +976,11 @@ def test_a_browser_provider_refuses_a_refresh_while_one_is_running(monkeypatch):
             SimpleNamespace(run=lambda on_done: None, busy=lambda: True)
         )
         answers: list[UsageSnapshot] = []
-        runner_module._ACTIVE_ACCOUNTS.add(account_id)  # noqa: SLF001
+        runner_module._mark_account_busy(account_id, 240.0)  # noqa: SLF001
         try:
             provider.refresh(answers.append)
         finally:
-            runner_module._ACTIVE_ACCOUNTS.discard(account_id)  # noqa: SLF001
+            runner_module._release_account(account_id)  # noqa: SLF001
 
         name = type(provider).__name__
         assert built == [], f"{name} started a second scrape on one profile"
@@ -1486,13 +1486,13 @@ def test_a_rebuilt_browser_provider_still_refuses_a_live_scrape():
 
     config = Config()
     app = _provider_app(config)
-    runner_module._ACTIVE_ACCOUNTS.add("claude")  # noqa: SLF001 - a live scrape
+    runner_module._mark_account_busy("claude", 240.0)  # noqa: SLF001 - live scrape
     try:
         app._build_providers()  # noqa: SLF001
         answers: list[UsageSnapshot] = []
         app._providers["claude"].refresh(answers.append)  # noqa: SLF001
     finally:
-        runner_module._ACTIVE_ACCOUNTS.discard("claude")  # noqa: SLF001
+        runner_module._release_account("claude")  # noqa: SLF001
 
     assert len(answers) == 1
     assert answers[0].status == SnapshotStatus.ERROR

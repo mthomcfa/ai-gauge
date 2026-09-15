@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import logging
+import math
+import time
 from typing import Any, Callable
 
 from PyQt6.QtCore import QObject
 
 from ..models import SnapshotStatus, UsageSnapshot
 from ..webview.scraper import HeadlessScraper
+
+log = logging.getLogger(__name__)
 
 
 # The one class a scrape may name about itself. `throttled` is deliberately
@@ -32,15 +36,58 @@ def _allowed_error_class(result: Any) -> str | None:
 # one cookie store, which is how a spurious sign-out happens. Without the
 # saves the same run started one scrape and refused eleven times.
 #
-# An entry always clears: `HeadlessScraper` arms its own timeout, so `done`
-# is emitted whatever the page does, and `_handle` discards before it
-# answers.
-_ACTIVE_ACCOUNTS: set[str] = set()
+# An entry normally clears the moment the scrape reports: `HeadlessScraper`
+# arms its own timeout, so `done` is emitted whatever the page does, and
+# `_handle` discards before it answers. That invariant lives in another
+# module, so the entry carries the instant it started and the longest its
+# scrape can legitimately take, and expires past it. Without the expiry a
+# `_finish` that raised before its emit - a page whose C++ half Qt had
+# already deleted, which is exactly what purging a profile under a live page
+# produces - parked the account for the life of the process: the tile read
+# "A refresh is already running." forever, and no settings save could clear
+# it, because not being clearable by a rebuild is the whole point of keeping
+# this in module state.
+_ACTIVE_ACCOUNTS: dict[str, tuple[float, float]] = {}
+
+# What a stale entry is allowed beyond the scrape's own worst case: enough
+# that a scrape finishing right at its bound is never called dead, little
+# enough that a lost `done` costs one refresh and not the process. The App
+# arms its watchdog on the same figure with 20 s of slack, and parks the
+# provider for twice it, so the guard outlives both the wait and the park.
+_ACTIVE_GUARD_SLACK_SECONDS = 60.0
+# Used only when the runner was handed a timeout that is not a usable number.
+_FALLBACK_SCRAPE_BUDGET_SECONDS = 240.0
+
+
+def _mark_account_busy(account_id: str, budget_seconds: float) -> None:
+    _ACTIVE_ACCOUNTS[account_id] = (
+        time.monotonic(),
+        max(0.0, budget_seconds) + _ACTIVE_GUARD_SLACK_SECONDS,
+    )
+
+
+def _release_account(account_id: str) -> None:
+    _ACTIVE_ACCOUNTS.pop(account_id, None)
 
 
 def account_is_busy(account_id: str) -> bool:
     """Is a scrape of this account still loading a page - whoever started it?"""
-    return account_id in _ACTIVE_ACCOUNTS
+    entry = _ACTIVE_ACCOUNTS.get(account_id)
+    if entry is None:
+        return False
+    started_at, budget = entry
+    age = time.monotonic() - started_at
+    if age <= budget:
+        return True
+    # Past its own worst case every attempt the scrape could make is over, so
+    # nothing of it is still holding the profile. Logged once - the entry is
+    # gone after this - because reaching here means a `done` was lost, which
+    # is a bug and not a routine expiry.
+    _ACTIVE_ACCOUNTS.pop(account_id, None)
+    log.warning(
+        "live scrape guard expired account=%s age_s=%.0f", account_id, age
+    )
+    return False
 
 
 class ScrapeRunner:
@@ -99,12 +146,34 @@ class ScrapeRunner:
         """
         return account_is_busy(self._account_id)
 
+    def _scrape_budget_seconds(self) -> float:
+        """The longest one attempt of this scrape can legitimately take.
+
+        The scraper's own timeout bounds each transport attempt and an
+        extractor rerun happens inside it, so this is the figure the browser
+        providers publish as `refresh_budget_seconds` and the App arms its
+        watchdog from - derived here rather than restated, so the guard's
+        expiry cannot drift away from the bound the scrape really enforces.
+        """
+        try:
+            budget = (
+                float(self._timeout_ms)
+                / 1000.0
+                * self._transport_max_attempts
+                * self._build_max_attempts
+            )
+        except (TypeError, ValueError):
+            budget = 0.0
+        if not math.isfinite(budget) or budget <= 0:
+            return _FALLBACK_SCRAPE_BUDGET_SECONDS
+        return budget
+
     def run(self, on_done: Callable[[UsageSnapshot], None]) -> None:
         attempts = [0]
 
         def _handle(result: Any, error: str) -> None:
             self._scraper = None
-            _ACTIVE_ACCOUNTS.discard(self._account_id)
+            _release_account(self._account_id)
             if error or not isinstance(result, dict):
                 # Keep the payload when the scraper managed to capture one. It
                 # is what makes a layout change diagnosable from the log and
@@ -176,6 +245,6 @@ class ScrapeRunner:
                 parent=self._parent,
             )
             self._scraper.done.connect(_handle)
-            _ACTIVE_ACCOUNTS.add(self._account_id)
+            _mark_account_busy(self._account_id, self._scrape_budget_seconds())
 
         _start_scrape()

@@ -323,7 +323,15 @@ class HeadlessScraper(QObject):
         # back a string or False would silently reproduce the empty-diagnostics
         # bug through a condition that looked like it covered everything.
         if error and not isinstance(result, dict):
-            result = self._load_failure_context(error=error, elapsed_s=elapsed)
+            # Reading the page is a diagnostic, and a page whose C++ half Qt
+            # has already deleted raises instead of answering. Losing the
+            # detail is a worse log line; losing the `done` signal below
+            # parks the account's live-scrape guard for the life of the
+            # process, so the detail is what gives way.
+            try:
+                result = self._load_failure_context(error=error, elapsed_s=elapsed)
+            except Exception:  # noqa: BLE001
+                result = {"load_failed": True, "failure": error}
         if error == "timeout" and self._is_resume_artifact(elapsed):
             # Not the provider failing: the app was suspended mid-scrape and
             # the wall clock carried on. Labelled here so the scheduler above
@@ -351,54 +359,77 @@ class HeadlessScraper(QObject):
                 self._max_progress,
                 self._last_load_status,
             )
-            self._view.stop()
-            self._begin_attempt()
-            return
+            try:
+                self._view.stop()
+                self._begin_attempt()
+            except Exception:  # noqa: BLE001
+                # A retry that cannot even start is a scrape that is over:
+                # fall through and report it, rather than return without
+                # ever emitting `done`.
+                log.exception(
+                    "scrape retry could not start provider=%s", self._provider
+                )
+            else:
+                return
         self._finished = True
-        self._timeout.stop()
-        if error:
+        # The signal is what releases the account's live-scrape guard and
+        # hands the snapshot back, so it is emitted whatever the
+        # diagnostics around it do: `self._page` belongs to a profile that
+        # may already have been destroyed under this scrape, and a
+        # RuntimeError from reading it used to take `done` with it.
+        try:
+            self._timeout.stop()
+            if error:
+                log.warning(
+                    "scrape fail provider=%s url=%s page_url=%s elapsed=%.1fs "
+                    "error=%s load_status=%s load_url=%s load_error_code=%s "
+                    "load_error_domain=%s load_error_string=%r load_is_error_page=%s "
+                    "title=%r progress=%s url_changes=%s render_terminated=%s "
+                    "attempts=%s",
+                    self._provider,
+                    _safe_url(self._url),
+                    _safe_url(self._page.url()),
+                    elapsed,
+                    error,
+                    self._last_load_status,
+                    self._last_load_url,
+                    self._last_load_error_code,
+                    self._last_load_error_domain,
+                    self._last_load_error_string,
+                    self._last_load_is_error_page,
+                    self._page.title(),
+                    self._max_progress,
+                    self._url_change_count,
+                    self._render_terminated,
+                    self._attempt,
+                )
+            else:
+                log.info(
+                    "scrape ok provider=%s elapsed=%.1fs page_url=%s load_status=%s "
+                    "load_url=%s load_is_error_page=%s title=%r progress=%s "
+                    "url_changes=%s render_terminated=%s attempts=%s result_keys=%s",
+                    self._provider,
+                    elapsed,
+                    _safe_url(self._page.url()),
+                    self._last_load_status,
+                    self._last_load_url,
+                    self._last_load_is_error_page,
+                    self._page.title(),
+                    self._max_progress,
+                    self._url_change_count,
+                    self._render_terminated,
+                    self._attempt,
+                    sorted(result.keys()) if isinstance(result, dict) else type(result).__name__,
+                )
+        except Exception:  # noqa: BLE001
             log.warning(
-                "scrape fail provider=%s url=%s page_url=%s elapsed=%.1fs "
-                "error=%s load_status=%s load_url=%s load_error_code=%s "
-                "load_error_domain=%s load_error_string=%r load_is_error_page=%s "
-                "title=%r progress=%s url_changes=%s render_terminated=%s "
-                "attempts=%s",
+                "scrape finished but its diagnostics could not be read "
+                "provider=%s error=%s",
                 self._provider,
-                _safe_url(self._url),
-                _safe_url(self._page.url()),
-                elapsed,
-                error,
-                self._last_load_status,
-                self._last_load_url,
-                self._last_load_error_code,
-                self._last_load_error_domain,
-                self._last_load_error_string,
-                self._last_load_is_error_page,
-                self._page.title(),
-                self._max_progress,
-                self._url_change_count,
-                self._render_terminated,
-                self._attempt,
+                error or "-",
             )
-        else:
-            log.info(
-                "scrape ok provider=%s elapsed=%.1fs page_url=%s load_status=%s "
-                "load_url=%s load_is_error_page=%s title=%r progress=%s "
-                "url_changes=%s render_terminated=%s attempts=%s result_keys=%s",
-                self._provider,
-                elapsed,
-                _safe_url(self._page.url()),
-                self._last_load_status,
-                self._last_load_url,
-                self._last_load_is_error_page,
-                self._page.title(),
-                self._max_progress,
-                self._url_change_count,
-                self._render_terminated,
-                self._attempt,
-                sorted(result.keys()) if isinstance(result, dict) else type(result).__name__,
-            )
-        self.done.emit(result, error)
+        finally:
+            self.done.emit(result, error)
         # Release Chromium resources after connected callbacks have had a
         # chance to clear their Python references.
         QTimer.singleShot(0, self._cleanup)
