@@ -90,9 +90,15 @@ def _refresh_app_stub() -> App:
     app._timer = _Timer()  # noqa: SLF001
     app._current_refresh_manual = False  # noqa: SLF001
     app._cycle_signatures = {"old": ()}  # noqa: SLF001
+    app._cycle_statuses = {}  # noqa: SLF001
+    app._cycle_active = False  # noqa: SLF001
+    app._cycle_started_at = None  # noqa: SLF001
+    app._cycle_reason = "startup"  # noqa: SLF001
+    app._dispatch_times = {}  # noqa: SLF001
+    app._next_refresh_reason = "startup"  # noqa: SLF001
     app._widget = _Widget()  # noqa: SLF001
     app._start_next_refresh = lambda: None  # noqa: SLF001
-    app._config = SimpleNamespace()  # noqa: SLF001
+    app._config = Config()  # noqa: SLF001
     return app
 
 
@@ -191,9 +197,9 @@ def test_refresh_order_prioritizes_openrouter_without_reordering_tiles():
 
     assert _refresh_provider_order(providers) == [
         "openrouter",
+        "copilot",
         "claude",
         "codex",
-        "copilot",
     ]
 
 
@@ -211,9 +217,65 @@ def test_refresh_order_puts_both_cheap_rest_providers_first():
     assert _refresh_provider_order(providers) == [
         "openrouter",
         "azure",
-        "claude",
         "copilot",
+        "claude",
     ]
+
+
+def test_refresh_order_puts_copilot_with_the_cheap_rest_providers():
+    """Copilot is five plain HTTPS calls, and it used to run behind every
+    browser scrape because _build_providers inserts browser accounts first.
+    In 4.5 days of desktop log its payload line landed near the end of cycles
+    with a median duration of 48 s - for an answer that takes about a second.
+    """
+    providers = {
+        "claude": object(),
+        "codex": object(),
+        "copilot": object(),
+        "openrouter": object(),
+        "azure": object(),
+    }
+
+    assert _refresh_provider_order(providers) == [
+        "openrouter",
+        "azure",
+        "copilot",
+        "claude",
+        "codex",
+    ]
+
+
+def test_a_disabled_browser_account_is_not_refreshed():
+    """BrowserAccount.enabled was dead: config.browser_accounts could filter
+    on it, no caller ever did, and the account kept costing a browser scrape
+    every cycle."""
+    config = Config()
+    config.browser_accounts.append(
+        BrowserAccount(id="claude-team", kind="claude", name="Team", enabled=False)
+    )
+
+    assert "claude-team" not in _enabled_providers(config)
+    assert "claude" in _enabled_providers(config)
+
+
+def test_a_legacy_config_with_no_accounts_still_gets_its_tiles():
+    """The fallback exists for a config written before browser_accounts did,
+    not for one whose accounts are all switched off - filtering first and
+    then falling back would resurrect exactly what the user disabled."""
+    config = Config()
+    config.browser_accounts = []
+
+    assert _enabled_providers(config)[:2] == ("claude", "codex")
+
+
+def test_every_account_disabled_does_not_fall_back_to_the_defaults():
+    config = Config()
+    for account in config.browser_accounts:
+        account.enabled = False
+
+    enabled = _enabled_providers(config)
+    assert "claude" not in enabled
+    assert "codex" not in enabled
 
 
 def test_enabled_providers_places_azure_next_to_copilot():
@@ -704,7 +766,11 @@ def test_the_snapshot_error_log_line_redacts_azure_identifiers(qapp, caplog):
     app = App.__new__(App)
     app._snapshots = {}  # noqa: SLF001
     app._cycle_signatures = {}  # noqa: SLF001
+    app._cycle_statuses = {}  # noqa: SLF001
+    app._cycle_active = False  # noqa: SLF001
+    app._dispatch_times = {}  # noqa: SLF001
     app._inflight = set()  # noqa: SLF001
+    app._providers = {"azure": object()}  # noqa: SLF001
     app._config = Config()  # noqa: SLF001
     app._widget = _SnapshotWidget()  # noqa: SLF001
     app._history = SimpleNamespace(record_snapshot=lambda snap: None)  # noqa: SLF001
@@ -735,6 +801,38 @@ def test_the_snapshot_error_log_line_redacts_azure_identifiers(qapp, caplog):
     assert "<guid>" in caplog.text
 
 
+def test_a_snapshot_for_a_provider_the_user_removed_is_dropped(qapp):
+    """A settings save rebuilds the providers while a refresh is still out.
+
+    Storing the late snapshot ran it through widget.update_snapshot, whose
+    ensure_tile re-created the tile _build_providers had just deleted - so a
+    provider the user had switched off reappeared until the next cycle.
+    """
+    app = App.__new__(App)
+    app._snapshots = {}  # noqa: SLF001
+    app._cycle_signatures = {}  # noqa: SLF001
+    app._cycle_statuses = {}  # noqa: SLF001
+    app._cycle_active = False  # noqa: SLF001
+    app._dispatch_times = {}  # noqa: SLF001
+    app._inflight = {"opencode_go"}  # noqa: SLF001
+    app._refresh_queue = []  # noqa: SLF001
+    app._providers = {"claude": object()}  # noqa: SLF001
+    app._config = Config()  # noqa: SLF001
+    app._widget = _SnapshotWidget()  # noqa: SLF001
+
+    app._on_snapshot(  # noqa: SLF001
+        UsageSnapshot(
+            provider="opencode_go",
+            status=SnapshotStatus.AUTH_REQUIRED,
+            error="Not signed in to OpenCode",
+        )
+    )
+
+    assert app._snapshots == {}, "a removed provider was stored anyway"  # noqa: SLF001
+    assert app._widget.snapshots == [], "the removed tile was re-created"  # noqa: SLF001
+    assert app._inflight == set()  # noqa: SLF001
+
+
 def test_a_provider_that_raises_out_of_refresh_is_redacted_too(qapp):
     """refresh() raising is turned into an ERROR snapshot here, and that
     string reaches the tile, the tray tooltip and the dialog header - none of
@@ -743,6 +841,8 @@ def test_a_provider_that_raises_out_of_refresh_is_redacted_too(qapp):
 
     app = App.__new__(App)
     app._inflight = set()  # noqa: SLF001
+    app._dispatch_times = {}  # noqa: SLF001
+    app._cycle_started_at = None  # noqa: SLF001
     sub = "11111111-2222-3333-4444-555555555555"
     captured: list = []
     app._signals = _NS(  # noqa: SLF001

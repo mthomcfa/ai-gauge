@@ -6,6 +6,7 @@ import logging
 import os
 import subprocess
 import sys
+import time
 from dataclasses import replace
 from datetime import datetime, timedelta
 
@@ -86,12 +87,20 @@ def _make_dot_tray_icon(color: str | None = None) -> QIcon:
 
 
 def _enabled_providers(config: Config) -> tuple[str, ...]:
+    # enabled_only: BrowserAccount.enabled existed, config.browser_accounts
+    # supported filtering on it, and nothing in src/ ever passed the flag - so
+    # a hand-edited config.json that turned an account off was silently
+    # ignored and the account kept costing a browser scrape every cycle.
+    accounts = browser_accounts(config)
     out: list[str] = [
         account.id
-        for account in browser_accounts(config)
-        if getattr(config.providers, account.kind, False)
+        for account in accounts
+        if account.enabled and getattr(config.providers, account.kind, False)
     ]
-    if not out:
+    # The fallback is for a legacy config that has no browser_accounts list at
+    # all - not for one whose accounts are all switched off, which would
+    # resurrect exactly what the user disabled.
+    if not accounts:
         providers = getattr(config, "providers", None)
         if getattr(providers, "claude", False):
             out.append("claude")
@@ -112,8 +121,14 @@ def _enabled_providers(config: Config) -> tuple[str, ...]:
 # fill while a Claude/Codex scrape is still loading a page. Azure is cheap in
 # the same sense - a handful of JSON calls - and it self-throttles to one live
 # fetch per hour internally, so putting it early costs the API nothing even
-# when the cycle-wide error fast-retry is running every minute.
-_REFRESH_FIRST = ("openrouter", "azure")
+# when an error fast-retry is running every minute.
+#
+# Copilot is five plain HTTPS calls and it used to sit *behind* the browser
+# scrapes, because _build_providers inserts browser accounts first. In 4.5
+# days of a real desktop log that cost it the whole browser queue: cycles ran
+# a median of 48 s (p90 79 s) and Copilot's payload line landed near the end
+# of every one of them, for a provider that answers in about a second.
+_REFRESH_FIRST = ("openrouter", "azure", "copilot")
 
 
 def _refresh_provider_order(providers: dict[str, Provider]) -> list[str]:
@@ -283,6 +298,12 @@ class App(QObject):
         self._active_until = datetime.now() + timedelta(minutes=_ACTIVE_MODE_MINUTES)
         self._current_refresh_manual = False
         self._pending_manual_refresh = False
+        self._cycle_active = False
+        self._cycle_started_at: float | None = None
+        self._cycle_reason = "startup"
+        self._cycle_statuses: dict[str, SnapshotStatus] = {}
+        self._dispatch_times: dict[str, float] = {}
+        self._next_refresh_reason = "startup"
         self._settings_dialog: SettingsDialog | None = None
         self._settings_old_copilot_quota: int | None = None
         self._install_lifecycle_logging()
@@ -427,7 +448,8 @@ class App(QObject):
             context = self._lifecycle_context()
             log.info(
                 "%s uptime_s=%s ui_mode=%s widget_visible=%s providers=%s "
-                "inflight=%s queue=%s next_refresh_s=%s unchanged_cycles=%s",
+                "inflight=%s queue=%s next_refresh_s=%s unchanged_cycles=%s "
+                "error_cycles=%s",
                 event,
                 context["uptime_s"],
                 context["ui_mode"],
@@ -437,6 +459,7 @@ class App(QObject):
                 context["queue"],
                 context["next_refresh_s"],
                 context["unchanged_cycles"],
+                context["error_cycles"],
             )
         except Exception:  # noqa: BLE001
             log.exception("%s logging failed", event)
@@ -456,7 +479,7 @@ class App(QObject):
         # Tear down any existing providers (no shared state to clean up beyond refs)
         self._providers.clear()
         desired_tiles: set[str] = set()
-        for account in browser_accounts(self._config):
+        for account in browser_accounts(self._config, enabled_only=True):
             if not getattr(self._config.providers, account.kind, False):
                 continue
             desired_tiles.add(account.id)
@@ -511,6 +534,7 @@ class App(QObject):
             max_minutes=max_minutes,
         )
         next_refresh_at = now + timedelta(minutes=minutes)
+        reason = "active" if active else "idle"
         # Don't let an idle backoff stretch past a known reset — otherwise the
         # panel keeps showing 100% for tens of minutes after the limit has
         # actually rolled over. Pull the refresh forward so we re-read shortly
@@ -518,6 +542,7 @@ class App(QObject):
         soon_after_reset = self._earliest_reset_refresh_time()
         if soon_after_reset is not None and soon_after_reset < next_refresh_at:
             next_refresh_at = soon_after_reset
+            reason = "reset_pull_forward"
             minutes = max(
                 1,
                 int((next_refresh_at - datetime.now()).total_seconds() // 60) or 1,
@@ -525,6 +550,7 @@ class App(QObject):
         error_retry = self._error_retry_time(now)
         if error_retry is not None and error_retry < next_refresh_at:
             next_refresh_at = error_retry
+            reason = "error_retry"
             minutes = max(
                 1,
                 int((next_refresh_at - datetime.now()).total_seconds() // 60) or 1,
@@ -533,7 +559,18 @@ class App(QObject):
             1000,
             int((next_refresh_at - datetime.now()).total_seconds() * 1000),
         )
+        self._next_refresh_reason = reason
         self._timer.start(delay_ms)
+        # The one line that makes an unexplained refresh explainable: the log
+        # showed 32% of cycles starting within two minutes of the previous one
+        # and no way to tell a fast retry from a reset pull-forward.
+        log.info(
+            "refresh scheduled in_s=%s reason=%s active=%s unchanged_cycles=%s",
+            delay_ms // 1000,
+            reason,
+            active,
+            self._unchanged_cycles,
+        )
         self._widget.set_refresh_state(
             active=active,
             minutes=minutes,
@@ -613,11 +650,23 @@ class App(QObject):
 
     # ----- Refresh -----
 
-    def refresh_now(self, manual: bool = True) -> None:
-        if not self._providers:
-            return
-        if self._inflight or self._refresh_queue:
-            return
+    def _display_names(self, names: list[str]) -> dict[str, str]:
+        return {
+            name: {
+                "copilot": "Copilot",
+                "openrouter": "OpenRouter",
+                "azure": "Microsoft · Azure",
+            }.get(name, display_name_for_account(self._config, name))
+            for name in names
+        }
+
+    def _begin_cycle(self, names: list[str], *, manual: bool, reason: str) -> None:
+        """Start one refresh cycle over ``names``, in queue order.
+
+        The single entry point for every cycle - manual, scheduled or a
+        per-provider retry - so the log line that opens a cycle cannot
+        disagree with what actually ran.
+        """
         if manual:
             self._active_until = datetime.now() + timedelta(
                 minutes=_ACTIVE_MODE_MINUTES
@@ -626,37 +675,50 @@ class App(QObject):
         self._timer.stop()
         self._current_refresh_manual = manual
         self._cycle_signatures = {}
+        self._cycle_statuses = {}
+        self._cycle_started_at = time.monotonic()
+        self._cycle_reason = reason
+        self._cycle_active = True
+        self._refresh_queue = list(names)
+        log.info(
+            "refresh cycle start manual=%s reason=%s providers=%s",
+            manual,
+            reason,
+            ",".join(names),
+        )
         self._widget.set_refreshing(True)
-        self._refresh_queue = _refresh_provider_order(self._providers)
         if manual:
-            self._widget.mark_loading(
-                {
-                    name: {
-                        "copilot": "Copilot",
-                        "openrouter": "OpenRouter",
-                        "azure": "Microsoft · Azure",
-                    }.get(name, display_name_for_account(self._config, name))
-                    for name in self._refresh_queue
-                }
-            )
+            self._widget.mark_loading(self._display_names(self._refresh_queue))
         self._start_next_refresh()
+
+    def refresh_now(self, manual: bool = True) -> None:
+        if not self._providers:
+            return
+        if self._inflight or self._refresh_queue:
+            log.info(
+                "refresh_now ignored inflight=%s queue=%s",
+                ",".join(sorted(self._inflight)) or "-",
+                ",".join(self._refresh_queue) or "-",
+            )
+            return
+        self._begin_cycle(
+            _refresh_provider_order(self._providers),
+            manual=manual,
+            reason="manual" if manual else self._next_refresh_reason,
+        )
 
     def refresh_provider(self, provider: str) -> None:
         if provider not in self._providers:
             return
         if self._inflight or self._refresh_queue:
+            log.info(
+                "refresh_provider ignored provider=%s inflight=%s queue=%s",
+                provider,
+                ",".join(sorted(self._inflight)) or "-",
+                ",".join(self._refresh_queue) or "-",
+            )
             return
-        self._active_until = datetime.now() + timedelta(minutes=_ACTIVE_MODE_MINUTES)
-        self._unchanged_cycles = 0
-        self._timer.stop()
-        self._current_refresh_manual = True
-        self._cycle_signatures = {}
-        self._widget.set_refreshing(True)
-        self._refresh_queue = [provider]
-        self._widget.mark_loading(
-            {provider: display_name_for_account(self._config, provider)}
-        )
-        self._start_next_refresh()
+        self._begin_cycle([provider], manual=True, reason="manual")
 
     def _start_next_refresh(self) -> None:
         if self._inflight or not self._refresh_queue:
@@ -667,6 +729,13 @@ class App(QObject):
             QTimer.singleShot(0, self._start_next_refresh)
             return
         self._inflight.add(name)
+        now = time.monotonic()
+        self._dispatch_times[name] = now
+        log.info(
+            "refresh provider start provider=%s queued_s=%.1f",
+            name,
+            max(0.0, now - (self._cycle_started_at or now)),
+        )
 
         def _emit(snap: UsageSnapshot, _name=name):
             self._signals.snapshot_ready.emit(snap)
@@ -686,13 +755,36 @@ class App(QObject):
             )
 
     def _on_snapshot(self, snapshot: UsageSnapshot) -> None:
+        name = snapshot.provider
+        was_inflight = name in self._inflight
+        self._inflight.discard(name)
+        dispatched_at = self._dispatch_times.pop(name, None)
+        if was_inflight:
+            log.info(
+                "refresh provider done provider=%s elapsed_s=%.1f status=%s",
+                name,
+                (time.monotonic() - dispatched_at) if dispatched_at else 0.0,
+                snapshot.status.value,
+            )
+        if name not in self._providers:
+            # A settings save can remove a provider while its refresh is still
+            # out. Storing the late snapshot re-created the tile that
+            # _build_providers had just deleted, so a provider the user had
+            # turned off came back until the next cycle.
+            log.info(
+                "refresh provider dropped provider=%s status=%s reason=not_configured",
+                name,
+                snapshot.status.value,
+            )
+            self._advance_cycle()
+            return
         snapshot = _preserve_error_metrics(
             snapshot,
             self._snapshots.get(snapshot.provider),
         )
         self._snapshots[snapshot.provider] = snapshot
         self._cycle_signatures[snapshot.provider] = _snapshot_signature(snapshot)
-        self._inflight.discard(snapshot.provider)
+        self._cycle_statuses[snapshot.provider] = snapshot.status
         if snapshot.status == SnapshotStatus.ERROR:
             log.warning(
                 "snapshot error provider=%s error=%s raw_keys=%s raw_summary=%s",
@@ -729,23 +821,56 @@ class App(QObject):
         except Exception:  # noqa: BLE001
             log.exception("widget.set_ratio failed")
 
+        self._advance_cycle()
+
+    def _advance_cycle(self) -> None:
+        """Dispatch the next provider, or close the cycle when none is left."""
+        if not self._cycle_active:
+            # A snapshot that arrived outside a cycle - a re-render from a
+            # settings change, or a provider reporting late - repaints its
+            # tile and nothing more. It must not close a cycle that is not
+            # running or re-arm the timer behind the scheduler's back.
+            return
         if self._refresh_queue:
             QTimer.singleShot(0, self._start_next_refresh)
-        else:
-            changed = self._cycle_changed()
-            if changed:
-                self._active_until = datetime.now() + timedelta(
-                    minutes=_ACTIVE_MODE_MINUTES
-                )
-                self._unchanged_cycles = 0
-            elif not self._current_refresh_manual:
-                self._unchanged_cycles += 1
-            self._record_cycle_outcome()
-            self._last_cycle_signatures = dict(self._cycle_signatures)
-            self._current_refresh_manual = False
-            self._widget.set_refreshing(False)
-            self._update_tray()
-            self._schedule_next_refresh()
+            return
+        if self._inflight:
+            return
+        self._end_cycle()
+
+    def _end_cycle(self) -> None:
+        self._cycle_active = False
+        changed = self._cycle_changed()
+        if changed:
+            self._active_until = datetime.now() + timedelta(
+                minutes=_ACTIVE_MODE_MINUTES
+            )
+            self._unchanged_cycles = 0
+        elif not self._current_refresh_manual:
+            self._unchanged_cycles += 1
+        self._record_cycle_outcome()
+        self._last_cycle_signatures = dict(self._cycle_signatures)
+        started_at = self._cycle_started_at
+        log.info(
+            "refresh cycle end duration_s=%.1f changed=%s errors=%s auth_required=%s",
+            (time.monotonic() - started_at) if started_at else 0.0,
+            changed,
+            sum(
+                1
+                for status in self._cycle_statuses.values()
+                if status == SnapshotStatus.ERROR
+            ),
+            sum(
+                1
+                for status in self._cycle_statuses.values()
+                if status == SnapshotStatus.AUTH_REQUIRED
+            ),
+        )
+        self._cycle_started_at = None
+        self._current_refresh_manual = False
+        self._widget.set_refreshing(False)
+        self._update_tray()
+        self._schedule_next_refresh()
 
     def _cycle_changed(self) -> bool:
         if self._last_cycle_signatures is None:

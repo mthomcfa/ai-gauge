@@ -33,6 +33,10 @@ def _next_local_midnight() -> datetime:
     return datetime(tomorrow.year, tomorrow.month, tomorrow.day)
 
 
+# The three healthy-path diagnosis lines below are info, not debug: the file
+# handler is set to INFO, so at debug OpenRouter contributed nothing at all to
+# the log and its turn in a refresh cycle could only be inferred from the gap
+# between the providers either side of it.
 def _fetch_credits(api_key: str) -> dict | None:
     """Returns the credits payload. Raises HTTPError on any non-200 response.
 
@@ -48,7 +52,7 @@ def _fetch_credits(api_key: str) -> dict | None:
     r.raise_for_status()
     payload = r.json()
     data = payload.get("data") if isinstance(payload, dict) else None
-    log.debug(
+    log.info(
         "provider api diagnosis provider=openrouter "
         "classification=credits_ok status=%s payload_keys=%s",
         r.status_code,
@@ -66,7 +70,7 @@ def _fetch_key_info(api_key: str) -> dict:
     r.raise_for_status()
     payload = r.json()
     data = payload.get("data", payload) if isinstance(payload, dict) else {}
-    log.debug(
+    log.info(
         "provider api diagnosis provider=openrouter "
         "classification=key_ok status=%s payload_keys=%s",
         r.status_code,
@@ -124,7 +128,7 @@ def _fetch_activity(
             type(payload).__name__,
         )
         return [], "/activity response shape unexpected"
-    log.debug(
+    log.info(
         "provider api diagnosis provider=openrouter "
         "classification=activity_ok status=%s rows=%d date=%s",
         r.status_code,

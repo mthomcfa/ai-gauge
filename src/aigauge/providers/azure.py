@@ -2026,7 +2026,11 @@ class AzureProvider(Provider):
         allowed_at = next_allowed_at(state)
         if allowed_at is not None and now < allowed_at:
             if state.aggregate is not None:
-                log.debug(
+                # info, not debug: this is the ordinary Azure path - the
+                # hourly floor means most refreshes end here - and at debug it
+                # never reached the file, so the log showed nothing at all
+                # between live fetches.
+                log.info(
                     "provider api diagnosis provider=azure "
                     "classification=throttled_serving_cache next_fetch_in_s=%s",
                     int((allowed_at - now).total_seconds()),

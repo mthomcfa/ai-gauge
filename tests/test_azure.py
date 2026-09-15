@@ -8,6 +8,7 @@ column map. A fixture written as a convenient dict would test nothing.
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -785,6 +786,26 @@ def test_second_refresh_within_the_hour_serves_the_cache(monkeypatch, config):
     assert second.status == SnapshotStatus.OK
     # Served from cache means the ORIGINAL fetch time, not "now".
     assert second.fetched_at == first.fetched_at
+
+
+@responses.activate
+def test_serving_the_cache_is_visible_in_the_log(monkeypatch, config, caplog):
+    """The common Azure path was invisible.
+
+    Within the hourly window refresh() serves the cached aggregate and logged
+    it at debug, which the file handler drops - so 4.5 days of a real log had
+    no Azure line at all between live fetches and "the Azure tile never moves"
+    could not be told apart from "Azure never ran".
+    """
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    provider = az.AzureProvider(config)
+    _run(provider, monkeypatch)
+
+    with caplog.at_level(logging.INFO, logger="aigauge.providers.azure"):
+        _run(provider, monkeypatch)
+
+    assert "classification=throttled_serving_cache" in caplog.text
 
 
 @responses.activate
