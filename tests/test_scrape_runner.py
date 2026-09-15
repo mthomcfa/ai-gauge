@@ -34,9 +34,13 @@ class _FakeScraper:
 @pytest.fixture
 def fake_scraper(monkeypatch):
     _FakeScraper.instances.clear()
+    # The live-scrape registry is module state keyed by account id, so a test
+    # that leaves an entry behind would make the next one refuse.
+    runner_module._ACTIVE_ACCOUNTS.clear()  # noqa: SLF001
     monkeypatch.setattr(runner_module, "HeadlessScraper", _FakeScraper)
     yield _FakeScraper
     _FakeScraper.instances.clear()
+    runner_module._ACTIVE_ACCOUNTS.clear()  # noqa: SLF001
 
 
 def _ok_snapshot() -> UsageSnapshot:
@@ -315,3 +319,59 @@ def test_a_scraper_may_still_name_a_resume_artifact(fake_scraper):
     )
 
     assert received[0].error_class == "resume_artifact"
+
+
+def test_a_rebuilt_runner_still_knows_the_account_is_scraping(fake_scraper):
+    """The guard is a property of the *account*, not of the object holding it.
+
+    `App._build_providers()` runs on every settings save - a colour-only one
+    included - and replaces the provider object, whose fresh `ScrapeRunner`
+    is `None`. The App's park expires at twice the watchdog budget, so past
+    that ceiling nothing refused and the account's single cached
+    `QWebEngineProfile` got a second `QWebEngineView` on it: measured at nine
+    concurrent views on one profile over six hours of settings saves, against
+    one and eleven refusals without them.
+    """
+    received: list[UsageSnapshot] = []
+    rn = ScrapeRunner(
+        account_id="acct",
+        url="http://example",
+        extractor_js="",
+        build=lambda payload: _ok_snapshot(),
+        log=logging.getLogger("test"),
+        build_max_attempts=1,
+    )
+    assert runner_module.account_is_busy("acct") is False
+    rn.run(received.append)
+    assert runner_module.account_is_busy("acct") is True
+
+    rebuilt = ScrapeRunner(
+        account_id="acct",
+        url="http://example",
+        extractor_js="",
+        build=lambda payload: _ok_snapshot(),
+        log=logging.getLogger("test"),
+        build_max_attempts=1,
+    )
+    assert rebuilt.busy() is True, "a rebuilt provider forgot the live scrape"
+
+    fake_scraper.instances[-1].done.emit({"payload": 1}, "")
+    assert received
+    assert runner_module.account_is_busy("acct") is False
+    assert rebuilt.busy() is False
+
+
+def test_one_accounts_scrape_does_not_make_another_busy(fake_scraper):
+    received: list[UsageSnapshot] = []
+    rn = ScrapeRunner(
+        account_id="claude-aaaa1111",
+        url="http://example",
+        extractor_js="",
+        build=lambda payload: _ok_snapshot(),
+        log=logging.getLogger("test"),
+        build_max_attempts=1,
+    )
+    rn.run(received.append)
+
+    assert runner_module.account_is_busy("claude-aaaa1111") is True
+    assert runner_module.account_is_busy("claude-bbbb2222") is False

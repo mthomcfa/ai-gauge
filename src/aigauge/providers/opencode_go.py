@@ -10,7 +10,7 @@ from PyQt6.QtCore import QObject
 from ..config import Config, validate_opencode_usage_url
 from ..models import SnapshotStatus, UsageMetric, UsageSnapshot
 from ._common import is_security_verification_page
-from ._scrape_runner import ScrapeRunner
+from ._scrape_runner import ScrapeRunner, account_is_busy
 from .base import Provider
 from .diagnostics import log_page_diagnosis
 
@@ -261,7 +261,7 @@ class OpenCodeGoProvider(Provider):
         self._runner: ScrapeRunner | None = None
 
     def refresh(self, on_done: Callable[[UsageSnapshot], None]) -> None:
-        if self._runner is not None and self._runner.busy():
+        if account_is_busy("opencode_go"):
             # The App's watchdog ends its own wait; it does not end the
             # scrape. Starting a second one here would put a second
             # QWebEngineView on the single cached QWebEngineProfile for this

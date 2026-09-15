@@ -14,7 +14,7 @@ from ._common import (
     is_security_verification_page,
     page_text,
 )
-from ._scrape_runner import ScrapeRunner
+from ._scrape_runner import ScrapeRunner, account_is_busy
 from .catalog import (
     MeterCatalog,
     adopt_rows,
@@ -806,7 +806,7 @@ class ClaudeProvider(Provider):
         self._runner: ScrapeRunner | None = None  # held to prevent GC
 
     def refresh(self, on_done: Callable[[UsageSnapshot], None]) -> None:
-        if self._runner is not None and self._runner.busy():
+        if account_is_busy(self._account_id):
             # The App's watchdog ends its own wait; it does not end the
             # scrape. Starting a second one here would put a second
             # QWebEngineView on the single cached QWebEngineProfile for this

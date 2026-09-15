@@ -945,20 +945,26 @@ def test_a_browser_provider_refuses_a_refresh_while_one_is_running(monkeypatch):
     a second `QWebEngineView` on the single cached `QWebEngineProfile` for
     the account: two writers to one cookie store. It refuses instead, and
     says so with an error class the scheduler does not read as a failure.
+
+    The live scrape is registered by account id, not on the provider object,
+    so the refusal also survives the `_build_providers()` that every settings
+    save runs.
     """
     import aigauge.providers.claude as claude_module
     import aigauge.providers.codex as codex_module
     import aigauge.providers.opencode_go as opencode_module
+    from aigauge.providers import _scrape_runner as runner_module
 
     config = Config()
     cases = [
-        (claude_module, claude_module.ClaudeProvider(
+        ("claude", claude_module, claude_module.ClaudeProvider(
             parent=None, account_id="claude", config=config)),
-        (codex_module, codex_module.CodexProvider(
+        ("codex", codex_module, codex_module.CodexProvider(
             parent=None, account_id="codex", config=config)),
-        (opencode_module, opencode_module.OpenCodeGoProvider(config, parent=None)),
+        ("opencode_go", opencode_module,
+         opencode_module.OpenCodeGoProvider(config, parent=None)),
     ]
-    for module, provider in cases:
+    for account_id, module, provider in cases:
         # Stand in for ScrapeRunner so a regression fails the assertion below
         # instead of constructing a real QWebEngineView.
         built: list = []
@@ -966,11 +972,12 @@ def test_a_browser_provider_refuses_a_refresh_while_one_is_running(monkeypatch):
             module, "ScrapeRunner", lambda **kwargs: built.append(kwargs) or
             SimpleNamespace(run=lambda on_done: None, busy=lambda: True)
         )
-        busy_runner = SimpleNamespace(busy=lambda: True)
-        provider._runner = busy_runner  # noqa: SLF001
         answers: list[UsageSnapshot] = []
-
-        provider.refresh(answers.append)
+        runner_module._ACTIVE_ACCOUNTS.add(account_id)  # noqa: SLF001
+        try:
+            provider.refresh(answers.append)
+        finally:
+            runner_module._ACTIVE_ACCOUNTS.discard(account_id)  # noqa: SLF001
 
         name = type(provider).__name__
         assert built == [], f"{name} started a second scrape on one profile"
@@ -979,7 +986,9 @@ def test_a_browser_provider_refuses_a_refresh_while_one_is_running(monkeypatch):
         assert answers[0].error_class == "throttled", (
             "a provider that is already working is not a provider that failed"
         )
-        assert provider._runner is busy_runner  # noqa: SLF001
+        assert provider._runner is None, (  # noqa: SLF001
+            f"{name} replaced its runner while refusing"
+        )
 
 
 def test_a_throttled_answer_clears_a_retry_that_was_already_owed():
@@ -1388,3 +1397,101 @@ def test_a_provider_that_raises_out_of_refresh_is_redacted_too(qapp, monkeypatch
     assert epoch == 1, "the answer must name the dispatch it answers"
     assert sub not in (snapshot.error or "")
     assert "<guid>" in (snapshot.error or "")
+
+
+class _TileOnlyWidget:
+    """Just enough widget for `_build_providers`."""
+
+    def __init__(self):
+        self._tiles: dict[str, str] = {}
+
+    def ensure_tile(self, tile_id, display_name):
+        self._tiles[tile_id] = display_name
+
+    def remove_tile(self, tile_id):
+        self._tiles.pop(tile_id, None)
+
+
+def _provider_app(config: Config) -> App:
+    app = App.__new__(App)
+    app._config = config  # noqa: SLF001
+    app._widget = _TileOnlyWidget()  # noqa: SLF001
+    app._providers = {}  # noqa: SLF001
+    app._snapshots = {}  # noqa: SLF001
+    app._inflight = set()  # noqa: SLF001
+    app._abandoned = {}  # noqa: SLF001
+    app._error_retry = {}  # noqa: SLF001
+    app._dispatch_times = {}  # noqa: SLF001
+    app._dispatch_epoch = {}  # noqa: SLF001
+    app._watchdogs = {}  # noqa: SLF001
+    app._build_providers()  # noqa: SLF001
+    return app
+
+
+def test_a_settings_save_keeps_the_provider_objects_it_did_not_change():
+    """`_build_providers` runs on every settings save, colour-only included.
+
+    Rebuilding a browser provider threw away the `ScrapeRunner` that knows a
+    scrape of that account is still loading a page - the one guard left once
+    the App's park expires at twice the watchdog budget. Every provider reads
+    `self._config` live, so a rebuilt instance differs from the one it
+    replaced only in the state it just discarded.
+    """
+    config = Config()
+    config.providers.openrouter = True
+    config.providers.azure = True
+    config.providers.opencode_go = True
+    app = _provider_app(config)
+    before = dict(app._providers)  # noqa: SLF001
+    assert set(before) == {
+        "claude",
+        "codex",
+        "copilot",
+        "openrouter",
+        "azure",
+        "opencode_go",
+    }
+
+    app._build_providers()  # noqa: SLF001
+
+    for name, provider in before.items():
+        assert app._providers[name] is provider, (  # noqa: SLF001
+            f"{name} was rebuilt although nothing about it changed"
+        )
+
+
+def test_a_provider_the_user_switched_off_and_on_again_is_a_new_object():
+    config = Config()
+    app = _provider_app(config)
+    first = app._providers["copilot"]  # noqa: SLF001
+
+    config.providers.copilot = False
+    app._build_providers()  # noqa: SLF001
+    assert "copilot" not in app._providers  # noqa: SLF001
+
+    config.providers.copilot = True
+    app._build_providers()  # noqa: SLF001
+    assert app._providers["copilot"] is not first  # noqa: SLF001
+
+
+def test_a_rebuilt_browser_provider_still_refuses_a_live_scrape():
+    """End to end: the account is scraping, the settings save rebuilds the
+    provider, and the fresh object still refuses. Nine concurrent
+    `QWebEngineView`s on one cached `QWebEngineProfile` were measured over
+    six hours of settings saves against a wedged scrape."""
+    from aigauge.providers import _scrape_runner as runner_module
+
+    config = Config()
+    app = _provider_app(config)
+    runner_module._ACTIVE_ACCOUNTS.add("claude")  # noqa: SLF001 - a live scrape
+    try:
+        app._build_providers()  # noqa: SLF001
+        answers: list[UsageSnapshot] = []
+        app._providers["claude"].refresh(answers.append)  # noqa: SLF001
+    finally:
+        runner_module._ACTIVE_ACCOUNTS.discard("claude")  # noqa: SLF001
+
+    assert len(answers) == 1
+    assert answers[0].status == SnapshotStatus.ERROR
+    assert answers[0].error == "A refresh is already running."
+    assert answers[0].error_class == "throttled"

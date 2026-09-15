@@ -632,40 +632,66 @@ class App(QObject):
         self._log_lifecycle_event("python atexit")
 
     def _build_providers(self) -> None:
-        # Tear down any existing providers (no shared state to clean up beyond refs)
+        # Tear down any existing providers (no shared state to clean up beyond
+        # refs), but keep the object when nothing about it changed. This runs
+        # on *every* settings save, a colour-only one included, and every
+        # provider reads `self._config` live - so a rebuilt instance differs
+        # from the one it replaced only in the state it just discarded. For a
+        # browser provider that state is the `ScrapeRunner` holding a live
+        # page load. The live-scrape guard is now keyed by account id in
+        # `_scrape_runner`, so this is belt to that brace; it also spares the
+        # provider its per-kind catalog work on a save that changed nothing.
+        previous = dict(self._providers)
         self._providers.clear()
+
+        def _kept(key: str, kind: type):
+            existing = previous.get(key)
+            return existing if type(existing) is kind else None
+
         desired_tiles: set[str] = set()
         for account in browser_accounts(self._config):
             if not getattr(self._config.providers, account.kind, False):
                 continue
             desired_tiles.add(account.id)
             if account.kind == "claude":
-                self._providers[account.id] = ClaudeProvider(
+                self._providers[account.id] = _kept(
+                    account.id, ClaudeProvider
+                ) or ClaudeProvider(
                     parent=self,
                     account_id=account.id,
                     config=self._config,
                 )
             elif account.kind == "codex":
-                self._providers[account.id] = CodexProvider(
+                self._providers[account.id] = _kept(
+                    account.id, CodexProvider
+                ) or CodexProvider(
                     parent=self,
                     account_id=account.id,
                     config=self._config,
                 )
             self._widget.ensure_tile(account.id, display_name_for_account(self._config, account.id))
         if self._config.providers.copilot:
-            self._providers["copilot"] = CopilotProvider(self._config)
+            self._providers["copilot"] = _kept(
+                "copilot", CopilotProvider
+            ) or CopilotProvider(self._config)
             desired_tiles.add("copilot")
             self._widget.ensure_tile("copilot", "Copilot")
         if getattr(self._config.providers, "azure", False):
-            self._providers["azure"] = AzureProvider(self._config)
+            self._providers["azure"] = _kept("azure", AzureProvider) or AzureProvider(
+                self._config
+            )
             desired_tiles.add("azure")
             self._widget.ensure_tile("azure", "Microsoft · Azure")
         if self._config.providers.openrouter:
-            self._providers["openrouter"] = OpenRouterProvider(self._config)
+            self._providers["openrouter"] = _kept(
+                "openrouter", OpenRouterProvider
+            ) or OpenRouterProvider(self._config)
             desired_tiles.add("openrouter")
             self._widget.ensure_tile("openrouter", "OpenRouter")
         if self._config.providers.opencode_go:
-            self._providers["opencode_go"] = OpenCodeGoProvider(self._config, parent=self)
+            self._providers["opencode_go"] = _kept(
+                "opencode_go", OpenCodeGoProvider
+            ) or OpenCodeGoProvider(self._config, parent=self)
             desired_tiles.add("opencode_go")
             self._widget.ensure_tile("opencode_go", "OpenCode")
         for tile_id in list(self._widget._tiles):  # noqa: SLF001

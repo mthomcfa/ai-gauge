@@ -23,6 +23,7 @@ regression shows up as a number, not a hang.
 from __future__ import annotations
 
 import heapq
+import logging
 import random
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -35,6 +36,8 @@ import aigauge.providers.azure as az
 from aigauge.app import App
 from aigauge.config import AzureConfig, Config
 from aigauge.models import SnapshotStatus, UsageSnapshot
+
+log = logging.getLogger("aigauge.tests.refresh_invariants")
 
 BASE = datetime(2026, 9, 15, 9, 0, 0)
 SUBSCRIPTION = "11111111-1111-1111-1111-111111111111"
@@ -337,33 +340,64 @@ def test_a_provider_that_only_ever_answers_throttled_cannot_spin_the_scheduler(
     )
 
 
-class _FuzzProvider:
-    """A provider shaped like the real browser ones.
+class _ScrapeAccount:
+    """What a scrape of one account costs, counted per *account*.
 
-    It refuses a re-entrant refresh exactly as `ClaudeProvider`,
-    `CodexProvider` and `OpenCodeGoProvider` now do - `ScrapeRunner.busy()`
-    is what a second `QWebEngineView` on one profile would have to get past -
-    and counts both the scrapes that really start (``max_live``) and the
-    dispatches that met the guard (``refused``). A dispatch that never
-    answers stays live until the test releases it, which is what makes the
-    concurrency invariant measurable.
+    The real guard is module state in `providers/_scrape_runner.py` keyed by
+    account id, not an attribute of the provider object - because
+    `App._build_providers()` replaces that object on every settings save, and
+    the one cached `QWebEngineProfile` belongs to the account. Counting here
+    is what lets the settings-save branch below swap the provider and still
+    measure the thing that matters.
     """
 
-    def __init__(self, name: str, *, uses_browser: bool, clock: _Clock, rng):
+    def __init__(self, name: str, *, uses_browser: bool):
         self.name = name
         self.uses_browser = uses_browser
-        self._clock = clock
-        self._rng = rng
         self.live = 0
         self.max_live = 0
         self.dispatches = 0
         self.refused = 0
         self.outstanding: list = []
 
+    def release_one(self) -> bool:
+        """Let one abandoned worker finally report back."""
+        if not self.outstanding:
+            return False
+        on_done = self.outstanding.pop(0)
+        self.live -= 1
+        on_done(UsageSnapshot(provider=self.name, status=SnapshotStatus.OK))
+        return True
+
+
+class _FuzzProvider:
+    """A provider shaped like the real browser ones.
+
+    It refuses a re-entrant refresh exactly as `ClaudeProvider`,
+    `CodexProvider` and `OpenCodeGoProvider` now do - `account_is_busy()` is
+    what a second `QWebEngineView` on one profile would have to get past -
+    and the account counts both the scrapes that really start (``max_live``)
+    and the dispatches that met the guard (``refused``). A dispatch that
+    never answers stays live until the test releases it, which is what makes
+    the concurrency invariant measurable.
+    """
+
+    def __init__(self, account: _ScrapeAccount, *, clock: _Clock, rng):
+        self.account = account
+        self.name = account.name
+        self.uses_browser = account.uses_browser
+        self._clock = clock
+        self._rng = rng
+
     def refresh(self, on_done) -> None:
-        self.dispatches += 1
-        if self.live:
-            self.refused += 1
+        account = self.account
+        account.dispatches += 1
+        if account.live:
+            account.refused += 1
+            log.warning(
+                "provider refresh refused provider=%s reason=already_running",
+                self.name,
+            )
             on_done(
                 UsageSnapshot(
                     provider=self.name,
@@ -373,12 +407,12 @@ class _FuzzProvider:
                 )
             )
             return
-        self.live += 1
-        self.max_live = max(self.max_live, self.live)
+        account.live += 1
+        account.max_live = max(account.max_live, account.live)
         roll = self._rng.random()
         if roll < 0.12:
             # Never answers on its own: the watchdog is what ends it.
-            self.outstanding.append(on_done)
+            account.outstanding.append(on_done)
             return
         delay = self._rng.uniform(0.5, 30.0)
         status = (
@@ -386,7 +420,7 @@ class _FuzzProvider:
         )
 
         def _answer() -> None:
-            self.live -= 1
+            account.live -= 1
             on_done(
                 UsageSnapshot(
                     provider=self.name,
@@ -397,36 +431,35 @@ class _FuzzProvider:
 
         self._clock.at(delay, _answer)
 
-    def release_one(self) -> bool:
-        """Let one abandoned worker finally report back."""
-        if not self.outstanding:
-            return False
-        on_done = self.outstanding.pop(0)
-        self.live -= 1
-        on_done(
-            UsageSnapshot(provider=self.name, status=SnapshotStatus.OK)
-        )
-        return True
-
 
 @pytest.mark.parametrize("seed", [1, 7, 19, 42, 101])
-def test_a_browser_provider_never_has_two_scrapes_alive(clock, seed):
+def test_a_browser_provider_never_has_two_scrapes_alive(clock, seed, caplog):
     """Six fake hours of cycles, watchdogs, manual refreshes and settings
     saves. Two live scrapes on one account means two `QWebEngineView`s on the
     single cached `QWebEngineProfile` for it - two writers to one cookie
     store, which is how a spurious sign-out happens.
+
+    The settings-save branch rebuilds the provider objects, because that is
+    what `_build_providers()` does on every save - a colour-only one
+    included. While that branch only restarted the timer, this test could not
+    see a guard that lived on the provider instance: with a wedged scrape and
+    a save every 400 s, six hours put nine views on one profile.
     """
+    caplog.set_level(logging.WARNING, logger="aigauge")
     rng = random.Random(seed)
     config = Config()
+    accounts = {
+        "claude": _ScrapeAccount("claude", uses_browser=True),
+        "codex": _ScrapeAccount("codex", uses_browser=True),
+        "copilot": _ScrapeAccount("copilot", uses_browser=False),
+        "openrouter": _ScrapeAccount("openrouter", uses_browser=False),
+    }
     providers = {
-        "claude": _FuzzProvider("claude", uses_browser=True, clock=clock, rng=rng),
-        "codex": _FuzzProvider("codex", uses_browser=True, clock=clock, rng=rng),
-        "copilot": _FuzzProvider("copilot", uses_browser=False, clock=clock, rng=rng),
-        "openrouter": _FuzzProvider(
-            "openrouter", uses_browser=False, clock=clock, rng=rng
-        ),
+        name: _FuzzProvider(account, clock=clock, rng=rng)
+        for name, account in accounts.items()
     }
     app = _build_app(clock, providers, config)
+    rebuilds = 0
     # Record every dispatch against what the App believed at the time.
     dispatched_while_parked: list[str] = []
     real_dispatch = app._dispatch  # noqa: SLF001
@@ -448,22 +481,35 @@ def test_a_browser_provider_never_has_two_scrapes_alive(clock, seed):
         elif roll < 0.40:
             app.refresh_provider(rng.choice(list(providers)))
         elif roll < 0.55:
-            # A settings save: rebuild, restart the timer, refresh.
+            # A settings save: `_build_providers()` really does replace every
+            # provider object, so a fresh one must not forget that a scrape
+            # of that account is still loading a page.
+            rebuilds += 1
+            for name, account in accounts.items():
+                providers[name] = _FuzzProvider(account, clock=clock, rng=rng)
+            app._providers = dict(providers)  # noqa: SLF001
             app._restart_timer()  # noqa: SLF001
             app.refresh_now(manual=True)
         elif roll < 0.75:
-            providers[rng.choice(list(providers))].release_one()
+            accounts[rng.choice(list(accounts))].release_one()
 
-    for provider in providers.values():
-        if provider.uses_browser:
-            assert provider.max_live <= 1, (
-                f"{provider.name}: {provider.max_live} scrapes alive at once "
+    assert rebuilds, "the settings-save branch never ran"
+    for account in accounts.values():
+        if account.uses_browser:
+            assert account.max_live <= 1, (
+                f"{account.name}: {account.max_live} scrapes alive at once "
                 "on one QtWebEngine profile"
             )
+    assert sum(account.refused for account in accounts.values()), (
+        "no dispatch ever met the guard, so the invariant proved nothing"
+    )
+    assert "provider refresh refused" in caplog.text, (
+        "a refusal was never logged, so it cannot be diagnosed from the log"
+    )
     # And the App is not leaning on that guard: while a provider is parked,
     # nothing dispatches it. Only the assumed-dead ceiling lets it go, and
     # that is the one case the provider's own guard is there to catch.
     assert dispatched_while_parked == [], (
         f"dispatched while the App had it parked: {sorted(set(dispatched_while_parked))}"
     )
-    assert any(p.dispatches for p in providers.values()), "nothing ever ran"
+    assert any(account.dispatches for account in accounts.values()), "nothing ever ran"
