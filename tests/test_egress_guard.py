@@ -828,7 +828,7 @@ def test_a_refused_destination_never_reaches_git(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize(
     "base",
-    ["--output=/tmp/x", "--ext-diff", "-c", "origin/main HEAD", "a;b", "--", "$(id)"],
+    ["--output=OUTFILE", "--ext-diff", "-c", "origin/main HEAD", "a;b", "--", "$(id)"],
 )
 def test_a_base_that_is_not_a_plain_ref_is_refused(base, tmp_path):
     repo = _git_repo(tmp_path)
@@ -837,7 +837,7 @@ def test_a_base_that_is_not_a_plain_ref_is_refused(base, tmp_path):
         eg.build_payload(args, repo)
 
 
-@pytest.mark.parametrize("base", ["--output=/tmp/x", "--ext-diff", "a;b", "$(id)"])
+@pytest.mark.parametrize("base", ["--output=OUTFILE", "--ext-diff", "a;b", "$(id)"])
 def test_a_base_that_is_not_a_plain_ref_never_reaches_git(base, tmp_path, monkeypatch):
     """The shape check is the control; `rev-parse` behind it is the second
     line, and a test that only sees the exception cannot tell them apart."""
