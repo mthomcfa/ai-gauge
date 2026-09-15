@@ -121,6 +121,47 @@ numbers in the entries below are that log's, not estimates.
 - **A snapshot for a provider you just removed no longer re-creates its
   tile.** A settings save rebuilds the providers while a refresh is still out,
   and the late snapshot came back through `ensure_tile`.
+- **Changing the Copilot quota or the OpenRouter budget mid-refresh no longer
+  throws that refresh away.** Both re-render the cached snapshot immediately
+  so the new denominator shows without waiting for a network call, and both
+  did it by handing the scheduler a snapshot with no dispatch identity. The
+  scheduler read it as that dispatch's answer: it cleared the in-flight
+  entry, destroyed the watchdog, wrote `refresh provider done … status=ok`
+  for a dispatch that had not answered, recorded the cached value as the
+  cycle's result and could close the cycle — after which the refresh the
+  settings save itself starts could put a second worker beside the first,
+  and the real answer was discarded as late. A re-render is now a repaint:
+  it touches the tile and nothing else.
+- **A settings save no longer lets a second browser scrape onto one
+  profile.** The "a refresh is already running" refusal read a field on the
+  provider object, and saving settings — a colour-only change included —
+  replaces that object. Past the point where the app stops assuming an
+  abandoned worker is still alive, nothing refused: six fake hours with a
+  wedged scrape and a save every 400 s put 28 headless views on one account's
+  single browser profile, all writing one cookie store, which is how a
+  spurious sign-out happens. The refusal is now keyed on the account, and a
+  provider object is reused when nothing about it changed.
+- **A provider that answers late is no longer stuck on "Refresh timed
+  out."** Dropping a late answer whole is right for the cycle's accounting
+  and wrong for the tile: a provider that is merely slower than its budget
+  answered correctly every time, and a genuine "sign in again" was never
+  shown. Its own tile now gets the answer when it is the newest dispatch's,
+  and the fast-retry entry is cleared only if it answered OK or
+  auth-required. Nothing else moves — no cycle is closed or joined, and no
+  newer dispatch is touched.
+- **A profile deletion deferred past a quit is no longer lost.** Removing an
+  account while a refresh of it is still out defers deleting its browser
+  profile, because Qt cannot free a profile under a live page. The list was
+  in memory only and the account is gone from the config by then, so quitting
+  inside that window left a removed account's persistent cookie store on disk
+  with no recovery path short of "Clear all browser data". What is still owed
+  is now recorded and run at the next start, before anything can open a page.
+  The stored credential was, and is, cleared immediately.
+- **A fast retry owed to a provider the app has given up on is no longer
+  spent for nothing.** Its deadline was consumed before the cycle filtered
+  it out, so the retry vanished and — when it was the only one owed — the
+  wake ran a completely empty cycle, header flicker included. The deadline is
+  now kept and re-armed for the moment that provider becomes eligible again.
 - **A provider that is only waiting can no longer spin the scheduler.** A
   `throttled` or `resume_artifact` answer skips the fast retry, and the skip
   used to leave an already-owed retry deadline in place — now in the past. A
@@ -199,7 +240,7 @@ numbers in the entries below are that log's, not estimates.
   5 KB. Nothing a provider page returns can name its own `error_class` any
   more either: the scraper boundary allowlists the one value it is allowed to
   set.
-- **1 099 → 1 176 tests.** Every finding from both review lanes has a
+- **1 099 → 1 199 tests.** Every finding from both review lanes has a
   regression test, including two invariants driven over a fake clock: an hour
   of any provider behaviour buys a bounded number of cycles, and six hours of
   fuzzed cycles, watchdogs and manual refreshes never puts two scrapes of one

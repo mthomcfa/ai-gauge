@@ -526,16 +526,34 @@ unnecessary source of behaviour change.
   manual refresh or settings save dispatches it until its worker reports back
   or twice its budget has passed and the worker can be assumed dead. A
   snapshot that arrives from a dispatch the App gave up on is matched by
-  epoch, logged and **dropped** — it repaints nothing and it closes no cycle.
-  The three browser providers refuse a re-entrant refresh outright
-  (`ScrapeRunner.busy()`), so the one case the assumed-dead ceiling lets
-  through cannot open a second `QWebEngineView` on one profile either.
+  epoch and closes no cycle: it joins no cycle's verdict, clears no
+  `_inflight` entry and destroys no watchdog. It *does* repaint its own tile
+  when it is the newest dispatch's answer — otherwise a provider that is
+  merely slower than its budget shows "Refresh timed out." forever while
+  answering correctly every time, and a genuine AUTH_REQUIRED is never
+  painted — and it clears that provider's retry entry only when it answered
+  OK or AUTH_REQUIRED. An older epoch, or a provider the user removed, is
+  still dropped whole. The three browser providers refuse a re-entrant
+  refresh outright, keyed by **account id** in a module-level registry in
+  `providers/_scrape_runner.py` rather than on the provider object, because
+  `_build_providers()` replaces that object on every settings save; a
+  provider object is also reused when its key and class are unchanged. So
+  the one case the assumed-dead ceiling lets through cannot open a second
+  `QWebEngineView` on one profile either.
+
+  A retry deadline that comes due while its provider is parked is not spent:
+  it is re-armed at the moment the park lifts, and a wake with nothing
+  runnable reschedules instead of opening an empty cycle.
 
   A removed account's on-disk profile is deleted by the App rather than by
   the settings dialog, and only once no dispatch of that account is
   outstanding: `purge_profile` releases the cached `QWebEngineProfile` and
   rmtree's its directory, and Qt requires a profile to outlive its pages. The
-  stored credential is still cleared by the dialog, immediately.
+  stored credential is still cleared by the dialog, immediately. What is
+  still owed is recorded in `config.pending_profile_purges` and drained at
+  the next start, before any cookie is hydrated and before any provider
+  exists, so a quit inside the deferral window no longer leaves a removed
+  account's `ForcePersistentCookies` store on disk forever.
 
   The heartbeat restarts a timer that is not running while nothing is in
   flight, and ends a cycle that is open with nothing in flight, nothing
@@ -591,20 +609,85 @@ unnecessary source of behaviour change.
   the fallback was left alone and its test renamed to claim only what it
   checks.
 - **Only the browser providers refuse a re-entrant refresh; Copilot and
-  OpenRouter do not.** The App parks a provider whose dispatch its watchdog
-  abandoned, but the assumed-dead ceiling has to let it go eventually, and for
-  the browser providers `ScrapeRunner.busy()` then catches it. Azure is
-  covered by its own `state.in_flight` gate. Copilot and OpenRouter have
-  neither, so a worker that outlives its budget *and* the 2x ceiling - a
-  server dripping bytes forever, since `requests`' timeout is per socket
-  operation - can have a second `QRunnable` started beside it, at three HTTPS
-  calls each, roughly every four minutes rather than every cycle. Measured in
-  the review's own six-hour fuzz, with a double that never answers and never
-  refuses: browser providers went from 19 concurrent to **1**, the REST ones
-  to 15 in that model. Giving them a busy flag means writing a provider
-  attribute from a pool thread, which is the one thing this scheduler
-  currently never does - every provider `on_done` only emits a queued signal -
-  so it deserves its own change rather than a tail-end addition here.
+  OpenRouter do not, and that is now a thread-pool question.** The App parks a
+  provider whose dispatch its watchdog abandoned, but the assumed-dead ceiling
+  has to let it go eventually, and for the browser providers the account-keyed
+  live-scrape registry then catches it. Azure is covered by its own
+  `state.in_flight` gate. Copilot and OpenRouter have neither, and `requests`'
+  `timeout` is per socket operation rather than a total, so a server that
+  sends one byte every 14 s against a 15 s timeout holds a worker forever.
+
+  **The bound is the pool, not the request rate.** Copilot, OpenRouter and
+  Azure all submit to `QThreadPool.globalInstance()`, so the live socket count
+  can never exceed `maxThreadCount`; measured over six fake hours against a
+  byte-dripping server, every pool slot ends up stuck (1 of 1, 2 of 2, 4 of 4,
+  8 of 8) with an unbounded FIFO of queued runnables growing about four or
+  five objects an hour. The request *rate* falls rather than amplifies -
+  queued runnables never get a thread, so nothing is sent.
+
+  **The consequence is availability.** All three REST tiles are dead for the
+  life of the process, with no recovery path; before the watchdog work the
+  same server produced one stuck worker and a stalled app, so this converts a
+  one-slot leak into an all-slots leak plus a growing queue. Measured in the
+  six-hour fuzz with a double that never answers and never refuses: browser
+  providers went from 19 concurrent to **1**, the REST ones to 15 in that
+  model, and 9 live workers against the dripping server.
+
+  **Fix options, for the maintainer to pick.** (a) A total-response deadline
+  on the REST side - `stream=True` plus an elapsed check while reading - which
+  is the only one that actually bounds the socket. (b) A dedicated
+  `QThreadPool` per provider, so one wedged provider cannot starve the other
+  two; cheapest containment, and it does not free the wedged worker. (c) Keep
+  the assumed-dead ceiling for browser providers only, and require a REST
+  worker to report back before its park is released. (d) A busy flag on the
+  provider - the smallest change, but it means writing a provider attribute
+  from a pool thread, which is the one thing this scheduler currently never
+  does: every provider `on_done` only emits a queued signal. Any of these
+  deserves its own change rather than a tail-end addition here.
+- **On a one-core host every REST watchdog is about six minutes.**
+  `_pool_wait_slack` adds `sum(every other REST budget) / maxThreadCount` to a
+  dispatch's watchdog, because the cycle hands openrouter, copilot and azure
+  to the shared pool in one burst and a budget that starts at dispatch would
+  otherwise fire inside a refresh that has not exceeded its own bound. With
+  the real numbers (openrouter 60, copilot 60, azure 225) that is 365 s at
+  capacity 1, 222 s at 2 and 151 s at 4 for the two REST providers, and
+  365/305/275 s for Azure - so on a single-core machine a REST watchdog is
+  six minutes (up from 80 s) and the park ceiling twelve. While that cycle is
+  open the scheduler timer is stopped, so one wedged REST provider blocks
+  every refresh for six minutes rather than eighty seconds. The model is also
+  pessimistic by construction: it assumes full serialisation of every other
+  budget even at capacity 3, where the real wait is zero. It is still the
+  right trade - a watchdog that fires early manufactures the failure it exists
+  to catch, and feeds the parking machinery - but the alternative is to scale
+  the allowance by pool size (or to have providers report when their work
+  actually starts, which is a Provider-API change: the API is one callback).
+- **"Clear all browser data" still purges a profile the App may be scraping.**
+  Profile deletion moved out of the settings dialog for the *removal* path,
+  because only the App knows whether a scrape of that account is still holding
+  the directory. `settings_dialog._clear_all_browser_data` still calls
+  `purge_profile` synchronously for every configured account, every account on
+  disk and the three fixed ids - including one whose scrape is live. That is
+  the same `deleteLater()`-then-`rmtree` under a live `QuietWebEnginePage`
+  that `_run_profile_purges` exists to prevent. Left as is because it is an
+  explicit, confirmed user action behind a warning dialog, unlike a settings
+  save; the fix is to emit the id list to the App the way `removed_profile_ids`
+  now does and let `_purge_removed_profiles` defer it.
+- **The resume-artifact threshold is still unreachable on an awake machine,
+  and two `scraper.py` log lines still carry uncapped page text.** Both
+  pre-date this work and `webview/scraper.py` is untouched by it. The
+  threshold: the scraper calls a timeout a resume artifact past
+  `timeout_ms x max_attempts x RESUME_ARTIFACT_FACTOR`, which for Claude is
+  40 x 2 x 3 = 240 s, while the App's watchdog for the same provider is
+  160 + 20 s - so the watchdog always wins and the classification only ever
+  fires across a real machine suspend, which is what it was written for.
+  `self._started_at` is also set once in `__init__` and not reset in
+  `_begin_attempt`. The log lines: `title=%r` and `result_keys=%s` print
+  `document.title` and the extractor's key names with no length cap, the
+  healthy one at INFO - worst case measured at 1.5 MB for a single record,
+  2.9x the 512 KiB rotation. The fix is the same one-line clip applied at
+  three call sites (`self._page.title()[:200]`, `sorted(result)[:50]` with
+  clipped names). Suppressive or diagnostic only, with no request-rate
+  consequence, so both are left for a scraper-scoped change.
 - **`CopilotProvider` and `OpenRouterProvider` do not declare
   `refresh_budget_seconds`.** Both take the flat 60 s default. Copilot's real
   nominal ceiling is 10 + 15 + 15 s of `requests` timeouts, each per socket
