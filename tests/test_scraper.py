@@ -404,3 +404,57 @@ def test_a_successful_scrape_survives_a_page_that_cannot_be_read(caplog):
         HeadlessScraper._finish(stand_in, {"usage": 42}, "")
 
     assert stand_in.finished_with == ({"usage": 42}, "")
+
+
+def _stand_in_with_title(title: str):
+    stand_in = _LoadFailStandIn()
+
+    class _Page:
+        def url(self):
+            return "https://claude.ai/usage"
+
+        def title(self):
+            return title
+
+    stand_in._page = _Page()  # noqa: SLF001
+    return stand_in
+
+
+@pytest.mark.parametrize("error", ["", "timeout"])
+def test_a_page_cannot_write_a_megabyte_into_one_log_record(
+    monkeypatch, caplog, error
+):
+    """`document.title` and the extractor's key names are chosen by the page.
+
+    Neither was capped, and the healthy line is at INFO, so one scrape of a
+    hostile or merely broken page overwrote the rotating 512 KiB x 3 log -
+    the file the error dialog asks the user to attach. Measured on the tree
+    before this cap, with a 1 MB title and 10 000 keys of 1 000 characters:
+    11 079 134 characters for `scrape ok` and 1 000 367 for `scrape fail`,
+    21x and 1.9x the whole rotation.
+    """
+    monkeypatch.setattr(
+        "aigauge.webview.scraper.QTimer.singleShot", lambda ms, cb: None
+    )
+    stand_in = _stand_in_with_title("T" * 1_000_000)
+    result = {("K" * 1_000) + str(index): 1 for index in range(10_000)}
+
+    with caplog.at_level(logging.INFO, logger="aigauge.scraper"):
+        caplog.clear()
+        HeadlessScraper._finish(stand_in, result if not error else None, error)
+
+    assert stand_in.finished_with is not None, "the scrape never reported"
+    worst = max(len(record.getMessage()) for record in caplog.records)
+    assert worst < 10_000, f"one record was {worst} characters"
+    line = "\n".join(record.getMessage() for record in caplog.records)
+    assert "TTTT" in line, "the title was dropped instead of clipped"
+    if not error:
+        assert "more" in line, "the key list was truncated without saying so"
+
+
+def test_the_scrapers_url_field_is_bounded_too():
+    """`_safe_url` is the other page-controlled field on those lines."""
+    from aigauge.webview.scraper import _safe_url
+
+    assert len(_safe_url("https://claude.ai/" + "p" * 100_000)) <= 300
+    assert len(_safe_url("not a url at all " + "q" * 100_000)) <= 300

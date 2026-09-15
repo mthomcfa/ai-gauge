@@ -46,6 +46,36 @@ def _safe_url(value: Any) -> str:
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))[:300]
 
 
+# What a page is allowed to cost one log line. `document.title` is chosen by
+# the page and nothing bounded it: with a 1 MB title the `scrape ok` record
+# measured 11 079 134 characters and `scrape fail` 1 000 367, against a
+# 512 KiB x 3 rotation - one scrape erasing the whole diagnostic history that
+# the error dialog asks the user to attach.
+_LOG_TITLE_LIMIT = 200
+# The extractor's key names are page data too. Both numbers are app.py's
+# `_LOG_KEY_LEN_LIMIT` and `_LOG_DICT_KEY_LIMIT`, by value rather than by
+# import: the same shape of list on the same log ring, and this module is
+# deliberately free of app imports.
+_LOG_KEY_LEN_LIMIT = 60
+_LOG_KEY_COUNT_LIMIT = 50
+
+
+def _clip(text: Any, limit: int) -> str:
+    text = str(text or "")
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _result_keys_for_log(result: Any) -> str:
+    """The extractor's top-level key names, bounded like app.py's."""
+    if not isinstance(result, dict):
+        return type(result).__name__
+    keys = sorted(_clip(key, _LOG_KEY_LEN_LIMIT) for key in result)
+    shown = keys[:_LOG_KEY_COUNT_LIMIT]
+    if len(keys) > _LOG_KEY_COUNT_LIMIT:
+        shown.append(f"... {len(keys) - _LOG_KEY_COUNT_LIMIT} more")
+    return str(shown)
+
+
 # A timeout is bounded by a QTimer, so a scrape cannot legitimately run for
 # several times its own budget. When it reports that it did, the clock moved
 # under it: the machine suspended mid-scrape. Observed on a laptop resumed
@@ -188,7 +218,7 @@ class HeadlessScraper(QObject):
             _enum_name(status),
             exit_code,
             _safe_url(self._page.url()),
-            self._page.title(),
+            _clip(self._page.title(), _LOG_TITLE_LIMIT),
             self._max_progress,
         )
 
@@ -221,7 +251,7 @@ class HeadlessScraper(QObject):
             self._provider,
             ok,
             _safe_url(self._page.url()),
-            self._page.title(),
+            _clip(self._page.title(), _LOG_TITLE_LIMIT),
             self._max_progress,
             self._last_load_status,
             self._last_load_is_error_page,
@@ -397,7 +427,7 @@ class HeadlessScraper(QObject):
                     self._last_load_error_domain,
                     self._last_load_error_string,
                     self._last_load_is_error_page,
-                    self._page.title(),
+                    _clip(self._page.title(), _LOG_TITLE_LIMIT),
                     self._max_progress,
                     self._url_change_count,
                     self._render_terminated,
@@ -414,12 +444,12 @@ class HeadlessScraper(QObject):
                     self._last_load_status,
                     self._last_load_url,
                     self._last_load_is_error_page,
-                    self._page.title(),
+                    _clip(self._page.title(), _LOG_TITLE_LIMIT),
                     self._max_progress,
                     self._url_change_count,
                     self._render_terminated,
                     self._attempt,
-                    sorted(result.keys()) if isinstance(result, dict) else type(result).__name__,
+                    _result_keys_for_log(result),
                 )
         except Exception:  # noqa: BLE001
             log.warning(
