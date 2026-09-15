@@ -252,6 +252,9 @@ def _snapshot_signature(snapshot: UsageSnapshot) -> tuple:
 
 
 _LOG_DICT_KEY_LIMIT = 50
+# A key *name* is a field name, not a value. Clipping it keeps a bounded list
+# of bounded strings even when the names themselves came off a provider page.
+_LOG_KEY_LEN_LIMIT = 60
 
 
 def _summarize_for_log(value, *, depth: int = 0):
@@ -285,6 +288,24 @@ def _summarize_for_log(value, *, depth: int = 0):
             summarized.append(f"... {len(value) - 5} more")
         return summarized
     return repr(value)
+
+
+def _raw_keys_for_log(raw: dict | None) -> str:
+    """The key names of a provider payload, bounded.
+
+    `_raw_summary` below already caps what it prints. This list did not, and
+    `snapshot.raw` on the browser providers is the extractor's own dict - page
+    data. One payload with tens of thousands of keys is a megabyte-long record
+    against a 512 KiB x 3 rotation, which discards the diagnostic history the
+    line exists to build.
+    """
+    if not raw:
+        return "[]"
+    keys = sorted(str(key) for key in raw)
+    shown = [key[:_LOG_KEY_LEN_LIMIT] for key in keys[:_LOG_DICT_KEY_LIMIT]]
+    if len(keys) > _LOG_DICT_KEY_LIMIT:
+        shown.append(f"... {len(keys) - _LOG_DICT_KEY_LIMIT} more")
+    return repr(shown)
 
 
 def _raw_summary(raw: dict) -> str:
@@ -1269,7 +1290,7 @@ class App(QObject):
                 "snapshot error provider=%s error=%s raw_keys=%s raw_summary=%s",
                 snapshot.provider,
                 _redact_azure_ids(snapshot.error or ""),
-                sorted(snapshot.raw.keys()) if snapshot.raw else [],
+                _raw_keys_for_log(snapshot.raw),
                 _raw_summary(snapshot.raw) if snapshot.raw else "{}",
             )
         elif snapshot.status == SnapshotStatus.AUTH_REQUIRED:
@@ -1277,7 +1298,7 @@ class App(QObject):
                 "snapshot auth_required provider=%s error=%s raw_keys=%s raw_summary=%s",
                 snapshot.provider,
                 _redact_azure_ids(snapshot.error or ""),
-                sorted(snapshot.raw.keys()) if snapshot.raw else [],
+                _raw_keys_for_log(snapshot.raw),
                 _raw_summary(snapshot.raw) if snapshot.raw else "{}",
             )
         try:

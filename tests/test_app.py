@@ -882,6 +882,23 @@ def test_a_provider_waiting_on_its_own_throttle_is_not_a_failure():
     assert app._timer.started_ms > 65_000  # noqa: SLF001
 
 
+def test_a_hostile_payload_cannot_flood_the_snapshot_log_line():
+    """`raw_summary` was bounded and `raw_keys` was not.
+
+    `snapshot.raw` on a browser provider is the extractor's own dict, so its
+    key names come off the provider page. One payload with tens of thousands
+    of keys is a megabyte-long record against a 512 KiB x 3 rotation.
+    """
+    from aigauge.app import _raw_keys_for_log
+
+    line = _raw_keys_for_log({f"{'k' * 500}{index}": index for index in range(5000)})
+
+    assert len(line) < 4000, f"one raw_keys field was {len(line)} bytes"
+    assert "more" in line, "the count of what was left out is the diagnostic bit"
+    assert _raw_keys_for_log(None) == "[]"
+    assert _raw_keys_for_log({"a": 1}) == "['a']"
+
+
 def test_a_browser_provider_refuses_a_refresh_while_one_is_running():
     """The last line of defence for one profile, one scrape.
 
