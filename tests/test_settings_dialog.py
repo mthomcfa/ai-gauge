@@ -624,14 +624,56 @@ def test_clear_all_browser_data_says_what_it_left_behind(qtbot, monkeypatch):
     )
 
 
-def test_the_settings_dialog_no_longer_deletes_profiles_itself():
-    """Pinned as an import, because a future `from .webview.profile import
-    purge_profile` here would silently restore the hazard."""
-    import inspect
+def test_the_settings_dialog_no_longer_deletes_profiles_itself(
+    qtbot, monkeypatch
+):
+    """Both routes out of this dialog hand the directory to the App.
 
-    source = inspect.getsource(settings_dialog)
-    assert "purge_profile(" not in source, (
-        "the settings dialog is deleting QtWebEngine profiles again"
+    This was an `inspect.getsource` substring test. `purge_profile` releases
+    the cached `QWebEngineProfile` and rmtree's its directory; the dialog is
+    modeless and a refresh cycle runs every five minutes, so only the App -
+    which knows what is in flight - may run it. Driven here instead, through
+    both buttons that used to: the module-level function is watched, and
+    neither the removal nor the clear-all calls it.
+    """
+    import aigauge.webview.profile as profile_module
+    from aigauge.config import app_data_dir
+
+    called: list[str] = []
+    monkeypatch.setattr(profile_module, "purge_profile", called.append)
+    monkeypatch.setattr(settings_dialog, "set_start_at_login", lambda enabled: None)
+    monkeypatch.setattr(
+        settings_dialog.QMessageBox,
+        "question",
+        lambda *a, **k: settings_dialog.QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(
+        settings_dialog.QMessageBox, "information", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        settings_dialog, "set_provider_cookie", lambda account_id, value: None
+    )
+    config = Config()
+    dialog = SettingsDialog(config)
+    qtbot.addWidget(dialog)
+    dialog._add_browser_account("claude")  # noqa: SLF001
+    account_id = dialog._browser_accounts[-1].id  # noqa: SLF001
+    profile_dir = app_data_dir() / "profiles" / account_id
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    (profile_dir / "Cookies").write_bytes(b"SQLite format 3\x00")
+
+    _button(dialog, "clear_browser_data_btn").click()
+    dialog._remove_browser_account(account_id)  # noqa: SLF001
+    dialog.apply_to(config)
+
+    assert called == [], "the settings dialog is deleting QtWebEngine profiles again"
+    assert profile_dir.is_dir(), "the dialog deleted a profile the App may be using"
+    # The spy above is bound on the defining module, so it sees a call made
+    # through it or through a function-local import. The one shape it cannot
+    # see is a module-level `from .webview.profile import purge_profile`,
+    # which binds before any patch - so that name must simply not be here.
+    assert not hasattr(settings_dialog, "purge_profile"), (
+        "the settings dialog imported purge_profile again"
     )
 
 

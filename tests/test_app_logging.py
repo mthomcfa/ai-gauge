@@ -141,6 +141,19 @@ class _Widget:
     def isVisible(self):
         return True
 
+    # What a settings save calls on its way through _on_settings_finished.
+    def restore_always_on_top(self):
+        pass
+
+    def apply_gauge_colors(self):
+        pass
+
+    def apply_window_settings(self):
+        pass
+
+    def show(self):
+        pass
+
 
 class _Provider:
     """Calls back synchronously unless told to hold the callback."""
@@ -1876,14 +1889,54 @@ def test_a_settings_save_does_not_write_the_parked_hint():
     ]
 
 
-def test_the_settings_save_is_the_only_unasked_manual_refresh():
-    """Pinned at the call site, because the flag is easy to lose in a later
-    edit: it is one keyword on one call."""
-    import inspect
+def test_the_settings_save_is_the_only_unasked_manual_refresh(monkeypatch):
+    """The save driven end to end, rather than its source text read.
 
-    source = inspect.getsource(App._on_settings_finished)
-    assert "refresh_now(manual=True, asked=False)" in source, (
-        "the settings save is asking for a refresh on the user's behalf again"
+    This was an `inspect.getsource` substring test, and it was the only
+    thing in the suite that noticed the keyword going away - a grep cannot
+    tell `asked=False` on the call from the same text in a comment, and it
+    would have passed if the call moved into a helper. Driven here: the
+    refresh a save runs is manual in every other respect - it re-arms the
+    active window, it dispatches what it can - but nobody asked for it, so a
+    provider refused as `abandoned` says nothing on its tile.
+    """
+    from PyQt6.QtWidgets import QDialog
+
+    copilot = _Provider(_ok("copilot"), hold=True)
+    claude = _BrowserProvider(_ok("claude"))
+    app = _app({"copilot": copilot, "claude": claude})
+    app.refresh_now(manual=False)
+    app._watchdogs["copilot"].fire()  # noqa: SLF001 - park copilot
+    app._widget.status_hints.clear()  # noqa: SLF001
+    claude.calls = 0
+    app._active_until = datetime.now() - timedelta(minutes=1)  # noqa: SLF001
+
+    # The rebuild is a different question and would replace these stand-ins
+    # with real providers; everything else on the path is the real thing.
+    monkeypatch.setattr(App, "_build_providers", lambda self: None)
+    dialog = SimpleNamespace(
+        apply_to=lambda config: None,
+        removed_profile_ids=[],
+        start_at_login_error=False,
+        ui_scale_changed=False,
+        deleteLater=lambda: None,
+    )
+    app._settings_dialog = dialog  # noqa: SLF001
+
+    app._on_settings_finished(  # noqa: SLF001
+        dialog,
+        QDialog.DialogCode.Accepted.value,
+        app._config.copilot.monthly_quota,  # noqa: SLF001
+        app._config.openrouter.daily_budget,  # noqa: SLF001
+    )
+
+    assert app._widget.status_hints == [], (  # noqa: SLF001
+        "a settings save marked a tile for a refusal nobody asked for"
+    )
+    assert claude.calls == 1, "the settings save ran no refresh at all"
+    assert copilot.calls == 1, "a settings save dispatched a parked provider"
+    assert app._active_until > datetime.now(), (  # noqa: SLF001
+        "the settings save stopped re-arming the active window"
     )
 
 

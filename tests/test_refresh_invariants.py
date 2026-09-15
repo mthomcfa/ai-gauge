@@ -683,9 +683,23 @@ def test_a_parked_provider_does_not_freeze_the_idle_backoff(monkeypatch):
     # Not equality: a cycle carrying the wedged provider stays open until its
     # watchdog gives up, which pushes each cadence wake out by that wait and
     # costs the run its last dispatch.
-    assert control_count - 1 <= wedged_count <= control_count, (
-        f"a parked provider changed a healthy sibling's rate: {wedged_count} "
+    #
+    # The property is `wedged <= control`. The lower bound is *not* a
+    # property - it is the size of that one wait, which is this fixture's
+    # `budget=60.0` (plus the pool-queue slack): the first healthy dispatch
+    # after the park lands at 300 + budget + 95 s. Measured over the same six
+    # hours at other budgets, the same run gives 11 of 12 at 30 s and 60 s,
+    # 11 at 240 s and 10 at 900 s, and a wedged *browser* provider at 240 s
+    # gives 9. So a floor of 2 is what a re-tuned fixture can carry; the
+    # ceiling is what this test exists for.
+    assert wedged_count <= control_count, (
+        f"a parked provider raised a healthy sibling's rate: {wedged_count} "
         f"dispatches in six hours against {control_count} with nothing parked"
+    )
+    assert wedged_count >= control_count - 2, (
+        f"a parked provider cost a healthy sibling {control_count - wedged_count} "
+        f"of {control_count} dispatches in six hours, which is more than the "
+        "one watchdog wait this fixture's 60 s budget buys"
     )
     assert wedged_unchanged >= control_unchanged - 1, (
         f"the idle backoff stalled at {wedged_unchanged} unchanged cycles "
