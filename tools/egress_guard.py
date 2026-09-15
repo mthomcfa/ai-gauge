@@ -631,7 +631,38 @@ def _server_auth_headers() -> dict[str, str]:
     return {"Authorization": f"Basic {token}"}
 
 
-def _post_json(url: str, body: dict[str, Any], timeout: float) -> Any:
+class _RedirectRefused(urllib.error.URLError):
+    """A 3xx from the pinned server, refused rather than followed."""
+
+
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect instead of following it.
+
+    `posture` proves the *configured* server is loopback; it says nothing about
+    where the connection ends up. A loopback server that answers `/session`
+    normally and returns 302 for the message POST sent this process to an
+    arbitrary host with the `Authorization: Basic` header still attached - the
+    password `posture` requires the operator to set - while the audit line went
+    on naming `127.0.0.1` as the endpoint that received the payload.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        raise _RedirectRefused(
+            f"the server answered {code} with a redirect to {server_endpoint(newurl)}; "
+            "the destination is pinned, so nothing was followed and nothing more was sent"
+        )
+
+
+# No proxy handler either: an `http_proxy` in the environment would otherwise
+# send a loopback POST to whatever it names.
+_OPENER = urllib.request.build_opener(_NoRedirects, urllib.request.ProxyHandler({}))
+
+
+def _post_json(url: str, body: dict[str, Any], timeout: float, endpoint: str | None = None) -> Any:
+    if endpoint is not None and server_endpoint(url) != endpoint:
+        raise _RedirectRefused(
+            f"refusing to send to {server_endpoint(url)}, which is not the pinned {endpoint}"
+        )
     payload = json.dumps(body).encode("utf-8")
     request = urllib.request.Request(
         url,
@@ -639,7 +670,14 @@ def _post_json(url: str, body: dict[str, Any], timeout: float) -> Any:
         headers={"Content-Type": "application/json", **_server_auth_headers()},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - loopback only
+    with _OPENER.open(request, timeout=timeout) as response:  # noqa: S310 - loopback only
+        # Belt and braces: a handler that ever learned to follow a redirect
+        # would show up here as a response from somewhere else.
+        landed = getattr(response, "url", None) or url
+        if endpoint is not None and server_endpoint(landed) != endpoint:
+            raise _RedirectRefused(
+                f"the response came from {server_endpoint(landed)}, not the pinned {endpoint}"
+            )
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -1176,15 +1214,18 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
         print("nothing was sent", file=sys.stderr)
         return 3
 
+    endpoint = server_endpoint(policy.server)
     try:
-        session = _post_json(f"{policy.server}/session", {"title": args.title}, args.timeout)
+        session = _post_json(
+            f"{policy.server}/session", {"title": args.title}, args.timeout, endpoint
+        )
         body: dict[str, Any] = {"parts": [{"type": "text", "text": sent}]}
         if args.model:
             body["model"] = args.model
         if args.agent:
             body["agent"] = args.agent
         response = _post_json(
-            f"{policy.server}/session/{session['id']}/message", body, args.timeout
+            f"{policy.server}/session/{session['id']}/message", body, args.timeout, endpoint
         )
     except (urllib.error.URLError, OSError, KeyError, json.JSONDecodeError) as exc:
         record["verdict"] = "error"

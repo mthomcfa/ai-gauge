@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 import sys
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -663,6 +664,141 @@ def test_the_dispatch_authenticates_with_the_password_posture_demands(monkeypatc
     assert base64.b64decode(headers["Authorization"].split()[1]) == b"opencode:hunter2"
     monkeypatch.delenv("OPENCODE_SERVER_PASSWORD")
     assert eg._server_auth_headers() == {}
+
+
+class _FakeResponse:
+    def __init__(self, url, payload=b'{"id": "s1", "ok": true}'):
+        self.url = url
+        self._payload = payload
+
+    def read(self):
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeOpener:
+    """Stands in for the module's opener and remembers every Request."""
+
+    def __init__(self, landing_url=None):
+        self.requests = []
+        self._landing_url = landing_url
+
+    def open(self, request, timeout=None):
+        self.requests.append(request)
+        return _FakeResponse(self._landing_url or request.full_url)
+
+
+def test_a_redirect_is_refused_and_names_where_it_was_being_sent():
+    """`posture` proves the configured server is loopback; it says nothing
+    about where the connection ends up. A loopback server that answers
+    `/session` and then 302s the message POST sent this process off the box
+    with the `Authorization: Basic` header attached."""
+    handler = eg._NoRedirects()
+    with pytest.raises(eg._RedirectRefused) as raised:
+        handler.redirect_request(
+            urllib.request.Request("http://127.0.0.1:4096/session/s1/message"),
+            None, 302, "Found", {},
+            "http://192.0.2.2:8777/session/s1/message",
+        )
+    assert "192.0.2.2:8777" in str(raised.value)
+
+
+def test_the_opener_refuses_redirects_and_ignores_a_proxy():
+    kinds = {type(handler).__name__ for handler in eg._OPENER.handlers}
+    assert "_NoRedirects" in kinds
+    assert not any(
+        name == "HTTPRedirectHandler" for name in kinds
+    ), "a handler that follows redirects is installed"
+    # An empty ProxyHandler registers no methods, so it does not appear in
+    # `handlers` - what matters is that no handler carries a proxy, which is
+    # what passing it kept `build_opener` from adding from the environment.
+    assert not any(getattr(handler, "proxies", None) for handler in eg._OPENER.handlers)
+
+
+def test_nothing_is_sent_to_a_host_that_is_not_the_pinned_one(monkeypatch):
+    opener = _FakeOpener()
+    monkeypatch.setattr(eg, "_OPENER", opener)
+    with pytest.raises(eg._RedirectRefused):
+        eg._post_json("http://192.0.2.2:8777/session", {}, 5, "127.0.0.1:4096")
+    assert opener.requests == [], "the request was built and sent anyway"
+
+
+def test_a_response_from_somewhere_else_is_refused(monkeypatch):
+    monkeypatch.setattr(eg, "_OPENER", _FakeOpener(landing_url="http://192.0.2.2:8777/session"))
+    with pytest.raises(eg._RedirectRefused) as raised:
+        eg._post_json("http://127.0.0.1:4096/session", {}, 5, "127.0.0.1:4096")
+    assert "192.0.2.2:8777" in str(raised.value)
+
+
+def test_a_redirected_dispatch_exits_three_and_records_the_target(tmp_path, monkeypatch):
+    _clean_posture(tmp_path, monkeypatch)
+    pol_file = tmp_path / "policy.json"
+    pol_file.write_text(
+        json.dumps(
+            {
+                "destinations": {"allow": ["openrouter/*"], "server": "http://127.0.0.1:4096"},
+                "audit": {"path": str(tmp_path / "audit.jsonl")},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def post(url, body, timeout, endpoint=None):
+        raise eg._RedirectRefused("redirect to 192.0.2.2:8777 refused")
+
+    monkeypatch.setattr(eg, "_post_json", post)
+    monkeypatch.setattr(sys, "stdin", _FakeStdin("rename the timer field"))
+    args = eg.build_parser().parse_args(
+        [
+            "--policy", str(pol_file), "--workspace", str(tmp_path),
+            "dispatch", "--stdin", "--model", "openrouter/x", "--timeout", "5",
+        ]
+    )
+    assert eg.cmd_dispatch(args) == 3
+    result = [line for line in _audit_lines(tmp_path) if line.get("stage") == "result"]
+    assert result and result[0]["verdict"] == "error"
+    assert "192.0.2.2:8777" in result[0]["error"]
+
+
+def test_the_dispatch_puts_the_password_posture_demands_on_the_request(tmp_path, monkeypatch):
+    """The M13 test asserted on `_server_auth_headers()`'s return value, so
+    deleting the header from the request survived the whole suite."""
+    import base64
+
+    _clean_posture(tmp_path, monkeypatch)
+    monkeypatch.setenv("OPENCODE_SERVER_PASSWORD", "hunter2")
+    monkeypatch.setenv("OPENCODE_SERVER_USERNAME", "opencode")
+    opener = _FakeOpener()
+    monkeypatch.setattr(eg, "_OPENER", opener)
+    pol_file = tmp_path / "policy.json"
+    pol_file.write_text(
+        json.dumps(
+            {
+                "destinations": {"allow": ["openrouter/*"], "server": "http://127.0.0.1:4096"},
+                "audit": {"path": str(tmp_path / "audit.jsonl")},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys, "stdin", _FakeStdin("rename the timer field"))
+    args = eg.build_parser().parse_args(
+        [
+            "--policy", str(pol_file), "--workspace", str(tmp_path),
+            "dispatch", "--stdin", "--model", "openrouter/x", "--timeout", "5",
+        ]
+    )
+    assert eg.cmd_dispatch(args) == 0
+    assert opener.requests, "nothing was sent"
+    for request in opener.requests:
+        assert eg.server_endpoint(request.full_url) == "127.0.0.1:4096"
+        header = request.get_header("Authorization")
+        assert header and header.startswith("Basic ")
+        assert base64.b64decode(header.split()[1]) == b"opencode:hunter2"
 
 
 def test_no_unused_network_primitive_ships():
@@ -1492,9 +1628,11 @@ class _Recorder:
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
+        self.endpoints: list[str | None] = []
 
-    def __call__(self, url, body, timeout):
+    def __call__(self, url, body, timeout, endpoint=None):
         self.calls.append((url, body))
+        self.endpoints.append(endpoint)
         return {"id": "s1", "ok": True}
 
     @property
@@ -1580,7 +1718,7 @@ def test_dispatch_writes_the_audit_line_before_the_post(tmp_path, monkeypatch):
     )
     seen: list[int] = []
 
-    def post(url, body, timeout):
+    def post(url, body, timeout, endpoint=None):
         seen.append(len(_audit_lines(tmp_path)))
         return {"id": "s1", "ok": True}
 
