@@ -184,17 +184,35 @@ _DEFAULT_DENY_GLOBS: tuple[str, ...] = (
     "**/auth.json",
 )
 
-# Path-shaped runs are found by scanning for separators and expanding within a
-# bounded window, not by a regex. The pattern this replaces,
-# `[A-Za-z0-9_.\-/\\]*[/\\][A-Za-z0-9_.\-/\\]+`, backtracked from every start
-# position of a separator-free run: measured 1.4 s at 16 000 characters, 22.2 s
-# at 64 000, quadratic, and at the tool's own 400 000-byte default cap it does
-# not finish. In the documented hook wiring - `"timeout": 10` - a hook that
-# cannot answer in time returns no exit 2, so the tool call proceeds unscanned.
-_PATH_CHARS = frozenset(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-/\\"
+# Path-shaped runs are found by splitting the text into tokens, not by a regex.
+# The pattern this replaces, `[A-Za-z0-9_.\-/\\]*[/\\][A-Za-z0-9_.\-/\\]+`,
+# backtracked from every start position of a separator-free run: measured 1.4 s
+# at 16 000 characters, 22.2 s at 64 000, quadratic, and at the tool's own
+# 400 000-byte default cap it does not finish. In the documented hook wiring -
+# `"timeout": 10` - a hook that cannot answer in time returns no exit 2, so the
+# tool call proceeds unscanned.
+#
+# A token is what lies between whitespace or a quote, and it is a path only if
+# every character in it could be part of one. Round 1 expanded a fixed 256
+# characters either side of each separator instead, and jumped the cursor past
+# each span it yielded - so when the ceiling fell between the two segments a
+# multi-segment glob needs, the path was not matched at all:
+# `/<240..250 a's>/.aws/credentials` passed the deny list for eleven widths of
+# padding, deterministically. Whole tokens have no such band.
+#
+# The character set is wider than a POSIX path because a path in a payload is
+# written for people: `%APPDATA%\...`, `$HOME/...`, `~/...`, an `@` in a scoped
+# package or a directory named after an address. What it does not contain is
+# sentence punctuation, and that is deliberate: `secrets.dat,` in a sentence is
+# prose about a file, not a path handed to an agent.
+_PATH_TOKEN_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-/\\~:@%+=#$"
 )
-_PATH_WINDOW = 256  # characters either side of a separator; real paths are shorter
+_TOKEN_BREAKS = frozenset(" \t\n\r\f\v\"'`")
+# Longer than any real path, and long tokens are windowed rather than dropped,
+# so a payload with no whitespace in it still has its paths scanned.
+_PATH_TOKEN_CAP = 4096
+_PATH_TOKEN_OVERLAP = 512
 
 _DEFAULT_POLICY: dict[str, Any] = {
     "destinations": {
@@ -459,31 +477,41 @@ def truncate(payload: str, policy: Policy) -> tuple[str, bool]:
 
 
 def _path_like_spans(text: str) -> Iterable[tuple[int, int]]:
-    """Spans that look like a path: one pass, plus a bounded expansion.
+    """The whole tokens that could be a path: one pass, no window.
 
-    Each separator is found by a plain scan and grown outwards over path
-    characters up to `_PATH_WINDOW` either side; separators already inside a
-    span are skipped, so no character is visited more than a constant number of
-    times whatever the input looks like.
+    A token is a run between whitespace or a quote. It is a path if every
+    character in it is a path character and it holds a separator with something
+    after it. Each character is visited a constant number of times whatever the
+    input looks like; a token longer than any real path is scanned in
+    overlapping windows rather than skipped, so a payload with no whitespace in
+    it is still covered.
     """
     length = len(text)
     index = 0
     while index < length:
-        char = text[index]
-        if char != "/" and char != "\\":
+        if text[index] in _TOKEN_BREAKS:
             index += 1
             continue
         start = index
-        floor = max(0, index - _PATH_WINDOW)
-        while start > floor and text[start - 1] in _PATH_CHARS:
-            start -= 1
-        end = index + 1
-        ceiling = min(length, index + 1 + _PATH_WINDOW)
-        while end < ceiling and text[end] in _PATH_CHARS:
-            end += 1
-        if end > index + 1:  # a separator with nothing after it is not a path
-            yield start, end
-        index = max(end, index + 1)
+        while index < length and text[index] not in _TOKEN_BREAKS:
+            index += 1
+        if index - start <= _PATH_TOKEN_CAP:
+            windows: Iterable[tuple[int, int]] = ((start, index),)
+        else:
+            step = _PATH_TOKEN_CAP - _PATH_TOKEN_OVERLAP
+            windows = [
+                (edge, min(edge + _PATH_TOKEN_CAP, index))
+                for edge in range(start, index, step)
+            ]
+        for window_start, window_end in windows:
+            span = text[window_start:window_end]
+            if not _PATH_TOKEN_CHARS.issuperset(span):
+                continue
+            # A separator with nothing after it is a directory reference, not a
+            # path: `trailing/ separator` is two words.
+            if "/" not in span.rstrip("/\\") and "\\" not in span.rstrip("/\\"):
+                continue
+            yield window_start, window_end
 
 
 def _scan_paths(text: str, policy: Policy) -> list[Finding]:

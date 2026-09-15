@@ -256,13 +256,41 @@ def test_a_denied_path_finding_does_not_carry_the_path(tmp_path):
     [
         ("a/b", ["a/b"]),
         ("read deploy/secrets/x.yaml now", ["deploy/secrets/x.yaml"]),
-        (r"C:\Users\m\.ssh\id_rsa", [r"\Users\m\.ssh\id_rsa"]),
+        # The whole token, drive letter included: expanding outwards from the
+        # separator stopped at the colon and reported a path nobody typed.
+        (r"C:\Users\m\.ssh\id_rsa", [r"C:\Users\m\.ssh\id_rsa"]),
         ("trailing/ separator", []),
         ("no separators at all", []),
+        ("please read '~/.ssh/id_rsa'", ["~/.ssh/id_rsa"]),
+        ("%APPDATA%\\ai-gauge\\profiles", ["%APPDATA%\\ai-gauge\\profiles"]),
+        # Sentence punctuation is not a path character, so a file named in
+        # prose is not a path handed to an agent.
+        ("stored in %APPDATA%/ai-gauge/secrets.dat, encrypted", []),
     ],
 )
 def test_path_spans_still_find_what_the_pattern_found(text, expected):
     assert [text[a:b] for a, b in eg._path_like_spans(text)] == expected
+
+
+@pytest.mark.parametrize("pad", [0, 1, 100, 200, 239, 240, 245, 250, 251, 255, 300, 600, 5000])
+def test_no_padding_width_hides_a_denied_path(pad):
+    """The 256-character window dropped a denied path in a deterministic band:
+    `/<240..250 a's>/.aws/credentials` passed the deny list, and `/home/<247..250
+    a's>/.env` with it, because the window ceiling fell between the two segments
+    the glob needs."""
+    for text in (
+        "/" + "a" * pad + "/.aws/credentials",
+        "/home/" + "a" * pad + "/.env",
+        "/home/" + "a" * pad + "/.ssh/id_rsa",
+    ):
+        assert eg._scan_paths(text, policy()), f"pad={pad} {text[:20]}... passed the deny list"
+
+
+def test_a_token_longer_than_any_path_is_still_scanned():
+    """A payload with no whitespace in it is one token; windowing it is what
+    keeps the path at the end of it from being skipped as too long."""
+    assert eg._scan_paths("x/" * 6000 + "/home/u/.aws/credentials", policy())
+    assert eg._scan_paths("x/" * 6000 + "deploy/secrets/prod.yaml", policy())
 
 
 def test_a_long_separator_free_run_scans_quickly():
