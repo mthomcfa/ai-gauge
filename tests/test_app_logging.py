@@ -1460,7 +1460,14 @@ def test_the_startup_drain_line_is_bounded_by_a_hostile_config(monkeypatch, capl
     )
     app = _app({})
     app._config = RealConfig(pending_profile_purges=hostile)  # noqa: SLF001
-    assert len(app._config.pending_profile_purges) == 5000  # noqa: SLF001
+    # The validator now drops the 200 000-character entry and caps the list,
+    # which is defence in depth ahead of this line rather than instead of it:
+    # what survives is still config-controlled, and the traversal payloads
+    # are still in it.
+    kept = app._config.pending_profile_purges  # noqa: SLF001
+    assert len(kept) == 64
+    assert "../../OUTSIDE" in kept and "%2e%2e%2fx" in kept
+    assert "a" * 200_000 not in kept
     outside = app_data_dir().parent / "treasure.txt"
     outside.write_text("decoy")
 
@@ -1474,7 +1481,7 @@ def test_the_startup_drain_line_is_bounded_by_a_hostile_config(monkeypatch, capl
         for rec in caplog.records
         if rec.getMessage().startswith("profile purge owed")
     )
-    assert "count=5000" in opening
+    assert "count=64" in opening
     assert len(opening) < 500, "the whole list reached the log"
     refusals = [
         rec.getMessage()

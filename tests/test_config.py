@@ -1,4 +1,5 @@
 import json
+import logging
 
 import pytest
 from pydantic import ValidationError
@@ -29,9 +30,59 @@ def test_browser_account_rejects_unsafe_ids(bad_id):
         BrowserAccount(id=bad_id, kind="claude")
 
 
-@pytest.mark.parametrize("good_id", ["claude", "codex", "opencode_go", "claude-ab12cd34"])
+@pytest.mark.parametrize("bad_id", ["copilot", "openrouter", "opencode_go", "azure"])
+def test_browser_account_rejects_another_providers_key(bad_id):
+    """`App._build_providers` keys one dict on both, so an account carrying
+    one of these ids owns that provider's entry in `_providers`, its
+    snapshot, its tile and its place in the refresh queue - one account's
+    numbers under another provider's name. `claude` and `codex` are not on
+    the list: they are the two fixed browser accounts, and those ids are
+    theirs."""
+    with pytest.raises(ValidationError):
+        BrowserAccount(id=bad_id, kind="claude")
+
+
+@pytest.mark.parametrize("good_id", ["claude", "codex", "claude-ab12cd34"])
 def test_browser_account_accepts_generated_ids(good_id):
     assert BrowserAccount(id=good_id, kind="claude").id == good_id
+
+
+def test_a_config_naming_a_provider_as_an_account_still_loads(caplog):
+    """`Config.load()` coerces rather than raises. One bad account must cost
+    the user that account, not their whole settings file - the id is dropped
+    in the migration, before validation can raise out of the blanket
+    except."""
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        json.dumps(
+            {
+                "active_refresh_interval_minutes": 7,
+                "browser_accounts": [
+                    {"id": "claude", "kind": "claude"},
+                    {"id": "copilot", "kind": "claude", "name": "Sneaky"},
+                    {"id": "x" * 500_000, "kind": "claude"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="aigauge.config"):
+        loaded = Config.load()
+
+    assert loaded.active_refresh_interval_minutes == 7, (
+        "the whole config was discarded"
+    )
+    assert [account.id for account in loaded.browser_accounts] == ["claude", "codex"]
+    dropped = [
+        record.getMessage()
+        for record in caplog.records
+        if "dropping browser account" in record.getMessage()
+    ]
+    assert len(dropped) == 2
+    assert max(len(message) for message in dropped) < 200, (
+        "a 500 000-character id reached the log"
+    )
 
 
 @pytest.mark.parametrize("bad_id", ["../../evil", "a/b", "..", "foo/bar"])
@@ -679,3 +730,27 @@ def test_the_pending_purge_list_survives_a_round_trip_through_the_file():
     )
 
     assert Config.load().pending_profile_purges == ["claude-ab12cd34"]
+
+
+def test_the_pending_purge_list_is_bounded_in_length_and_in_entries():
+    """A delete list read at every start, from a file this module treats as
+    hostile everywhere else. `purge_profile` is still the defence that
+    matters - it refuses anything that does not resolve strictly inside
+    `profiles/` - but a poisoned file carrying 5 000 ids of 200 000
+    characters should not reach it, or the line that announces the drain, at
+    all. The length bound is `_PROFILE_ID_RE`'s own, so nothing the app can
+    generate is lost.
+    """
+    from aigauge.config import _PENDING_PURGE_LIMIT, _PROFILE_ID_MAX_LEN
+
+    long_id = "a" * (_PROFILE_ID_MAX_LEN + 1)
+    kept = Config(
+        pending_profile_purges=["claude-ab12cd34", long_id, "b" * _PROFILE_ID_MAX_LEN]
+    ).pending_profile_purges
+    assert kept == ["claude-ab12cd34", "b" * _PROFILE_ID_MAX_LEN]
+
+    many = Config(
+        pending_profile_purges=[f"codex-{index:08d}" for index in range(5_000)]
+    ).pending_profile_purges
+    assert len(many) == _PENDING_PURGE_LIMIT
+    assert many[0] == "codex-00000000", "the cap took the wrong end of the list"

@@ -79,7 +79,22 @@ def app_data_dir() -> Path:
 # Restrict them to the shape our own generators produce (slugs, hex suffixes,
 # and the fixed provider ids like ``opencode_go``) so a poisoned config.json
 # can never turn an id into a path-traversal payload.
-_PROFILE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_PROFILE_ID_MAX_LEN = 64
+_PROFILE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,%d}" % _PROFILE_ID_MAX_LEN)
+
+# The provider keys ``App._build_providers`` creates that are NOT browser
+# accounts. A ``BrowserAccount`` carrying one of these collides with it in
+# ``_providers``, ``_snapshots`` and the tile map - one account's numbers
+# under another provider's name, and a ``profiles/`` directory named after a
+# provider that has no profile. ``claude`` and ``codex`` are deliberately
+# absent: they are the two fixed browser accounts and those ids are theirs.
+_RESERVED_PROVIDER_IDS = frozenset({"copilot", "openrouter", "opencode_go", "azure"})
+
+# How many deferred purges a config file may carry. The app defers one per
+# removed account and drains the list at the next start, so a real one holds
+# a handful; the cap is what stops a poisoned file from walking 5 000 ids
+# through `purge_profile` and the log line that announces them.
+_PENDING_PURGE_LIMIT = 64
 
 # Windows treats these as device names regardless of any extension, so a
 # profiles/<id> path built from one would target the device, not a directory.
@@ -96,6 +111,11 @@ def _is_safe_profile_id(provider: str) -> bool:
     if not provider or _PROFILE_ID_RE.fullmatch(provider) is None:
         return False
     return provider.split(".", 1)[0].lower() not in _WIN_RESERVED_NAMES
+
+
+def _is_valid_account_id(account_id: str) -> bool:
+    """Safe as a path component *and* not the name of another provider."""
+    return _is_safe_profile_id(account_id) and account_id not in _RESERVED_PROVIDER_IDS
 
 
 def webview_profile_dir(provider: str) -> Path:
@@ -367,7 +387,10 @@ class BrowserAccount(BaseModel):
         # The id is used verbatim as a profiles/ path component and as a
         # keyring/secret name; keep it to the generated slug-<hex> / fixed-id
         # shape so it can never carry a path-traversal or separator payload.
-        if not _is_safe_profile_id(value):
+        # It must also not be the key of a provider that is not a browser
+        # account - see _RESERVED_PROVIDER_IDS - because `_build_providers`
+        # keys one dict on both.
+        if not _is_valid_account_id(value):
             raise ValueError(f"unsafe browser account id: {value!r}")
         return value
 
@@ -694,7 +717,18 @@ class Config(BaseModel):
     def _coerce_pending_purges(cls, value: object) -> list[str]:
         if not isinstance(value, list):
             return []
-        return [item for item in value if isinstance(item, str) and item]
+        # Defence in depth, and a bound on the line the startup drain logs.
+        # Path safety stays downstream in `_is_safe_profile_id` /
+        # `purge_profile`, which is what actually refuses a traversal
+        # payload; this is what stops a poisoned file carrying 5 000 ids of
+        # 200 000 characters from reaching either. The length bound is
+        # `_PROFILE_ID_RE`'s own, so no id the app can generate is lost.
+        kept = [
+            item
+            for item in value
+            if isinstance(item, str) and 1 <= len(item) <= _PROFILE_ID_MAX_LEN
+        ]
+        return kept[:_PENDING_PURGE_LIMIT]
 
     @field_validator("meter_catalog_last_scan", mode="before")
     @classmethod
@@ -815,15 +849,24 @@ class Config(BaseModel):
             accounts = [
                 item for item in data["browser_accounts"] if isinstance(item, dict)
             ]
-            # Drop entries whose id can't be a safe profiles/ path component
-            # before validation runs. Otherwise one poisoned id would raise out
-            # of Config.load()'s blanket except and discard the entire config;
+            # Drop entries whose id can't be a safe profiles/ path component,
+            # or that would collide with a non-browser provider key, before
+            # validation runs. Otherwise one poisoned id would raise out of
+            # Config.load()'s blanket except and discard the entire config;
             # dropping just the bad account preserves everything else.
-            accounts = [
-                item
-                for item in accounts
-                if _is_safe_profile_id(str(item.get("id") or ""))
-            ]
+            kept = []
+            for item in accounts:
+                account_id = str(item.get("id") or "")
+                if _is_valid_account_id(account_id):
+                    kept.append(item)
+                    continue
+                # Bounded: the id is config-controlled, and if it failed the
+                # regex it was never bounded by it either.
+                log.warning(
+                    "config: dropping browser account with an unusable id (%s)",
+                    _safe_repr(account_id, limit=_PROFILE_ID_MAX_LEN),
+                )
+            accounts = kept
             ids = {str(item.get("id") or "") for item in accounts}
             if "claude" not in ids:
                 accounts.insert(
