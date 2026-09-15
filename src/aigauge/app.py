@@ -45,6 +45,7 @@ from .providers.azure import AzureProvider
 from .providers.copilot import CopilotProvider
 from .providers.openrouter import OpenRouterProvider
 from .providers.opencode_go import OpenCodeGoProvider, usage_url as opencode_go_usage_url
+from .providers._scrape_runner import account_is_busy
 from .ratio import RatioStore, sessions_per_week
 from .ratio_dialog import RatioHistoryDialog
 from .settings_dialog import SettingsDialog
@@ -486,6 +487,10 @@ class App(QObject):
         # Accounts the user removed whose on-disk profile is waiting for a
         # live scrape to let go of it. See _run_profile_purges.
         self._pending_profile_purges: list[str] = []
+        # The same wait for "Clear all browser data", kept apart because
+        # these ids belong to accounts the user still has. See
+        # _on_browser_data_clear_requested.
+        self._pending_data_clears: list[str] = []
         # The names this cycle is accounting for. A snapshot from outside it
         # repaints its tile without joining its progress or its verdict.
         self._cycle_names: set[str] = set()
@@ -663,7 +668,7 @@ class App(QObject):
         # A profile whose scrape was abandoned is only released when that
         # worker reports back or its ceiling passes; the heartbeat is what
         # notices the second of those.
-        if self._pending_profile_purges:
+        if self._pending_profile_purges or self._pending_data_clears:
             self._run_profile_purges()
 
     def _recover_dead_timer(self) -> None:
@@ -1340,8 +1345,91 @@ class App(QObject):
         except Exception:  # noqa: BLE001 - cleanup must not crash the app
             log.exception("failed to record the pending profile purges")
 
+    def _on_browser_data_clear_requested(self, account_ids) -> None:
+        """Run the profile half of Settings' "Clear all browser data".
+
+        The dialog still clears the stored cookies at the click: that is a
+        keyring write, nothing holds it open, and it is the part that
+        matters. Deleting the on-disk QtWebEngine profile is the App's job
+        for the same reason a removed account's is - `purge_profile` calls
+        `deleteLater()` on the cached `QWebEngineProfile` and then rmtree's
+        its directory, and Qt requires a profile to outlive its pages. The
+        dialog is modeless and a cycle runs every five minutes, so a live
+        scrape during that click is ordinary rather than exotic, and doing
+        it synchronously from the dialog was the most reachable way to
+        produce a destroyed page under a live one.
+
+        These ids are kept apart from `pending_profile_purges` because they
+        are accounts the user still has. That list is persisted and its
+        drain skips a configured account by design
+        (`purge skipped ... reason=reconfigured`), which is right for a
+        removal that a restored backup has undone and wrong for this: a
+        deferred clear would be dropped at the next start. This list is in
+        memory only, so if the app quits while one is deferred the profile
+        survives and the user can click the button again - the honest cost
+        of not writing "delete a live account's profile" into a file that
+        outlives the click.
+        """
+        for account_id in account_ids:
+            if not isinstance(account_id, str) or not account_id:
+                continue
+            if account_id not in self._pending_data_clears:
+                self._pending_data_clears.append(account_id)
+        log.info(
+            "browser data clear requested count=%s accounts=%s",
+            len(self._pending_data_clears),
+            _ids_for_log(self._pending_data_clears),
+        )
+        self._run_profile_purges()
+
+    def _purge_blocked_reason(self, account_id: str) -> str | None:
+        """Why this profile cannot be deleted yet, or None.
+
+        `_inflight` and `_abandoned` are what the App knows: a dispatch it
+        has not seen the end of. `account_is_busy` is what the *runner*
+        knows, and it is the only one of the three that can still answer yes
+        once the App has given up on a dispatch or never made one - it is
+        module state keyed by account, so it survives the `_build_providers`
+        every settings save runs. Neither purge path consulted it.
+        """
+        if account_id in self._inflight or self._is_abandoned(account_id):
+            return "refresh_in_flight"
+        if account_is_busy(account_id):
+            return "scrape_in_flight"
+        return None
+
+    def _purge_or_defer(self, account_ids: list[str], *, persisted: bool) -> list[str]:
+        """Purge what is free; return what is still waiting."""
+        waiting: list[str] = []
+        for account_id in account_ids:
+            blocked = self._purge_blocked_reason(account_id)
+            if blocked is not None:
+                if persisted:
+                    log.info(
+                        "profile purge deferred account=%s reason=%s",
+                        _clip_for_log(account_id),
+                        blocked,
+                    )
+                else:
+                    # Said out loud because this one is not written down: a
+                    # quit inside the window loses it, and clicking the
+                    # button again is the whole recovery.
+                    log.info(
+                        "browser data clear deferred account=%s reason=%s "
+                        "recorded=no",
+                        _clip_for_log(account_id),
+                        blocked,
+                    )
+                waiting.append(account_id)
+                continue
+            try:
+                purge_profile(account_id)
+            except Exception:  # noqa: BLE001 - cleanup must not crash the app
+                log.exception("failed to purge profile for %s", account_id)
+        return waiting
+
     def _run_profile_purges(self) -> None:
-        """Delete a removed account's profile, once nothing is still using it.
+        """Delete a profile the app is finished with, once nothing is using it.
 
         `purge_profile` calls `deleteLater()` on the cached
         `QWebEngineProfile` and then rmtree's its directory. A settings save
@@ -1352,24 +1440,22 @@ class App(QObject):
         cookies back into the directory that was just deleted, which puts a
         removed account's live credential back on disk.
 
+        Two lists, one test. `_pending_profile_purges` is the removals: it is
+        persisted, so a quit cannot lose it. `_pending_data_clears` is
+        "Clear all browser data", which is about accounts the user still has
+        and is therefore in memory only - see
+        `_on_browser_data_clear_requested`.
+
         The keyring secret is cleared immediately by the dialog either way;
         this is only the on-disk profile, and deferring it costs nothing.
         """
-        waiting: list[str] = []
-        for account_id in self._pending_profile_purges:
-            if account_id in self._inflight or self._is_abandoned(account_id):
-                log.info(
-                    "profile purge deferred account=%s reason=refresh_in_flight",
-                    account_id,
-                )
-                waiting.append(account_id)
-                continue
-            try:
-                purge_profile(account_id)
-            except Exception:  # noqa: BLE001 - cleanup must not crash the app
-                log.exception("failed to purge profile for %s", account_id)
-        self._pending_profile_purges = waiting
+        self._pending_profile_purges = self._purge_or_defer(
+            self._pending_profile_purges, persisted=True
+        )
         self._persist_pending_profile_purges()
+        self._pending_data_clears = self._purge_or_defer(
+            self._pending_data_clears, persisted=False
+        )
 
     def _pool_wait_slack(self, name: str) -> float:
         """How long this dispatch may sit in the thread pool before it starts.
@@ -2145,6 +2231,12 @@ class App(QObject):
         # The dialog has already cleared the scan timestamps; refresh so the
         # scan happens now rather than at the next scheduled cycle.
         dlg.rescan_meters_clicked.connect(lambda: self.refresh_now(manual=True))
+        # The dialog clears the stored cookies itself; the on-disk profiles
+        # are the App's, because only it knows whether a scrape of one is
+        # still holding the directory. See _on_browser_data_clear_requested.
+        dlg.browser_data_clear_requested.connect(
+            self._on_browser_data_clear_requested
+        )
         dlg.finished.connect(
             lambda result, dialog=dlg, old_quota=old_copilot_quota, old_budget=old_openrouter_budget: (
                 self._on_settings_finished(dialog, result, old_quota, old_budget)

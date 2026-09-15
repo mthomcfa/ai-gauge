@@ -186,6 +186,7 @@ def _build_app(clock: _Clock, providers: dict, config: Config) -> App:
     app._abandoned = {}  # noqa: SLF001
     app._pool_wait_budgets = {}  # noqa: SLF001
     app._pending_profile_purges = []  # noqa: SLF001
+    app._pending_data_clears = []  # noqa: SLF001
     app._dispatching = False  # noqa: SLF001
     app._next_refresh_reason = "startup"  # noqa: SLF001
     app._started_at = clock.now()  # noqa: SLF001

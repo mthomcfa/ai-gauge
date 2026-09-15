@@ -60,7 +60,6 @@ from .config import (
 )
 from .error_dialog import reveal_path
 from .logging_setup import log_path
-from .webview.profile import purge_profile
 from .providers.catalog import clear_scans
 from .providers.claude import CLAUDE_USAGE_URL
 from .providers.codex import CODEX_USAGE_URL
@@ -526,6 +525,13 @@ class SettingsDialog(QDialog):
     sign_in_clicked = pyqtSignal(str)  # provider name
     paste_cookie_clicked = pyqtSignal(str)  # provider name
     rescan_meters_clicked = pyqtSignal()
+    # Every profile id "Clear all browser data" is about, handed to the App
+    # to delete. The dialog cannot do it itself: `purge_profile` releases the
+    # cached `QWebEngineProfile` and rmtree's its directory, Qt requires a
+    # profile to outlive its pages, and only the App knows whether a scrape
+    # of that account is still holding one. See
+    # App._on_browser_data_clear_requested.
+    browser_data_clear_requested = pyqtSignal(list)
 
     def __init__(self, config: Config, parent=None):
         # Don't pass parent — avoids any cascading stylesheet issues.
@@ -1299,12 +1305,30 @@ class SettingsDialog(QDialog):
             return []
 
     def _clear_all_browser_data(self) -> None:
+        """Clear the stored cookies here; hand the profiles to the App.
+
+        The credential is a keyring entry, nothing holds it open, and it is
+        the part that matters - so it goes at the click, for every id. The
+        on-disk QtWebEngine profile is a different thing: `purge_profile`
+        calls `deleteLater()` on the cached `QWebEngineProfile` and then
+        rmtree's its directory, and Qt requires a profile to outlive its
+        pages. This dialog is modeless and a refresh cycle runs every five
+        minutes, so a live scrape while the button is clicked is ordinary,
+        and deleting a profile under a live `QuietWebEnginePage` is a
+        use-after-free - the most reachable route to the destroyed page that
+        used to strand the live-scrape guard for the life of the process.
+        Only the App knows whether a scrape of an account is still out, so
+        the ids go to it and it deletes each one as soon as that account is
+        free.
+        """
         answer = QMessageBox.question(
             self,
             "Clear all browser data",
             "Delete every account's saved cookie and embedded-browser profile?\n\n"
             "You will need to sign in again for each provider. This cannot be "
-            "undone.",
+            "undone.\n\n"
+            "A profile that is being refreshed right now is deleted as soon "
+            "as that refresh finishes.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -1313,18 +1337,22 @@ class SettingsDialog(QDialog):
         account_ids = {account.id for account in self._current_browser_accounts()}
         account_ids |= {account.id for account in self._config.browser_accounts}
         account_ids |= {"claude", "codex", "opencode_go"}
+        # Ids on disk that are not accounts go the same way: they are exactly
+        # the leftovers this button exists to sweep up.
         account_ids |= set(self._profile_ids_on_disk())
         for account_id in sorted(account_ids):
             try:
                 set_provider_cookie(account_id, None)
-                purge_profile(account_id)
             except Exception:  # noqa: BLE001 - clear as much as possible
-                log.exception("failed to clear browser data for %s", account_id)
+                log.exception("failed to clear the stored cookie for %s", account_id)
+        self.browser_data_clear_requested.emit(sorted(account_ids))
         QMessageBox.information(
             self,
             "Browser data cleared",
-            "Saved cookies and browser profiles were deleted. Sign in again to "
-            "resume monitoring.",
+            "Saved cookies were deleted and the browser profiles are being "
+            "removed; one that is being refreshed right now is removed as "
+            "soon as that refresh finishes. Sign in again to resume "
+            "monitoring.",
         )
 
     def _rescan_meters(self) -> None:

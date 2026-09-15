@@ -485,3 +485,61 @@ def test_a_foundry_project_child_id_can_be_pinned(qtbot, monkeypatch):
     dialog.azure_foundry_ids.setPlainText(child)
     dialog.apply_to(config)
     assert config.azure.foundry_resource_ids == [child]
+
+
+def test_clear_all_browser_data_hands_the_profiles_to_the_app(qtbot, monkeypatch):
+    """The dialog clears the credentials and deletes no directory.
+
+    `purge_profile` releases the cached `QWebEngineProfile` and rmtree's its
+    directory; Qt requires a profile to outlive its pages, and this dialog is
+    modeless with a refresh cycle running every five minutes, so doing it
+    here is the most reachable way to destroy a profile under a live page.
+    The id set is the whole sweep - the accounts in the dialog, the accounts
+    in the config, the three fixed ids and every directory on disk - because
+    the leftovers are what the button is for.
+    """
+    from aigauge.config import BrowserAccount, app_data_dir
+
+    monkeypatch.setattr(
+        settings_dialog.QMessageBox,
+        "question",
+        lambda *a, **k: settings_dialog.QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(settings_dialog.QMessageBox, "information", lambda *a, **k: None)
+    cleared: list[str] = []
+    monkeypatch.setattr(
+        settings_dialog,
+        "set_provider_cookie",
+        lambda account_id, value: cleared.append(account_id),
+    )
+    orphan = app_data_dir() / "profiles" / "claude-deadbeef"
+    orphan.mkdir(parents=True)
+
+    config = Config()
+    config.browser_accounts.append(BrowserAccount(id="codex-12345678", kind="codex"))
+    dialog = SettingsDialog(config)
+    qtbot.addWidget(dialog)
+
+    with qtbot.waitSignal(dialog.browser_data_clear_requested) as signal:
+        _button(dialog, "clear_browser_data_btn").click()
+
+    ids = signal.args[0]
+    assert {"claude", "codex", "opencode_go"} <= set(ids), "a fixed id was missed"
+    assert "codex-12345678" in ids, "a configured account was missed"
+    assert "claude-deadbeef" in ids, "a profile on disk was missed"
+    # Every id whose profile is going is logged out of the credential store
+    # at the click: that is a keyring write, nothing holds it open, and it is
+    # the part that matters.
+    assert sorted(cleared) == sorted(ids)
+    assert orphan.is_dir(), "the dialog deleted a profile directory itself"
+
+
+def test_the_settings_dialog_no_longer_deletes_profiles_itself():
+    """Pinned as an import, because a future `from .webview.profile import
+    purge_profile` here would silently restore the hazard."""
+    import inspect
+
+    source = inspect.getsource(settings_dialog)
+    assert "purge_profile(" not in source, (
+        "the settings dialog is deleting QtWebEngine profiles again"
+    )

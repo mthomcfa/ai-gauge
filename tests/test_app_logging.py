@@ -204,6 +204,7 @@ def _app(providers: dict[str, _Provider]) -> App:
     app._abandoned = {}  # noqa: SLF001
     app._pool_wait_budgets = {}  # noqa: SLF001
     app._pending_profile_purges = []  # noqa: SLF001
+    app._pending_data_clears = []  # noqa: SLF001
     app._dispatching = False  # noqa: SLF001
     app._next_refresh_reason = "startup"  # noqa: SLF001
     app._active_until = datetime.now() + timedelta(minutes=30)  # noqa: SLF001
@@ -1773,3 +1774,73 @@ def test_a_retry_wake_still_runs_the_providers_that_are_not_parked():
     assert copilot.calls == copilot_calls + 1, "the runnable provider was skipped"
     assert claude.calls == claude_calls, "the parked one was dispatched"
     assert app._error_retry["claude"][1] is not None, "its due was spent anyway"  # noqa: SLF001
+
+
+def test_clear_all_browser_data_waits_for_the_account_that_is_scraping(
+    monkeypatch, caplog
+):
+    """The one profile a live scrape is holding is deleted last, not first.
+
+    `purge_profile` is `deleteLater()` on the cached `QWebEngineProfile` and
+    then `rmtree`; Qt requires a profile to outlive its pages. The settings
+    dialog is modeless and a cycle runs every five minutes, so the click
+    landing on a live scrape is ordinary - and it is the same hazard
+    `_run_profile_purges` already exists to avoid for the removal path.
+    """
+    from aigauge.config import Config as RealConfig
+
+    purged: list[str] = []
+    monkeypatch.setattr(app_module, "purge_profile", purged.append)
+    claude = _BrowserProvider(_ok("claude"), hold=True)
+    app = _app({"claude": claude})
+    app._config = RealConfig()  # noqa: SLF001
+    app.refresh_now(manual=False)
+    assert app._inflight == {"claude"}  # noqa: SLF001
+
+    with caplog.at_level(logging.INFO, logger="aigauge.app"):
+        app._on_browser_data_clear_requested(  # noqa: SLF001
+            ["claude", "codex", "opencode_go", "claude-deadbeef"]
+        )
+
+    assert purged == ["codex", "opencode_go", "claude-deadbeef"], (
+        "a profile was deleted under a live page, or a free one was not"
+    )
+    assert "browser data clear deferred account=claude" in caplog.text
+    assert "recorded=no" in caplog.text, "the deferral did not say it is not stored"
+    # Never on the persisted list: its drain skips a configured account by
+    # design, so a deferred clear would be dropped at the next start.
+    assert app._pending_profile_purges == []  # noqa: SLF001
+    assert RealConfig.load().pending_profile_purges == []
+    assert app._pending_data_clears == ["claude"]  # noqa: SLF001
+
+    claude.pending(_ok("claude"))
+
+    assert purged[-1] == "claude", "the deferred clear never ran"
+    assert app._pending_data_clears == []  # noqa: SLF001
+
+
+def test_a_purge_waits_for_the_runners_own_live_scrape_guard(monkeypatch, caplog):
+    """`account_is_busy` is the only signal that knows about a scrape the App
+    is not waiting on - one whose dispatch it gave up on, or one a rebuilt
+    provider started. It is module state keyed by account, so it survives the
+    `_build_providers` every settings save runs. Neither purge path consulted
+    it."""
+    from aigauge.providers import _scrape_runner as runner_module
+
+    purged: list[str] = []
+    monkeypatch.setattr(app_module, "purge_profile", purged.append)
+    app = _app({})
+    runner_module._mark_account_busy("claude", 240.0)  # noqa: SLF001
+
+    with caplog.at_level(logging.INFO, logger="aigauge.app"):
+        app._purge_removed_profiles(["claude"])  # noqa: SLF001
+        app._on_browser_data_clear_requested(["codex"])  # noqa: SLF001
+
+    assert purged == ["codex"], "a profile was deleted under a live scraper"
+    assert "profile purge deferred account=claude reason=scrape_in_flight" in caplog.text
+    assert app._pending_profile_purges == ["claude"]  # noqa: SLF001
+
+    runner_module._release_account("claude")  # noqa: SLF001
+    app._run_profile_purges()  # noqa: SLF001
+
+    assert purged == ["codex", "claude"]
