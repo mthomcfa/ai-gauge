@@ -101,6 +101,9 @@ def _refresh_app_stub() -> App:
     app._cycle_started_at = None  # noqa: SLF001
     app._cycle_reason = "startup"  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
+    app._watchdogs = {}  # noqa: SLF001
+    app._pending_manual_refresh = False  # noqa: SLF001
+    app._pending_manual_providers = []  # noqa: SLF001
     app._next_refresh_reason = "startup"  # noqa: SLF001
     app._widget = _Widget()  # noqa: SLF001
     app._start_next_refresh = lambda: None  # noqa: SLF001
@@ -791,6 +794,7 @@ def test_the_snapshot_error_log_line_redacts_azure_identifiers(qapp, caplog):
     app._cycle_statuses = {}  # noqa: SLF001
     app._cycle_active = False  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
+    app._watchdogs = {}  # noqa: SLF001
     app._inflight = set()  # noqa: SLF001
     app._providers = {"azure": object()}  # noqa: SLF001
     app._config = Config()  # noqa: SLF001
@@ -832,6 +836,7 @@ def _mid_cycle_app(widget) -> App:
     app._cycle_active = True  # noqa: SLF001
     app._cycle_started_at = None  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
+    app._watchdogs = {}  # noqa: SLF001
     app._inflight = {"claude"}  # noqa: SLF001
     app._refresh_queue = ["codex"]  # noqa: SLF001
     app._providers = {"claude": object(), "codex": object()}  # noqa: SLF001
@@ -902,6 +907,7 @@ def test_a_snapshot_for_a_provider_the_user_removed_is_dropped(qapp):
     app._cycle_statuses = {}  # noqa: SLF001
     app._cycle_active = False  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
+    app._watchdogs = {}  # noqa: SLF001
     app._inflight = {"opencode_go"}  # noqa: SLF001
     app._refresh_queue = []  # noqa: SLF001
     app._providers = {"claude": object()}  # noqa: SLF001
@@ -921,14 +927,45 @@ def test_a_snapshot_for_a_provider_the_user_removed_is_dropped(qapp):
     assert app._inflight == set()  # noqa: SLF001
 
 
-def test_a_provider_that_raises_out_of_refresh_is_redacted_too(qapp):
+class _RecordingTimer:
+    """QTimer stand-in for tests that walk the dispatch path.
+
+    _start_next_refresh arms a per-provider watchdog, and a real QTimer needs
+    a constructed QObject parent - which App.__new__(App) deliberately is not.
+    """
+
+    def __init__(self, parent=None):
+        self.timeout = self
+
+    def connect(self, callback):
+        pass
+
+    def setSingleShot(self, value):
+        pass
+
+    def start(self, ms=None):
+        pass
+
+    def stop(self):
+        pass
+
+    @staticmethod
+    def singleShot(ms, callback):
+        callback()
+
+
+def test_a_provider_that_raises_out_of_refresh_is_redacted_too(qapp, monkeypatch):
     """refresh() raising is turned into an ERROR snapshot here, and that
     string reaches the tile, the tray tooltip and the dialog header - none of
     which redact. The other exit from this method already redacts."""
     from types import SimpleNamespace as _NS
 
+    import aigauge.app as app_module
+
+    monkeypatch.setattr(app_module, "QTimer", _RecordingTimer)
     app = App.__new__(App)
     app._inflight = set()  # noqa: SLF001
+    app._watchdogs = {}  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
     app._cycle_started_at = None  # noqa: SLF001
     sub = "11111111-2222-3333-4444-555555555555"

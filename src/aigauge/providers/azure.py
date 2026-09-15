@@ -1901,6 +1901,10 @@ def _exception_summary(exc: BaseException) -> str:
 class AzureProvider(Provider):
     name = "azure"
     display_name = "Microsoft · Azure"
+    # A fetch bounds itself with REFRESH_DEADLINE_SECONDS; the App-level
+    # watchdog reads the same number so it can never fire inside a refresh
+    # that is still legitimately running.
+    refresh_budget_seconds = REFRESH_DEADLINE_SECONDS
 
     def __init__(self, config: Config, pool=None):
         self._config = config

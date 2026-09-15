@@ -66,6 +66,29 @@ _ERROR_RETRY_MINUTES = 1
 _ERROR_FAST_RETRY_CYCLES = 3
 _HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000
 _LOG_VALUE_LIMIT = 300
+# How long a provider may hold a refresh before the App declares it lost.
+# Browser providers name their own bound (the scraper timeout times the
+# attempts it may make); a REST provider is a handful of HTTPS calls with
+# request timeouts of their own, so it gets a flat ceiling.
+_REST_REFRESH_BUDGET_SECONDS = 60.0
+# Enough slack that a provider finishing right at its own bound reports
+# normally rather than racing the watchdog.
+_WATCHDOG_SLACK_SECONDS = 20.0
+
+
+def _refresh_budget_seconds(provider) -> float:
+    """The watchdog budget for one provider, taken from the provider itself.
+
+    Reading it off the provider keeps the App's deadline from drifting away
+    from the bound the provider actually enforces - a watchdog that fires
+    inside a refresh that is still legitimately running would manufacture
+    failures rather than catch them.
+    """
+    try:
+        budget = float(getattr(provider, "refresh_budget_seconds", 0) or 0)
+    except (TypeError, ValueError):
+        budget = 0.0
+    return budget if budget > 0 else _REST_REFRESH_BUDGET_SECONDS
 
 
 def _make_dot_tray_icon(color: str | None = None) -> QIcon:
@@ -298,6 +321,8 @@ class App(QObject):
         self._active_until = datetime.now() + timedelta(minutes=_ACTIVE_MODE_MINUTES)
         self._current_refresh_manual = False
         self._pending_manual_refresh = False
+        self._pending_manual_providers: list[str] = []
+        self._watchdogs: dict[str, QTimer] = {}
         self._cycle_active = False
         self._cycle_started_at: float | None = None
         self._cycle_reason = "startup"
@@ -468,6 +493,26 @@ class App(QObject):
 
     def _log_heartbeat(self) -> None:
         self._log_lifecycle_event("heartbeat")
+        self._recover_dead_timer()
+
+    def _recover_dead_timer(self) -> None:
+        """Restart a scheduler that stopped scheduling.
+
+        `_schedule_next_refresh` returns without starting the timer while
+        anything is in flight, so any path that loses a cycle leaves the app
+        with no timer at all: refreshes stop, the header freezes, and only a
+        restart fixes it. The heartbeat is the one timer still running, so it
+        is what notices.
+        """
+        if self._inflight or self._refresh_queue or self._cycle_active:
+            return
+        try:
+            if self._timer.isActive():
+                return
+        except RuntimeError:
+            return
+        log.warning("refresh timer was not running; rescheduling")
+        self._schedule_next_refresh()
 
     def _log_about_to_quit(self) -> None:
         self._log_lifecycle_event("qt aboutToQuit")
@@ -699,6 +744,21 @@ class App(QObject):
         if not self._providers:
             return
         if self._inflight or self._refresh_queue:
+            if manual:
+                # The widget's Refresh button is disabled for the whole cycle,
+                # so the reachable path is the tray menu's "Refresh now" - and
+                # it silently did nothing, at exactly the moment a tile looks
+                # stale, which is usually mid-cycle. Settings-save went the
+                # same way: apply, then a refresh_now that no-opped.
+                self._pending_manual_refresh = True
+                log.info(
+                    "refresh_now queued inflight=%s queue=%s",
+                    ",".join(sorted(self._inflight)) or "-",
+                    ",".join(self._refresh_queue) or "-",
+                )
+                return
+            # A *scheduled* wake landing inside a cycle needs no queueing:
+            # the cycle it landed in already covers every provider.
             log.info(
                 "refresh_now ignored inflight=%s queue=%s",
                 ",".join(sorted(self._inflight)) or "-",
@@ -715,14 +775,37 @@ class App(QObject):
         if provider not in self._providers:
             return
         if self._inflight or self._refresh_queue:
+            if provider not in self._pending_manual_providers:
+                self._pending_manual_providers.append(provider)
             log.info(
-                "refresh_provider ignored provider=%s inflight=%s queue=%s",
+                "refresh_provider queued provider=%s inflight=%s queue=%s",
                 provider,
                 ",".join(sorted(self._inflight)) or "-",
                 ",".join(self._refresh_queue) or "-",
             )
             return
         self._begin_cycle([provider], manual=True, reason="manual")
+
+    def _ordered(self, names) -> list[str]:
+        """The configured providers in ``names``, in canonical queue order."""
+        wanted = set(names)
+        return [
+            name
+            for name in _refresh_provider_order(self._providers)
+            if name in wanted
+        ]
+
+    def _run_pending_manual(self) -> None:
+        full = self._pending_manual_refresh
+        names = self._ordered(self._pending_manual_providers)
+        self._pending_manual_refresh = False
+        self._pending_manual_providers = []
+        if full:
+            log.info("refresh pending manual running scope=all")
+            self.refresh_now(manual=True)
+        elif names:
+            log.info("refresh pending manual running scope=%s", ",".join(names))
+            self._begin_cycle(names, manual=True, reason="manual")
 
     def _start_next_refresh(self) -> None:
         if self._inflight or not self._refresh_queue:
@@ -740,6 +823,7 @@ class App(QObject):
             name,
             max(0.0, now - (self._cycle_started_at or now)),
         )
+        self._arm_watchdog(name, provider)
 
         def _emit(snap: UsageSnapshot, _name=name):
             self._signals.snapshot_ready.emit(snap)
@@ -758,10 +842,48 @@ class App(QObject):
                 )
             )
 
+    def _arm_watchdog(self, name: str, provider: Provider) -> None:
+        """Bound one dispatch, so a provider that never answers cannot stall
+        the cycle - and with it every future refresh."""
+        self._cancel_watchdog(name)
+        budget = _refresh_budget_seconds(provider) + _WATCHDOG_SLACK_SECONDS
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(lambda n=name, b=budget: self._on_watchdog(n, b))
+        timer.start(int(budget * 1000))
+        self._watchdogs[name] = timer
+
+    def _cancel_watchdog(self, name: str) -> None:
+        timer = self._watchdogs.pop(name, None)
+        if timer is None:
+            return
+        try:
+            timer.stop()
+        except RuntimeError:
+            pass
+
+    def _on_watchdog(self, name: str, budget: float) -> None:
+        self._watchdogs.pop(name, None)
+        if name not in self._inflight:
+            return
+        log.warning(
+            "refresh provider watchdog provider=%s budget_s=%.0f - giving up",
+            name,
+            budget,
+        )
+        self._signals.snapshot_ready.emit(
+            UsageSnapshot(
+                provider=name,
+                status=SnapshotStatus.ERROR,
+                error="Refresh timed out.",
+            )
+        )
+
     def _on_snapshot(self, snapshot: UsageSnapshot) -> None:
         name = snapshot.provider
         was_inflight = name in self._inflight
         self._inflight.discard(name)
+        self._cancel_watchdog(name)
         dispatched_at = self._dispatch_times.pop(name, None)
         if was_inflight:
             log.info(
@@ -883,6 +1005,8 @@ class App(QObject):
         self._widget.set_refreshing(False)
         self._update_tray()
         self._schedule_next_refresh()
+        if self._pending_manual_refresh or self._pending_manual_providers:
+            QTimer.singleShot(0, self._run_pending_manual)
 
     def _cycle_changed(self) -> bool:
         if self._last_cycle_signatures is None:

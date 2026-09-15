@@ -935,9 +935,21 @@ def _build_snapshot(
     )
 
 
+# The scrape's own bound, named once so the App-level watchdog can be derived
+# from it. Codex leaves timeout_ms at the scraper default.
+SCRAPE_TIMEOUT_MS = 25000
+SCRAPE_TRANSPORT_ATTEMPTS = 1
+SCRAPE_BUILD_ATTEMPTS = 2
+
+
 class CodexProvider(Provider):
     name = "codex"
     display_name = "Codex"
+    # What the App-level watchdog allows this provider before it declares the
+    # refresh lost: the scraper's own timeout x every attempt it may make.
+    refresh_budget_seconds = (
+        SCRAPE_TIMEOUT_MS / 1000 * SCRAPE_TRANSPORT_ATTEMPTS * SCRAPE_BUILD_ATTEMPTS
+    )
 
     def __init__(
         self,
@@ -1019,8 +1031,8 @@ class CodexProvider(Provider):
             build=_build,
             log=log,
             wait_ms=7000,
-            transport_max_attempts=1,
-            build_max_attempts=2,
+            transport_max_attempts=SCRAPE_TRANSPORT_ATTEMPTS,
+            build_max_attempts=SCRAPE_BUILD_ATTEMPTS,
             parent=self._parent,
         )
         self._runner.run(on_done)

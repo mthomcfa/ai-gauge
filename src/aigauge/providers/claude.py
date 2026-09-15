@@ -776,9 +776,22 @@ def _build_snapshot(
     )
 
 
+# The scrape's own bound, named once so the App-level watchdog can be derived
+# from it rather than guessed at: each transport attempt is capped by the
+# scraper's timeout, and ScrapeRunner may rebuild the scraper.
+SCRAPE_TIMEOUT_MS = 40000
+SCRAPE_TRANSPORT_ATTEMPTS = 2
+SCRAPE_BUILD_ATTEMPTS = 2
+
+
 class ClaudeProvider(Provider):
     name = "claude"
     display_name = "Claude"
+    # What the App-level watchdog allows this provider before it declares the
+    # refresh lost: the scraper's own timeout x every attempt it may make.
+    refresh_budget_seconds = (
+        SCRAPE_TIMEOUT_MS / 1000 * SCRAPE_TRANSPORT_ATTEMPTS * SCRAPE_BUILD_ATTEMPTS
+    )
 
     def __init__(
         self,
@@ -871,9 +884,9 @@ class ClaudeProvider(Provider):
             # while the page was still showing "Loading...".
             wait_ms=3000,
             max_extractor_reruns=20,
-            timeout_ms=40000,
-            transport_max_attempts=2,
-            build_max_attempts=2,
+            timeout_ms=SCRAPE_TIMEOUT_MS,
+            transport_max_attempts=SCRAPE_TRANSPORT_ATTEMPTS,
+            build_max_attempts=SCRAPE_BUILD_ATTEMPTS,
             # Discovery, not yet load-bearing: the gauge still reads the DOM.
             # This records the SHAPE of the JSON the page fetches so a field
             # mapping can be written from a real account without guessing, and

@@ -185,6 +185,8 @@ def _app(providers: dict[str, _Provider]) -> App:
     app._active_until = datetime.now() + timedelta(minutes=30)  # noqa: SLF001
     app._current_refresh_manual = False  # noqa: SLF001
     app._pending_manual_refresh = False  # noqa: SLF001
+    app._pending_manual_providers = []  # noqa: SLF001
+    app._watchdogs = {}  # noqa: SLF001
     app._timer = _Timer()  # noqa: SLF001
     app._widget = _Widget()  # noqa: SLF001
     app._started_at = datetime.now()  # noqa: SLF001
@@ -283,7 +285,8 @@ def test_a_manual_refresh_that_lands_mid_cycle_leaves_a_trace(caplog):
     """The one question 4.5 days of log could not answer.
 
     `refresh_now` returned early with no line at all, so "I clicked Refresh
-    and nothing happened" was unprovable either way.
+    and nothing happened" was unprovable either way. It is queued now, and
+    the queueing says so.
     """
     app = _app({"claude": _Provider(_ok("claude"), hold=True)})
     app.refresh_now(manual=False)
@@ -292,8 +295,147 @@ def test_a_manual_refresh_that_lands_mid_cycle_leaves_a_trace(caplog):
     with caplog.at_level(logging.INFO, logger="aigauge.app"):
         app.refresh_now(manual=True)
 
-    assert "refresh_now" in caplog.text
+    assert "refresh_now queued" in caplog.text
     assert "inflight=claude" in caplog.text
+
+
+def test_a_scheduled_wake_that_lands_mid_cycle_is_ignored_not_queued(caplog):
+    """A queued *scheduled* refresh would cascade: the cycle it landed in
+    already covers every provider."""
+    app = _app({"claude": _Provider(_ok("claude"), hold=True)})
+    app.refresh_now(manual=False)
+
+    with caplog.at_level(logging.INFO, logger="aigauge.app"):
+        app.refresh_now(manual=False)
+
+    assert "refresh_now ignored" in caplog.text
+    assert app._pending_manual_refresh is False  # noqa: SLF001
+
+
+def test_a_manual_refresh_during_a_cycle_runs_when_the_cycle_ends():
+    """_pending_manual_refresh was scaffolded in __init__ and never read.
+
+    The widget's Refresh button is disabled for the whole cycle, so the
+    reachable path is the tray menu's "Refresh now" - which silently did
+    nothing, at precisely the moment a tile looks stale, which is usually
+    mid-cycle.
+    """
+    claude = _Provider(_ok("claude"), hold=True)
+    app = _app({"claude": claude})
+
+    app.refresh_now(manual=False)
+    app.refresh_now(manual=True)
+    assert app._pending_manual_refresh is True  # noqa: SLF001
+
+    claude.hold = False
+    claude.pending(_ok("claude"))
+
+    assert claude.calls == 2, "the queued manual refresh never ran"
+    assert app._pending_manual_refresh is False  # noqa: SLF001
+
+
+def test_a_queued_manual_refresh_runs_exactly_once():
+    claude = _Provider(_ok("claude"), hold=True)
+    app = _app({"claude": claude})
+
+    app.refresh_now(manual=False)
+    app.refresh_now(manual=True)
+    app.refresh_now(manual=True)
+    app.refresh_now(manual=True)
+
+    claude.hold = False
+    claude.pending(_ok("claude"))
+
+    assert claude.calls == 2, "three clicks produced more than one refresh"
+
+
+def test_refresh_provider_during_a_cycle_is_queued_for_that_provider():
+    """The sign-in and cookie-paste paths call refresh_provider; both of them
+    used to no-op if a cycle happened to be running."""
+    claude = _Provider(_ok("claude"), hold=True)
+    codex = _Provider(_ok("codex"))
+    app = _app({"claude": claude, "codex": codex})
+
+    app.refresh_now(manual=False)
+    app.refresh_provider("codex")
+
+    claude.hold = False
+    claude.pending(_ok("claude"))
+
+    assert app._pending_manual_providers == []  # noqa: SLF001
+    assert codex.calls == 2, "the queued provider refresh never ran"
+    assert claude.calls == 1, "a single-provider request refreshed everything"
+
+
+def test_the_heartbeat_restarts_a_timer_that_died(caplog):
+    """_schedule_next_refresh returns without starting the timer while
+    anything is in flight. If the cycle then ends in a way that never
+    reschedules, refreshes simply stop - the heartbeat is the only thing
+    still running, so it is what notices."""
+    app = _app({"claude": _Provider(_ok("claude"))})
+    app._timer.active = False  # noqa: SLF001
+
+    with caplog.at_level(logging.WARNING, logger="aigauge.app"):
+        app._log_heartbeat()  # noqa: SLF001
+
+    assert "refresh timer was not running" in caplog.text
+    assert app._timer.active is True  # noqa: SLF001
+
+
+def test_a_provider_that_never_calls_back_does_not_stall_the_cycle(caplog):
+    """_inflight was cleared only by an arriving snapshot, and
+    _schedule_next_refresh, refresh_now and refresh_provider all return early
+    while it is non-empty. One provider that never reported back therefore
+    stopped every refresh until the app was restarted.
+    """
+    claude = _Provider(_ok("claude"), hold=True)
+    codex = _Provider(_ok("codex"))
+    app = _app({"claude": claude, "codex": codex})
+
+    with caplog.at_level(logging.WARNING, logger="aigauge.app"):
+        app.refresh_now(manual=False)
+        assert app._inflight == {"claude"}  # noqa: SLF001
+        watchdog = _FakeQTimer.armed[-1]
+        watchdog.fire()
+
+    assert "watchdog" in caplog.text
+    assert app._snapshots["claude"].status == SnapshotStatus.ERROR  # noqa: SLF001
+    assert "timed out" in (app._snapshots["claude"].error or "")  # noqa: SLF001
+    assert codex.calls == 1, "the queue did not continue past the stuck provider"
+    assert app._inflight == set()  # noqa: SLF001
+    assert app._cycle_active is False  # noqa: SLF001
+
+
+def test_the_stuck_providers_late_snapshot_does_not_close_a_second_cycle():
+    claude = _Provider(_ok("claude"), hold=True)
+    app = _app({"claude": claude})
+    app.refresh_now(manual=False)
+    _FakeQTimer.armed[-1].fire()
+    ends = app._timer.started_ms
+
+    # The provider finally reports back, long after the cycle closed.
+    claude.pending(_ok("claude"))
+
+    assert app._snapshots["claude"].status == SnapshotStatus.OK  # noqa: SLF001
+    assert app._cycle_active is False  # noqa: SLF001
+    assert app._timer.started_ms == ends, "a late snapshot re-armed the timer"
+
+
+def test_the_watchdog_budget_follows_the_providers_own_bound():
+    from aigauge.app import _refresh_budget_seconds
+    from aigauge.providers.azure import AzureProvider
+    from aigauge.providers.claude import ClaudeProvider
+    from aigauge.providers.codex import CodexProvider
+    from aigauge.providers.copilot import CopilotProvider
+
+    # 40 s timeout x 2 transport attempts x 2 build attempts.
+    assert _refresh_budget_seconds(ClaudeProvider) == 160
+    # 25 s x 1 x 2.
+    assert _refresh_budget_seconds(CodexProvider) == 50
+    # Azure bounds its own refresh; the watchdog must not fire inside it.
+    assert _refresh_budget_seconds(AzureProvider) == 90
+    # A plain REST provider gets the flat budget.
+    assert _refresh_budget_seconds(CopilotProvider) == 60
 
 
 def test_the_heartbeat_carries_the_error_retry_state(caplog):
