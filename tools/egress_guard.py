@@ -56,6 +56,9 @@ _DETECTORS: tuple[tuple[str, str, str], ...] = (
     ("openai-key", BLOCK, r"sk-(?:proj-)?[A-Za-z0-9_\-]{20,}"),
     ("aws-access-key", BLOCK, r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
     ("github-token", BLOCK, r"\bgh[pousr]_[A-Za-z0-9]{36,}\b"),
+    # Fine-grained PATs are the current default on github.com and match none of
+    # the gh[pousr]_ shapes.
+    ("github-fine-grained-pat", BLOCK, r"(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{20,}"),
     ("google-api-key", BLOCK, r"\bAIza[0-9A-Za-z_\-]{35}\b"),
     ("slack-token", BLOCK, r"\bxox[baprs]-[0-9A-Za-z\-]{10,}"),
     ("jwt", BLOCK, r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"),
@@ -65,11 +68,40 @@ _DETECTORS: tuple[tuple[str, str, str], ...] = (
         r"\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqps?|mssql)://[^\s/@]+:[^\s/@]+@",
     ),
     ("basic-auth-url", BLOCK, r"\bhttps?://[^\s/@:]+:[^\s/@]+@[^\s/]+"),
+    # A bearer header carries a live credential whatever its shape.
+    ("bearer-header", BLOCK, r"(?i)\bauthorization\s*:\s*bearer\s+[A-Za-z0-9._\-~+/=]{8,}"),
+    # Entra ID client secrets are ~40 characters with a '~' a few characters in.
+    # SECURITY.md names this one as a secret the app itself holds.
+    (
+        "azure-client-secret",
+        BLOCK,
+        r"(?<![A-Za-z0-9])[A-Za-z0-9._\-]{1,5}[A-Za-z0-9]~[A-Za-z0-9._\-~]{30,}",
+    ),
+    # This app's own stores: src/aigauge/config.py defines KEYRING_SERVICE
+    # "ai-gauge" with the usernames below, and the per-provider session cookies
+    # it keeps beside them.
+    (
+        "aigauge-keyring",
+        BLOCK,
+        r"(?i)\bai-gauge\b[^\n]{0,60}?"
+        r"\b(?:github-pat|openrouter-mgmt-key|openrouter-key|azure-client-secret)\b",
+    ),
+    (
+        "aigauge-session-cookie",
+        BLOCK,
+        r"(?i)\b(?:sessionkey|(?:__secure-)?next-auth\.session-token(?:\.[01])?|"
+        r"opencode-session)\b\s*[=:]\s*[\"']?[^\s\"';,]{16,}",
+    ),
     (
         "secret-assignment",
         REDACT,
-        r"(?i)\b(?:password|passwd|secret|api[_-]?key|access[_-]?token|client[_-]?secret|"
-        r"auth[_-]?token|bearer)\b\s*[:=]\s*[\"']?([^\s\"',;]{8,})",
+        # Anchored on the *tail* of the name, not on a word boundary in front of
+        # it: `\b` does not fire after `_`, which is why `DATABASE_PASSWORD=`,
+        # `DB_PASSWORD:` and `MY_SECRET=` - the commonest shape in a .env file
+        # or a CI diff - produced no finding at all. The runs either side are
+        # bounded so that a long separator-free blob cannot make this quadratic.
+        r"(?i)(?:password|passwd|secret|token|api[_-]?key|private[_-]?key|credential)"
+        r"[A-Za-z0-9_]{0,64}\s{0,16}[:=]\s{0,16}[\"']?[^\s\"',;]{8,}",
     ),
     ("certificate", WARN, r"-----BEGIN CERTIFICATE-----"),
     (
@@ -291,7 +323,11 @@ def scan(text: str, policy: Policy) -> list[Finding]:
                 Finding(rule, action, match.start(), match.end(), _mask(match.group(0)))
             )
 
-    entropy_action = policy.action_for("opaque-token", WARN)
+    # The catch-all for credentials with no recognised shape defaults to
+    # redact, not warn: a high-entropy blob the operator cannot name is the
+    # case where taking it out of the payload is most obviously right, and
+    # warn used to mean "send it and say nothing".
+    entropy_action = policy.action_for("opaque-token", REDACT)
     if entropy_action != "off":
         for match in _OPAQUE_TOKEN_RE.finditer(text):
             token = match.group(0)
@@ -540,9 +576,15 @@ def _report(findings: list[Finding], policy: Policy, stream=sys.stderr) -> None:
     for rule, count in by_rule.most_common():
         action = next(f.action for f in findings if f.rule == rule)
         print(f"  {action:<7} {rule} x{count}", file=stream)
-    shown = [f for f in findings if f.action in (BLOCK, REDACT)][:limit]
-    for finding in shown:
-        print(f"    at {finding.start}: {finding.rule} {finding.excerpt}", file=stream)
+    # Every finding is listed, whatever its action. `warn` used to print
+    # nothing on the dispatch path, which made it indistinguishable from
+    # "nothing was found" - three credential findings were recorded in the
+    # audit and shown to nobody.
+    for finding in findings[:limit]:
+        print(
+            f"    at {finding.start}: {finding.action} {finding.rule} {finding.excerpt}",
+            file=stream,
+        )
 
 
 @dataclass
@@ -702,6 +744,17 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
     record["sent_sha256"] = hashlib.sha256(sent.encode("utf-8")).hexdigest()
     record["sent_bytes"] = len(sent.encode("utf-8"))
 
+    # The allowed branch reports too, and before the POST: an allowed dispatch
+    # that found and redacted a credential has to say so, or `warn` and
+    # `redact` are silent exactly where it matters.
+    redacted_count = sum(1 for f in decision.findings if f.action == REDACT)
+    print(
+        f"verdict: allowed - {len(decision.findings)} finding(s), "
+        f"{redacted_count} redacted before sending",
+        file=sys.stderr,
+    )
+    _report(decision.findings, policy, stream=sys.stderr)
+
     # The audit line goes down BEFORE the POST. A dispatch that is killed, or
     # whose audit write fails, must not be a payload on the wire with no record
     # of it; if the trail cannot be written, nothing is sent.
@@ -732,7 +785,6 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
 
     record["elapsed_s"] = round(time.time() - started, 3)
     _audit_best_effort(policy, dict(record, stage="result"))
-    _report(decision.findings, policy, stream=sys.stderr)
     print(json.dumps(response, indent=2))
     return 0
 

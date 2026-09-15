@@ -56,6 +56,71 @@ def test_credential_shapes_are_blocked(rule, sample):
     assert all(f.action == eg.BLOCK for f in findings if f.rule == rule)
 
 
+@pytest.mark.parametrize(
+    "label, sample",
+    [
+        ("github fine-grained PAT", "github_pat_11ABCDEFG0" + "abcdefghij" * 3 + "ABCDEFGHIJKLMN"),
+        ("azure client secret", "AZURE_CLIENT_SECRET=8Xq~Q7Yk2Nv6Lp1Rt4Ws9Zc3Bd5Fg8Hj0Km2Pn"),
+        ("bearer header", "Authorization: Bearer 2YotnFZFEjr1zCsicMWpAA9f4tR6yU8iO0pA3sD"),
+        (
+            "this app's keyring entry",
+            "keyring.get_password('ai-gauge','azure-client-secret') -> 'Rk9PQkFSUVVYMTIzNDU2'",
+        ),
+        ("this app's github pat entry", "keyring get ai-gauge github-pat"),
+        ("a Codex session cookie", "next-auth.session-token=AAAAAAAAAAAAAAAAAAAAAAAA"),
+        ("a Claude session cookie", "sessionKey=sk-ant-sid01-" + "Q" * 80),
+    ],
+)
+def test_plain_current_credential_formats_are_blocked(label, sample):
+    """Every plain form the review listed as delivered verbatim."""
+    findings = eg.scan(sample, policy())
+    assert any(f.action == eg.BLOCK for f in findings), label
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "DATABASE_PASSWORD=hunter2hunter2",
+        "DB_PASSWORD: hunter2hunter2",
+        "MY_SECRET=abcd1234abcd1234abcd",
+        "AIGAUGE_GITHUB_TOKEN=abcd1234abcd1234abcd",
+        "OPENROUTER_API_KEY=abcd1234abcd1234abcd",
+        "password = hunter2hunter2",
+        "client_secret=8Xq7Yk2Nv6Lp1Rt4Ws9Zc3Bd",
+        "access_token=abcd1234abcd1234abcd",
+        "MY_PRIVATE_KEY=abcd1234abcd1234abcd",
+    ],
+)
+def test_a_prefixed_variable_name_does_not_walk_through(line):
+    """`\\b` does not fire after `_`, so DATABASE_PASSWORD= used to be invisible."""
+    actions = {f.action for f in eg.scan(line, policy())}
+    assert actions & {eg.BLOCK, eg.REDACT}, f"no blocking or redacting finding for {line!r}"
+
+
+def test_a_redacted_assignment_loses_its_value():
+    text = "DATABASE_PASSWORD=hunter2hunter2"
+    out, count = eg.redact(text, eg.scan(text, policy()))
+    assert count == 1
+    assert "hunter2hunter2" not in out
+
+
+def test_an_unrecognised_high_entropy_blob_is_redacted_not_merely_warned():
+    """The only net for credentials with no known shape used to let them past."""
+    text = "value=aZ9+kQ/mN2xP7wL4tR6yU8iO0pA3sD5fG1hJ2kL4zX6c"
+    findings = [f for f in eg.scan(text, policy()) if f.rule == "opaque-token"]
+    assert findings and all(f.action == eg.REDACT for f in findings)
+
+
+def test_the_report_names_a_warn_finding(capsys):
+    text = "COMPANY CONFIDENTIAL - do not circulate"
+    findings = eg.scan(text, policy())
+    assert any(f.action == eg.WARN for f in findings)
+    eg._report(findings, policy(), stream=sys.stderr)
+    err = capsys.readouterr().err
+    assert "classification-banner" in err
+    assert "warn" in err
+
+
 def test_anthropic_key_is_not_reported_as_an_openai_key():
     """Ordering matters: the generic sk- rule would swallow sk-ant- otherwise."""
     hits = rules_hit("sk-ant-api03-" + "Z" * 24)
