@@ -1844,3 +1844,57 @@ def test_a_purge_waits_for_the_runners_own_live_scrape_guard(monkeypatch, caplog
     app._run_profile_purges()  # noqa: SLF001
 
     assert purged == ["codex", "claude"]
+
+
+def test_an_answer_is_stamped_with_the_name_the_app_dispatched(caplog):
+    """A snapshot cannot name a tile other than its own dispatch's.
+
+    Every gate downstream keys on `snapshot.provider`, and epochs advance in
+    lockstep across a cycle, so an answer from A labelled B was accepted as
+    B's live answer: B's `_inflight` entry cleared, B's watchdog destroyed,
+    B's tile painted with A's numbers. Unreachable today, which is why the
+    fix is one line in the one place that knows what it dispatched.
+    """
+    account_a = _BrowserProvider(hold=True)
+    account_b = _BrowserProvider(hold=True)
+    app = _app({"claude-aaaa": account_a, "claude-bbbb": account_b})
+
+    app._begin_cycle(  # noqa: SLF001
+        ["claude-aaaa", "claude-bbbb"], manual=False, reason="active"
+    )
+    # Browser providers are serial, so B is queued rather than dispatched;
+    # dispatch it by hand so both are genuinely in flight at once.
+    app._dispatch("claude-bbbb")  # noqa: SLF001
+    assert app._inflight == {"claude-aaaa", "claude-bbbb"}  # noqa: SLF001
+    watchdog_b = app._watchdogs["claude-bbbb"]  # noqa: SLF001
+
+    with caplog.at_level(logging.WARNING, logger="aigauge.app"):
+        caplog.clear()
+        account_a.pending(
+            UsageSnapshot(
+                provider="claude-bbbb",
+                status=SnapshotStatus.OK,
+                metrics=[UsageMetric("Session", 99.0)],
+            )
+        )
+
+    assert "claude-bbbb" in app._inflight, "a sibling's dispatch was closed"  # noqa: SLF001
+    assert app._watchdogs.get("claude-bbbb") is watchdog_b, (  # noqa: SLF001
+        "a sibling's watchdog was destroyed"
+    )
+    assert watchdog_b.deleted is False
+    assert set(app._cycle_statuses) == {"claude-aaaa"}  # noqa: SLF001
+    painted = [snapshot.provider for snapshot in app._widget.snapshots]  # noqa: SLF001
+    assert painted == ["claude-aaaa"], "a sibling's tile was painted"
+    assert app._snapshots["claude-aaaa"].metrics[0].percent_used == 99.0
+
+    relabelled = [
+        record.getMessage()
+        for record in caplog.records
+        if "answer relabelled" in record.getMessage()
+    ]
+    assert len(relabelled) == 1, relabelled
+    assert "provider=claude-aaaa" in relabelled[0]
+    assert "claude-bbbb" not in relabelled[0], (
+        "the payload's own string reached the log"
+    )

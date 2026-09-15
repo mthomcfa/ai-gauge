@@ -1507,7 +1507,29 @@ class App(QObject):
         # The epoch travels with the answer, so a snapshot can be matched to
         # the dispatch it answers rather than to whatever is in flight for
         # that name when it lands.
-        def _emit(snap: UsageSnapshot, _epoch=epoch):
+        def _emit(snap: UsageSnapshot, _epoch=epoch, _name=name):
+            # And the *name* is the App's, not the payload's. Every gate
+            # downstream - `_on_snapshot`, the epoch check,
+            # `_on_late_snapshot`, `_inflight`, `_watchdogs`, the cycle's
+            # books, which tile is painted - keys on `snapshot.provider`, and
+            # epochs advance in lockstep across a cycle, so an answer
+            # mislabelled with a sibling account's id is accepted as that
+            # sibling's live answer: its in-flight entry cleared, its
+            # watchdog destroyed, its tile painted with another account's
+            # numbers. Unreachable today - `ScrapeRunner` sets
+            # `provider=self._account_id`, the browser builders take
+            # `account_id=` from the App and the three REST providers
+            # hardcode their literal - and the check belongs in the one place
+            # that knows what was dispatched rather than in each provider.
+            if getattr(snap, "provider", _name) != _name:
+                # The payload's own name is never printed: it is
+                # provider-controlled text, and not trusting it to name a
+                # tile is the entire point of this.
+                log.warning(
+                    "refresh provider answer relabelled provider=%s relabelled=True",
+                    _name,
+                )
+                snap = replace(snap, provider=_name)
             self._signals.snapshot_ready.emit((snap, _epoch))
 
         try:
