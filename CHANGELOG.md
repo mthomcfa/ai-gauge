@@ -116,14 +116,39 @@ allowed to cost.
   tooltip and the error dialog still get the string whole. `scrape fail`'s
   `load_error_string` is clipped the same way; measured against a real
   QtWebEngine it is a Qt string-table message rather than the server's, so
-  that one closes an assumption rather than a hole.
+  that one closes an assumption rather than a hole. All three arguments are
+  guarded, `snapshot.error` included: `UsageSnapshot` is a plain dataclass,
+  so `error or ""` runs the object's `__bool__` and `str()` its `__str__`,
+  and either raised straight out of `_on_snapshot` — before the tile was
+  painted — until the helper caught it and answered
+  `<unprintable error>`. The clip runs *before* the redaction rather than
+  after, so four regex passes see 500 characters rather than the whole
+  string; the margin past the 300-character limit is there so an identifier
+  straddling it is redacted rather than cut in half. The scraper's
+  `_result_keys_for_log` gets the same outer guard as app.py's twin, because
+  `for key in result` runs the payload's `__iter__` and a `dict` subclass
+  can refuse it.
+- **A short id with a newline in it cannot forge a log record.** The
+  coercion on both pending-purge lists bounds an id's type and its length,
+  not its characters, and four records print ids through `_clip_for_log`. A
+  53-character id from a hand-edited `config.json` carrying two newlines
+  read as three records in the file — a forged `ERROR … balance=0.00
+  key=sk-ant-x` among them. Flattened exactly as `snapshot.error` is: 6
+  forged lines to 0 on the same poisoned config.
 - **Smaller ones.** A settings save no longer writes "Waiting for the
   previous refresh to finish." onto a parked tile — it refreshes without the
-  user having asked, exactly like a scheduled cycle. An id on both deferral
-  lists reaches `purge_profile` once rather than twice. "Clear all browser
-  data" counts the `profiles/` directories whose names the id rule rejects —
-  `purge_profile` always refused them, silently — and says how many were
-  left alone, without naming them.
+  user having asked, exactly like a scheduled cycle — while a sign-in queued
+  behind such a save still does, which it did not: the queued route recorded
+  the provider and not that a person had asked, and the save's own queued
+  refresh won. An id owed both a removal and a clear reaches `purge_profile`
+  once across the two calls one dialog session makes, and one `deferred` line
+  per drain rather than two while its scrape is still out. "Clear all browser
+  data" counts the `profiles/` directories `purge_profile` will refuse — by
+  the rule it refuses them with, the resolved path and not the name alone, so
+  a symlink pointing out of `profiles/` is counted as left alone instead of
+  reported as removed — and says how many, without naming them. Its keyring
+  pass still takes every name on disk: only the directory sweep has a
+  containment question to answer.
 - **Neither purge path asked whether a scrape was live.** Both now consult
   `account_is_busy()` from `providers/_scrape_runner.py` as well as
   `_inflight` and the abandoned-dispatch park. It is the only one of the
@@ -161,10 +186,12 @@ allowed to cost.
   them. `_raw_summary` now catches `Exception` — a log line must never be
   able to raise — and its fallback is a bounded literal, where `repr(raw)`
   handed back the whole payload on the one path that had already gone wrong.
-  The existing adversarial payloads are unmoved at a worst record of 4 803
-  characters (`_nested(20, 4)`; an earlier draft of this entry, and the
-  message of commit `21bd5be`, said 4 283 — the claim was right and the
-  number was not, on both trees). None of it is reachable today; it bites the first time an
+  The existing adversarial payloads are unmoved: the worst `raw_summary=`
+  argument is 4 803 characters and the whole `snapshot error …` record it
+  sits in is 4 998 (`_nested(20, 4)`, measured on both trees; an earlier
+  draft of this entry, and the message of commit `21bd5be`, gave 4 283 and
+  called it the record — the claim was right, the number was not, and 4 803
+  is the argument rather than the line). None of it is reachable today; it bites the first time an
   extractor or a provider returns something that is not plain JSON.
 - **The scraper's log lines clip the text the page chose.** `title=%r` at
   four call sites and `result_keys=%s` at one had no length cap, and the
@@ -173,7 +200,8 @@ allowed to cost.
   characters: **11 079 134 characters for `scrape ok` and 1 000 367 for
   `scrape fail`** — 21x and 1.9x the whole rotation, from one scrape, into
   the file the error dialog asks the user to attach. The same inputs now
-  produce 3 814 and 570. Titles clip at 200; the key list takes the shape
+  produce 3 664 and 570 (3 814 until `_key_text(key)[:60]` stopped appending
+  the `"..."` marker to each of 50 over-long key names). Titles clip at 200; the key list takes the shape
   `raw_keys=` already has, 50 names of 60 characters and the true count
   beside them. `_safe_url` was checked and was already bounded at 300.
   Nothing else in the scraper moves.
@@ -197,7 +225,7 @@ allowed to cost.
 
 ### Notes
 
-- **1 216 → 1 259 tests.** Including six fake hours of a wedged REST worker
+- **1 216 → 1 270 tests.** Including six fake hours of a wedged REST worker
   against a browser sibling, an hour-long park ridden out over eleven cadence
   wakes, a mislabelled answer that must not touch its sibling's dispatch, and
   the three payloads that used to raise out of `_on_snapshot`. Twenty of them

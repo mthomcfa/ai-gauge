@@ -4,7 +4,7 @@ State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#1
 610 tests passing, all five providers reading.
 
 > **Updated 2026-09-15** by the hardening follow-up (`1.3.1+cfa.6`,
-> 1 259 tests), which closed most of what the refresh-cadence work left in
+> 1 270 tests), which closed most of what the refresh-cadence work left in
 > [§8.3](#83-known-soft-spots-in-what-was-built): the REST park, the
 > "Clear all browser data" purge, the dispatch epoch's name, the log
 > summariser and the scraper's uncapped log lines. What is still open there
@@ -755,6 +755,13 @@ unnecessary source of behaviour change.
   deferral window left the live provider session cookie on disk with the
   keyring copy already deleted - nothing in the UI would mention it again
   and clicking the button a second time was the only thing that reached it.
+  The two lists are kept *disjoint*: an id owed both - one dialog session
+  removing an account and clearing all browser data puts it on each, as two
+  separate calls - stays on the clear list only, because both end in the
+  same `purge_profile` and the clear's drain skips nothing. Carrying both
+  cost a second deletion and, while that account's scrape was out, a second
+  `deferred` line at every heartbeat. The dialog also stops asking twice:
+  `removed_profile_ids` drops whatever the clear-all set already covered.
 - **A deferred purge makes the app write `config.json` on its own.**
   `_run_profile_purges` records what is still owed, and it is called from
   `App.__init__` and from the five-minute heartbeat - so while a purge is
@@ -821,7 +828,7 @@ unnecessary source of behaviour change.
   earlier note counted. Titles clip at 200 and the key list takes
   `raw_keys=`'s shape (50 names of 60, with the true count beside them).
   Measured by driving `_finish` with a 1 MB `document.title` and 10 000 keys
-  of 1 000 characters: `scrape ok` 11 079 134 → 3 814 characters and
+  of 1 000 characters: `scrape ok` 11 079 134 → 3 664 characters and
   `scrape fail` 1 000 367 → 570. `_safe_url` was checked and was already
   bounded at 300. Note that `_load_failure_context` still puts the raw title
   into the *payload*, which is bounded downstream by `_raw_summary` and by
