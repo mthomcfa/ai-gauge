@@ -706,13 +706,23 @@ class Config(BaseModel):
     # refuses anything that does not resolve strictly inside
     # `app_data_dir()/profiles`.
     pending_profile_purges: list[str] = Field(default_factory=list)
+    # The same deferral for Settings' "Clear all browser data", kept on its
+    # own list because the two drains differ: this one has no
+    # configured-account skip. The user asked for these profiles to be gone,
+    # and "the account is still configured" is what every one of them is -
+    # skipping them is what the *removal* list does, for an entry a restored
+    # backup has undone. Persisted for the same reason as that list: what
+    # would otherwise survive a quit inside the deferral window is the live
+    # provider session cookie, which is the thing the button exists to
+    # destroy.
+    pending_data_clears: list[str] = Field(default_factory=list)
     # When each provider kind last asked its page for every meter it renders,
     # ISO-8601 per kind. Empty (or missing) means the next refresh re-scans -
     # which is also how the Settings "Re-scan meters now" button works.
     meter_catalog_last_scan: dict[str, str] = Field(default_factory=dict)
     window: WindowState = Field(default_factory=WindowState)
 
-    @field_validator("pending_profile_purges", mode="before")
+    @field_validator("pending_profile_purges", "pending_data_clears", mode="before")
     @classmethod
     def _coerce_pending_purges(cls, value: object) -> list[str]:
         if not isinstance(value, list):

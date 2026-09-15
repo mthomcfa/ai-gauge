@@ -722,6 +722,26 @@ def test_the_pending_purge_list_coerces_instead_of_carrying_junk():
     ).pending_profile_purges == ["claude-ab12cd34", "codex-99999999"]
 
 
+def test_the_clear_list_is_coerced_and_bounded_like_the_purge_list():
+    """The second deferral list is read at startup from the same file, and
+    reaches the same rmtree, so it carries the same bounds."""
+    from aigauge.config import _PENDING_PURGE_LIMIT, _PROFILE_ID_MAX_LEN
+
+    assert Config(pending_data_clears={"a": 1}).pending_data_clears == []
+    assert Config(pending_data_clears="claude").pending_data_clears == []
+    assert Config(
+        pending_data_clears=["claude", "", None, 3, b"codex", ["nested"], "codex"]
+    ).pending_data_clears == ["claude", "codex"]
+    assert Config(
+        pending_data_clears=["claude", "a" * (_PROFILE_ID_MAX_LEN + 1)]
+    ).pending_data_clears == ["claude"]
+    assert len(
+        Config(
+            pending_data_clears=[f"codex-{index:08d}" for index in range(5_000)]
+        ).pending_data_clears
+    ) == _PENDING_PURGE_LIMIT
+
+
 def test_the_pending_purge_list_survives_a_round_trip_through_the_file():
     config_path().parent.mkdir(parents=True, exist_ok=True)
     config_path().write_text(

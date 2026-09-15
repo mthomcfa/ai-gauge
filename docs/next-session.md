@@ -729,24 +729,34 @@ unnecessary source of behaviour change.
   scraping.**~~ **Closed in 1.3.1+cfa.6.** The dialog emits the id list on
   `browser_data_clear_requested` and the App defers each one exactly as it
   defers a removal; both purge paths now also ask `account_is_busy()`. The
-  clear-all ids are held on a separate in-memory list, because the persisted
-  `pending_profile_purges` drain skips an id that is also a configured
-  account by design - so a quit inside the deferral window loses that one
-  clear and the user clicks again, which the deferral line says.
+  clear-all ids are held on a separate list, `config.pending_data_clears`,
+  because the `pending_profile_purges` drain skips an id that is also a
+  configured account by design - which is right for a removal a restored
+  backup has undone and would drop every deferred clear at the next start.
+  That second list is persisted too, and drained at startup beside the
+  first, before any cookie is hydrated and before any provider exists, with
+  no configured-account skip: the user asked for those profiles to be gone.
+  It was in memory only for one round, which meant a quit inside the
+  deferral window left the live provider session cookie on disk with the
+  keyring copy already deleted - nothing in the UI would mention it again
+  and clicking the button a second time was the only thing that reached it.
 - **A deferred purge makes the app write `config.json` on its own.**
   `_run_profile_purges` records what is still owed, and it is called from
   `App.__init__` and from the five-minute heartbeat - so while a purge is
   deferred the app rewrites the user's settings file without the user asking,
-  which nothing else in it does. It is well guarded: `_persist_pending_profile_purges`
-  early-returns when the list is unchanged, so the steady state (an empty
-  list) writes nothing and a normal start writes nothing. What a write costs
+  which nothing else in it does. It is well guarded: `_persist_pending_purges`
+  early-returns when neither list has changed, so the steady state (two empty
+  lists) writes nothing and a normal start writes nothing. What a write costs
   is that `Config.save()` serialises the whole model, so a key an older or
   newer build wrote that this one does not model is dropped, and a concurrent
-  hand-edit is overwritten. Worth knowing before adding a second such writer;
-  not worth a mechanism on its own. (1.3.1+cfa.6 added a second deferral
-  list, for "Clear all browser data", and deliberately did **not** persist
-  it - so it is not a second writer, at the cost of losing one clear if the
-  app quits inside the window.) (It also means an ad-hoc harness that
+  hand-edit is overwritten. **1.3.1+cfa.6 put a second deferral list through
+  the same writer** - `pending_data_clears`, for "Clear all browser data" -
+  so there are now two reasons the app writes `config.json` unasked, through
+  one helper and one `Config.save()` per drain. The alternative was leaving
+  that list in memory, which loses a live account's session cookie to a quit
+  inside the deferral window, and the write is the cheaper of the two.
+  A third writer is still worth thinking twice about. (It also means an
+  ad-hoc harness that
   drives `_run_profile_purges` must set `APPDATA` - an override on every OS,
   which `tests/conftest.py` sets for the suite - or it edits the developer's
   real config.)

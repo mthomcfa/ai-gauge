@@ -534,6 +534,39 @@ def test_clear_all_browser_data_hands_the_profiles_to_the_app(qtbot, monkeypatch
     assert orphan.is_dir(), "the dialog deleted a profile directory itself"
 
 
+def test_clear_all_browser_data_says_when_a_busy_profile_goes(qtbot, monkeypatch):
+    """What the user is told has to match what the app does.
+
+    The deletion of a profile that is mid-scrape is deferred, and both
+    deferral lists are recorded in `config.json`, so the honest answer is
+    "when that refresh finishes, or at the next start". While the clear list
+    was in memory only the completion box said the profiles were being
+    removed and a quit could silently leave one - with its live session
+    cookie - on disk.
+    """
+    monkeypatch.setattr(
+        settings_dialog.QMessageBox,
+        "question",
+        lambda *a, **k: settings_dialog.QMessageBox.StandardButton.Yes,
+    )
+    said: list[str] = []
+    monkeypatch.setattr(
+        settings_dialog.QMessageBox,
+        "information",
+        lambda parent, title, text, *a, **k: said.append(text),
+    )
+    monkeypatch.setattr(
+        settings_dialog, "set_provider_cookie", lambda account_id, value: None
+    )
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+
+    _button(dialog, "clear_browser_data_btn").click()
+
+    assert said, "the click said nothing at all"
+    assert "next start" in said[0], said[0]
+
+
 def test_the_settings_dialog_no_longer_deletes_profiles_itself():
     """Pinned as an import, because a future `from .webview.profile import
     purge_profile` here would silently restore the hazard."""

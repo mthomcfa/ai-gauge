@@ -1501,11 +1501,59 @@ def test_a_deferred_profile_purge_survives_a_quit(monkeypatch):
     # Next start, before any cookie is hydrated and before any provider runs.
     fresh = _app({})
     fresh._config = saved  # noqa: SLF001
-    fresh._drain_pending_profile_purges()  # noqa: SLF001
+    fresh._drain_pending_purges()  # noqa: SLF001
 
     assert purged == ["claude-ab12cd34"], "the purge was lost across the quit"
     assert RealConfig.load().pending_profile_purges == [], (
         "a purge that ran is still recorded as owed"
+    )
+
+
+def test_a_deferred_browser_data_clear_survives_a_quit(monkeypatch, caplog):
+    """"Clear all browser data" promises the saved credential is gone.
+
+    The keyring copy goes at the click, so nothing in the UI will ever
+    mention the profile again - and the profile a live scrape defers is a
+    QtWebEngine directory with `ForcePersistentCookies`, i.e. the live
+    session cookie itself. Held in memory only, a quit inside the deferral
+    window left it on disk and clicking the button a second time was the
+    only thing that reached it.
+
+    Its drain has no configured-account skip: these ids belong to accounts
+    the user still has, which is exactly what the removal list's skip is for,
+    so routing them there would drop every deferred clear at the next start.
+    """
+    from aigauge.config import BrowserAccount, Config as RealConfig
+
+    purged: list[str] = []
+    monkeypatch.setattr(app_module, "purge_profile", purged.append)
+    claude = _BrowserProvider(_ok("claude-ab12cd34"), hold=True)
+    app = _app({"claude-ab12cd34": claude})
+    app._config = RealConfig(  # noqa: SLF001
+        browser_accounts=[BrowserAccount(id="claude-ab12cd34", kind="claude")]
+    )
+    app.refresh_now(manual=False)
+
+    app._on_browser_data_clear_requested(["claude-ab12cd34"])  # noqa: SLF001
+    assert purged == [], "a profile was deleted under a live scrape"
+
+    # The user quits here. Whatever is still owed must be on disk.
+    saved = RealConfig.load()
+    assert saved.pending_data_clears == ["claude-ab12cd34"]
+    assert saved.pending_profile_purges == []
+
+    # Next start, before any cookie is hydrated and before any provider runs.
+    fresh = _app({})
+    fresh._config = saved  # noqa: SLF001
+    with caplog.at_level(logging.INFO, logger="aigauge.app"):
+        fresh._drain_pending_purges()  # noqa: SLF001
+
+    assert purged == ["claude-ab12cd34"], "the clear was lost across the quit"
+    assert "reason=reconfigured" not in caplog.text, (
+        "the clear drain skipped an account the user still has"
+    )
+    assert RealConfig.load().pending_data_clears == [], (
+        "a clear that ran is still recorded as owed"
     )
 
 
@@ -1532,7 +1580,7 @@ def test_the_drain_does_not_purge_an_account_that_is_configured_again(
     )
 
     with caplog.at_level(logging.INFO, logger="aigauge.app"):
-        app._drain_pending_profile_purges()  # noqa: SLF001
+        app._drain_pending_purges()  # noqa: SLF001
 
     assert purged == ["codex-99999999"], "a configured account's profile was deleted"
     assert "purge skipped account=claude-ab12cd34 reason=reconfigured" in caplog.text
@@ -1573,7 +1621,7 @@ def test_the_startup_drain_line_is_bounded_by_a_hostile_config(monkeypatch, capl
     with caplog.at_level(logging.INFO, logger="aigauge"):
         # The real purge, so the refusal lines are the real ones too.
         monkeypatch.setattr(app_module, "purge_profile", purge_profile)
-        app._drain_pending_profile_purges()  # noqa: SLF001
+        app._drain_pending_purges()  # noqa: SLF001
 
     opening = next(
         rec.getMessage()
@@ -1615,11 +1663,11 @@ def test_the_pending_purges_run_before_any_provider_is_built():
     import inspect
 
     source = inspect.getsource(App.__init__)
-    assert "_drain_pending_profile_purges" in source
-    assert source.index("_drain_pending_profile_purges") < source.index(
+    assert "_drain_pending_purges" in source
+    assert source.index("_drain_pending_purges") < source.index(
         "self._build_providers()"
     ), "a provider could be scraping the profile that is owed a deletion"
-    assert source.index("_drain_pending_profile_purges") < source.index(
+    assert source.index("_drain_pending_purges") < source.index(
         "hydrate_all_from_keyring"
     ), "a cookie was hydrated into a profile that is owed a deletion"
 
@@ -1912,17 +1960,22 @@ def test_clear_all_browser_data_waits_for_the_account_that_is_scraping(
         "a profile was deleted under a live page, or a free one was not"
     )
     assert "browser data clear deferred account=claude" in caplog.text
-    assert "recorded=no" in caplog.text, "the deferral did not say it is not stored"
-    # Never on the persisted list: its drain skips a configured account by
-    # design, so a deferred clear would be dropped at the next start.
+    # Never on the *removal* list: its drain skips a configured account by
+    # design, so a deferred clear routed there would be dropped at the next
+    # start. It goes on the clear list, which is persisted with a drain of
+    # its own.
     assert app._pending_profile_purges == []  # noqa: SLF001
     assert RealConfig.load().pending_profile_purges == []
     assert app._pending_data_clears == ["claude"]  # noqa: SLF001
+    assert RealConfig.load().pending_data_clears == ["claude"]
 
     claude.pending(_ok("claude"))
 
     assert purged[-1] == "claude", "the deferred clear never ran"
     assert app._pending_data_clears == []  # noqa: SLF001
+    assert RealConfig.load().pending_data_clears == [], (
+        "a clear that ran is still recorded as owed"
+    )
 
 
 def test_a_clear_request_takes_only_usable_ids(monkeypatch):

@@ -54,15 +54,22 @@ and what a log line is allowed to cost.
   cleared at the click, for every id. The profiles now go to the App, which
   deletes each one as soon as that account is free, and the confirmation says
   that a profile being refreshed right now is deleted when that refresh
-  finishes.
+  finishes or at the next start.
 
-  These ids are kept on their own in-memory list rather than in
-  `pending_profile_purges`: that list is persisted and its drain skips an id
-  that is *also* a configured account, which is right for a removal a
-  restored backup has undone and would silently drop every deferred clear at
-  the next start. The cost is that a quit inside the deferral window loses
-  it — the profile survives, the user can click again — and the deferral line
-  says so rather than leaving it to be discovered.
+  These ids are kept on their own list, `config.pending_data_clears`, rather
+  than in `pending_profile_purges`: that list's drain skips an id that is
+  *also* a configured account, which is right for a removal a restored backup
+  has undone and would silently drop every deferred clear at the next start,
+  because a clear is *always* about an account the user still has. Both lists
+  are persisted and both are drained at the next start — before any cookie is
+  hydrated and before any provider exists — through one helper and one
+  `Config.save()`; only the skip rule differs. The clear list has to be
+  written down: the keyring copy of the credential is deleted at the click,
+  so a quit inside the deferral window used to leave the account's
+  `ForcePersistentCookies` profile — the live session cookie, which is what
+  the button exists to destroy — on disk with nothing in the app ever
+  mentioning it again. `docs/next-session.md` §8.3 records that this is the
+  second thing that makes the app write `config.json` unasked.
 
 ### Fixed
 

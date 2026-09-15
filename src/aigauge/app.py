@@ -544,9 +544,9 @@ class App(QObject):
         # Accounts the user removed whose on-disk profile is waiting for a
         # live scrape to let go of it. See _run_profile_purges.
         self._pending_profile_purges: list[str] = []
-        # The same wait for "Clear all browser data", kept apart because
-        # these ids belong to accounts the user still has. See
-        # _on_browser_data_clear_requested.
+        # The same wait for "Clear all browser data", kept apart because the
+        # two drains differ - this one skips nothing. Persisted like the
+        # other. See _on_browser_data_clear_requested.
         self._pending_data_clears: list[str] = []
         # The names this cycle is accounting for. A snapshot from outside it
         # repaints its tile without joining its progress or its verdict.
@@ -559,7 +559,7 @@ class App(QObject):
 
         # Anything a previous run left owed, before a cookie is hydrated into
         # a profile and before a provider exists that could scrape it.
-        self._drain_pending_profile_purges()
+        self._drain_pending_purges()
 
         # Push any saved session cookies into the WebEngine profiles before any
         # scrape runs, so the headless page loads as signed-in.
@@ -1357,29 +1357,49 @@ class App(QObject):
             return False
         return True
 
-    def _drain_pending_profile_purges(self) -> None:
-        """Run what a previous run left owed.
+    def _drain_pending_purges(self) -> None:
+        """Run what a previous run left owed - both lists, before anything else.
 
-        The deferral list used to be in memory only: `App` has no
-        `aboutToQuit` hook that flushes it, and once the account is gone from
+        Neither list used to be in memory only: `App` has no `aboutToQuit`
+        hook that flushes them, and once an account is gone from
         `config.json` nothing at the next start looked for its directory -
         the only sweep of `profiles/` on disk is the manual Settings "Clear
-        all browser data". What survived was the removed account's Chromium
-        profile, which uses `ForcePersistentCookies`, i.e. the live session
-        cookie itself, with no recovery path at all. (The keyring secret is
-        cleared by the dialog at the moment of removal either way.)
+        all browser data". What survived was a Chromium profile that uses
+        `ForcePersistentCookies`, i.e. the live session cookie itself, with
+        no recovery path at all. (The keyring secret is cleared by the dialog
+        at the moment of the removal or the click either way, which is why
+        nothing in the UI would ever mention such a profile again.)
+
+        The two drains differ in one thing and are kept apart for it: a
+        removal skips an id that is a configured account again, a clear-all
+        skips nothing.
         """
         pending = list(getattr(self._config, "pending_profile_purges", []) or [])
-        if not pending:
+        clears = list(getattr(self._config, "pending_data_clears", []) or [])
+        if not pending and not clears:
             return
-        # A count, and a bounded sample of the ids: the list is
-        # config-controlled and nothing bounds it, so echoing it whole let a
-        # poisoned `config.json` erase the log ring at every start.
-        log.info(
-            "profile purge owed from a previous run count=%s accounts=%s",
-            len(pending),
-            _ids_for_log(pending),
-        )
+        # A count, and a bounded sample of the ids: both lists are
+        # config-controlled and nothing bounds them, so echoing one whole let
+        # a poisoned `config.json` erase the log ring at every start.
+        if pending:
+            log.info(
+                "profile purge owed from a previous run count=%s accounts=%s",
+                len(pending),
+                _ids_for_log(pending),
+            )
+        if clears:
+            log.info(
+                "browser data clear owed from a previous run count=%s accounts=%s",
+                len(clears),
+                _ids_for_log(clears),
+            )
+        for account_id in clears:
+            # No configured-account skip here, on purpose: the user asked for
+            # these profiles to be deleted and every one of them belongs to
+            # an account they still have, so the skip below would drop the
+            # whole list at the next start.
+            if account_id not in self._pending_data_clears:
+                self._pending_data_clears.append(account_id)
         configured = {account.id for account in browser_accounts(self._config)}
         for account_id in pending:
             if account_id in configured:
@@ -1410,12 +1430,27 @@ class App(QObject):
                 self._pending_profile_purges.append(account_id)
         self._run_profile_purges()
 
-    def _persist_pending_profile_purges(self) -> None:
-        """Record what is still owed, so a quit cannot lose it."""
-        pending = list(self._pending_profile_purges)
-        if list(getattr(self._config, "pending_profile_purges", []) or []) == pending:
+    def _persist_pending_purges(self) -> None:
+        """Record what is still owed, so a quit cannot lose it.
+
+        Both lists through one helper and one `Config.save()`: they are owed
+        together, drained together, and the app writing the user's settings
+        file on its own is worth doing once rather than twice. The equality
+        test is what keeps the steady state - two empty lists - from writing
+        anything at all, which is most of the life of the app.
+        """
+        changed = False
+        for field, owed in (
+            ("pending_profile_purges", self._pending_profile_purges),
+            ("pending_data_clears", self._pending_data_clears),
+        ):
+            pending = list(owed)
+            if list(getattr(self._config, field, []) or []) == pending:
+                continue
+            setattr(self._config, field, pending)
+            changed = True
+        if not changed:
             return
-        self._config.pending_profile_purges = pending
         try:
             self._config.save()
         except Exception:  # noqa: BLE001 - cleanup must not crash the app
@@ -1440,11 +1475,16 @@ class App(QObject):
         drain skips a configured account by design
         (`purge skipped ... reason=reconfigured`), which is right for a
         removal that a restored backup has undone and wrong for this: a
-        deferred clear would be dropped at the next start. This list is in
-        memory only, so if the app quits while one is deferred the profile
-        survives and the user can click the button again - the honest cost
-        of not writing "delete a live account's profile" into a file that
-        outlives the click.
+        deferred clear would be dropped at the next start. So this list is a
+        second persisted one, with a drain of its own that skips nothing.
+
+        It has to be persisted. The profile that is most likely to be
+        deferred is the one being scraped right now, the button's whole
+        promise is that the saved credential is gone, and the keyring copy
+        *is* gone at the click - so a quit inside the deferral window used to
+        leave the live provider session cookie on disk with nothing in the UI
+        ever mentioning it again. Clicking the button a second time was the
+        only thing that reached it.
         """
         for account_id in account_ids:
             if not isinstance(account_id, str) or not account_id:
@@ -1474,28 +1514,26 @@ class App(QObject):
             return "scrape_in_flight"
         return None
 
-    def _purge_or_defer(self, account_ids: list[str], *, persisted: bool) -> list[str]:
-        """Purge what is free; return what is still waiting."""
+    def _purge_or_defer(self, account_ids: list[str], *, removal: bool) -> list[str]:
+        """Purge what is free; return what is still waiting.
+
+        `removal` picks the log line only. Both lists are recorded and both
+        are drained at the next start; what differs is the drain's skip rule,
+        which is why they are two lists.
+        """
         waiting: list[str] = []
         for account_id in account_ids:
             blocked = self._purge_blocked_reason(account_id)
             if blocked is not None:
-                if persisted:
-                    log.info(
-                        "profile purge deferred account=%s reason=%s",
-                        _clip_for_log(account_id),
-                        blocked,
-                    )
-                else:
-                    # Said out loud because this one is not written down: a
-                    # quit inside the window loses it, and clicking the
-                    # button again is the whole recovery.
-                    log.info(
-                        "browser data clear deferred account=%s reason=%s "
-                        "recorded=no",
-                        _clip_for_log(account_id),
-                        blocked,
-                    )
+                log.info(
+                    (
+                        "profile purge deferred account=%s reason=%s"
+                        if removal
+                        else "browser data clear deferred account=%s reason=%s"
+                    ),
+                    _clip_for_log(account_id),
+                    blocked,
+                )
                 waiting.append(account_id)
                 continue
             try:
@@ -1516,22 +1554,23 @@ class App(QObject):
         cookies back into the directory that was just deleted, which puts a
         removed account's live credential back on disk.
 
-        Two lists, one test. `_pending_profile_purges` is the removals: it is
-        persisted, so a quit cannot lose it. `_pending_data_clears` is
-        "Clear all browser data", which is about accounts the user still has
-        and is therefore in memory only - see
-        `_on_browser_data_clear_requested`.
+        Two lists, one test. `_pending_profile_purges` is the removals and
+        `_pending_data_clears` is "Clear all browser data"; both are
+        persisted, so a quit cannot lose either, and they stay apart because
+        their startup drains differ - see `_on_browser_data_clear_requested`.
 
         The keyring secret is cleared immediately by the dialog either way;
         this is only the on-disk profile, and deferring it costs nothing.
         """
         self._pending_profile_purges = self._purge_or_defer(
-            self._pending_profile_purges, persisted=True
+            self._pending_profile_purges, removal=True
         )
-        self._persist_pending_profile_purges()
         self._pending_data_clears = self._purge_or_defer(
-            self._pending_data_clears, persisted=False
+            self._pending_data_clears, removal=False
         )
+        # One write, after both lists have been worked: what is owed is what
+        # is left on them.
+        self._persist_pending_purges()
 
     def _pool_wait_slack(self, name: str) -> float:
         """How long this dispatch may sit in the thread pool before it starts.

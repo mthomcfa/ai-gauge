@@ -1328,7 +1328,7 @@ class SettingsDialog(QDialog):
             "You will need to sign in again for each provider. This cannot be "
             "undone.\n\n"
             "A profile that is being refreshed right now is deleted as soon "
-            "as that refresh finishes.",
+            "as that refresh finishes, or at the next start.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -1351,8 +1351,8 @@ class SettingsDialog(QDialog):
             "Browser data cleared",
             "Saved cookies were deleted and the browser profiles are being "
             "removed; one that is being refreshed right now is removed as "
-            "soon as that refresh finishes. Sign in again to resume "
-            "monitoring.",
+            "soon as that refresh finishes, or at the next start if you quit "
+            "before then. Sign in again to resume monitoring.",
         )
 
     def _rescan_meters(self) -> None:
