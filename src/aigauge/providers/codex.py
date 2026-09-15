@@ -945,6 +945,7 @@ SCRAPE_BUILD_ATTEMPTS = 2
 class CodexProvider(Provider):
     name = "codex"
     display_name = "Codex"
+    uses_browser = True
     # What the App-level watchdog allows this provider before it declares the
     # refresh lost: the scraper's own timeout x every attempt it may make.
     refresh_budget_seconds = (

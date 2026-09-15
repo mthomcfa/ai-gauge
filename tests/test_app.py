@@ -88,7 +88,12 @@ class _Dialog:
 
 def _refresh_app_stub() -> App:
     app = App.__new__(App)
-    app._providers = {"claude": object(), "codex": object()}  # noqa: SLF001
+    # Browser-backed: these are the ones that queue rather than going out
+    # together, which is what the queueing assertions below are about.
+    app._providers = {  # noqa: SLF001
+        "claude": SimpleNamespace(uses_browser=True),
+        "codex": SimpleNamespace(uses_browser=True),
+    }
     app._inflight = set()  # noqa: SLF001
     app._refresh_queue = []  # noqa: SLF001
     app._active_until = datetime.now() - timedelta(minutes=1)  # noqa: SLF001
@@ -101,6 +106,7 @@ def _refresh_app_stub() -> App:
     app._cycle_started_at = None  # noqa: SLF001
     app._cycle_reason = "startup"  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
+    app._dispatching = False  # noqa: SLF001
     app._watchdogs = {}  # noqa: SLF001
     app._pending_manual_refresh = False  # noqa: SLF001
     app._pending_manual_providers = []  # noqa: SLF001
@@ -924,6 +930,7 @@ def test_the_snapshot_error_log_line_redacts_azure_identifiers(qapp, caplog):
     app._cycle_statuses = {}  # noqa: SLF001
     app._cycle_active = False  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
+    app._dispatching = False  # noqa: SLF001
     app._watchdogs = {}  # noqa: SLF001
     app._error_retry = {}  # noqa: SLF001
     app._inflight = set()  # noqa: SLF001
@@ -964,9 +971,11 @@ def _mid_cycle_app(widget) -> App:
     app._snapshots = {}  # noqa: SLF001
     app._cycle_signatures = {}  # noqa: SLF001
     app._cycle_statuses = {}  # noqa: SLF001
+    app._cycle_total = 2  # noqa: SLF001
     app._cycle_active = True  # noqa: SLF001
     app._cycle_started_at = None  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
+    app._dispatching = False  # noqa: SLF001
     app._watchdogs = {}  # noqa: SLF001
     app._error_retry = {}  # noqa: SLF001
     app._inflight = {"claude"}  # noqa: SLF001
@@ -1039,6 +1048,7 @@ def test_a_snapshot_for_a_provider_the_user_removed_is_dropped(qapp):
     app._cycle_statuses = {}  # noqa: SLF001
     app._cycle_active = False  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
+    app._dispatching = False  # noqa: SLF001
     app._watchdogs = {}  # noqa: SLF001
     app._inflight = {"opencode_go"}  # noqa: SLF001
     app._refresh_queue = []  # noqa: SLF001

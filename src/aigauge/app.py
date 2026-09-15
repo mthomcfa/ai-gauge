@@ -341,8 +341,10 @@ class App(QObject):
         self._cycle_started_at: float | None = None
         self._cycle_reason = "startup"
         self._cycle_statuses: dict[str, SnapshotStatus] = {}
+        self._cycle_total = 0
         self._cycle_partial = False
         self._dispatch_times: dict[str, float] = {}
+        self._dispatching = False
         self._next_refresh_reason = "startup"
         self._settings_dialog: SettingsDialog | None = None
         self._settings_old_copilot_quota: int | None = None
@@ -783,25 +785,36 @@ class App(QObject):
         self._current_refresh_manual = manual
         self._cycle_signatures = {}
         self._cycle_statuses = {}
+        self._cycle_total = len(names)
         self._cycle_started_at = time.monotonic()
         self._cycle_reason = reason
         self._cycle_partial = len(names) < len(self._providers)
         self._cycle_active = True
-        self._refresh_queue = list(names)
         log.info(
             "refresh cycle start manual=%s reason=%s providers=%s",
             manual,
             reason,
             ",".join(names),
         )
-        self._widget.set_refreshing(True, total=len(self._refresh_queue))
+        self._widget.set_refreshing(True, total=len(names))
         # Both kinds of cycle mark their tiles now. A scheduled one is marked
         # more lightly - nobody asked for it - but it is marked, because the
         # alternative was a 48 s median cycle with no visible sign at all.
-        self._widget.mark_loading(
-            self._display_names(self._refresh_queue), subtle=not manual
-        )
-        self._start_next_refresh()
+        self._widget.mark_loading(self._display_names(names), subtle=not manual)
+        # The browser providers keep the serial queue; everything else goes
+        # out at once. A provider that answers from inside this loop would
+        # otherwise find an empty queue and close the cycle before the rest of
+        # the batch had even been dispatched, so the loop holds the cycle open
+        # until it is done.
+        concurrent = [name for name in names if not self._uses_browser(name)]
+        self._refresh_queue = [name for name in names if self._uses_browser(name)]
+        self._dispatching = True
+        try:
+            for name in concurrent:
+                self._dispatch(name)
+        finally:
+            self._dispatching = False
+        self._advance_cycle()
 
     def refresh_now(self, manual: bool = True) -> None:
         if not self._providers:
@@ -870,13 +883,28 @@ class App(QObject):
             log.info("refresh pending manual running scope=%s", ",".join(names))
             self._begin_cycle(names, manual=True, reason="manual")
 
+    def _uses_browser(self, name: str) -> bool:
+        return bool(getattr(self._providers.get(name), "uses_browser", False))
+
+    def _browser_in_flight(self) -> bool:
+        return any(self._uses_browser(name) for name in self._inflight)
+
     def _start_next_refresh(self) -> None:
-        if self._inflight or not self._refresh_queue:
+        if not self._refresh_queue:
+            return
+        # Only the browser queue is serial. A REST provider still in flight
+        # must not hold up the next scrape.
+        if self._browser_in_flight():
             return
         name = self._refresh_queue.pop(0)
+        if self._providers.get(name) is None:
+            QTimer.singleShot(0, self._start_next_refresh)
+            return
+        self._dispatch(name)
+
+    def _dispatch(self, name: str) -> None:
         provider = self._providers.get(name)
         if provider is None:
-            QTimer.singleShot(0, self._start_next_refresh)
             return
         self._inflight.add(name)
         now = time.monotonic()
@@ -1030,9 +1058,12 @@ class App(QObject):
         except Exception:  # noqa: BLE001
             log.exception("widget.set_ratio failed")
         if self._cycle_active:
+            # The cycle's own total, not one recomputed from the queue: while
+            # the REST batch is going out, the providers not yet dispatched
+            # are in neither set and the header would count down to a
+            # denominator that moves.
             self._widget.set_refresh_progress(
-                len(self._cycle_statuses),
-                len(self._cycle_statuses) + len(self._inflight) + len(self._refresh_queue),
+                len(self._cycle_statuses), self._cycle_total
             )
         # Per snapshot, not per cycle: the tray dot and its tooltip used to be
         # a whole cycle behind the tiles, which is minutes on a failing cycle.
@@ -1047,6 +1078,10 @@ class App(QObject):
             # settings change, or a provider reporting late - repaints its
             # tile and nothing more. It must not close a cycle that is not
             # running or re-arm the timer behind the scheduler's back.
+            return
+        if self._dispatching:
+            # Still handing out this cycle's work; a synchronous answer must
+            # not be read as "everything is done".
             return
         if self._refresh_queue:
             QTimer.singleShot(0, self._start_next_refresh)

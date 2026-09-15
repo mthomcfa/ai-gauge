@@ -191,9 +191,14 @@ The cost is not Python. It is three things, in value order:
    the last values at startup, so every tile starts empty and fills serially.
    A small dedicated "last snapshot" file would be cleaner than bending
    `record_snapshot`, which keys on `resets_at`.
-2. **The refresh queue is strictly serial.** `app._start_next_refresh` returns
-   early if anything is in flight. The providers are independent; parallelising
-   turns 40–70s into roughly the slowest single provider.
+2. ~~**The refresh queue is strictly serial.**~~ **Half-fixed in
+   1.3.0+cfa.5.** The REST providers (Copilot, OpenRouter, Azure) are
+   dispatched together at cycle start; the browser providers still run one at
+   a time, because QtWebEngine is GUI-thread-only and each scrape holds a
+   profile. A cycle is now roughly the browser queue, with the cheap tiles
+   filled in the first second rather than after it. Fully parallel refresh -
+   two `QWebEngineView`s at once - remains a design decision, not a patch:
+   concurrent profile locking and renderer memory are the open questions.
 3. **Fixed pre-extractor sleeps.** `wait_ms` is 3000 for Claude, 7000 for Codex,
    5000 for OpenCode — slept unconditionally before the extractor runs, even on
    a page that was ready immediately. The extractor already has a retry protocol

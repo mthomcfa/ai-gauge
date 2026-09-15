@@ -137,6 +137,8 @@ class _Widget:
 class _Provider:
     """Calls back synchronously unless told to hold the callback."""
 
+    uses_browser = False
+
     def __init__(self, snapshot: UsageSnapshot | None = None, *, hold: bool = False):
         self.snapshot = snapshot
         self.hold = hold
@@ -149,6 +151,12 @@ class _Provider:
             self.pending = on_done
             return
         on_done(self.snapshot)
+
+
+class _BrowserProvider(_Provider):
+    """A QtWebEngine-backed provider: these stay strictly serial."""
+
+    uses_browser = True
 
 
 def _ok(provider: str) -> UsageSnapshot:
@@ -181,7 +189,9 @@ def _app(providers: dict[str, _Provider]) -> App:
     app._cycle_started_at = None  # noqa: SLF001
     app._cycle_reason = "startup"  # noqa: SLF001
     app._cycle_statuses = {}  # noqa: SLF001
+    app._cycle_total = 0  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
+    app._dispatching = False  # noqa: SLF001
     app._next_refresh_reason = "startup"  # noqa: SLF001
     app._active_until = datetime.now() + timedelta(minutes=30)  # noqa: SLF001
     app._current_refresh_manual = False  # noqa: SLF001
@@ -389,15 +399,14 @@ def test_a_provider_that_never_calls_back_does_not_stall_the_cycle(caplog):
     while it is non-empty. One provider that never reported back therefore
     stopped every refresh until the app was restarted.
     """
-    claude = _Provider(_ok("claude"), hold=True)
-    codex = _Provider(_ok("codex"))
+    claude = _BrowserProvider(_ok("claude"), hold=True)
+    codex = _BrowserProvider(_ok("codex"))
     app = _app({"claude": claude, "codex": codex})
 
     with caplog.at_level(logging.WARNING, logger="aigauge.app"):
         app.refresh_now(manual=False)
         assert app._inflight == {"claude"}  # noqa: SLF001
-        watchdog = _FakeQTimer.armed[-1]
-        watchdog.fire()
+        app._watchdogs["claude"].fire()  # noqa: SLF001
 
     assert "watchdog" in caplog.text
     assert app._snapshots["claude"].status == SnapshotStatus.ERROR  # noqa: SLF001
@@ -408,10 +417,10 @@ def test_a_provider_that_never_calls_back_does_not_stall_the_cycle(caplog):
 
 
 def test_the_stuck_providers_late_snapshot_does_not_close_a_second_cycle():
-    claude = _Provider(_ok("claude"), hold=True)
+    claude = _BrowserProvider(_ok("claude"), hold=True)
     app = _app({"claude": claude})
     app.refresh_now(manual=False)
-    _FakeQTimer.armed[-1].fire()
+    app._watchdogs["claude"].fire()  # noqa: SLF001
     ends = app._timer.started_ms
 
     # The provider finally reports back, long after the cycle closed.
@@ -506,3 +515,79 @@ def test_the_heartbeat_carries_the_error_retry_state(caplog):
         app._log_heartbeat()  # noqa: SLF001
 
     assert "error_cycles=claude:2" in caplog.text
+
+
+
+def test_the_cheap_rest_providers_all_start_at_once():
+    """Copilot, OpenRouter and Azure are plain HTTPS calls on a thread pool;
+    only App's queue made them wait for a browser scrape. The log put cycles
+    at a median of 48 s and a p90 of 79 s, almost all of it browser time, with
+    the REST tiles filling behind it."""
+    providers = {
+        "claude": _BrowserProvider(_ok("claude"), hold=True),
+        "codex": _BrowserProvider(_ok("codex"), hold=True),
+        "copilot": _Provider(_ok("copilot"), hold=True),
+        "openrouter": _Provider(_ok("openrouter"), hold=True),
+        "azure": _Provider(_ok("azure"), hold=True),
+    }
+    app = _app(providers)
+
+    app.refresh_now(manual=False)
+
+    assert {"copilot", "openrouter", "azure"} <= app._inflight  # noqa: SLF001
+    # Exactly one browser scrape is out; the other waits its turn.
+    assert len(app._inflight & {"claude", "codex"}) == 1  # noqa: SLF001
+    assert app._refresh_queue == ["codex"]  # noqa: SLF001
+
+
+def test_browser_providers_stay_strictly_serial():
+    """QtWebEngine is GUI-thread-only and each scrape holds a profile."""
+    claude = _BrowserProvider(_ok("claude"), hold=True)
+    codex = _BrowserProvider(_ok("codex"), hold=True)
+    app = _app({"claude": claude, "codex": codex})
+
+    app.refresh_now(manual=False)
+
+    assert claude.calls == 1
+    assert codex.calls == 0, "two browser scrapes were dispatched at once"
+
+    claude.pending(_ok("claude"))
+    assert codex.calls == 1
+
+
+def test_a_rest_provider_answering_instantly_does_not_close_the_cycle_early():
+    """Copilot with no PAT answers AUTH_REQUIRED synchronously, from inside
+    the dispatch loop. The cycle must not end while the rest of the batch has
+    not been dispatched."""
+    copilot = _Provider(
+        UsageSnapshot(
+            provider="copilot",
+            status=SnapshotStatus.AUTH_REQUIRED,
+            error="no PAT",
+        )
+    )
+    openrouter = _Provider(_ok("openrouter"), hold=True)
+    app = _app({"copilot": copilot, "openrouter": openrouter})
+
+    app.refresh_now(manual=False)
+
+    assert app._cycle_active is True, "the cycle closed mid-dispatch"  # noqa: SLF001
+    assert openrouter.calls == 1
+    assert app._inflight == {"openrouter"}  # noqa: SLF001
+
+    openrouter.pending(_ok("openrouter"))
+    assert app._cycle_active is False  # noqa: SLF001
+
+
+def test_the_cycle_ends_only_when_the_last_provider_reports():
+    claude = _BrowserProvider(_ok("claude"), hold=True)
+    azure = _Provider(_ok("azure"), hold=True)
+    app = _app({"claude": claude, "azure": azure})
+
+    app.refresh_now(manual=False)
+    claude.pending(_ok("claude"))
+    assert app._cycle_active is True, "closed while a REST provider was still out"
+
+    azure.pending(_ok("azure"))
+    assert app._cycle_active is False
+    assert app._timer.started_ms is not None, "the next refresh was never scheduled"
