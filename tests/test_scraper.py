@@ -1,4 +1,5 @@
 import logging
+import time
 
 import pytest
 
@@ -82,7 +83,12 @@ class _LoadFailStandIn:
         self._provider = "claude"
         self._attempt = 1
         self._render_terminated = False
-        self._started_at = 0.0
+        # Not 0.0: `_is_resume_artifact` compares `monotonic() - _started_at`
+        # against the timeout budget, so a literal zero makes the elapsed time
+        # the host's uptime - hours on a long-lived machine, seconds on a
+        # freshly booted CI runner, and the same test then passes or fails by
+        # where it runs. Every test below sets the elapsed time it means.
+        self._started_at = time.monotonic()
         self._timeout_ms = 25000
         self._max_attempts = 1
         self._RETRYABLE_ERRORS = ()
@@ -256,7 +262,7 @@ def test_a_timeout_measured_across_a_suspend_is_named_as_one(caplog):
     import logging
 
     stand_in = _LoadFailStandIn()
-    stand_in._started_at = 0.0  # monotonic zero: elapsed is hours, not seconds
+    stand_in._started_at = time.monotonic() - 300_000.0  # the lid was shut for days
 
     with caplog.at_level(logging.WARNING, logger="aigauge.webview.scraper"):
         HeadlessScraper._finish(stand_in, None, "timeout")
@@ -283,7 +289,7 @@ def test_a_page_that_failed_to_load_is_never_a_resume_artifact():
     """Only a timeout can be measured across a suspend; every other failure
     is reported by Chromium at the moment it happens."""
     stand_in = _LoadFailStandIn()
-    stand_in._started_at = 0.0
+    stand_in._started_at = time.monotonic() - 300_000.0
 
     HeadlessScraper._finish(stand_in, None, "page failed to load")
 
