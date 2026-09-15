@@ -375,25 +375,29 @@ def _mask(matched: str) -> str:
     return f"<{_length_bucket(len(matched))}, run-salted:{digest}>"
 
 
+# Which claim wins when two findings overlap. `redact()` needs non-overlapping
+# spans, so one of them has to go - and it must never be the blocking one.
+# Running the rules in order and letting the first claim stand meant a `redact`
+# finding could silence a `block`: `read /srv/ops@example.org/.env` was an
+# allowed dispatch, because `email-address` claimed the span that `denied-path`
+# would have blocked on - and the path was still in the text that went out.
+_SEVERITY = {BLOCK: 0, REDACT: 1, WARN: 2}
+
+
 def scan(text: str, policy: Policy) -> list[Finding]:
-    findings: list[Finding] = []
-    claimed: list[tuple[int, int]] = []
+    candidates: list[tuple[int, int, Finding]] = []
 
-    def overlaps(start: int, end: int) -> bool:
-        return any(start < c_end and c_start < end for c_start, c_end in claimed)
-
-    for rule, default_action, pattern in _DETECTORS:
+    for order, (rule, default_action, pattern) in enumerate(_DETECTORS):
         action = policy.action_for(rule, default_action)
         if action == "off":
             continue
         for match in re.finditer(pattern, text):
-            # The narrower, earlier rule wins: a Postgres URL is one finding,
-            # not also a basic-auth URL and a secret assignment.
-            if overlaps(match.start(), match.end()):
-                continue
-            claimed.append((match.start(), match.end()))
-            findings.append(
-                Finding(rule, action, match.start(), match.end(), _mask(match.group(0)))
+            candidates.append(
+                (
+                    _SEVERITY[action],
+                    order,
+                    Finding(rule, action, match.start(), match.end(), _mask(match.group(0))),
+                )
             )
 
     # The catch-all for credentials with no recognised shape defaults to
@@ -404,21 +408,31 @@ def scan(text: str, policy: Policy) -> list[Finding]:
     if entropy_action != "off":
         for match in _OPAQUE_TOKEN_RE.finditer(text):
             token = match.group(0)
-            if overlaps(match.start(), match.end()):
-                continue
             if shannon_entropy(token) < _ENTROPY_FLOOR:
                 continue
-            claimed.append((match.start(), match.end()))
-            findings.append(
-                Finding("opaque-token", entropy_action, match.start(), match.end(), _mask(token))
+            candidates.append(
+                (
+                    _SEVERITY[entropy_action],
+                    len(_DETECTORS),
+                    Finding(
+                        "opaque-token", entropy_action, match.start(), match.end(), _mask(token)
+                    ),
+                )
             )
 
-    # Path findings go through the same overlap filter as everything else.
-    # They did not, and `redact()` assumes non-overlapping spans, so a denied
-    # path overlapping an email address chewed the placeholder of whichever
-    # was written second.
     for finding in _scan_paths(text, policy):
-        if overlaps(finding.start, finding.end):
+        candidates.append((_SEVERITY[finding.action], len(_DETECTORS) + 1, finding))
+
+    # Severity first, then the rule order, so the narrower, earlier rule still
+    # wins between two claims that mean the same thing - a Postgres URL is one
+    # finding, not also a basic-auth URL - while a block always displaces a
+    # redaction rather than the other way round.
+    findings: list[Finding] = []
+    claimed: list[tuple[int, int]] = []
+    for _severity, _order, finding in sorted(
+        candidates, key=lambda candidate: (candidate[0], candidate[1], candidate[2].start)
+    ):
+        if any(finding.start < end and start < finding.end for start, end in claimed):
             continue
         claimed.append((finding.start, finding.end))
         findings.append(finding)

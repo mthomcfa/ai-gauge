@@ -202,6 +202,43 @@ def test_this_repos_own_secret_stores_are_denied(path):
     assert "denied-path" in rules_hit(f"please read {path}")
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "please read /srv/ops@example.org/.env and summarise",
+        "please read /home/ops@example.org/.aws/credentials and summarise",
+        "please read deploy/secrets/QmX9vT3kLpZr7bNw2Ys5Hd8Fg4Jc6Me1Ab and summarise",
+        "please read /srv/QmX9vT3kLpZr7bNw2Ys5Hd8Fg4Jc6Me1AbCd/id_rsa and summarise",
+    ],
+)
+def test_a_block_is_not_lost_to_an_overlapping_redaction(text):
+    """Putting an `@` in a directory name turned a blocked path into an allowed
+    dispatch: `email-address` claimed the span first and the path went out in
+    the text. A `redact` must never silence a `block`."""
+    findings = eg.scan(text, policy())
+    assert any(f.rule == "denied-path" and f.action == eg.BLOCK for f in findings), (
+        f"no blocking denied-path finding for {text!r}: {[(f.rule, f.action) for f in findings]}"
+    )
+    decision = eg._decide(
+        text,
+        policy(
+            destinations={"allow": ["openrouter/*"], "server": "http://127.0.0.1:4096"},
+            posture={"require_server_password": False},
+        ),
+        Path("."),
+        "openrouter/x",
+    )
+    assert decision.verdict == "blocked"
+    assert decision.exit_code == 2
+
+
+def test_the_narrower_earlier_rule_still_wins_between_equal_claims():
+    """Severity first, rule order second: ranking by severity alone would let a
+    later rule of the same severity displace the one written to be specific."""
+    findings = eg.scan("postgres://svc:hunter2@db.internal:5432/app", policy())
+    assert [f.rule for f in findings] == ["connection-string"]
+
+
 def test_a_denied_path_finding_does_not_carry_the_path(tmp_path):
     """`Finding.excerpt` promises it never carries the matched secret. The raw
     path carries the local username."""
