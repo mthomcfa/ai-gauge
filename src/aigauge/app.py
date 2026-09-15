@@ -1457,8 +1457,13 @@ class App(QObject):
             self._error_retry[name] = (errors, None)
         self._begin_cycle(runnable, manual=False, reason="error_retry")
 
-    def _repaint_snapshot(self, snapshot: UsageSnapshot) -> None:
-        """Show a snapshot again. The tile only - never the cycle.
+    def _repaint_snapshot(
+        self, snapshot: UsageSnapshot, *, record: bool = False
+    ) -> None:
+        """Show a snapshot again: the tile, and with ``record`` the stores.
+
+        Never the cycle, either way - no `_inflight` entry, no watchdog, no
+        progress counter, no verdict.
 
         A settings save re-renders Copilot's or OpenRouter's cached payload
         against the new denominator, so the tile shows it immediately rather
@@ -1479,15 +1484,34 @@ class App(QObject):
         if name not in self._providers:
             return
         self._snapshots[name] = snapshot
+        if record:
+            # A late answer is a new observation, and the only thing the
+            # stores heard about that dispatch was the watchdog's synthetic
+            # `Refresh timed out.` - which both of them drop, because neither
+            # records anything that is not OK. Painting it and not recording
+            # it gave a provider that answers correctly but slower than its
+            # budget a healthy tile with an empty ratio history and a
+            # permanently blank burn-rate row: measured at 0 rows over twelve
+            # cycles where a provider inside its budget contributes 12.
+            #
+            # A settings re-render passes record=False and means it: that
+            # payload is a cached observation already recorded, re-rendered
+            # against a new denominator, and recording it again would move an
+            # average nothing new happened to.
+            try:
+                self._history.record_snapshot(snapshot)
+            except Exception:  # noqa: BLE001
+                log.exception("history.record_snapshot failed")
+            try:
+                self._ratio.record_snapshot(snapshot)
+            except Exception:  # noqa: BLE001
+                log.exception("ratio.record_snapshot failed")
         self._widget.update_snapshot(
             snapshot, display_name_for_account(self._config, name)
         )
         # The burn-rate row is hidden by `set_snapshot` on anything but OK, so
         # a repaint that turns an ERROR tile back into an OK one has to ask
-        # for it again. The *estimator* is not fed: this is an observation
-        # already recorded, or a cached one re-rendered against a new
-        # denominator, and either way recording it twice would move an
-        # average that nothing new happened to.
+        # for it again.
         try:
             self._widget.set_ratio(
                 name,
@@ -1630,6 +1654,14 @@ class App(QObject):
         paint over, and its retry entry is cleared only when it answered OK
         or AUTH_REQUIRED. A late failure keeps the streak the watchdog
         earned.
+
+        It is recorded as well as painted. The observation is genuinely new -
+        the only thing `HistoryStore` and `RatioStore` heard about this
+        dispatch was the watchdog's synthetic ERROR, which both of them drop -
+        so a provider slower than its budget otherwise showed a healthy tile
+        above an empty ratio history and a blank burn-rate row. Recording it
+        is not a scheduling side effect: the cycle, the epoch and the
+        watchdogs still belong to whatever dispatch is current.
         """
         name = snapshot.provider
         current = self._dispatch_epoch.get(name)
@@ -1646,8 +1678,13 @@ class App(QObject):
             "tile repainted" if painted else "dropped",
         )
         if painted:
+            # Recorded as well as painted: it is a real observation, and no
+            # other one was ever recorded for this dispatch. It still joins
+            # no cycle, clears no `_inflight` entry and destroys no watchdog -
+            # paint and record, but no scheduling side effects.
             self._repaint_snapshot(
-                _preserve_error_metrics(snapshot, self._snapshots.get(name))
+                _preserve_error_metrics(snapshot, self._snapshots.get(name)),
+                record=True,
             )
             if snapshot.status in (
                 SnapshotStatus.OK,

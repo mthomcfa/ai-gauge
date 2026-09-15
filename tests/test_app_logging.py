@@ -1138,6 +1138,84 @@ def test_a_late_answer_from_a_slow_provider_repaints_its_tile():
     assert ratios == ["copilot"], "the burn-rate row stayed hidden"
 
 
+def test_a_late_answer_is_recorded_and_not_only_painted():
+    """A slow-but-healthy provider had a healthy tile and no history at all.
+
+    The only thing either store heard about that dispatch was the watchdog's
+    synthetic `Refresh timed out.`, and both drop anything that is not OK. So
+    the tile showed the right number while "Open ratio history" stayed empty
+    and the burn-rate row never populated - for as long as the provider stayed
+    slower than its budget, which for a REST provider on a one-core host is
+    the six-minute window the pool slack deliberately makes generous.
+    """
+    copilot = _Provider(_ok("copilot"), hold=True)
+    app = _app({"copilot": copilot})
+    history: list[UsageSnapshot] = []
+    recorded: list[UsageSnapshot] = []
+    app._history = SimpleNamespace(record_snapshot=history.append)  # noqa: SLF001
+    app._ratio = SimpleNamespace(  # noqa: SLF001
+        record_snapshot=recorded.append,
+        display_estimate=lambda provider: None,
+        current_estimate=lambda provider: None,
+    )
+
+    for _ in range(12):
+        app.refresh_now(manual=False)
+        late = copilot.pending
+        app._watchdogs["copilot"].fire()  # noqa: SLF001
+        app._abandoned.clear()  # noqa: SLF001 - the assumed-dead ceiling passes
+        late(
+            UsageSnapshot(
+                provider="copilot",
+                status=SnapshotStatus.OK,
+                metrics=[UsageMetric("Session", 41.0)],
+            )
+        )
+
+    assert copilot.calls == 12
+    # The real stores drop anything that is not OK (the watchdog's synthetic
+    # ERROR reaches them and goes nowhere), so the OK rows are the measure.
+    ok_rows = [
+        snap.metrics[0].percent_used
+        for snap in history
+        if snap.status is SnapshotStatus.OK
+    ]
+    assert ok_rows == [41.0] * 12, (
+        "twelve late-but-healthy cycles left the ratio history empty"
+    )
+    assert len([s for s in recorded if s.status is SnapshotStatus.OK]) == 12, (
+        "the burn-rate estimator was never fed"
+    )
+    # Recorded, and still no scheduling side effect: the cycle's verdict is
+    # what the watchdog gave it, and nothing is left in flight or armed.
+    assert app._cycle_statuses == {"copilot": SnapshotStatus.ERROR}  # noqa: SLF001
+    assert app._inflight == set() and app._watchdogs == {}  # noqa: SLF001
+
+
+def test_a_settings_rerender_is_not_recorded_a_second_time():
+    """The other caller of the same repaint means the opposite: that payload
+    is an observation already recorded, re-rendered against a new
+    denominator, and recording it again moves an average nothing new
+    happened to."""
+    copilot = _Provider(_ok("copilot"))
+    app = _app({"copilot": copilot})
+    app.refresh_now(manual=False)
+    history: list[UsageSnapshot] = []
+    recorded: list[UsageSnapshot] = []
+    app._history = SimpleNamespace(record_snapshot=history.append)  # noqa: SLF001
+    app._ratio = SimpleNamespace(  # noqa: SLF001
+        record_snapshot=recorded.append,
+        display_estimate=lambda provider: None,
+        current_estimate=lambda provider: None,
+    )
+
+    app._repaint_snapshot(app._snapshots["copilot"])  # noqa: SLF001
+
+    assert history == [] and recorded == [], (
+        "a re-render moved an average nothing new happened to"
+    )
+
+
 def test_a_late_auth_required_is_still_shown():
     """The one status that tells the user to sign in again was never
     painted when it arrived past the watchdog."""
