@@ -105,11 +105,16 @@ _DETECTORS: tuple[tuple[str, str, str], ...] = (
     ),
     # This app's own stores: src/aigauge/config.py defines KEYRING_SERVICE
     # "ai-gauge" with the usernames below, and the per-provider session cookies
-    # it keeps beside them.
+    # it keeps beside them. The lookup has to be there. Matching the two names
+    # anywhere on a line fired four times on this app's own error message -
+    # "Remove the 'ai-gauge' / 'github-pat' credential from your system
+    # keychain" - which is prose about a credential, not a credential, and it
+    # blocked one of this repository's own recent diffs.
     (
         "aigauge-keyring",
         BLOCK,
-        r"(?i)\bai-gauge\b[^\n]{0,60}?"
+        r"(?i)(?:\bkeyring\b|(?:get|set|delete)_password[ \t]{0,8}\()[^\n]{0,40}?"
+        r"\bai-gauge\b[^\n]{0,40}?"
         r"\b(?:github-pat|openrouter-mgmt-key|openrouter-key|azure-client-secret)\b",
     ),
     (
@@ -126,8 +131,23 @@ _DETECTORS: tuple[tuple[str, str, str], ...] = (
         # `DB_PASSWORD:` and `MY_SECRET=` - the commonest shape in a .env file
         # or a CI diff - produced no finding at all. Every run is bounded, so a
         # long separator-free blob cannot make this quadratic.
+        #
+        # The value has to look like a credential too. Any eight characters
+        # after the separator made a finding of every `token = get_token(
+        # tenant_id`, every `secret_edit = QLineEdit()` and every
+        # `"secret_storage: refusing"` log prefix: 22 hits on this repository's
+        # own source, 22 of them false, and the lines removed from the payload
+        # were the lines the delegate was being asked about. A credential value
+        # is quoted, or it is an unquoted run carrying a digit or a base64
+        # character - `hunter2hunter2`, `abcd1234...`, `8Xq7Yk2...` - and it is
+        # never a call, which is what the possessive run plus `(?!\()` says.
+        # `[ \t]` rather than `\s`, because an assignment's value is on the same
+        # line as its name; `\s` walked over the newline into the next
+        # statement.
         r"(?i)(?:password|passwd|secret|token|api[_-]?key|private[_-]?key|credential)"
-        r"[A-Za-z0-9_]{0,64}\s{0,16}[:=]\s{0,16}[\"']?[^\s\"',;]{8,256}+",
+        r"[A-Za-z0-9_]{0,64}[ \t]{0,16}[:=][ \t]{0,16}"
+        r"(?:[\"'][^\"'\n]{8,256}+[\"']"
+        r"|(?=[A-Za-z0-9._+/=~\-]{0,63}[0-9+/=~])[A-Za-z0-9._+/=~\-]{8,256}+(?!\())",
     ),
     ("certificate", WARN, r"-----BEGIN CERTIFICATE-----"),
     (
@@ -140,10 +160,13 @@ _DETECTORS: tuple[tuple[str, str, str], ...] = (
         # A local part is at most 64 characters (RFC 5321), so bounding it loses
         # no address; the lookbehind puts the only start position at the start of
         # the run, which is what makes a 400 KB run of `a.-` one failed match
-        # rather than 266 000 of them.
+        # rather than 266 000 of them. The lookahead makes the local part carry
+        # at least one alphanumeric: without it a diff line reading
+        # `+@responses.activate` is an address with a local part of `+`, and one
+        # of this repository's own diffs produced 102 of those.
         "email-address",
         REDACT,
-        r"(?<![A-Za-z0-9._%+\-])[A-Za-z0-9._%+\-]{1,64}+@"
+        r"(?<![A-Za-z0-9._%+\-])(?=[._%+\-]{0,63}[A-Za-z0-9])[A-Za-z0-9._%+\-]{1,64}+@"
         r"(?:[A-Za-z0-9\-]{1,63}+\.){1,8}[A-Za-z]{2,24}\b",
     ),
 )

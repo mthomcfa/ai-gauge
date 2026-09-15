@@ -105,6 +105,74 @@ def test_a_redacted_assignment_loses_its_value():
     assert "hunter2hunter2" not in out
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        "token = self.next()",
+        "secret = None",
+        "password: str",
+        'secret = keyring.get_password(KEYRING_SERVICE, "github-pat")',
+        "api_key = get_openrouter_key()",
+        "token = get_token(tenant_id, azure_cfg)",
+        "secret_edit = QLineEdit()",
+        'log.warning("secret_storage: refusing to write secrets on this host")',
+        "self._secret_cb = QCheckBox(self)",
+        "MAX_TOKENS = 4096",
+    ],
+)
+def test_source_code_that_merely_mentions_a_credential_is_not_redacted(line):
+    """Matching any eight characters after the `=` made a finding of every one
+    of these: 22 hits on this repository's own source, 22 of them false, and
+    the lines taken out of the payload were the lines the delegate was being
+    asked about."""
+    hits = [f for f in eg.scan(line, policy()) if f.rule == "secret-assignment"]
+    assert not hits, f"{line!r} -> {[f.rule for f in eg.scan(line, policy())]}"
+
+
+@pytest.mark.parametrize(
+    "line, expected",
+    [
+        ("keyring.get_password('ai-gauge', 'github-pat')", True),
+        ("keyring get ai-gauge openrouter-key", True),
+        ("Remove the 'ai-gauge' / 'github-pat' credential from your keychain.", False),
+        ("ai-gauge stores an azure-client-secret somewhere on this machine", False),
+    ],
+)
+def test_the_keyring_rule_needs_the_lookup_and_not_the_words(line, expected):
+    """This app's own error message named both halves in prose and blocked one
+    of this repository's own recent diffs."""
+    assert ("aigauge-keyring" in rules_hit(line)) is expected
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["+@responses.activate", "+@pytest.mark.parametrize", "-@functools.cache"],
+)
+def test_a_decorator_on_a_diff_line_is_not_an_email_address(line):
+    assert "email-address" not in rules_hit(line)
+
+
+@pytest.mark.parametrize(
+    "line", ["+user@example.org", "-user@example.org", "person.name+tag@sub.example.co.uk"]
+)
+def test_an_address_on_a_diff_line_still_is_one(line):
+    assert "email-address" in rules_hit(line)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["secret_storage.py", "settings_dialog.py", "config.py"],
+)
+def test_this_repos_own_source_is_not_blocked_by_its_own_guard(name):
+    """A choke point that refuses the repository it ships in is a choke point
+    people route around. These three files carried every false positive the
+    round-2 review measured: 22 `secret-assignment`, four `aigauge-keyring` and
+    one `denied-path`, none of them a credential."""
+    source = (REPO_ROOT / "src" / "aigauge" / name).read_text(encoding="utf-8")
+    blocking = [f for f in eg.scan(source, policy()) if f.action == eg.BLOCK]
+    assert not blocking, [(f.rule, source[f.start : f.end]) for f in blocking]
+
+
 def test_an_unrecognised_high_entropy_blob_is_redacted_not_merely_warned():
     """The only net for credentials with no known shape used to let them past."""
     text = "value=aZ9+kQ/mN2xP7wL4tR6yU8iO0pA3sD5fG1hJ2kL4zX6c"
