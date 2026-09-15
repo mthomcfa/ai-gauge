@@ -31,6 +31,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -602,6 +603,9 @@ def _within(child: Path, parent: Path) -> bool:
     return True
 
 
+_BASE_REF_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._/\-^~]{0,200}\Z")
+
+
 def build_payload(args: argparse.Namespace, workspace: Path) -> str:
     if args.stdin:
         return sys.stdin.read()
@@ -610,14 +614,57 @@ def build_payload(args: argparse.Namespace, workspace: Path) -> str:
         parts.append(args.task)
     if args.include_diff:
         parts.append(_git(workspace, "status", "--short", "--untracked-files=all"))
-        parts.append(_git(workspace, "diff", *( [f"{args.base}...HEAD"] if args.base else [])))
+        diff = ["diff", "--no-ext-diff", "--no-textconv"]
+        if args.base:
+            diff += ["--end-of-options", f"{_verified_base(workspace, args.base)}...HEAD"]
+        else:
+            diff.append("--end-of-options")
+        parts.append(_git(workspace, *diff, "--"))
     return "\n\n".join(p for p in parts if p)
 
 
+def _verified_base(workspace: Path, base: str) -> str:
+    """Refuse a `--base` that is not a plain ref, then ask git whether it is one.
+
+    argparse rejects a bare leading dash but binds the `=` form, so
+    `--base=--output=PATH` reached `git diff` as an option and wrote an
+    arbitrary file. A ref name is a narrow shape; anything else is refused
+    before git sees it, and what is left is checked against the repository.
+    """
+    if base.startswith("-") or not _BASE_REF_RE.match(base):
+        raise Fault(f"--base {base!r} is not a plain ref name")
+    _git(workspace, "rev-parse", "--verify", "--quiet", "--end-of-options", f"{base}^{{commit}}")
+    return base
+
+
 def _git(workspace: Path, *args: str) -> str:
+    """Run git with the workspace's own diff drivers disabled.
+
+    `diff.external` and `diff.textconv` are commands git runs on the operator's
+    behalf. A workspace the delegated agent can write - which is the whole
+    threat this tool exists for, per finding A1's `edit: allow` - is a
+    workspace where one can be planted, and `--include-diff` alone was then
+    enough to run it. A failed git call is a fault rather than an empty diff:
+    a user who believes they preflighted a diff must not have preflighted a
+    nine-byte status line.
+    """
+    git = shutil.which("git")
+    if git is None:
+        raise Fault("git was not found on PATH, so --include-diff cannot be honoured")
     result = subprocess.run(
-        ["git", *args], cwd=workspace, capture_output=True, text=True, check=False
+        [git, "-c", "diff.external=", "-c", "diff.textconv=", "-c", "core.pager=cat",
+         "--no-pager", *args],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        check=False,
     )
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip().splitlines()
+        raise Fault(
+            f"git {args[0]} failed in {workspace} "
+            f"(exit {result.returncode}): {detail[-1] if detail else 'no output'}"
+        )
     return result.stdout
 
 
@@ -747,9 +794,56 @@ def cmd_posture(args: argparse.Namespace) -> int:
     return 3
 
 
+def _destination_refusal(policy: Policy, model: str | None) -> str | None:
+    """The destination decision, made before the payload is gathered.
+
+    `--include-diff` shells out to git, and running git in a workspace the
+    delegated agent can write is not a free action. The doc claims a refused
+    destination is refused "before the payload is read"; it now is.
+    """
+    if model is None or destination_allowed(model, policy):
+        return None
+    return (
+        f"destination {model!r} is not in destinations.allow "
+        f"({policy.allowed_destinations or 'empty - nothing is allowed'})"
+    )
+
+
+def _refuse_before_payload(
+    command: str, args: argparse.Namespace, policy: Policy, workspace: Path, refusal: str
+) -> int:
+    record = {
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "command": command,
+        "workspace": str(workspace),
+        "policy_source": policy.source,
+        "model": args.model,
+        "server": server_endpoint(policy.server),
+        "payload_sha256": None,
+        "payload_bytes": None,
+        "verdict": "blocked",
+        "findings": [],
+        "posture": [],
+        "refusals": [refusal],
+        "note": "the destination was refused before the payload was gathered",
+    }
+    print(f"policy: {policy.source}", file=sys.stderr)
+    print("verdict: blocked - nothing was gathered and nothing was sent", file=sys.stderr)
+    print(f"  fault  {refusal}", file=sys.stderr)
+    try:
+        audit(policy, record)
+    except OSError as exc:
+        print(f"fault: the audit trail could not be written ({exc})", file=sys.stderr)
+        return 3
+    return 2
+
+
 def cmd_preflight(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace or os.getcwd())
     policy = Policy.load(args.policy, workspace)
+    refusal = _destination_refusal(policy, args.model)
+    if refusal is not None:
+        return _refuse_before_payload("preflight", args, policy, workspace, refusal)
     payload = build_payload(args, workspace)
     decision = _decide(payload, policy, workspace, args.model)
 
@@ -783,6 +877,9 @@ def cmd_preflight(args: argparse.Namespace) -> int:
 def cmd_dispatch(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace or os.getcwd())
     policy = Policy.load(args.policy, workspace)
+    refusal = _destination_refusal(policy, args.model)
+    if refusal is not None:
+        return _refuse_before_payload("dispatch", args, policy, workspace, refusal)
     payload = build_payload(args, workspace)
     decision = _decide(payload, policy, workspace, args.model)
 

@@ -613,6 +613,123 @@ def test_a_new_audit_file_is_owner_only(tmp_path):
     assert target.stat().st_mode & 0o077 == 0
 
 
+# --- gathering the diff ----------------------------------------------------
+
+
+def _git_repo(tmp_path) -> Path:
+    """A throwaway repository with a `diff.external` driver planted in it."""
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=repo, capture_output=True, text=True, check=False
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.org")
+    git("config", "user.name", "t")
+    (repo / "a.txt").write_text("one\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "one")
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    return repo
+
+
+def _plant_external_diff(repo: Path, sentinel: Path) -> None:
+    import subprocess
+
+    if sys.platform == "win32":  # pragma: no cover - the driver shape differs
+        driver = repo.parent / "extdiff.bat"
+        driver.write_text(f"@echo ran > {sentinel}\n", encoding="utf-8")
+    else:
+        driver = repo.parent / "extdiff.sh"
+        driver.write_text(f'#!/bin/sh\necho ran > "{sentinel}"\n', encoding="utf-8")
+        driver.chmod(0o755)
+    subprocess.run(
+        ["git", "config", "diff.external", str(driver)],
+        cwd=repo, capture_output=True, text=True, check=False,
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX diff driver script")
+def test_include_diff_does_not_run_the_workspace_diff_driver(tmp_path):
+    """`--include-diff` alone was arbitrary command execution: any process that
+    can write the repo can plant `diff.external`, and the delegated agent runs
+    with `edit: allow`."""
+    repo = _git_repo(tmp_path)
+    sentinel = tmp_path / "ran"
+    _plant_external_diff(repo, sentinel)
+    args = eg.build_parser().parse_args(["scan", "--include-diff"])
+    eg.build_payload(args, repo)
+    assert not sentinel.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX diff driver script")
+def test_a_refused_destination_never_reaches_git(tmp_path, monkeypatch):
+    repo = _git_repo(tmp_path)
+    sentinel = tmp_path / "ran"
+    _plant_external_diff(repo, sentinel)
+    _clean_posture(tmp_path, monkeypatch)
+    pol_file = tmp_path / "policy.json"
+    pol_file.write_text(
+        json.dumps(
+            {
+                "destinations": {"allow": ["anthropic/*"], "server": "http://127.0.0.1:4096"},
+                "audit": {"path": str(tmp_path / "audit.jsonl")},
+            }
+        ),
+        encoding="utf-8",
+    )
+    code = eg.main(
+        [
+            "--policy", str(pol_file), "--workspace", str(repo),
+            "preflight", "--include-diff", "--model", "openrouter/x",
+        ]
+    )
+    assert code == 2
+    assert not sentinel.exists()
+    record = json.loads((tmp_path / "audit.jsonl").read_text(encoding="utf-8").strip())
+    assert record["payload_bytes"] is None
+
+
+@pytest.mark.parametrize(
+    "base",
+    ["--output=/tmp/x", "--ext-diff", "-c", "origin/main HEAD", "a;b", "--", "$(id)"],
+)
+def test_a_base_that_is_not_a_plain_ref_is_refused(base, tmp_path):
+    repo = _git_repo(tmp_path)
+    args = eg.build_parser().parse_args(["scan", "--include-diff", f"--base={base}"])
+    with pytest.raises(SystemExit):
+        eg.build_payload(args, repo)
+
+
+def test_a_base_that_names_no_commit_is_refused(tmp_path):
+    repo = _git_repo(tmp_path)
+    args = eg.build_parser().parse_args(["scan", "--include-diff", "--base", "no-such-ref"])
+    with pytest.raises(SystemExit):
+        eg.build_payload(args, repo)
+
+
+def test_a_failed_git_call_is_a_fault_not_an_empty_diff(tmp_path):
+    """A user who believes they preflighted a diff must not have preflighted a
+    nine-byte status line."""
+    not_a_repo = tmp_path / "plain"
+    not_a_repo.mkdir()
+    args = eg.build_parser().parse_args(["scan", "--include-diff"])
+    with pytest.raises(SystemExit):
+        eg.build_payload(args, not_a_repo)
+
+
+def test_a_good_base_still_produces_a_diff(tmp_path):
+    repo = _git_repo(tmp_path)
+    args = eg.build_parser().parse_args(["scan", "--include-diff", "--base", "main"])
+    payload = eg.build_payload(args, repo)
+    assert "a.txt" in payload
+
+
 # --- hook mode -------------------------------------------------------------
 
 
