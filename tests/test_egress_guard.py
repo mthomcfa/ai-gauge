@@ -178,6 +178,95 @@ def test_an_ordinary_source_path_is_not_denied():
     assert "denied-path" not in rules_hit("see src/aigauge/providers/claude.py line 40")
 
 
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("a/b", ["a/b"]),
+        ("read deploy/secrets/x.yaml now", ["deploy/secrets/x.yaml"]),
+        (r"C:\Users\m\.ssh\id_rsa", [r"\Users\m\.ssh\id_rsa"]),
+        ("trailing/ separator", []),
+        ("no separators at all", []),
+    ],
+)
+def test_path_spans_still_find_what_the_pattern_found(text, expected):
+    assert [text[a:b] for a, b in eg._path_like_spans(text)] == expected
+
+
+def test_a_long_separator_free_run_scans_quickly():
+    """The pattern this replaces took 22.2 s at 64 000 characters and did not
+    finish at the tool's own 400 000-byte default cap."""
+    import time
+
+    payload = "A" * 400_000
+    started = time.monotonic()
+    eg.scan(payload, policy())
+    # Generous by two orders of magnitude, so CI variance cannot flake it.
+    assert time.monotonic() - started < 10.0
+
+
+def test_every_scanning_pattern_is_linear_on_400kb():
+    import re
+    import time
+
+    payload = "A" * 400_000
+    for rule, _action, pattern in eg._DETECTORS:
+        started = time.monotonic()
+        re.compile(pattern).search(payload)
+        assert time.monotonic() - started < 5.0, rule
+    started = time.monotonic()
+    list(eg._OPAQUE_TOKEN_RE.finditer(payload))
+    assert time.monotonic() - started < 5.0
+
+
+def test_the_payload_is_truncated_to_the_cap_before_it_is_scanned():
+    pol = policy(limits={"max_payload_bytes": 16})
+    scanned, was_truncated = eg.truncate("x" * 64, pol)
+    assert was_truncated is True
+    assert len(scanned) == 16
+    assert eg.truncate("short", pol) == ("short", False)
+
+
+def test_a_credential_past_the_cap_is_not_what_gets_scanned():
+    """A cap that does not gate the scan bounds nothing; one that does has to
+    be honest that it did not look at the rest."""
+    pol = policy(limits={"max_payload_bytes": 32})
+    scanned, was_truncated = eg.truncate("A" * 64 + " AKIAIOSFODNN7EXAMPLE", pol)
+    assert was_truncated is True
+    assert "AKIA" not in scanned
+
+
+def test_the_hook_scans_at_most_the_cap_and_blocks_what_it_could_not_read(
+    tmp_path, monkeypatch, capsys
+):
+    (tmp_path / ".egress-policy.json").write_text(
+        json.dumps({"limits": {"max_payload_bytes": 64}}), encoding="utf-8"
+    )
+    event = {
+        "cwd": str(tmp_path),
+        "tool_name": "Agent",
+        "tool_input": {"prompt": "A" * 400_000},
+    }
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(json.dumps(event)))
+    import time
+
+    started = time.monotonic()
+    code = eg.cmd_hook(eg.build_parser().parse_args(["hook"]))
+    assert time.monotonic() - started < 10.0
+    assert code == 2
+    assert "max_payload_bytes" in capsys.readouterr().err
+
+
+def test_overlapping_findings_do_not_corrupt_the_redacted_text():
+    """`redact()` assumes non-overlapping spans; path findings used to skip the
+    overlap filter, which chewed the placeholder of whichever was written second."""
+    pol = policy(rules={"denied-path": "redact"})
+    text = "backup at /srv/ops@example.org/.env now"
+    out, _ = eg.redact(text, eg.scan(text, pol))
+    assert out.count("[redacted:") == out.count("]")
+    assert "ops@example.org" not in out or ".env" not in out
+    assert "dacted:" not in out.replace("[redacted:", "")
+
+
 # --- policy overrides ------------------------------------------------------
 
 

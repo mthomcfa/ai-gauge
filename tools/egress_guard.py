@@ -138,7 +138,17 @@ _DEFAULT_DENY_GLOBS: tuple[str, ...] = (
     "**/secrets/**",
 )
 
-_PATH_LIKE_RE = re.compile(r"[A-Za-z0-9_.\-/\\]*[/\\][A-Za-z0-9_.\-/\\]+")
+# Path-shaped runs are found by scanning for separators and expanding within a
+# bounded window, not by a regex. The pattern this replaces,
+# `[A-Za-z0-9_.\-/\\]*[/\\][A-Za-z0-9_.\-/\\]+`, backtracked from every start
+# position of a separator-free run: measured 1.4 s at 16 000 characters, 22.2 s
+# at 64 000, quadratic, and at the tool's own 400 000-byte default cap it does
+# not finish. In the documented hook wiring - `"timeout": 10` - a hook that
+# cannot answer in time returns no exit 2, so the tool call proceeds unscanned.
+_PATH_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-/\\"
+)
+_PATH_WINDOW = 256  # characters either side of a separator; real paths are shorter
 
 _DEFAULT_POLICY: dict[str, Any] = {
     "destinations": {
@@ -340,9 +350,63 @@ def scan(text: str, policy: Policy) -> list[Finding]:
                 Finding("opaque-token", entropy_action, match.start(), match.end(), _mask(token))
             )
 
-    findings.extend(_scan_paths(text, policy))
+    # Path findings go through the same overlap filter as everything else.
+    # They did not, and `redact()` assumes non-overlapping spans, so a denied
+    # path overlapping an email address chewed the placeholder of whichever
+    # was written second.
+    for finding in _scan_paths(text, policy):
+        if overlaps(finding.start, finding.end):
+            continue
+        claimed.append((finding.start, finding.end))
+        findings.append(finding)
+
     findings.sort(key=lambda f: f.start)
     return findings
+
+
+def truncate(payload: str, policy: Policy) -> tuple[str, bool]:
+    """Cut the payload to `limits.max_payload_bytes` before anything scans it.
+
+    The cap was computed and then ignored: `_decide` recorded "over
+    max_payload_bytes" as a problem and scanned the whole payload anyway, and
+    `scan`/`hook` applied no cap at all. A cap that does not gate the scan
+    bounds nothing.
+    """
+    cap = policy.max_payload_bytes
+    if cap <= 0:
+        return payload, False
+    encoded = payload.encode("utf-8")
+    if len(encoded) <= cap:
+        return payload, False
+    return encoded[:cap].decode("utf-8", "ignore"), True
+
+
+def _path_like_spans(text: str) -> Iterable[tuple[int, int]]:
+    """Spans that look like a path: one pass, plus a bounded expansion.
+
+    Each separator is found by a plain scan and grown outwards over path
+    characters up to `_PATH_WINDOW` either side; separators already inside a
+    span are skipped, so no character is visited more than a constant number of
+    times whatever the input looks like.
+    """
+    length = len(text)
+    index = 0
+    while index < length:
+        char = text[index]
+        if char != "/" and char != "\\":
+            index += 1
+            continue
+        start = index
+        floor = max(0, index - _PATH_WINDOW)
+        while start > floor and text[start - 1] in _PATH_CHARS:
+            start -= 1
+        end = index + 1
+        ceiling = min(length, index + 1 + _PATH_WINDOW)
+        while end < ceiling and text[end] in _PATH_CHARS:
+            end += 1
+        if end > index + 1:  # a separator with nothing after it is not a path
+            yield start, end
+        index = max(end, index + 1)
 
 
 def _scan_paths(text: str, policy: Policy) -> list[Finding]:
@@ -352,8 +416,8 @@ def _scan_paths(text: str, policy: Policy) -> list[Finding]:
         return []
     found: list[Finding] = []
     seen: set[str] = set()
-    for match in _PATH_LIKE_RE.finditer(text):
-        raw = match.group(0).replace("\\", "/")
+    for start, end in _path_like_spans(text):
+        raw = text[start:end].replace("\\", "/")
         # git diff headers name the same file twice, as a/path and b/path.
         normalised = raw.removeprefix("a/").removeprefix("b/")
         if normalised in seen:
@@ -361,7 +425,7 @@ def _scan_paths(text: str, policy: Policy) -> list[Finding]:
         for glob in globs:
             if _glob_match(normalised, glob):
                 seen.add(normalised)
-                found.append(Finding("denied-path", action, match.start(), match.end(), normalised))
+                found.append(Finding("denied-path", action, start, end, normalised))
                 break
     return found
 
@@ -618,10 +682,12 @@ def _decide(payload: str, policy: Policy, workspace: Path, model: str | None) ->
     refusals: list[str] = []
 
     size = len(payload.encode("utf-8"))
-    if policy.max_payload_bytes and size > policy.max_payload_bytes:
+    scanned, was_truncated = truncate(payload, policy)
+    if was_truncated:
         refusals.append(
             f"payload is {size} bytes, over limits.max_payload_bytes "
-            f"({policy.max_payload_bytes})"
+            f"({policy.max_payload_bytes}); only the first {policy.max_payload_bytes} "
+            "bytes were scanned"
         )
 
     if model is None:
@@ -632,8 +698,8 @@ def _decide(payload: str, policy: Policy, workspace: Path, model: str | None) ->
             f"({policy.allowed_destinations or 'empty - nothing is allowed'})"
         )
 
-    findings = scan(payload, policy)
-    redacted, _ = redact(payload, findings)
+    findings = scan(scanned, policy)
+    redacted, _ = redact(scanned, findings)
 
     blocked = [f for f in findings if f.action == BLOCK]
     if problems:
@@ -647,13 +713,25 @@ def cmd_scan(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace or os.getcwd())
     policy = Policy.load(args.policy, workspace)
     payload = build_payload(args, workspace)
-    findings = scan(payload, policy)
+    size = len(payload.encode("utf-8"))
+    scanned, was_truncated = truncate(payload, policy)
+    findings = scan(scanned, policy)
     if args.json:
         print(json.dumps([f.as_record() for f in findings], indent=2))
     else:
         print(f"policy: {policy.source}")
-        print(f"payload: {len(payload.encode('utf-8'))} bytes, {len(findings)} finding(s)")
+        note = (
+            f" (truncated to the first {policy.max_payload_bytes} bytes before scanning)"
+            if was_truncated
+            else ""
+        )
+        print(f"payload: {size} bytes{note}, {len(findings)} finding(s)")
         _report(findings, policy, stream=sys.stdout)
+    if was_truncated:
+        print(
+            f"note: only the first {policy.max_payload_bytes} of {size} bytes were scanned",
+            file=sys.stderr,
+        )
     return 2 if any(f.action == BLOCK for f in findings) else 0
 
 
@@ -828,11 +906,21 @@ def cmd_hook(args: argparse.Namespace) -> int:
     prompt = str(tool_input.get("prompt") or tool_input.get("description") or "")
     if not prompt:
         return 0
-    findings = scan(prompt, policy)
+    # Bounded before the scan, so a prompt padded past the hook's configured
+    # timeout cannot make the guard too slow to answer.
+    scanned, was_truncated = truncate(prompt, policy)
+    findings = scan(scanned, policy)
     blocked = [f for f in findings if f.action == BLOCK]
     if blocked:
         rules = ", ".join(sorted({f.rule for f in blocked}))
         print(f"Blocked: sub-task prompt carries {rules}.", file=sys.stderr)
+        return 2
+    if was_truncated:
+        print(
+            f"Blocked: sub-task prompt is over limits.max_payload_bytes "
+            f"({policy.max_payload_bytes}), so it could not be scanned in full.",
+            file=sys.stderr,
+        )
         return 2
     return 0
 
