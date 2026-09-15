@@ -1208,7 +1208,11 @@ def _mid_cycle_app(widget) -> App:
     app._cycle_active = True  # noqa: SLF001
     app._cycle_started_at = None  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
-    app._dispatch_epoch = {}  # noqa: SLF001
+    # A mid-cycle answer is a *dispatch* answer, so it arrives in the tuple
+    # form `_dispatch` emits, matched against the epoch it was sent with. An
+    # epoch-less snapshot for a provider that is still in flight is a
+    # settings re-render, and only repaints (see App._repaint_snapshot).
+    app._dispatch_epoch = {"claude": 1}  # noqa: SLF001
     app._abandoned = {}  # noqa: SLF001
     app._pool_wait_budgets = {}  # noqa: SLF001
     app._pending_profile_purges = []  # noqa: SLF001
@@ -1250,10 +1254,13 @@ def test_the_tray_keeps_up_with_the_tiles(qapp):
     app._update_tray = lambda: tray_calls.append(1)  # noqa: SLF001
 
     app._on_snapshot(  # noqa: SLF001
-        UsageSnapshot(
-            provider="claude",
-            status=SnapshotStatus.OK,
-            metrics=[UsageMetric("Session", 50.0)],
+        (
+            UsageSnapshot(
+                provider="claude",
+                status=SnapshotStatus.OK,
+                metrics=[UsageMetric("Session", 50.0)],
+            ),
+            1,
         )
     )
 
@@ -1266,7 +1273,7 @@ def test_the_header_is_told_how_far_through_the_cycle_it_is(qapp):
     app._update_tray = lambda: None  # noqa: SLF001
 
     app._on_snapshot(  # noqa: SLF001
-        UsageSnapshot(provider="claude", status=SnapshotStatus.OK)
+        (UsageSnapshot(provider="claude", status=SnapshotStatus.OK), 1)
     )
 
     assert widget.progress == [(1, 2)], "the header was not counted forward"
@@ -1286,7 +1293,7 @@ def test_a_snapshot_for_a_provider_the_user_removed_is_dropped(qapp):
     app._cycle_names = set()  # noqa: SLF001
     app._cycle_active = False  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
-    app._dispatch_epoch = {}  # noqa: SLF001
+    app._dispatch_epoch = {"opencode_go": 1}  # noqa: SLF001
     app._abandoned = {}  # noqa: SLF001
     app._pool_wait_budgets = {}  # noqa: SLF001
     app._pending_profile_purges = []  # noqa: SLF001
@@ -1299,10 +1306,13 @@ def test_a_snapshot_for_a_provider_the_user_removed_is_dropped(qapp):
     app._widget = _SnapshotWidget()  # noqa: SLF001
 
     app._on_snapshot(  # noqa: SLF001
-        UsageSnapshot(
-            provider="opencode_go",
-            status=SnapshotStatus.AUTH_REQUIRED,
-            error="Not signed in to OpenCode",
+        (
+            UsageSnapshot(
+                provider="opencode_go",
+                status=SnapshotStatus.AUTH_REQUIRED,
+                error="Not signed in to OpenCode",
+            ),
+            1,
         )
     )
 

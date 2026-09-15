@@ -920,3 +920,121 @@ def test_the_cycle_ends_only_when_the_last_provider_reports():
     azure.pending(_ok("azure"))
     assert app._cycle_active is False
     assert app._timer.started_ms is not None, "the next refresh was never scheduled"
+
+
+def _cached_copilot() -> UsageSnapshot:
+    """A cached OK snapshot shaped the way `_rerender_copilot` needs it."""
+    return UsageSnapshot(
+        provider="copilot",
+        status=SnapshotStatus.OK,
+        metrics=[UsageMetric("Premium", 20.0)],
+        raw={"usageItems": []},
+    )
+
+
+def test_a_settings_rerender_does_not_end_a_live_dispatch(caplog):
+    """Changing the Copilot quota mid-cycle is a repaint, not an answer.
+
+    `_rerender_copilot` handed `_on_snapshot` a bare, epoch-less snapshot.
+    The epoch gate only applies when an epoch is present, so the re-render
+    took the live-answer path: it discarded `_inflight`, destroyed the
+    watchdog, wrote a `refresh provider done ... status=ok` line for a
+    dispatch that had not answered, recorded the cached value as that
+    cycle's result, and could close the cycle. The real worker was then
+    bounded by nothing, and its answer was dropped as late.
+    """
+    copilot = _Provider(_ok("copilot"), hold=True)
+    claude = _BrowserProvider(_ok("claude"), hold=True)
+    app = _app({"copilot": copilot, "claude": claude})
+    app._snapshots["copilot"] = _cached_copilot()  # noqa: SLF001
+
+    app.refresh_now(manual=False)
+    assert app._inflight == {"copilot", "claude"}  # noqa: SLF001
+    watchdog = app._watchdogs["copilot"]  # noqa: SLF001
+    epoch = app._dispatch_epoch["copilot"]  # noqa: SLF001
+
+    with caplog.at_level(logging.INFO, logger="aigauge"):
+        app._rerender_copilot(1500)  # noqa: SLF001
+
+    assert app._inflight == {"copilot", "claude"}, (  # noqa: SLF001
+        "the re-render ended a live dispatch"
+    )
+    assert app._watchdogs.get("copilot") is watchdog, (  # noqa: SLF001
+        "the dispatch lost its deadline"
+    )
+    assert app._dispatch_epoch["copilot"] == epoch  # noqa: SLF001
+    assert app._cycle_active is True, "the re-render closed a live cycle"  # noqa: SLF001
+    assert app._cycle_statuses == {}, (  # noqa: SLF001
+        "a re-render was recorded as this cycle's answer"
+    )
+    assert "refresh provider done provider=copilot" not in caplog.text
+    # It is still a repaint: the tile gets the new denominator now.
+    assert app._widget.snapshots[-1].provider == "copilot"  # noqa: SLF001
+
+    # And the dispatch it did not answer still lands.
+    copilot.pending(
+        UsageSnapshot(
+            provider="copilot",
+            status=SnapshotStatus.OK,
+            metrics=[UsageMetric("Session", 77.0)],
+        )
+    )
+    assert app._snapshots["copilot"].metrics[0].percent_used == 77.0  # noqa: SLF001
+    assert app._cycle_statuses.get("copilot") is SnapshotStatus.OK  # noqa: SLF001
+
+
+def test_an_openrouter_rerender_does_not_end_a_live_dispatch():
+    openrouter = _Provider(_ok("openrouter"), hold=True)
+    app = _app({"openrouter": openrouter})
+    app._snapshots["openrouter"] = UsageSnapshot(  # noqa: SLF001
+        provider="openrouter",
+        status=SnapshotStatus.OK,
+        metrics=[UsageMetric("Spend", 10.0)],
+        raw={"credits": {}, "key": {}, "top_models": [], "mgmt_key_configured": True},
+    )
+
+    app.refresh_now(manual=False)
+    watchdog = app._watchdogs["openrouter"]  # noqa: SLF001
+
+    app._rerender_openrouter(5.0)  # noqa: SLF001
+
+    assert app._inflight == {"openrouter"}  # noqa: SLF001
+    assert app._watchdogs.get("openrouter") is watchdog  # noqa: SLF001
+    assert app._cycle_active is True  # noqa: SLF001
+
+
+def test_a_quota_change_during_a_refresh_does_not_start_a_second_worker():
+    """The settings save re-renders and then calls `refresh_now(manual=True)`.
+
+    With the re-render read as the dispatch's answer the cycle closed, so
+    that `refresh_now` found nothing in flight and dispatched a second
+    worker beside the first: two live REST workers for one provider.
+    """
+    copilot = _Provider(_ok("copilot"), hold=True)
+    app = _app({"copilot": copilot})
+    app._snapshots["copilot"] = _cached_copilot()  # noqa: SLF001
+
+    app.refresh_now(manual=False)
+    app._rerender_copilot(1500)  # noqa: SLF001
+    app.refresh_now(manual=True)  # what _on_settings_finished does next
+
+    assert copilot.calls == 1, "a second worker was started beside the first"
+    assert app._pending_manual_refresh is True, (  # noqa: SLF001
+        "the manual refresh was neither run nor queued"
+    )
+
+
+def test_an_epochless_snapshot_for_a_live_dispatch_only_repaints():
+    """Belt and braces for any future caller that reaches `_on_snapshot`
+    without an epoch while that provider's dispatch is still out."""
+    copilot = _Provider(_ok("copilot"), hold=True)
+    app = _app({"copilot": copilot})
+
+    app.refresh_now(manual=False)
+    watchdog = app._watchdogs["copilot"]  # noqa: SLF001
+
+    app._on_snapshot(_ok("copilot"))  # noqa: SLF001
+
+    assert app._inflight == {"copilot"}  # noqa: SLF001
+    assert app._watchdogs.get("copilot") is watchdog  # noqa: SLF001
+    assert app._cycle_active is True  # noqa: SLF001

@@ -1323,6 +1323,33 @@ class App(QObject):
             self._error_retry[name] = (errors, None)
         self._begin_cycle(due, manual=False, reason="error_retry")
 
+    def _repaint_snapshot(self, snapshot: UsageSnapshot) -> None:
+        """Show a snapshot again. The tile only - never the cycle.
+
+        A settings save re-renders Copilot's or OpenRouter's cached payload
+        against the new denominator, so the tile shows it immediately rather
+        than after the next refresh. That is a repaint, not a dispatch
+        answer, and it used to go through `_on_snapshot` with no epoch -
+        which applies the epoch gate only when one is present, so the
+        re-render took the live-answer path. It discarded `_inflight`,
+        destroyed the watchdog, wrote a `refresh provider done ... status=ok`
+        line for a dispatch that had not answered, recorded the cached value
+        as that cycle's result and could close the cycle; the real worker was
+        then in neither `_inflight` nor `_watchdogs` nor `_abandoned`, its
+        answer was dropped as late, and the `refresh_now(manual=True)` the
+        settings save runs two lines later started a second one beside it.
+        Measured on the one provider class with no re-entrancy guard of its
+        own: two live REST workers, and the fresh answer thrown away.
+        """
+        name = snapshot.provider
+        if name not in self._providers:
+            return
+        self._snapshots[name] = snapshot
+        self._widget.update_snapshot(
+            snapshot, display_name_for_account(self._config, name)
+        )
+        self._update_tray()
+
     def _on_snapshot(self, payload) -> None:
         if isinstance(payload, tuple):
             snapshot, epoch = payload
@@ -1331,6 +1358,12 @@ class App(QObject):
             # snapshot with a new denominator. There is no epoch to match.
             snapshot, epoch = payload, None
         name = snapshot.provider
+        if epoch is None and name in self._inflight:
+            # Belt and braces for any future caller that reaches here without
+            # an epoch while that provider's dispatch is still out. A repaint
+            # must not be read as its answer. See _repaint_snapshot.
+            self._repaint_snapshot(snapshot)
+            return
         if epoch is not None and not (
             name in self._inflight and self._dispatch_epoch.get(name) == epoch
         ):
@@ -1862,7 +1895,7 @@ class App(QObject):
         from .providers.copilot import _build_snapshot
 
         try:
-            self._on_snapshot(_build_snapshot(cached.raw, quota))
+            self._repaint_snapshot(_build_snapshot(cached.raw, quota))
         except Exception:  # noqa: BLE001
             log.exception("failed to re-render copilot snapshot with new quota")
 
@@ -1878,7 +1911,7 @@ class App(QObject):
             for name, cost in (raw.get("top_models") or [])
         ]
         try:
-            self._on_snapshot(
+            self._repaint_snapshot(
                 _build_snapshot(
                     raw.get("credits"),
                     raw.get("key", {}) or {},
