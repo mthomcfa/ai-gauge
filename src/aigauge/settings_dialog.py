@@ -40,7 +40,7 @@ from .config import (
     BrowserAccount,
     ColorThresholds,
     Config,
-    _is_safe_profile_id,
+    is_usable_profile_id,
     account_display_name,
     app_data_dir,
     browser_accounts,
@@ -1301,26 +1301,34 @@ class SettingsDialog(QDialog):
             url = OPENCODE_GO_USAGE_URL
         _open_in_browser(url)
 
-    def _profile_ids_on_disk(self) -> tuple[list[str], int]:
-        """The ids this sweep can act on, and how many it cannot.
+    def _profile_ids_on_disk(self) -> tuple[list[str], list[str]]:
+        """Every name in `profiles/`, and the ones this sweep can act on.
 
         Names on disk are read from the filesystem, so they are not bounded
-        by anything the app generates. `purge_profile` refuses any that the
-        id rule rejects - that refusal is the containment guarantee and it
-        holds - but it refuses them one at a time, deep in the App, where the
-        user never hears about it. The count comes back here so the button
-        can say the directories were left alone rather than implying it
-        deleted everything in `profiles/`.
+        by anything the app generates. `purge_profile` refuses any whose id
+        the rule rejects *and* any whose resolved path leaves the
+        `profiles/` root - that refusal is the containment guarantee and it
+        holds - but it refuses them one at a time, deep in the App, where
+        the user never hears about it. `is_usable_profile_id` asks the same
+        two questions on the same resolved path, so the count the button
+        reports is the count that was really left alone: a symlink inside
+        `profiles/` pointing out of it has a legal *name*, and the name rule
+        on its own called it deleted.
+
+        Both lists come back, because the button's two halves want
+        different ones. The stored credential is a keyring entry, nothing
+        holds it open and it is the part that matters, so that pass takes
+        every name on disk; only the ids handed to the App for deletion are
+        filtered, because deletion is the half with a containment rule.
         """
         try:
             profiles_root = app_data_dir() / "profiles"
             if not profiles_root.is_dir():
-                return [], 0
+                return [], []
             names = [child.name for child in profiles_root.iterdir() if child.is_dir()]
         except OSError:
-            return [], 0
-        usable = [name for name in names if _is_safe_profile_id(name)]
-        return usable, len(names) - len(usable)
+            return [], []
+        return names, [name for name in names if is_usable_profile_id(name)]
 
     def _clear_all_browser_data(self) -> None:
         """Clear the stored cookies here; hand the profiles to the App.
@@ -1357,9 +1365,16 @@ class SettingsDialog(QDialog):
         account_ids |= {"claude", "codex", "opencode_go"}
         # Ids on disk that are not accounts go the same way: they are exactly
         # the leftovers this button exists to sweep up.
-        on_disk, unusable = self._profile_ids_on_disk()
-        account_ids |= set(on_disk)
-        for account_id in sorted(account_ids):
+        on_disk, usable = self._profile_ids_on_disk()
+        unusable = len(on_disk) - len(usable)
+        # The keyring pass takes every name, including the ones the sweep
+        # will not touch: no reachable keyring entry can exist under such a
+        # name - the three writers are this sweep, the removal path and the
+        # cookie dialog, all of which hold ids that pass the rule - but this
+        # is the one button whose whole promise is "everything", and a
+        # keyring write has no containment question to answer.
+        account_ids |= set(usable)
+        for account_id in sorted(account_ids | set(on_disk)):
             try:
                 set_provider_cookie(account_id, None)
             except Exception:  # noqa: BLE001 - clear as much as possible
@@ -1382,9 +1397,12 @@ class SettingsDialog(QDialog):
             "before then. Sign in again to resume monitoring."
         )
         if unusable:
+            # Not "not named like an account": the sweep also leaves alone a
+            # folder whose name is fine but whose resolved path is not inside
+            # `profiles/`, which is the one case a hostile tree constructs.
             message += (
-                f"\n\n{unusable} folder(s) in the profiles directory are not "
-                "named like an account and were left alone."
+                f"\n\n{unusable} folder(s) in the profiles directory could "
+                "not be matched to an account and were left alone."
             )
         QMessageBox.information(self, "Browser data cleared", message)
 

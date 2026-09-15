@@ -136,6 +136,29 @@ def webview_profile_dir(provider: str) -> Path:
     return target
 
 
+def is_usable_profile_id(provider: str) -> bool:
+    """Whether the profile sweep can act on this `profiles/` entry.
+
+    Exactly the two tests the deletion path applies, on the same resolved
+    path: the id rule, and containment inside the `profiles/` root. A name
+    can pass the first and fail the second - a symlink inside `profiles/`
+    that points out of it has a perfectly legal name - so anything that
+    wants to know what will actually be deleted has to ask for both, which
+    is what `webview_profile_dir` already answers. Public because the
+    settings dialog needs the same answer and was reaching for the name
+    rule alone.
+    """
+    try:
+        webview_profile_dir(provider)
+    except ValueError:
+        return False
+    except OSError:
+        # `resolve()` touches the filesystem: a name the OS itself refuses
+        # is one `purge_profile` will not act on either.
+        return False
+    return True
+
+
 def config_path() -> Path:
     return app_data_dir() / "config.json"
 

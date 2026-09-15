@@ -576,6 +576,12 @@ def test_clear_all_browser_data_says_what_it_left_behind(qtbot, monkeypatch):
     account's saved cookie and embedded-browser profile". The count comes
     back to the dialog, which says the folders were left alone; the names
     themselves never reach the message or the log.
+
+    The filter is on the half that deletes directories, and only that half.
+    A stored cookie is a keyring entry with no containment question to
+    answer, and this is the one button whose whole promise is "everything",
+    so every name on disk is still cleared - which is what it did before the
+    filter existed.
     """
     from aigauge.config import app_data_dir
 
@@ -590,8 +596,11 @@ def test_clear_all_browser_data_says_what_it_left_behind(qtbot, monkeypatch):
         "information",
         lambda parent, title, text, *a, **k: said.append(text),
     )
+    cleared: list[str] = []
     monkeypatch.setattr(
-        settings_dialog, "set_provider_cookie", lambda account_id, value: None
+        settings_dialog,
+        "set_provider_cookie",
+        lambda account_id, value: cleared.append(account_id),
     )
     profiles = app_data_dir() / "profiles"
     (profiles / "claude-deadbeef").mkdir(parents=True)
@@ -610,6 +619,9 @@ def test_clear_all_browser_data_says_what_it_left_behind(qtbot, monkeypatch):
     )
     assert "2 folder(s)" in said[0], said[0]
     assert "not an id" not in said[0], "the message named a directory on disk"
+    assert {"not an id", "also.bad!"} <= set(cleared), (
+        "the sweep's filter narrowed the keyring pass too"
+    )
 
 
 def test_the_settings_dialog_no_longer_deletes_profiles_itself():

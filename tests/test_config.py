@@ -16,6 +16,7 @@ from aigauge.config import (
     browser_accounts,
     config_path,
     display_name_for_account,
+    is_usable_profile_id,
     qt_scale_factor_env,
     webview_profile_dir,
 )
@@ -89,6 +90,37 @@ def test_a_config_naming_a_provider_as_an_account_still_loads(caplog):
 def test_webview_profile_dir_rejects_traversal(bad_id):
     with pytest.raises(ValueError):
         webview_profile_dir(bad_id)
+
+
+def test_a_usable_profile_id_is_one_the_purge_will_actually_act_on():
+    """The sweep's filter and the deletion's refusal must be the same rule.
+
+    Settings' "Clear all browser data" tells the user how many folders in
+    `profiles/` it left alone. It counted names the id rule rejects - but
+    `purge_profile` refuses on two tests, the id rule *and* whether the
+    resolved path is still inside `profiles/`, and a symlink pointing out of
+    that directory has a perfectly legal name. So the one entry a hostile
+    tree would construct was counted as deleted while the purge refused it,
+    and the message was wrong in the "we deleted it" direction.
+    """
+    assert is_usable_profile_id("claude-deadbeef")
+    for bad in ("../../evil", "a/b", "..", "foo/bar", "not an id", "CON", ""):
+        assert not is_usable_profile_id(bad), bad
+        with pytest.raises(ValueError):
+            webview_profile_dir(bad)
+
+    # The containment half, where the filesystem allows it to be built.
+    profiles = app_data_dir() / "profiles"
+    profiles.mkdir(parents=True, exist_ok=True)
+    outside = app_data_dir() / "OUTSIDE"
+    outside.mkdir(exist_ok=True)
+    try:
+        (profiles / "escape").symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError):  # pragma: no cover - Windows/CI
+        pytest.skip("this filesystem does not allow symlinks")
+    assert not is_usable_profile_id("escape"), (
+        "a legal name resolving outside profiles/ counted as one to delete"
+    )
 
 
 @pytest.mark.parametrize(
