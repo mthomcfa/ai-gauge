@@ -527,6 +527,13 @@ class App(QObject):
         # is matched against it, so an answer from a dispatch the App has
         # already given up on cannot be read as the current one.
         self._dispatch_epoch: dict[str, int] = {}
+        # provider -> whether the dispatch now outstanding was a browser
+        # scrape. Recorded here rather than asked of `_providers` when the
+        # watchdog fires, because a settings save that removes the account
+        # takes the provider object with it while its dispatch is still out:
+        # `_uses_browser` then answered False for a browser scrape and the
+        # watchdog parked it under the REST rule.
+        self._dispatch_browser: dict[str, bool] = {}
         # provider -> (the epoch the watchdog abandoned, when its worker may
         # be assumed dead). While an entry is live the provider is not
         # dispatched again by anything.
@@ -854,7 +861,11 @@ class App(QObject):
         # leaves nothing behind. A name still in flight or still parked keeps
         # its entries: its dispatch is what they bound.
         keep = set(self._providers) | self._inflight | set(self._abandoned)
-        for mapping in (self._dispatch_times, self._dispatch_epoch):
+        for mapping in (
+            self._dispatch_times,
+            self._dispatch_epoch,
+            self._dispatch_browser,
+        ):
             for name in [n for n in mapping if n not in keep]:
                 mapping.pop(name, None)
         for name in [n for n in self._watchdogs if n not in keep]:
@@ -1561,6 +1572,7 @@ class App(QObject):
         self._inflight.add(name)
         now = time.monotonic()
         self._dispatch_times[name] = now
+        self._dispatch_browser[name] = self._uses_browser(name)
         log.info(
             "refresh provider start provider=%s epoch=%s queued_s=%.1f",
             name,
@@ -1679,7 +1691,15 @@ class App(QObject):
         # per socket operation, with no provider-side guard at all: assuming
         # it dead on a clock hands the same endpoint another worker, and they
         # accumulate until the global QThreadPool has no free slot.
-        if self._uses_browser(name):
+        # What was dispatched, not what is configured now: a settings save
+        # that removes an account drops its provider object while the scrape
+        # is still out, and reading `uses_browser` off `_providers` then
+        # parked a *browser* account for an hour under `rest_backstop` - its
+        # on-disk profile, which holds the session cookie, waited 60 minutes
+        # for deletion rather than 10, re-adding the same account left its
+        # tile refused for the rest of the hour, and the log line named the
+        # wrong rule.
+        if self._dispatch_browser.get(name, self._uses_browser(name)):
             assumed_dead_in = _ABANDONED_CEILING_FACTOR * budget
             ceiling = "browser_2x"
         else:

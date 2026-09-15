@@ -108,6 +108,7 @@ def _refresh_app_stub() -> App:
     app._cycle_reason = "startup"  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
     app._dispatch_epoch = {}  # noqa: SLF001
+    app._dispatch_browser = {}  # noqa: SLF001
     app._abandoned = {}  # noqa: SLF001
     app._pool_wait_budgets = {}  # noqa: SLF001
     app._pending_profile_purges = []  # noqa: SLF001
@@ -1094,6 +1095,7 @@ def test_the_watchdog_timers_do_not_accumulate(qapp):
     app._watchdogs = {}  # noqa: SLF001
     app._abandoned = {}  # noqa: SLF001
     app._dispatch_epoch = {}  # noqa: SLF001
+    app._dispatch_browser = {}  # noqa: SLF001
     app._pool_wait_budgets = {}  # noqa: SLF001
     app._pending_profile_purges = []  # noqa: SLF001
     provider = SimpleNamespace(uses_browser=False, refresh_budget_seconds=60.0)
@@ -1171,6 +1173,7 @@ def test_the_snapshot_error_log_line_redacts_azure_identifiers(qapp, caplog):
     app._cycle_active = False  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
     app._dispatch_epoch = {}  # noqa: SLF001
+    app._dispatch_browser = {}  # noqa: SLF001
     app._abandoned = {}  # noqa: SLF001
     app._pool_wait_budgets = {}  # noqa: SLF001
     app._pending_profile_purges = []  # noqa: SLF001
@@ -1374,6 +1377,7 @@ def test_a_provider_that_raises_out_of_refresh_is_redacted_too(qapp, monkeypatch
     app._watchdogs = {}  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
     app._dispatch_epoch = {}  # noqa: SLF001
+    app._dispatch_browser = {}  # noqa: SLF001
     app._abandoned = {}  # noqa: SLF001
     app._pool_wait_budgets = {}  # noqa: SLF001
     app._pending_profile_purges = []  # noqa: SLF001
@@ -1426,6 +1430,7 @@ def _provider_app(config: Config) -> App:
     app._error_retry = {}  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
     app._dispatch_epoch = {}  # noqa: SLF001
+    app._dispatch_browser = {}  # noqa: SLF001
     app._watchdogs = {}  # noqa: SLF001
     app._build_providers()  # noqa: SLF001
     return app
@@ -1468,8 +1473,8 @@ def test_a_park_does_not_outlive_the_provider_the_user_removed():
 
     `_dispatch_refusal` answers `not_configured` before it ever reaches
     `_is_abandoned`, so the entry - and the `_dispatch_times` /
-    `_dispatch_epoch` rows the rebuild holds open for anything still parked -
-    would live for the process. A name still in flight keeps its park: that
+    `_dispatch_epoch` / `_dispatch_browser` rows the rebuild holds open for
+    anything still parked - would live for the process. A name still in flight keeps its park: that
     dispatch is what it bounds.
     """
     config = Config()
@@ -1478,8 +1483,10 @@ def test_a_park_does_not_outlive_the_provider_the_user_removed():
     far_future = 10.0**18
     app._abandoned["copilot"] = (3, far_future)  # noqa: SLF001
     app._dispatch_epoch["copilot"] = 3  # noqa: SLF001
+    app._dispatch_browser["copilot"] = False  # noqa: SLF001
     app._abandoned["openrouter"] = (1, far_future)  # noqa: SLF001
     app._dispatch_epoch["openrouter"] = 1  # noqa: SLF001
+    app._dispatch_browser["openrouter"] = False  # noqa: SLF001
     app._inflight.add("openrouter")  # noqa: SLF001
 
     config.providers.copilot = False
@@ -1488,10 +1495,12 @@ def test_a_park_does_not_outlive_the_provider_the_user_removed():
 
     assert "copilot" not in app._abandoned, "a park outlived its provider"  # noqa: SLF001
     assert "copilot" not in app._dispatch_epoch  # noqa: SLF001
+    assert "copilot" not in app._dispatch_browser  # noqa: SLF001
     assert "openrouter" in app._abandoned, (  # noqa: SLF001
         "a dispatch that is still out lost the park that bounds it"
     )
     assert "openrouter" in app._dispatch_epoch  # noqa: SLF001
+    assert "openrouter" in app._dispatch_browser  # noqa: SLF001
 
 
 def test_a_provider_the_user_switched_off_and_on_again_is_a_new_object():

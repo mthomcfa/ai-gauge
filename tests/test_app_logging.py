@@ -23,7 +23,7 @@ from types import SimpleNamespace
 import pytest
 
 import aigauge.app as app_module
-from aigauge.app import App, app_data_dir
+from aigauge.app import App, _REST_PARK_BACKSTOP_SECONDS, app_data_dir
 from aigauge.config import Config
 from aigauge.models import SnapshotStatus, UsageMetric, UsageSnapshot
 
@@ -201,6 +201,7 @@ def _app(providers: dict[str, _Provider]) -> App:
     app._cycle_total = 0  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
     app._dispatch_epoch = {}  # noqa: SLF001
+    app._dispatch_browser = {}  # noqa: SLF001
     app._abandoned = {}  # noqa: SLF001
     app._pool_wait_budgets = {}  # noqa: SLF001
     app._pending_profile_purges = []  # noqa: SLF001
@@ -585,6 +586,65 @@ def test_an_abandoned_worker_is_assumed_dead_after_twice_its_budget(monkeypatch)
     clock["t"] = 2 * budget_s + 1
     app.refresh_now(manual=True)
     assert claude.calls == 2, "parked past the ceiling"
+
+
+def test_a_removed_browser_account_still_parks_under_the_browser_rule(
+    monkeypatch, caplog
+):
+    """The park rule follows the dispatch, not the current config.
+
+    A settings save that removes an account rebuilds `_providers` while that
+    account's scrape is still out, so asking `_uses_browser` at watchdog time
+    answered False for a browser scrape: the account was parked for an hour
+    under `ceiling=rest_backstop` instead of twice its budget. Its on-disk
+    profile - which holds the session cookie - then waited 60 minutes for
+    deletion rather than 10, and re-adding the same account left its tile
+    refused for the rest of that hour.
+    """
+    caplog.set_level(logging.WARNING, logger="aigauge.app")
+    clock = {"t": 0.0}
+    monkeypatch.setattr(
+        app_module, "time", SimpleNamespace(monotonic=lambda: clock["t"])
+    )
+    claude = _BrowserProvider(_ok("claude-ab12cd34"), hold=True)
+    claude.refresh_budget_seconds = 240.0
+    app = _app({"claude-ab12cd34": claude})
+    app.refresh_now(manual=False)
+    watchdog = app._watchdogs["claude-ab12cd34"]  # noqa: SLF001
+    budget_s = (watchdog.interval_ms or 0) / 1000.0
+
+    app._providers.pop("claude-ab12cd34")  # noqa: SLF001 - the settings save
+    watchdog.fire()
+
+    _epoch, dead_at = app._abandoned["claude-ab12cd34"]  # noqa: SLF001
+    assert dead_at - clock["t"] == 2 * budget_s, (
+        f"parked for {dead_at - clock['t']:.0f}s, not twice its {budget_s:.0f}s "
+        "budget"
+    )
+    assert "ceiling=browser_2x" in caplog.text
+    assert "ceiling=rest_backstop" not in caplog.text
+
+
+def test_a_removed_rest_provider_still_parks_under_the_backstop(
+    monkeypatch, caplog
+):
+    """The other direction: a REST dispatch keeps the hour."""
+    caplog.set_level(logging.WARNING, logger="aigauge.app")
+    clock = {"t": 0.0}
+    monkeypatch.setattr(
+        app_module, "time", SimpleNamespace(monotonic=lambda: clock["t"])
+    )
+    app = _app({"copilot": _Provider(_ok("copilot"), hold=True)})
+    app.refresh_now(manual=False)
+    watchdog = app._watchdogs["copilot"]  # noqa: SLF001
+
+    app._providers.pop("copilot")  # noqa: SLF001
+    watchdog.fire()
+
+    _epoch, dead_at = app._abandoned["copilot"]  # noqa: SLF001
+    assert dead_at - clock["t"] == _REST_PARK_BACKSTOP_SECONDS
+    assert "ceiling=rest_backstop" in caplog.text
+    assert "ceiling=browser_2x" not in caplog.text
 
 
 def test_a_snapshot_from_outside_the_cycle_is_not_folded_into_it():

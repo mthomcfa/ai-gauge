@@ -193,6 +193,7 @@ def _build_app(clock: _Clock, providers: dict, config: Config) -> App:
     app._cycle_partial = False  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
     app._dispatch_epoch = {}  # noqa: SLF001
+    app._dispatch_browser = {}  # noqa: SLF001
     app._abandoned = {}  # noqa: SLF001
     app._pool_wait_budgets = {}  # noqa: SLF001
     app._pending_profile_purges = []  # noqa: SLF001
