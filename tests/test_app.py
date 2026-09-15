@@ -1463,6 +1463,37 @@ def test_a_settings_save_keeps_the_provider_objects_it_did_not_change():
         )
 
 
+def test_a_park_does_not_outlive_the_provider_the_user_removed():
+    """Nothing else clears `_abandoned` for a name the user turned off.
+
+    `_dispatch_refusal` answers `not_configured` before it ever reaches
+    `_is_abandoned`, so the entry - and the `_dispatch_times` /
+    `_dispatch_epoch` rows the rebuild holds open for anything still parked -
+    would live for the process. A name still in flight keeps its park: that
+    dispatch is what it bounds.
+    """
+    config = Config()
+    config.providers.openrouter = True
+    app = _provider_app(config)
+    far_future = 10.0**18
+    app._abandoned["copilot"] = (3, far_future)  # noqa: SLF001
+    app._dispatch_epoch["copilot"] = 3  # noqa: SLF001
+    app._abandoned["openrouter"] = (1, far_future)  # noqa: SLF001
+    app._dispatch_epoch["openrouter"] = 1  # noqa: SLF001
+    app._inflight.add("openrouter")  # noqa: SLF001
+
+    config.providers.copilot = False
+    config.providers.openrouter = False
+    app._build_providers()  # noqa: SLF001
+
+    assert "copilot" not in app._abandoned, "a park outlived its provider"  # noqa: SLF001
+    assert "copilot" not in app._dispatch_epoch  # noqa: SLF001
+    assert "openrouter" in app._abandoned, (  # noqa: SLF001
+        "a dispatch that is still out lost the park that bounds it"
+    )
+    assert "openrouter" in app._dispatch_epoch  # noqa: SLF001
+
+
 def test_a_provider_the_user_switched_off_and_on_again_is_a_new_object():
     config = Config()
     app = _provider_app(config)

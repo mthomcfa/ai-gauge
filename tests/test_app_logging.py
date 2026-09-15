@@ -113,6 +113,10 @@ class _Widget:
         self.refresh_state_calls = []
         self.snapshots = []
         self.progress = []
+        self.status_hints = []
+
+    def set_status_hint(self, provider, text):
+        self.status_hints.append((provider, text))
 
     def set_refreshing(self, refreshing, **kwargs):
         self.refreshing.append(refreshing)
@@ -1577,6 +1581,101 @@ def test_a_retry_due_on_a_parked_provider_is_kept_for_when_the_park_lifts(
     app._on_refresh_timer()  # noqa: SLF001
 
     assert claude.calls == 2, "the retry it kept never ran"
+
+
+def test_a_kept_retry_rides_out_an_hour_long_rest_park(monkeypatch, caplog):
+    """The same kept due, against the park a wedged REST worker now earns.
+
+    A REST park lasts until its worker reports or an hour passes, so the due
+    it keeps has to survive several cadence wakes without buying a wake of
+    its own and without spinning: the wake it would have armed is an hour
+    out, the cadence is five minutes, and every one of those five-minute
+    wakes must refuse the parked provider and go back to sleep.
+    """
+    clock = {"t": 0.0}
+    monkeypatch.setattr(
+        app_module, "time", SimpleNamespace(monotonic=lambda: clock["t"])
+    )
+    copilot = _Provider(_ok("copilot"), hold=True)
+    openrouter = _Provider(_ok("openrouter"))
+    app = _app({"copilot": copilot, "openrouter": openrouter})
+    app._config.refresh_interval_minutes = 5  # noqa: SLF001
+    app._config.active_refresh_interval_minutes = 5  # noqa: SLF001
+
+    app.refresh_now(manual=False)
+    app._watchdogs["copilot"].fire()  # noqa: SLF001
+    _epoch, assumed_dead_at = app._abandoned["copilot"]  # noqa: SLF001
+    assert assumed_dead_at - clock["t"] == 3600.0, "a REST park is the backstop"
+
+    cadence_ms = 5 * 60 * 1000
+    app._error_retry["copilot"] = (1, datetime.now() - timedelta(seconds=1))  # noqa: SLF001
+    app._next_refresh_reason = "error_retry"  # noqa: SLF001
+    with caplog.at_level(logging.INFO, logger="aigauge.app"):
+        caplog.clear()
+        app._on_refresh_timer()  # noqa: SLF001
+
+    assert "refresh retry deferred provider=copilot reason=abandoned" in caplog.text
+    assert app._timer.started_ms <= cadence_ms + 2000, (  # noqa: SLF001
+        "the kept due armed a wake of its own an hour out"
+    )
+
+    dispatches = copilot.calls
+    wakes = 0
+    while clock["t"] + 300.0 < 3600.0:
+        clock["t"] += 300.0
+        wakes += 1
+        with caplog.at_level(logging.INFO, logger="aigauge.app"):
+            caplog.clear()
+            app.refresh_now(manual=False)
+        assert copilot.calls == dispatches, (
+            "a second worker went out on the endpoint that wedged the first"
+        )
+        assert "refresh provider skipped provider=copilot reason=abandoned" in caplog.text
+        assert app._timer.started_ms <= cadence_ms + 2000, (  # noqa: SLF001
+            "the scheduler stopped waking on the cadence"
+        )
+        errors, due = app._error_retry["copilot"]  # noqa: SLF001
+        assert errors == 1 and due is not None, "the kept due was spent"
+
+    assert wakes >= 6, "the park did not outlast several cadence wakes"
+
+    clock["t"] = 3601.0
+    app.refresh_now(manual=False)
+    assert copilot.calls == dispatches + 1, "the backstop never released the park"
+
+
+def test_a_manual_refresh_on_a_parked_provider_says_so_on_the_tile():
+    """A refusal the user asked for is not a silent one.
+
+    Both manual routes - the Refresh button and the per-provider one - used
+    to re-enable and do nothing visible; with a REST park now lasting up to
+    an hour that silence is long enough to read as a broken button. The hint
+    is all that moves: no snapshot, no history, no ratio, no cycle. A
+    scheduled cycle still says nothing, because nobody asked for it.
+    """
+    copilot = _Provider(_ok("copilot"), hold=True)
+    app = _app({"copilot": copilot})
+    app.refresh_now(manual=False)
+    app._watchdogs["copilot"].fire()  # noqa: SLF001
+    app._widget.status_hints.clear()  # noqa: SLF001
+    app._widget.snapshots.clear()  # noqa: SLF001
+
+    app.refresh_now(manual=True)
+    app.refresh_provider("copilot")
+
+    hint = "Waiting for the previous refresh to finish."
+    assert app._widget.status_hints == [  # noqa: SLF001
+        ("copilot", hint),
+        ("copilot", hint),
+    ]
+    assert copilot.calls == 1, "a parked provider was dispatched"
+    assert app._widget.snapshots == [], "a refusal repainted the tile"  # noqa: SLF001
+
+    app._widget.status_hints.clear()  # noqa: SLF001
+    app.refresh_now(manual=False)
+    assert app._widget.status_hints == [], (  # noqa: SLF001
+        "a scheduled cycle marked a tile for a refusal nobody asked for"
+    )
 
 
 def test_a_manual_refresh_with_nothing_eligible_starts_no_cycle(caplog):

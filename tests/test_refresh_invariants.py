@@ -211,6 +211,7 @@ def _build_app(clock: _Clock, providers: dict, config: Config) -> App:
         set_refresh_state=lambda **k: None,
         update_snapshot=lambda *a, **k: None,
         set_ratio=lambda *a, **k: None,
+        set_status_hint=lambda *a, **k: None,
         remove_tile=lambda *a, **k: None,
         isVisible=lambda: True,
     )
@@ -513,3 +514,100 @@ def test_a_browser_provider_never_has_two_scrapes_alive(clock, seed, caplog):
         f"dispatched while the App had it parked: {sorted(set(dispatched_while_parked))}"
     )
     assert any(account.dispatches for account in accounts.values()), "nothing ever ran"
+
+
+class _WedgedProvider:
+    """A provider whose worker takes the refresh and never answers.
+
+    The one case the park exists for. It records the moment of every
+    dispatch, so what the scheduler does with a worker that never comes back
+    is a list of numbers rather than an impression.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        uses_browser: bool,
+        budget: float,
+        clock: _Clock,
+    ) -> None:
+        self.name = name
+        self.uses_browser = uses_browser
+        self.refresh_budget_seconds = budget
+        self._clock = clock
+        self.dispatches: list[float] = []
+        self.pending: list = []
+
+    def refresh(self, on_done) -> None:
+        self.dispatches.append(self._clock.t)
+        self.pending.append(on_done)
+
+
+def _wedged_app(clock: _Clock) -> tuple[App, _WedgedProvider, _WedgedProvider]:
+    config = Config()
+    # A five-minute ceiling as well as a five-minute floor, so the idle
+    # backoff cannot grow the cadence into the bound under test: what this
+    # measures is the park, not `_adaptive_refresh_minutes`.
+    config.refresh_interval_minutes = 5
+    config.active_refresh_interval_minutes = 5
+    rest = _WedgedProvider("copilot", uses_browser=False, budget=60.0, clock=clock)
+    browser = _WedgedProvider("claude", uses_browser=True, budget=160.0, clock=clock)
+    app = _build_app(clock, {"copilot": rest, "claude": browser}, config)
+    return app, rest, browser
+
+
+def test_a_wedged_rest_worker_is_not_re_dispatched_on_a_clock(clock, caplog):
+    """A REST park is released by the worker, not by a timer.
+
+    `requests`' `timeout` is per socket operation, so a server that drips a
+    byte just inside it holds a `QThreadPool` worker indefinitely and there
+    is no provider-side guard to refuse the next one. Releasing the park at
+    twice the budget therefore started another stuck worker every few
+    minutes until the global pool had no free slot and all three REST tiles
+    were dead for the life of the process. The browser sibling in the same
+    run keeps the 2x ceiling, because its account-keyed live-scrape guard
+    refuses the re-entrant scrape anyway.
+    """
+    caplog.set_level(logging.INFO, logger="aigauge")
+    app, rest, browser = _wedged_app(clock)
+
+    app.refresh_now(manual=False)
+    clock.run_until(6 * 3600.0)
+
+    assert len(rest.dispatches) <= 1 + 6, (
+        f"{len(rest.dispatches)} wedged REST workers started in six hours"
+    )
+    gaps = [
+        later - earlier
+        for earlier, later in zip(rest.dispatches, rest.dispatches[1:])
+    ]
+    assert gaps, "the REST provider was never re-dispatched at all"
+    assert min(gaps) >= 3600.0, (
+        f"a second worker went out {min(gaps):.0f}s after the previous one"
+    )
+    assert len(browser.dispatches) > len(rest.dispatches), (
+        "the browser provider did not keep the 2x ceiling"
+    )
+    assert "provider=copilot" in caplog.text and "ceiling=rest_backstop" in caplog.text
+    assert "provider=claude" in caplog.text and "ceiling=browser_2x" in caplog.text
+
+
+def test_a_rest_worker_that_reports_back_late_un_parks_its_provider(clock):
+    """The report is what normally lifts a REST park - well inside the hour."""
+    app, rest, _browser = _wedged_app(clock)
+
+    app.refresh_now(manual=False)
+    clock.run_until(200.0)  # past the REST watchdog (60 + 20s)
+    assert "copilot" in app._abandoned  # noqa: SLF001
+    assert len(rest.dispatches) == 1
+
+    rest.pending[0](
+        UsageSnapshot(provider="copilot", status=SnapshotStatus.OK)
+    )
+
+    assert "copilot" not in app._abandoned, (  # noqa: SLF001
+        "the worker reported and the provider stayed parked"
+    )
+    clock.run_until(1800.0)  # half an hour: well inside the hour backstop
+    assert len(rest.dispatches) > 1, "an un-parked provider was never refreshed"

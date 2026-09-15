@@ -975,6 +975,21 @@ class _ProviderTile(QFrame):
         self._opacity_anim.setEndValue(target)
         self._opacity_anim.start()
 
+    def set_status_hint(self, text: str) -> None:
+        """A one-line note about a refresh that was asked for and refused.
+
+        Nothing was measured, so nothing else on the tile moves: the
+        snapshot, the metric rows, the history and the burn rate are exactly
+        as they were. It goes in the tooltip, plus the status text when that
+        text is empty - an OK tile's status label is blank, and writing there
+        says something, while overwriting "not signed in" or the error link
+        would take away the one thing on the tile the user can act on. The
+        next `set_snapshot` rewrites both, which is what clears it.
+        """
+        self.status.setToolTip(text)
+        if not self.status.text():
+            self.status.setText(text)
+
     def set_snapshot(self, snapshot: UsageSnapshot | None) -> None:
         self._latest_snapshot = snapshot
         if snapshot is None:
@@ -1522,6 +1537,12 @@ class UsageWidget(QWidget):
         tile = self._tiles.get(provider)
         if tile is not None:
             tile.set_ratio(estimate, recent, live)
+
+    def set_status_hint(self, provider: str, text: str) -> None:
+        """Pass a refusal hint to one tile, if that tile exists."""
+        tile = self._tiles.get(provider)
+        if tile is not None:
+            tile.set_status_hint(text)
 
     def mark_loading(self, providers: dict[str, str], *, subtle: bool = False) -> None:
         """Signal a refresh is in progress without wiping prior data.

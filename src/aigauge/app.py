@@ -77,6 +77,9 @@ _NO_FAST_RETRY_ERROR_CLASSES = ("throttled", "resume_artifact")
 _RETRY_WAKE_TOLERANCE_SECONDS = 2
 _HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000
 _LOG_VALUE_LIMIT = 300
+# What a tile says when the user asks for a refresh the App cannot start yet.
+# Fixed text: nothing a provider chose reaches the tile through this.
+_PARKED_REFRESH_HINT = "Waiting for the previous refresh to finish."
 # How long a provider may hold a refresh before the App declares it lost.
 # Browser providers name their own bound (the scraper timeout times the
 # attempts it may make); a REST provider is a handful of HTTPS calls with
@@ -85,13 +88,25 @@ _REST_REFRESH_BUDGET_SECONDS = 60.0
 # Enough slack that a provider finishing right at its own bound reports
 # normally rather than racing the watchdog.
 _WATCHDOG_SLACK_SECONDS = 20.0
-# How long after the watchdog gave up a provider stays parked, as a multiple
-# of the budget that expired. Until then its worker is presumed still out
-# there - a browser scrape holding the one cached QWebEngineProfile for that
-# account - and re-dispatching would put a second one on it. Past it the
-# worker is assumed dead, because parking a provider forever is its own
-# failure mode.
+# How long after the watchdog gave up a BROWSER provider stays parked, as a
+# multiple of the budget that expired. Until then its worker is presumed
+# still out there - a browser scrape holding the one cached
+# QWebEngineProfile for that account - and re-dispatching would put a second
+# one on it. Past it the worker is assumed dead, because parking a provider
+# forever is its own failure mode, and the account-keyed live-scrape guard in
+# `providers/_scrape_runner.py` refuses the re-entrant scrape anyway.
 _ABANDONED_CEILING_FACTOR = 2.0
+# A REST provider has no such guard, and `requests`' `timeout` is per socket
+# operation rather than a total: a server that sends one byte just inside the
+# timeout holds a `QThreadPool` worker for as long as it likes. Releasing the
+# park on a clock therefore starts ANOTHER stuck worker every time it
+# expires, and the pool is global - measured against a byte-dripping server
+# over six fake hours, every slot ends up stuck (1 of 1, 2 of 2, 4 of 4, 8 of
+# 8) and all three REST tiles are dead for the life of the process. So a REST
+# park lasts until its worker reports back - any snapshot for that name, live
+# or late, un-parks it - with this as a backstop, because a park nothing can
+# lift is its own failure mode too.
+_REST_PARK_BACKSTOP_SECONDS = 3600.0
 
 
 def _pool_capacity() -> int:
@@ -768,6 +783,18 @@ class App(QObject):
             for name, state in self._error_retry.items()
             if name in self._providers
         }
+        # A park outlives the provider it was about. Nothing else clears it
+        # for a name the user removed - `_dispatch_refusal` answers
+        # `not_configured` before it ever asks `_is_abandoned` - so the entry
+        # and the `_dispatch_times` / `_dispatch_epoch` rows `keep` holds open
+        # for it would live for the process. A name still in flight keeps its
+        # park: that dispatch is what it bounds.
+        for name in [
+            n
+            for n in self._abandoned
+            if n not in self._providers and n not in self._inflight
+        ]:
+            self._abandoned.pop(name, None)
         # Same pruning for the other per-provider maps, so a removed provider
         # leaves nothing behind. A name still in flight or still parked keeps
         # its entries: its dispatch is what they bound.
@@ -1011,6 +1038,10 @@ class App(QObject):
                 log.info(
                     "refresh provider skipped provider=%s reason=%s", name, refusal
                 )
+                if manual and refusal == "abandoned":
+                    # The user asked, and the answer is "not yet". A
+                    # scheduled cycle says nothing - nobody asked for it.
+                    self._note_refresh_parked(name)
         names = wanted
         if not names:
             # Nothing runnable. A cycle over zero providers blinked
@@ -1147,6 +1178,23 @@ class App(QObject):
             # from the request never having been made.
             log.info("refresh pending manual dropped scope=%s", ",".join(wanted))
 
+    def _note_refresh_parked(self, name: str) -> None:
+        """Say on the tile that a refresh the user asked for is waiting.
+
+        A manual refresh refused as `abandoned` used to do nothing visible at
+        all: the button re-enabled, no tile moved, and the log line was the
+        only evidence. A REST park now lasts until its worker reports or an
+        hour passes, so that silence can be an hour long.
+
+        It is a hint and nothing more - no snapshot, no history, no ratio, no
+        cycle - and its text is a fixed literal, so no provider string
+        reaches the tile through it. The next paint of that tile clears it.
+        """
+        try:
+            self._widget.set_status_hint(name, _PARKED_REFRESH_HINT)
+        except Exception:  # noqa: BLE001 - a hint is not worth a crash
+            log.exception("widget.set_status_hint failed")
+
     def _uses_browser(self, name: str) -> bool:
         return bool(getattr(self._providers.get(name), "uses_browser", False))
 
@@ -1204,8 +1252,15 @@ class App(QObject):
         writing one cookie store, which is how a spurious sign-out happens,
         and N times the load on the provider from one desktop app.
 
-        The entry clears when the abandoned worker finally reports back, or
-        when twice its budget has passed and it can fairly be called dead.
+        The entry clears when the abandoned worker finally reports back -
+        which for a REST provider is the only thing that normally clears it,
+        because nothing bounds a `requests` call that keeps dripping bytes
+        and a second worker on the same endpoint just holds a second slot of
+        the global QThreadPool. A browser provider is let go at twice its
+        budget, where its worker really is over and the account-keyed
+        live-scrape guard would refuse a re-entrant scrape anyway; a REST one
+        at `_REST_PARK_BACKSTOP_SECONDS`, so that a park nothing can lift
+        does not become permanent either.
         """
         entry = self._abandoned.get(name)
         if entry is None:
@@ -1442,13 +1497,29 @@ class App(QObject):
         # name until that worker reports back or can be assumed dead, so no
         # cycle, retry wake, manual refresh or settings save starts a second
         # one alongside it.
-        assumed_dead_in = _ABANDONED_CEILING_FACTOR * budget
+        #
+        # How long "can be assumed dead" is depends on what is holding the
+        # worker. A browser scrape is bounded by the scraper's own QTimer and
+        # guarded by the account-keyed registry in `_scrape_runner`, so twice
+        # the budget is a fair assumption and the one case it lets through is
+        # refused there. A REST worker is a `requests` call whose timeout is
+        # per socket operation, with no provider-side guard at all: assuming
+        # it dead on a clock hands the same endpoint another worker, and they
+        # accumulate until the global QThreadPool has no free slot.
+        if self._uses_browser(name):
+            assumed_dead_in = _ABANDONED_CEILING_FACTOR * budget
+            ceiling = "browser_2x"
+        else:
+            assumed_dead_in = _REST_PARK_BACKSTOP_SECONDS
+            ceiling = "rest_backstop"
         self._abandoned[name] = (epoch, time.monotonic() + assumed_dead_in)
         log.warning(
-            "refresh provider abandoned provider=%s epoch=%s eligible_again_in_s=%.0f",
+            "refresh provider abandoned provider=%s epoch=%s "
+            "eligible_again_in_s=%.0f ceiling=%s",
             name,
             epoch,
             assumed_dead_in,
+            ceiling,
         )
         self._signals.snapshot_ready.emit(
             (
