@@ -97,8 +97,6 @@ numbers in the entries below are that log's, not estimates.
 - **A snapshot for a provider you just removed no longer re-creates its
   tile.** A settings save rebuilds the providers while a refresh is still out,
   and the late snapshot came back through `ensure_tile`.
-- **`BrowserAccount.enabled` is honoured.** The field existed and nothing read
-  it, so a disabled account still cost a browser scrape every cycle.
 - **A timeout measured across a machine suspend is not counted as a provider
   failure.** A laptop resumed after two days reported `elapsed_s=228477`
   against an 80 s budget; every resume cost one spurious failure per provider,
@@ -113,6 +111,18 @@ numbers in the entries below are that log's, not estimates.
   one-word error class so the scheduler does not read a provider that is
   deliberately not fetching as a provider that failed. The hourly floor, the
   backoff and the cache are exactly as they were.
+- **`BrowserAccount.enabled` is still not honoured, deliberately.** An
+  earlier draft of this release made `_enabled_providers` and
+  `_build_providers` read the field. Nothing in the app writes it: the
+  settings dialog sets it once when adding an account, and the only other
+  writer is the config migration, which stamps `bool(providers.<kind>)` when
+  it inserts a missing fixed account. A config migrated while
+  `providers.claude` was false would therefore carry `enabled: false`
+  forever, and the Settings checkbox - which flips `providers.claude`, not
+  this - could never undo it. Reading a field nothing writes turns that
+  checkbox into a permanent no-op, so the change was reverted. The field is
+  still parsed, so an existing `config.json` loads unchanged.
+
 - **Metric labels still count toward the cadence.** OpenRouter's
   `Today ($3.10/$5.00)` and Copilot's `Credits (12.5/1500)` can still read as
   a change. Hashing a stable `key` instead is the same repo-wide decision that

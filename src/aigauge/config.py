@@ -346,6 +346,18 @@ class BrowserAccount(BaseModel):
     id: str
     kind: str
     name: str | None = None
+    # Parsed for compatibility and then IGNORED. Nothing in the app writes it:
+    # the settings dialog sets it to True when it adds an account and never
+    # again, and the only other writer is _migrate below, which stamps
+    # ``bool(providers.<kind>)`` when it inserts a missing fixed account. A
+    # config migrated while ``providers.claude`` was false would therefore
+    # carry ``enabled: false`` forever, and the Settings checkbox - which
+    # flips ``providers.claude``, not this - could never undo it. Honouring
+    # the field made that checkbox a permanent no-op, so the provider toggle
+    # is the only switch. Kept so an existing config.json still loads, and so
+    # a future per-account toggle has somewhere to land once something writes
+    # it. ``browser_accounts(..., enabled_only=True)`` still filters on it and
+    # has no caller in src/.
     enabled: bool = True
     colors: GaugeColors = Field(default_factory=ColorThresholds)
 

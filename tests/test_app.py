@@ -276,37 +276,43 @@ def test_refresh_order_puts_copilot_with_the_cheap_rest_providers():
     ]
 
 
-def test_a_disabled_browser_account_is_not_refreshed():
-    """BrowserAccount.enabled was dead: config.browser_accounts could filter
-    on it, no caller ever did, and the account kept costing a browser scrape
-    every cycle."""
+def test_browser_account_enabled_is_not_a_switch():
+    """`BrowserAccount.enabled` is parsed and then ignored, deliberately.
+
+    Nothing in the app ever writes it. The one place that ever set it to
+    anything but the default is the config migration, which stamps
+    `bool(providers.<kind>)` when it inserts a missing fixed account - so a
+    config migrated while `providers.claude` was false would carry
+    `enabled: false` forever, and the Settings checkbox, which only flips
+    `providers.claude`, could never undo it. Honouring the field made that
+    checkbox a permanent no-op. The provider toggle is the only switch.
+    """
     config = Config()
+    for account in config.browser_accounts:
+        account.enabled = False
     config.browser_accounts.append(
         BrowserAccount(id="claude-team", kind="claude", name="Team", enabled=False)
     )
 
-    assert "claude-team" not in _enabled_providers(config)
-    assert "claude" in _enabled_providers(config)
+    enabled = _enabled_providers(config)
+
+    assert "claude" in enabled
+    assert "codex" in enabled
+    assert "claude-team" in enabled
+
+    config.providers.claude = False
+    enabled = _enabled_providers(config)
+    assert "claude" not in enabled
+    assert "claude-team" not in enabled
+    assert "codex" in enabled
 
 
 def test_a_legacy_config_with_no_accounts_still_gets_its_tiles():
-    """The fallback exists for a config written before browser_accounts did,
-    not for one whose accounts are all switched off - filtering first and
-    then falling back would resurrect exactly what the user disabled."""
+    """The fallback exists for a config written before browser_accounts did."""
     config = Config()
     config.browser_accounts = []
 
     assert _enabled_providers(config)[:2] == ("claude", "codex")
-
-
-def test_every_account_disabled_does_not_fall_back_to_the_defaults():
-    config = Config()
-    for account in config.browser_accounts:
-        account.enabled = False
-
-    enabled = _enabled_providers(config)
-    assert "claude" not in enabled
-    assert "codex" not in enabled
 
 
 def test_enabled_providers_places_azure_next_to_copilot():

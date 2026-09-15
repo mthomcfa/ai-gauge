@@ -116,19 +116,19 @@ def _make_dot_tray_icon(color: str | None = None) -> QIcon:
 
 
 def _enabled_providers(config: Config) -> tuple[str, ...]:
-    # enabled_only: BrowserAccount.enabled existed, config.browser_accounts
-    # supported filtering on it, and nothing in src/ ever passed the flag - so
-    # a hand-edited config.json that turned an account off was silently
-    # ignored and the account kept costing a browser scrape every cycle.
+    # `BrowserAccount.enabled` is deliberately NOT consulted here. See
+    # config.BrowserAccount: nothing in the app ever writes the field, and the
+    # migration can stamp it false permanently, so reading it turned the
+    # Settings provider checkbox into a no-op the user could never undo. The
+    # `providers.<kind>` toggle is the only switch.
     accounts = browser_accounts(config)
     out: list[str] = [
         account.id
         for account in accounts
-        if account.enabled and getattr(config.providers, account.kind, False)
+        if getattr(config.providers, account.kind, False)
     ]
     # The fallback is for a legacy config that has no browser_accounts list at
-    # all - not for one whose accounts are all switched off, which would
-    # resurrect exactly what the user disabled.
+    # all.
     if not accounts:
         providers = getattr(config, "providers", None)
         if getattr(providers, "claude", False):
@@ -541,7 +541,7 @@ class App(QObject):
         # Tear down any existing providers (no shared state to clean up beyond refs)
         self._providers.clear()
         desired_tiles: set[str] = set()
-        for account in browser_accounts(self._config, enabled_only=True):
+        for account in browser_accounts(self._config):
             if not getattr(self._config.providers, account.kind, False):
                 continue
             desired_tiles.add(account.id)

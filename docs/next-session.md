@@ -513,6 +513,21 @@ unnecessary source of behaviour change.
   the queue carries on; a snapshot that arrives after its watchdog repaints
   its tile and cannot close a second cycle. The heartbeat also restarts a
   timer that is not running while nothing is in flight.
+- **`BrowserAccount.enabled` is parsed and ignored, on purpose.** F13 made
+  `_enabled_providers` and `_build_providers` honour it. That was reverted
+  before merge: nothing in the app ever *writes* the field except the config
+  migration, which stamps `bool(providers.<kind>)` when it inserts a missing
+  fixed account - so a config migrated while `providers.claude` was false
+  carries `enabled: false` forever, and the Settings checkbox, which flips
+  `providers.claude`, could never undo it. Honouring a field nothing writes
+  turns that checkbox into a permanent no-op. The field stays in the model so
+  an existing `config.json` still loads and a future real per-account toggle
+  has somewhere to land; `browser_accounts(..., enabled_only=True)` still
+  exists and has no caller in `src/`. Making the writer match the reader -
+  syncing the fixed accounts in `SettingsDialog.apply_to` plus a one-time
+  repair in `Config._migrate` - is the other half, and belongs with whatever
+  actually needs a per-account switch.
+
 - **The per-provider retry does not cover Azure's remembered error.** Inside
   its hourly window Azure re-serves `state.last_error` on every refresh. That
   snapshot is a real failure and carries no `error_class`, so it still earns
