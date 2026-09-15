@@ -832,6 +832,26 @@ unnecessary source of behaviour change.
   the segfault is a suite-level soft spot that predates this PR's code and
   belongs with the WebEngine teardown warning, not with Azure.
 
+  **The named cause is now fixed** (`c759bdc`). The real `App()` that
+  `test_app.py` constructs was never torn down, and its startup refresh was a
+  bare `QTimer.singleShot(500, lambda: ...)` whose lambda kept the App alive:
+  500 ms later, inside whatever test was then processing events, a real cycle
+  dispatched real providers and started a real scrape. That stray page was the
+  `Release of profile requested but WebEnginePage still not deleted` warning,
+  and it was also the intermittent
+  `TypeError: 'NoneType' object is not callable` that pytest-qt pinned on a
+  long-running test in `test_app_logging.py`. The startup refresh is now a
+  parented single-shot `QTimer`, `App.shutdown()` stops it along with the
+  cadence timer, the heartbeat and every armed watchdog, and the smoke test
+  calls it in a `finally`.
+
+  What that closes and what it does not: the teardown warning and the
+  misattributed `TypeError` are gone, and the suite no longer leaves a live
+  Chromium page running under later tests. The run 67 segfault itself was
+  never reproduced, so this removes its most likely cause rather than proving
+  it was the cause. If a native-thread crash reappears with the stray page
+  gone, this entry is no longer the explanation and the hunt starts fresh.
+
 ### 8.4 Decisions taken in review, so they are not relitigated
 
 Three reviews went over this feature before it merged (see the
