@@ -2146,15 +2146,24 @@ def test_an_id_on_both_deferral_lists_is_purged_once(monkeypatch, caplog):
     assert "reason=reconfigured" not in caplog.text
 
     # And straight off disk, which is how a `config.json` restored from a
-    # backup can present the same id on both lists at once.
+    # backup presents the same id on both lists at once. `claude` is a fixed
+    # browser account, so the removal list's drain would skip it and say
+    # `reason=reconfigured` - a line that would claim the profile was kept
+    # while the clear list deletes it two statements later.
     purged.clear()
+    caplog.clear()
     restored = _app({})
     restored._config = RealConfig(  # noqa: SLF001
-        pending_profile_purges=["codex-dead"],
-        pending_data_clears=["codex-dead"],
+        pending_profile_purges=["claude", "codex-dead"],
+        pending_data_clears=["claude", "codex-dead"],
     )
-    restored._drain_pending_purges()  # noqa: SLF001
-    assert purged == ["codex-dead"], purged
+    with caplog.at_level(logging.INFO, logger="aigauge.app"):
+        restored._drain_pending_purges()  # noqa: SLF001
+
+    assert purged == ["claude", "codex-dead"], purged
+    assert "reason=reconfigured" not in caplog.text, (
+        "the drain said a profile was kept that the clear list then deleted"
+    )
 
 
 def test_a_clear_request_takes_only_usable_ids(monkeypatch):
