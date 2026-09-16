@@ -8,15 +8,22 @@ injected, the stream is a fake, and nothing here opens a socket.
 
 from __future__ import annotations
 
+import gzip
 import socket
 import threading
+import tracemalloc
+from pathlib import Path
 
 import requests
 import pytest
 import responses
+import urllib3
+from packaging.version import Version
 from urllib3.exceptions import ProtocolError
 
 from aigauge.providers import _http
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 class _FakeRaw:
@@ -223,6 +230,112 @@ def test_a_body_exactly_at_the_cap_is_allowed(monkeypatch):
     )
 
     assert response.content == b"z" * 64
+
+
+# --- what a Content-Encoding may cost -------------------------------------
+#
+# The cap above is on decoded bytes, and the count between reads only helps if
+# one read cannot produce a gigabyte on its own. That property is urllib3's:
+# every 2.x returns at most `amt` decoded bytes from `read1`, and 2.6 is where
+# the decoder itself stops at `max_length` rather than decoding the whole raw
+# read and buffering the surplus. Hence a declared floor, and a refusal for the
+# shape that defeats any single-layer bound.
+
+URLLIB3_FLOOR = Version("2.6")
+
+
+def test_the_urllib3_floor_the_memory_bound_depends_on_is_installed():
+    """Parsed, not string-compared: "2.10" < "2.6" as strings."""
+    assert Version(urllib3.__version__) >= URLLIB3_FLOOR
+
+
+def test_the_urllib3_floor_is_declared_as_a_dependency():
+    """`requests>=2.32` asks only for `urllib3>=1.21.1,<3`, so without this
+    line a resolver may hand this code a urllib3 whose decompression is not
+    bounded - and nothing in build.sh or build.ps1 pins one."""
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    declared = [
+        line.strip().strip('",')
+        for line in pyproject.splitlines()
+        if line.strip().startswith('"urllib3')
+    ]
+    assert declared == [f"urllib3>={URLLIB3_FLOOR}"], declared
+
+
+@responses.activate
+def test_a_body_under_more_than_one_coding_is_refused_before_it_is_read(
+    monkeypatch,
+):
+    """`gzip, gzip` is 988 bytes on the wire and 1 070 MiB in a worker on a
+    urllib3 the floor above now forbids. No host this app speaks to serves
+    nested codings, so the body is never read at all - which is also the only
+    bound that does not depend on the resolved urllib3."""
+    responses.add(
+        responses.GET,
+        "https://example.invalid/nested",
+        body=gzip.compress(gzip.compress(b'{"a": 1}')),
+        status=200,
+        headers={"Content-Encoding": "gzip, gzip"},
+    )
+
+    def no_reads(response, chunk_bytes):  # noqa: ARG001
+        raise AssertionError("the body was read before it was refused")
+
+    monkeypatch.setattr(_http, "_body_chunks", no_reads)
+
+    with pytest.raises(_http.ResponseEncodingRefused) as excinfo:
+        _http.bounded_request("GET", "https://example.invalid/nested", timeout=15)
+
+    assert issubclass(_http.ResponseEncodingRefused, requests.RequestException)
+    # The message reaches snapshot.error and the log: a count, never the
+    # endpoint's own header text.
+    assert "gzip" not in str(excinfo.value)
+    assert "http" not in str(excinfo.value).lower()
+
+
+@responses.activate
+def test_one_coding_is_still_read():
+    """The refusal is of *nested* codings; the ordinary gzip every host may
+    send is what the drain exists to decode."""
+    responses.add(
+        responses.GET,
+        "https://example.invalid/ok",
+        body=gzip.compress(b'{"a": 1}'),
+        status=200,
+        headers={"Content-Encoding": "gzip"},
+    )
+
+    response = _http.bounded_request(
+        "GET", "https://example.invalid/ok", timeout=15
+    )
+
+    assert response.json() == {"a": 1}
+
+
+@responses.activate
+def test_a_single_gzip_bomb_still_ends_at_the_cap_without_the_memory():
+    """32 MiB of zeros in 33 KiB on the wire. The point is the peak, not the
+    exception: a cap that is only enforced after the decoder has finished is
+    not a memory bound."""
+    responses.add(
+        responses.GET,
+        "https://example.invalid/bomb",
+        body=gzip.compress(b"\0" * (32 * 1024 * 1024), 9),
+        status=200,
+        headers={"Content-Encoding": "gzip"},
+    )
+
+    tracemalloc.start()
+    try:
+        with pytest.raises(_http.ResponseTooLarge):
+            _http.bounded_request(
+                "GET", "https://example.invalid/bomb", timeout=15
+            )
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+    assert peak < 32 * 1024 * 1024, f"peak {peak / 1024 / 1024:.1f} MiB"
 
 
 # --- the Response the caller gets back --------------------------------------

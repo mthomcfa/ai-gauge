@@ -24,6 +24,14 @@ dependencies = [
     "PyQt6>=6.7,<7",
     "PyQt6-WebEngine>=6.7,<7",
     "requests>=2.32",
+    # requests' own transitive dependency, made explicit rather than added:
+    # providers/_http.py's 8 MiB memory ceiling is urllib3's bounded
+    # decompression (`max_length` through `_decode`), which arrived in 2.6.
+    # On 2.4 and 2.5 - both permitted by `requests>=2.32`, which asks only for
+    # `urllib3>=1.21.1,<3` - a 988-byte `Content-Encoding: gzip, gzip` body
+    # cost a worker 1 070 MiB, measured. Nothing in build.sh or build.ps1 pins
+    # it, so a build machine with an older one already present would ship it.
+    "urllib3>=2.6",
     "pydantic>=2.6",
     "keyring>=25.0",
     "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",

@@ -70,7 +70,14 @@ REQUEST_TOTAL_SECONDS = 30.0
 #
 # The count is of *decoded* bytes: the drain asks urllib3 to decode
 # content-encoding, so a gzip bomb is measured at the size it would actually
-# cost us (see _body_chunks).
+# cost us (see _body_chunks). What keeps one read from *producing* a gigabyte
+# before this count is consulted is urllib3's, not ours: every 2.x ends
+# `read1` with `self._decoded_buffer.get(amt)`, so a read returns at most
+# `chunk_bytes` of decoded bytes - but only 2.6 and later stop the decoder
+# itself at `max_length`. On 2.4 and 2.5 the whole raw read is decoded first
+# and the surplus buffered, which is why pyproject.toml declares the floor
+# rather than leaving it to whatever `requests` resolves: measured on 2.5.0, a
+# 988-byte `Content-Encoding: gzip, gzip` body peaked at 1 070 MiB.
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
 # The most one read asks for. Also how often the deadline and the size cap are
@@ -94,6 +101,19 @@ class ResponseDeadlineExceeded(requests.RequestException):
 
 class ResponseTooLarge(requests.RequestException):
     """The body passed ``max_bytes``. Same contract as the class above."""
+
+
+class ResponseEncodingRefused(requests.RequestException):
+    """The response declared more than one ``Content-Encoding``.
+
+    Nothing this app asks for is served under nested codings - the four hosts
+    are fixed and documented - and urllib3 decodes them one layer at a time,
+    each layer whole before the next sees it below 2.6. So 988 bytes on the
+    wire cost a worker 1 070 MiB and the entire deadline there, against a
+    constant above that says a gigabyte is exactly what cannot happen. The
+    version floor is one half of the answer; refusing before a byte of the
+    body is read is the other, and costs nothing a real endpoint would miss.
+    """
 
 
 def request_worst_case_seconds(
@@ -282,8 +302,9 @@ def bounded_request(
     ``.raise_for_status()`` (including the ``HTTPError.response`` back-link)
     are all unchanged, so no call site has to know this helper is in the way.
 
-    Raises ``ResponseDeadlineExceeded`` or ``ResponseTooLarge`` - both
-    ``requests.RequestException`` - and closes the response first, so the
+    Raises ``ResponseDeadlineExceeded``, ``ResponseTooLarge`` or
+    ``ResponseEncodingRefused`` - all ``requests.RequestException`` - and
+    closes the response first, so the
     socket is released rather than left to the garbage collector. Every other
     ``requests`` exception propagates as before, *except* one raised by a read
     the deadline timer cut: that is a deadline, and is re-raised as one with
@@ -325,6 +346,7 @@ def bounded_request(
         # headers has already spent the budget, and there is no reason to
         # wait out a whole chunk read to say so.
         _check_deadline(started, total_seconds, monotonic, deadline)
+        _refuse_nested_encoding(response)
         for chunk in _body_chunks(response, chunk_bytes):
             body += chunk
             if len(body) > max_bytes:
@@ -333,7 +355,7 @@ def bounded_request(
                 )
             _check_deadline(started, total_seconds, monotonic, deadline)
     except BaseException as exc:
-        # Covers the two bounds above and anything requests raises mid-stream
+        # Covers the three bounds above and anything requests raises mid-stream
         # (a chunked-encoding failure, a read timeout on one chunk). Abandoning
         # the generator stops the read; close() releases the connection.
         if response is not None:
@@ -364,6 +386,19 @@ def bounded_request(
     response._content_consumed = True
     return response
 
+
+def _refuse_nested_encoding(response: requests.Response) -> None:
+    """Refuse ``Content-Encoding: gzip, gzip`` before reading a byte of it."""
+    codings = [
+        coding.strip()
+        for coding in response.headers.get("Content-Encoding", "").split(",")
+        if coding.strip()
+    ]
+    if len(codings) > 1:
+        raise ResponseEncodingRefused(
+            f"Response declared {len(codings)} content encodings; "
+            "this app reads at most one."
+        )
 
 def _body_chunks(response: requests.Response, chunk_bytes: int) -> Iterator[bytes]:
     """Yield body bytes as soon as any of them arrive.
@@ -445,7 +480,7 @@ def _cut_by_the_deadline(
     A socket the timer shut down surfaces as whatever the broken read raised -
     a ``ChunkedEncodingError`` on a truncated body, a ``ConnectionError`` on a
     cut header block - which would tell the call site the endpoint failed when
-    in fact this app gave up. The two bounds below are already the right
+    in fact this app gave up. The three bounds below are already the right
     answer and keep their own names; ``KeyboardInterrupt`` and ``SystemExit``
     are not transport failures and keep theirs.
     """
@@ -454,6 +489,7 @@ def _cut_by_the_deadline(
         (
             ResponseDeadlineExceeded,
             ResponseTooLarge,
+            ResponseEncodingRefused,
         ),
     ):
         return False

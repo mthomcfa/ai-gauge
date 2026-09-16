@@ -92,6 +92,28 @@ call that answers in under a second answers exactly as it did.
   provider that gives up on its own at 130, 135 or 495 s closes its own cycle,
   so the ceiling is reached less often than before rather than more.
 
+- **The 8 MiB memory ceiling now has the floor it was standing on, and a
+  refusal that does not need one.** The cap counts *decoded* bytes, and that
+  only bounds memory if one read cannot produce a gigabyte by itself. Every
+  urllib3 2.x returns at most `chunk_bytes` of decoded bytes from `read1`, but
+  only 2.6 and later stop the decoder at `max_length`: on 2.4 and 2.5 the whole
+  raw read is decoded first and the surplus buffered. `requests>=2.32` asks
+  only for `urllib3>=1.21.1,<3`, and neither `build.sh` nor `build.ps1` pins
+  one, so the comment promising that "a hostile or broken endpoint cannot make
+  a background worker allocate a gigabyte" was true of the resolved version
+  rather than of this code. Measured on 2.5.0, a **988-byte** response with
+  `Content-Encoding: gzip, gzip` cost **1 070 MiB** and the whole 30 s
+  deadline (9.8 MiB on the shipped 2.6.3).
+
+  Both halves are taken. `pyproject.toml` declares `urllib3>=2.6` - requests'
+  own transitive dependency made explicit, not a new one - and a response
+  whose `Content-Encoding` names more than one coding is refused before a
+  byte of its body is read, with `ResponseEncodingRefused`, another
+  `requests.RequestException`. No host this app speaks to serves nested
+  codings. After: **0.2 MiB and 0.01 s** on 2.6.3 *and* on 2.5.0, with the
+  body never read. A single-layer gzip bomb is unchanged - `ResponseTooLarge`
+  at the cap, with a `tracemalloc` peak the suite now pins under 32 MiB.
+
 - **`allow_redirects=False` on every REST call.** Every host this app speaks
   to is fixed and listed in `SECURITY.md`, so a redirect is a failure, not
   something to follow. Azure already said so; Copilot and OpenRouter get the
