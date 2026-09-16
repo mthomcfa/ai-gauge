@@ -697,6 +697,38 @@ def test_a_longer_deny_list_still_denies_what_it_names():
     assert not [f for f in eg.scan("read src/aigauge/app.py", pol) if f.rule == "denied-path"]
 
 
+@pytest.mark.parametrize(
+    "glob, denied",
+    [
+        pytest.param("**/CREDENTIALS", "a/credentials", id="UPPER glob"),
+        pytest.param("**/Secrets/**", "x/secrets/y", id="Mixed glob"),
+        pytest.param("**/ID_RSA", "k/id_rsa", id="UPPER stem"),
+        pytest.param("**/*.PEM", "k/cert.pem", id="UPPER suffix"),
+        pytest.param("**/credentials", "A/CREDENTIALS", id="UPPER path"),
+        pytest.param("**/secrets/**", "X/SECRETS/Y", id="UPPER dir"),
+        pytest.param("**/id_rsa", "K/ID_RSA", id="UPPER file"),
+        pytest.param("**/*.pem", "K/CERT.PEM", id="UPPER ext"),
+    ],
+)
+def test_a_deny_glob_is_case_folded_on_both_sides(glob, denied):
+    """Both sides are lowered, and only the candidate side had a test.
+
+    `fnmatch` is case-sensitive on POSIX and insensitive on Windows, so a deny
+    list that depends on the case a path was typed in is not a deny list. The
+    candidate half is covered by `C:\\Users\\m\\.AWS\\CREDENTIALS` in
+    `test_this_repos_own_secret_stores_are_denied`; the *pattern* half was not
+    covered by anything, because every built-in deny glob is already
+    lower-case - so dropping `.lower()` from the compile side survived the
+    whole suite. `paths.deny` is an operator-editable list and section 9 of
+    `docs/next-session.md` tells this repository to edit it, so an
+    operator-written `**/Secrets/**` has to deny `x/secrets/y`.
+    """
+    pol = policy(paths={"deny": [glob]})
+    assert any(
+        f.rule == "denied-path" for f in eg.scan(f"please read {denied}", pol)
+    ), f"{glob!r} did not deny {denied!r}"
+
+
 def _quantifiers(pattern: str, verbose: bool = False):
     """Every quantifier in `pattern`, as (position, text, bounded_or_possessive)."""
     index = 0
