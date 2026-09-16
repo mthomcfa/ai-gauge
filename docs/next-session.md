@@ -4,7 +4,7 @@ State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#1
 610 tests passing, all five providers reading.
 
 > **Updated 2026-09-15** by the hardening follow-up (`1.3.1+cfa.6`,
-> 1 274 tests), which closed most of what the refresh-cadence work left in
+> 1 275 tests), which closed most of what the refresh-cadence work left in
 > [§8.3](#83-known-soft-spots-in-what-was-built): the REST park, the
 > "Clear all browser data" purge, the dispatch epoch's name, the log
 > summariser and the scraper's uncapped log lines. What is still open there

@@ -121,11 +121,11 @@ allowed to cost.
   whole. `scrape fail`'s `load_error_string` is clipped the same way;
   measured against a real QtWebEngine it is a Qt string-table message
   rather than the server's, so that one closes an assumption rather than a
-  hole. All three arguments are guarded, `snapshot.error` included: `UsageSnapshot` is a plain dataclass,
-  so `error or ""` runs the object's `__bool__` and `str()` its `__str__`,
-  and either raised straight out of `_on_snapshot` — before the tile was
-  painted — until the helper caught it and answered
-  `<unprintable error>`. The clip runs *before* the redaction rather than
+  hole. All three arguments are guarded, `snapshot.error` included:
+  `UsageSnapshot` is a plain dataclass, so `error or ""` runs the object's
+  `__bool__` and `str()` its `__str__`, and either raised straight out of
+  `_on_snapshot` — before the tile was painted — until the helper caught it
+  and answered `<unprintable error>`. The clip runs *before* the redaction rather than
   after, so four regex passes see 500 characters rather than the whole
   string (0.08 ms for a 1.2 MB error against 163 ms): the margin past the
   300-character limit keeps an identifier straddling *that* limit whole for
@@ -246,10 +246,10 @@ allowed to cost.
 
 ### Notes
 
-- **1 216 → 1 274 tests.** Including six fake hours of a wedged REST worker
+- **1 216 → 1 275 tests.** Including six fake hours of a wedged REST worker
   against a browser sibling, an hour-long park ridden out over eleven cadence
   wakes, a mislabelled answer that must not touch its sibling's dispatch, and
-  the three payloads that used to raise out of `_on_snapshot`. **Thirty-five**
+  the three payloads that used to raise out of `_on_snapshot`. **Thirty-six**
   of them are this release's own review, over three rounds: the idle backoff
   measured with a provider parked and without, a removed browser account's
   park, the epoch guard on the un-park, a deferred clear carried across a
@@ -259,7 +259,8 @@ allowed to cost.
   purged once (round 2); and a subscription id swept across every offset the
   log's clip can cut it at, a link in `profiles/` that is never a profile,
   and the two arms of `is_usable_profile_id` the filesystem decides
-  (round 3).
+  (round 3). Counted by collection: 1 216 at `origin/main`, 1 239 when the
+  release was tagged, 1 275 after the three review rounds.
 - **The REST socket itself is still unbounded.** This bounds how many workers
   a hung endpoint can accumulate, not how long one of them lives. A total
   response deadline — `stream=True` plus an elapsed check while reading — is
