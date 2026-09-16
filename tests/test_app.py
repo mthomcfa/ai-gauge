@@ -1834,23 +1834,33 @@ def test_no_fragment_of_a_subscription_id_survives_the_clip():
     window = _LOG_VALUE_LIMIT + _LOG_REDACT_MARGIN
     # Each filler unit redacts to `/subscriptions/<guid>`, which is the
     # shrinkage that drags the cut fragment into the kept 300 characters.
+    # How many of them there are decides how much shrinkage there is, and
+    # so whether the redacted window lands under the 300-character limit or
+    # a little over it - the second is the case where the final clip does
+    # the cutting rather than the window, and it leaks too.
     unit = "/subscriptions/" + guid + "."
 
-    for offset in range(window - 60, window + 61):
-        filler = ""
-        while len(filler) + len(unit) + len("/subscriptions/") <= offset:
-            filler += unit
-        head = filler + "." * (offset - len(filler) - len("/subscriptions/"))
-        record = _error_for_log(
-            head + "/subscriptions/" + guid + "/resourceGroups/rg-real/x" + "y" * 4000
-        )
-        for run in _re.findall(r"[0-9A-Fa-f-]{8,}", record):
-            for size in range(len(run), 7, -1):
-                pieces = (run[at : at + size] for at in range(len(run) - size + 1))
-                assert not any(piece in guid for piece in pieces), (
-                    f"{size} characters of the subscription id reached the "
-                    f"record with the id starting at offset {offset}: {record!r}"
-                )
+    for units in range(10):
+        filler = unit * units
+        for offset in range(window - 60, window + 61):
+            pad = offset - len(filler) - len("/subscriptions/")
+            if pad < 0:
+                continue
+            head = filler + "." * pad
+            record = _error_for_log(
+                head + "/subscriptions/" + guid + "/resourceGroups/rg-real/x"
+                + "y" * 4000
+            )
+            for run in _re.findall(r"[0-9A-Fa-f-]{8,}", record):
+                for size in range(len(run), 7, -1):
+                    pieces = (
+                        run[at : at + size] for at in range(len(run) - size + 1)
+                    )
+                    assert not any(piece in guid for piece in pieces), (
+                        f"{size} characters of the subscription id reached "
+                        f"the record with {units} ids in front of it and this "
+                        f"one starting at offset {offset}: {record!r}"
+                    )
 
     # The drop is for the cut token only. An error the window did not truncate
     # ends on whatever it ends on, and a hex run the redaction deliberately

@@ -164,6 +164,28 @@ def test_a_symlink_inside_the_profiles_directory_is_never_usable():
     assert (profiles / "live_one").is_dir(), "the predicate deleted something"
 
 
+def test_an_entry_resolving_to_the_profiles_root_is_not_one_to_delete(monkeypatch):
+    """The containment case `webview_profile_dir` and `purge_profile` differ on.
+
+    `webview_profile_dir` permits `resolved == root`; `purge_profile` refuses
+    it. A plain symlink is caught a line earlier, so this is the reachable
+    shape on Windows, where a directory *junction* to the `profiles/` root is
+    followed by `resolve()` and reported as a link by nothing - `is_symlink()`
+    answers False for one. Stood in for here by making that answer False.
+    """
+    from pathlib import Path
+
+    profiles = app_data_dir() / "profiles"
+    profiles.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(Path, "is_symlink", lambda self: False)
+    monkeypatch.setattr(
+        Path, "resolve", lambda self, strict=False: profiles.absolute()
+    )
+    assert not is_usable_profile_id("junction"), (
+        "an entry resolving to the profiles/ root was counted as one to delete"
+    )
+
+
 def test_is_usable_profile_id_answers_where_the_filesystem_refuses(monkeypatch):
     """A public predicate returns a bool or it is not one.
 
