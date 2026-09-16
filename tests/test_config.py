@@ -996,6 +996,34 @@ def test_the_saved_file_is_owner_only_on_posix():
     assert stat.S_IMODE(config_path().stat().st_mode) == 0o600
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="needs symlink privilege")
+def test_a_save_replaces_a_symlinked_config_rather_than_writing_through_it():
+    """The behaviour change `os.replace` brought, pinned and documented.
+
+    A bare `write_text` followed the link, so a `config.json` pointed at some
+    other file got that file truncated and overwritten with app JSON, in a
+    directory the user never chose. `os.replace` replaces the link itself.
+    This is the right direction - and it is also why a user who deliberately
+    symlinks this file into a synced folder loses the link at the first save,
+    which the docstring now says.
+    """
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    target = path.parent / "elsewhere.json"
+    target.write_text("do not overwrite me", encoding="utf-8")
+    try:
+        path.symlink_to(target)
+    except (OSError, NotImplementedError):  # pragma: no cover - CI/Windows
+        pytest.skip("this filesystem does not allow symlinks")
+
+    Config().save()
+
+    assert not path.is_symlink(), "the save wrote through the link"
+    assert path.is_file()
+    assert target.read_text(encoding="utf-8") == "do not overwrite me"
+    assert list(path.parent.glob("*.tmp")) == []
+
+
 def test_a_quarantined_config_is_written_the_same_way():
     config_path().parent.mkdir(parents=True, exist_ok=True)
     config_path().write_text("{ not json", encoding="utf-8")

@@ -966,8 +966,22 @@ class Config(BaseModel):
 
         No ``mode``: ``config.json`` holds no secret - the ids in it are not
         credentials, and every credential lives in the OS store - and the
-        catalog's ``0600`` is for page-derived data. On Windows it relies on
-        the user-scoped ``%APPDATA%`` location exactly as it always has.
+        catalog's ``0600`` is for page-derived data. The file still lands
+        ``0600`` on macOS and Linux, where a bare ``write_text`` gave ``0644``
+        under the usual umask, because ``mkstemp`` creates its temp at
+        ``0600`` and ``os.replace`` carries the mode across. That is a
+        one-way tightening on an existing install and nothing in the app
+        reads this file as another user. On Windows it relies on the
+        user-scoped ``%APPDATA%`` location exactly as it always has.
+
+        A ``config.json`` the user has replaced with a **symlink** stops
+        being one at the first save: ``os.replace`` replaces the link itself
+        with a regular file, where the previous ``write_text`` followed it
+        (both executed). That is the right direction - following a link means
+        a ``config.json`` pointed at some other file gets that file truncated
+        and overwritten with app JSON, in a directory the user never chose -
+        but it is a behaviour change, so it is written down here rather than
+        discovered. The profile paths already refuse to follow a link.
 
         Raises ``OSError`` on a full disk or a refused write, which is what it
         raised before; callers that swallow it still do and callers that do

@@ -31,6 +31,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from ..atomic_write import atomic_write
 from ..config import _is_safe_profile_id, app_data_dir
 from ..models import UsageMetric
 from ._common import normalize_percent
@@ -992,18 +993,12 @@ def _write_override(
     document["meters"].extend(_spec_to_raw(spec) for spec in new_specs)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Imported here rather than at module scope: secret_storage is the
-        # Windows credential path and loads ctypes.wintypes, and a catalog
-        # that is read on every refresh should not make non-Windows startup
-        # depend on it.
-        from ..secret_storage import _atomic_write
-
         # Same write discipline as the secrets file: a reader sees the old
         # document or the new one, never half of either, and the file carries
         # page-derived labels and an account id so it is owner-only. Windows
         # has no POSIX mode; there the file sits under the user-scoped
         # %APPDATA% like the rest of the app data (see SECURITY.md).
-        _atomic_write(
+        atomic_write(
             path,
             (json.dumps(document, indent=2) + "\n").encode("utf-8"),
             mode=None if os.name == "nt" else 0o600,

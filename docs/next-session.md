@@ -4,7 +4,7 @@ State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#1
 610 tests passing, all five providers reading.
 
 > **Updated 2026-09-16** by the REST-deadline follow-up (`1.3.2+cfa.7`,
-> 1 769 tests), which closed the three residuals that release left in
+> 1 805 tests), which closed the three residuals that release left in
 > [§8.3](#83-known-soft-spots-in-what-was-built): the unbounded REST socket,
 > the non-atomic `Config.save()`, and what `SECURITY.md` did not say about
 > "Clear all browser data". It also gave the egress guard's glob-side case
@@ -1013,12 +1013,21 @@ unnecessary source of behaviour change.
   *ceiling* itself stops holding: the wedged run makes 31 dispatches against
   a control of 12 over the same six hours, because a watchdog wait longer
   than the cycle spacing keeps `_unchanged_cycles` down and the app on its
-  short cadence. **1.3.2+cfa.7 moved Azure's budget to 495 s**, which is
-  closer to that shape than anything in the tree has been - it still has its
-  own in-flight gate, and its worker now returns inside that budget rather
-  than never, so the watchdog wait is a ceiling it rarely reaches. It is
-  still a note about the fixture's reach rather than a live rate defect, but
-  the margin is half what it was.
+  short cadence. The quantity that governs that fixture is the **watchdog
+  wait**, not the budget: `refresh_budget_seconds` plus
+  `_WATCHDOG_SLACK_SECONDS` plus `_pool_wait_slack`. At pool capacity 1
+  that is **780 s for all three REST providers** after 1.3.2+cfa.7 (openrouter
+  and copilot are now in the same band as azure, which they were not before),
+  so the margin against the 900 s at which the ceiling stops holding is
+  **120 s, not 405**. Azure's 495 s budget is the smaller number and not the
+  one to compare. It is still a note about the fixture's reach rather than a
+  live rate defect: the 60-seed six-fake-hour fuzz was re-run with the real
+  budgets rather than the fixture's 60/60/90, and is clean - no dead
+  scheduler, no runaway, no double browser scrape, nothing dispatched while
+  parked, worst concurrent REST workers 5/6/5 - with the median total
+  dispatch rate going *down*, 55.3/h to 50.7/h. Bigger budgets cost the
+  invariants nothing; what they cost is how long a wedged tile shows its last
+  state.
 - ~~**`SECURITY.md` does not describe "Clear all browser data".**~~
   **Closed in 1.3.2+cfa.7**, under its own heading beside the local-data one.
 - **One CI job segfaulted in a native thread, once, and the cause is not

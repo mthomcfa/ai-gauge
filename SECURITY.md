@@ -193,8 +193,13 @@ action, not a loop.
 
 The embedded browser's navigation allowlist is separate from and stricter than
 this table; see [Embedded Browser](#embedded-browser). No Azure traffic goes
-through the embedded browser — it is plain `requests` with a 15-second timeout,
-like Copilot and OpenRouter.
+through the embedded browser — it is `requests`, like Copilot and OpenRouter,
+and since 1.3.2+cfa.7 every one of those calls goes through one bounded
+helper: a 15-second per-socket timeout (10 seconds on Copilot's `/user`), a
+30-second deadline on the whole exchange — connect, response headers and body,
+enforced by shutting the socket down rather than by hoping a read returns — an
+8 MiB ceiling on the response, no redirects followed and none reported as
+anything but a redirect, and no retry of any kind.
 
 Diagnostic logs are written locally to `<app-data>/ai-gauge.log`. Logs
 are intended to avoid recording

@@ -64,7 +64,9 @@ call that answers in under a second answers exactly as it did.
   predicted 4.0 s. In the shipped units (30 s total, 15 s timeout, declared
   worst case 45 s) a header drip of one byte every 10 s went from **90.0 s**
   to **30.0 s**. A server flooding chunked data against a 1 MiB cap:
-  `ResponseTooLarge` at 0.00 s with 2 162 688 bytes pushed.
+  `ResponseTooLarge` at 0.00 s. (An earlier draft of this entry said how many
+  bytes that server had managed to push; that number says how fast the server
+  got going, not anything about the bound, and it did not reproduce.)
 
   The obvious implementation does not work, which is the part worth knowing.
   `iter_content(chunk_size=N)` goes through urllib3's `stream()`, which
@@ -205,11 +207,39 @@ call that answers in under a second answers exactly as it did.
   deleted through. The "written atomically" paragraph now covers
   `config.json` as well.
 
+- **`SECURITY.md` describes the transport it now has.** The sentence about
+  Azure traffic said "plain `requests` with a 15-second timeout, like Copilot
+  and OpenRouter" - true of one socket operation, and incomplete about
+  everything this release added. It now names the per-socket timeouts (15 s,
+  10 s on Copilot's `/user`), the 30-second deadline on the whole exchange
+  and how it is enforced, the 8 MiB response ceiling, the refusal to follow
+  or to misreport a redirect, and that nothing retries.
+
+- **Three comments and a docstring that had drifted.**
+  `Config.save()` now says that the file lands `0600` on macOS and Linux and
+  why, and that a symlinked `config.json` is replaced rather than written
+  through (pinned by a test on both counts, the second one new).
+  `azure.REFRESH_DEADLINE_SECONDS`' justification quoted "~13 min" for 50
+  unguarded page calls, which was the arithmetic at a per-socket timeout;
+  at a whole call it is ~37 min, and the comment says what the deadline is
+  for rather than restating a number that moved. `providers/catalog.py`
+  imported the private `secret_storage._atomic_write` inside a function, to
+  keep `ctypes.wintypes` out of a non-Windows startup - a reason that expired
+  when the helper moved to `atomic_write.py`; it imports the public
+  `atomic_write` at module scope, and importing the catalog no longer pulls
+  in `secret_storage` at all.
+
 ### Notes
 
-- The suite is **1 769 tests**, from 1 729: `tests/test_http.py` is new (17),
-  with 3 additions each to the Copilot and OpenRouter files, 3 to Azure's, 6
-  to the config file and 8 parameters to the egress guard's.
+- The suite is **1 805 tests**, from 1 729. `tests/test_http.py` is new and
+  holds 43 of them; the Copilot file is at 22, OpenRouter's at 38, Azure's at
+  232, the config file at 138, and the egress guard's at 460. Thirty-six of
+  the seventy-six came from round 1 of the review: the out-of-band deadline
+  (12), the urllib3 floor and the nested-coding refusal (5), Copilot's named
+  transport failures (2), the redirect refusal (10), the five mutation
+  survivors the code lane found (6) and the symlinked-`config.json` note (1).
+  One existing test also had its derivation completed rather than left with a
+  magic constant in it.
 - Not one `responses.add(...)` in the existing provider tests needed editing.
   `responses` supports `stream=True` and hands back a real urllib3 handle, so
   the whole transport change is invisible to them - which is the point.

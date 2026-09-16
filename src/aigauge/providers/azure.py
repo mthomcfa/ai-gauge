@@ -134,10 +134,15 @@ _NOT_A_COST_WORD = ("center", "centre", "category", "rule", "id")
 # nextLink is therefore the normal case on a busy subscription, not an edge one.
 # The cap is a ceiling on one refresh's request count, not an expected limit.
 MAX_QUERY_PAGES = 20
-# One refresh's own ceiling, on top of the per-request timeout. Page loops are
+# One refresh's own ceiling, on top of the per-request bound. Page loops are
 # the only thing here that multiplies: 20 cost-query pages plus 20 marketplace
-# pages plus 10 discovery pages at REQUEST_TIMEOUT each is ~13 min on one
-# QThreadPool thread that every other provider is queued behind.
+# pages plus 10 discovery pages is 50 calls on one QThreadPool thread that
+# every other provider is queued behind. That was quoted as ~13 min while the
+# per-call term was REQUEST_TIMEOUT; a whole call is bounded at
+# request_worst_case_seconds(REQUEST_TIMEOUT) = 45 s, so the unguarded loops
+# would be ~37 min. The deadline is what makes the number 90 s instead, and
+# it is the reason the loops are guarded at all - not an estimate of what
+# they would otherwise cost.
 REFRESH_DEADLINE_SECONDS = 90.0
 # What the *page loops* may spend. The fixed handful around them (token,
 # subscription, first cost page, the metric retry, first marketplace page,
