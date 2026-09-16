@@ -20,7 +20,8 @@ import pytest
 import responses
 import urllib3
 from packaging.version import Version
-from urllib3.exceptions import ProtocolError
+from urllib3.exceptions import DecodeError, ProtocolError, ReadTimeoutError
+from urllib3.exceptions import SSLError as Urllib3SSLError
 
 from aigauge.providers import _http
 
@@ -1350,6 +1351,118 @@ def test_a_mid_stream_failure_is_the_deadline_only_after_the_deadline(
         )
 
     assert raw.closed == 1
+
+
+# --- the edges no call site reaches today -----------------------------------
+#
+# Each of these survived the whole suite as a mutation. None is reachable from
+# a call site as the package stands, which is exactly why they are the lines
+# that rot: the negative clamp, the `BaseException` branch, the close on the
+# failure path, and one arm of the mapping the drain wears.
+
+
+def test_a_negative_deadline_is_clamped_rather_than_armed(monkeypatch):
+    """`threading.Timer(-1, ...)` fires at once, so the clamp is the
+    difference between a nonsense argument being a nonsense deadline and
+    being a cut socket before the request is made."""
+    made = _patch_timer(monkeypatch)
+
+    _http._DeadlineShutdown(-5.0).arm()
+
+    assert made[0].interval == 0.0
+
+
+def test_a_keyboard_interrupt_is_not_relabelled_as_a_deadline(monkeypatch):
+    """The drain catches `BaseException` so that a cut socket is closed
+    whatever ended it, which puts `KeyboardInterrupt` and `SystemExit` in the
+    same branch as a transport failure. They are not transport failures, and
+    a deadline that swallowed one would make Ctrl-C look like a dripping
+    server."""
+
+    class _InterruptedRaw(_FakeRaw):
+        def read1(self, amt=None, decode_content=None):  # noqa: ARG002
+            raise KeyboardInterrupt
+
+    raw = _InterruptedRaw([])
+    _patch_request(monkeypatch, _fake_response(raw))
+
+    with pytest.raises(KeyboardInterrupt):
+        _http.bounded_request(
+            "GET",
+            "https://example.invalid/x",
+            timeout=15,
+            total_seconds=30.0,
+            # Past the deadline by the time the interrupt is classified, so
+            # the clock alone would call it one.
+            monotonic=_Clock(step=20.0),
+        )
+
+    assert raw.closed == 1, "the socket was left open"
+
+
+def test_the_session_is_closed_on_the_failing_path_as_well(monkeypatch):
+    """One `Session` per call is only a property if each one is closed; on
+    the failure path the pool is what holds the socket, and a `Session` left
+    to the collector is what this release removed from the healthy path."""
+    closed: list = []
+    real_close = _http.requests.Session.close
+
+    def close(session):
+        closed.append(session)
+        real_close(session)
+
+    monkeypatch.setattr(_http.requests.Session, "close", close)
+    _patch_request(monkeypatch, _fake_response(_FakeRaw([b"{}"])))
+
+    _http.bounded_request("GET", "https://example.invalid/x", timeout=15)
+    assert len(closed) == 1
+
+    _patch_request(monkeypatch, _fake_response(_FakeRaw([b"x"]), status=301))
+    with pytest.raises(_http.ResponseRedirected):
+        _http.bounded_request("GET", "https://example.invalid/x", timeout=15)
+
+    assert len(closed) == 2, "the failing call kept its Session"
+    assert closed[0] is not closed[1]
+
+
+@pytest.mark.parametrize(
+    "raised, expected",
+    [
+        pytest.param(
+            ProtocolError("broken"),
+            requests.exceptions.ChunkedEncodingError,
+            id="protocol",
+        ),
+        pytest.param(
+            DecodeError("bad"),
+            requests.exceptions.ContentDecodingError,
+            id="decode",
+        ),
+        pytest.param(
+            ReadTimeoutError(None, "/x", "read timed out"),
+            requests.exceptions.ConnectionError,
+            id="readtimeout",
+        ),
+        pytest.param(
+            Urllib3SSLError("tls"), requests.exceptions.SSLError, id="ssl"
+        ),
+    ],
+)
+def test_a_raw_read_wears_requests_own_exception_mapping(raised, expected):
+    """Lifted from `Response.iter_content`, and load-bearing: without it a
+    mid-stream failure reaches the call sites as a urllib3 exception, walks
+    past every `except requests.RequestException` branch there, and lands in
+    a worker's blanket handler instead of the named one. The read-timeout arm
+    is the one no test drove."""
+
+    def read1(amt, decode_content=None):  # noqa: ARG001
+        raise raised
+
+    with pytest.raises(expected) as excinfo:
+        _http._read1(read1, 4096)
+
+    assert type(excinfo.value) is expected
+    assert excinfo.value.__cause__ is raised
 
 
 # --- the arithmetic ---------------------------------------------------------
