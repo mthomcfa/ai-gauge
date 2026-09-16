@@ -57,11 +57,30 @@ call that answers in under a second answers exactly as it did.
   only once, with nothing bounding the status line, the header block or the
   body after it either. Measured at the scaled constants, that was 40 s and
   70 s against a 4.0 s bound, both ended by the harness rather than by the
-  app; with the re-arm it is 3.75 s. Name resolution itself is still outside
-  the bound, here as in plain `requests`, and the docstring, `SECURITY.md`
-  and `docs/next-session.md` 8.3 now say so instead of implying otherwise:
-  one call returns or raises within 45 s **of the socket**, plus whatever the
-  resolver spends before it.
+  app; with the re-arm it is 3.75 s. The same look-again covers a socket the
+  timer can see but cannot reach: for the whole of a TLS handshake urllib3
+  still holds the plain socket, which `wrap_socket` has already detached, so
+  the shutdown raises EBADF - and swallowing that gave the deadline away for
+  the rest of the call on the path all four hosts use. Measured over real
+  TLS against a 12.0 s bound, a deadline landing inside the handshake cost
+  **23.0 s** and a re-arm landing there **22.5 s**, and one dripped header
+  line was unbounded - still inside the call when the harness gave up; with
+  that branch looking again too they are 3.25 s and 2.56 s. Name resolution
+  itself is still outside the bound, here as in plain `requests`, and the
+  docstring, `SECURITY.md` and `docs/next-session.md` 8.3 now say so instead
+  of implying otherwise: one call returns or raises within 45 s **of the
+  socket**, plus whatever the resolver spends before it.
+
+  **A deadline that cannot be armed refuses the call.** `threading.Timer`
+  needs a thread, and `Thread.start()` raises `RuntimeError` when the process
+  has none to give. On the first arm that walked out of the helper past every
+  `except requests.RequestException` branch its callers have; it now raises
+  `DeadlineUnavailable`, a `RequestException` with a fixed message, before
+  the request is made. A re-arm that cannot start used to die on the timer's
+  own thread - a traceback to stderr, which the packaged build discards -
+  leaving the exchange bounded by nothing and the log empty; it now writes
+  one `provider http deadline_rearm_failed=True` and marks the deadline, so
+  the next in-band check ends the call.
 
   Measured on a dripping loopback server with the constants scaled down
   (1 s socket timeout, 3 s total, so the promised bound is 4.0 s). Before, on
@@ -215,9 +234,19 @@ call that answers in under a second answers exactly as it did.
   resolve GitHub username (PAT may lack read:user)"* - the same wrong
   diagnosis the redirect fix above removed, reached by a different route.
   `InvalidJSONError` now goes to `work()`'s branch instead:
-  `GitHub request failed (JSONDecodeError).` A real refusal is untouched - a
-  401 on `/user` is still AUTH_REQUIRED with the read:user message, which is
-  what that message is for.
+  `GitHub request failed (JSONDecodeError).`
+
+  That was the second route closed one at a time, and the rule behind them
+  was what was wrong: `_resolve_username` answered `None` - "PAT may lack
+  read:user" - for **every** transport failure it did not name, which still
+  covered three of the four exceptions this release's own helper raises, a
+  500, and an ordinary offline machine. The rule is now the one the message
+  is a diagnosis of: GitHub answered and refused, which is a 401 or a 403 on
+  `/user`. Measured through the tile, the deadline, an oversized reply, a
+  refused encoding, a `ConnectionError`, a `ReadTimeout` and a 500 all moved
+  from AUTH_REQUIRED *"PAT may lack read:user"* to an ERROR that says what
+  happened; a 401 and a 403 are untouched, which is what that message is
+  for.
 
 - **A healthy call's socket no longer waits for the cyclic collector.** The
   hook that learns the connection replaces `pool._get_conn` with a closure
@@ -305,10 +334,10 @@ call that answers in under a second answers exactly as it did.
 
 ### Notes
 
-- The suite is **1 835 tests**, from 1 729. `tests/test_http.py` is new and
-  holds 71 of them; the Copilot file is at 24, OpenRouter's at 38, Azure's at
-  232, the config file at 138, and the egress guard's at 460. Sixty-six of
-  the hundred and six came from the two review rounds. Round 1's
+- The suite is **1 852 tests**, from 1 729. `tests/test_http.py` is new and
+  holds 79 of them; the Copilot file is at 33, OpenRouter's at 38, Azure's at
+  232, the config file at 138, and the egress guard's at 460. Eighty-three of
+  the hundred and twenty-three came from the three review rounds. Round 1's
   thirty-six: the out-of-band deadline (12), the urllib3 floor and the
   nested-coding refusal (5), Copilot's named transport failures (2), the
   redirect refusal (10), the five mutation survivors the code lane found (6)
@@ -316,19 +345,29 @@ call that answers in under a second answers exactly as it did.
   re-arm (4), the adapter hook driven from `requests` itself (4), the
   un-watched pool (1), the comma refusal (9 with its parameters), the 304
   (3), Copilot's truncated reply (2) and four edges that survived the code
-  lane's mutations (7). One existing test also had its derivation completed
-  rather than left with a magic constant in it.
+  lane's mutations (7). Round 3's eighteen, less the one they replaced: the
+  detached socket a handshake leaves behind (1), Copilot's username rule (10
+  with its parameters), the missed-hook line's meaning (1), the timer that
+  cannot start (2), the un-watch that must not mask a call's failure (2),
+  and two the mutation runs walked through - the re-arm interval against the
+  read timeouts, and the count inside the refusal message. One existing test
+  also had its derivation completed rather than left with a magic constant
+  in it.
 - **The hook the whole bound rests on is now driven by `requests`.** Every
   other transport test injects at `Session.request`, which is above the
   adapter, so `_ConnectionRecordingAdapter.get_connection_with_tls_context` -
   a `requests` 2.32 method feeding urllib3's private `_get_conn` - was
   covered by nothing: renaming it left the suite green while a TLS header
-  drip went from 3.00 s back to 14.03 s and stuck. Two tests now run
+  drip went from 3.00 s to unbounded - still inside the call when the harness
+  gave up watching. (An earlier draft said "14.03 s and stuck" there, which
+  was one harness's give-up rather than a bound.) Two tests now run
   `requests`' own send path with the urllib3 pool faked below the adapter,
-  and when the deadline comes due with no connection recorded the timer
-  writes one `provider http deadline_hook_missed=True` - a fixed literal, the
-  module's only log line - so a future `requests` that moves the seam shows
-  up somewhere rather than nowhere.
+  and when the deadline comes due with no connection recorded at all the
+  timer writes one `provider http deadline_hook_missed=True` - a fixed
+  literal - so a future `requests` that moves the seam shows up somewhere
+  rather than nowhere. A call that merely has no socket yet, which is what
+  a slow resolver looks like from there, says nothing: writing the line for
+  that too made the signal unreadable on exactly the networks it matters on.
 - Not one `responses.add(...)` in the existing provider tests needed editing.
   `responses` supports `stream=True` and hands back a real urllib3 handle, so
   the whole transport change is invisible to them - which is the point.

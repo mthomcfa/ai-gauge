@@ -4,7 +4,7 @@ State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#1
 610 tests passing, all five providers reading.
 
 > **Updated 2026-09-16** by the REST-deadline follow-up (`1.3.2+cfa.7`,
-> 1 835 tests), which closed the three residuals that release left in
+> 1 852 tests), which closed the three residuals that release left in
 > [§8.3](#83-known-soft-spots-in-what-was-built): the unbounded REST socket,
 > the non-atomic `Config.save()`, and what `SECURITY.md` did not say about
 > "Clear all browser data". It also gave the egress guard's glob-side case
@@ -746,7 +746,23 @@ unnecessary source of behaviour change.
   resolver slower than the deadline then left the status line, the header
   block and the body bounded by nothing again (measured at the scaled
   constants: 40 s and 70 s against a 4.0 s bound, ended by the harness rather
-  than by the app, and 3.75 s once the timer looks again). What the bound
+  than by the app, and 3.75 s once the timer looks again). The third review
+  found the same hole one layer along, on the path every production host
+  uses: for the whole of a **TLS handshake** the object urllib3 keeps in
+  `conn.sock` is the plain socket, which `ssl.wrap_socket` detaches before
+  the handshake runs, so `shutdown()` on it raises EBADF - and that branch
+  swallowed the error and did not look again, which gave the deadline away
+  for the rest of the call. Measured over real TLS against a 12.0 s bound: a
+  deadline landing inside the handshake 23.0 s, a re-arm landing there after
+  a slow resolve 22.5 s, and one dripped header line unbounded - still inside
+  the call at the harness's give-up - against 3.25 s and 2.56 s now that the
+  EBADF looks again too. A timer that cannot be *started* at all - the
+  process is out of threads - is the one remaining way the bound can go: the
+  first arm now refuses the call with `DeadlineUnavailable` rather than
+  letting a bare `RuntimeError` past every caller's `except
+  requests.RequestException`, and a failed re-arm writes
+  `provider http deadline_rearm_failed=True` and marks the deadline instead
+  of dying in `threading.excepthook`. What the bound
   does **not** cover is name resolution: `getaddrinfo` runs before any socket
   exists, so neither the connect timeout nor the timer reaches it and the OS
   resolver's own timeout is what ends it - added to the 45 s rather than
@@ -778,7 +794,7 @@ unnecessary source of behaviour change.
   a busy flag on the provider, is still moot: the park does that job from the
   App side, without writing a provider attribute from a pool thread.
 
-  Two residuals of the transport itself, recorded rather than fixed. **Name
+  Three residuals of the transport itself, recorded rather than fixed. **Name
   resolution is outside the bound** - the paragraph above - so a worker can
   be held for the OS resolver's own timeout on top of the 130/135/495 s these
   budgets promise, and a watchdog can therefore still fire inside a refresh
@@ -792,7 +808,23 @@ unnecessary source of behaviour change.
   helper cannot tell that from a legitimate empty body - a 204, or a HEAD -
   so the judgement belongs at the call sites; Copilot's username resolve,
   where it produced "PAT may lack read:user" for a truncated reply, is the
-  one that had it wrong and is fixed.
+  one that had it wrong and is fixed. The third review found that two rounds
+  had closed two routes to that message without touching the rule behind
+  them - `_resolve_username` answered `None` for **any** transport failure,
+  so a deadline, an oversized reply, a refused encoding, a 500 and an
+  ordinary offline machine all told the user to re-issue a credential that
+  was fine. The rule is now what the message is a diagnosis of: GitHub
+  answered and refused, a 401 or a 403 on `/user`. Everything else reaches
+  the tile as what it was. **A `Session`, an adapter, a pool and a timer per
+  call**, with no connection reuse: that is what makes the deadline possible
+  (a mounted adapter is the only way to learn the socket) and what keeps a
+  hostile endpoint's cookies and pool out of the next refresh, and it is what
+  `requests.request` already did. It costs about 1 ms per call of machinery -
+  measured 1.04 ms against plain `requests`' 0.83 ms on loopback - plus a TCP
+  connect and a TLS handshake where a kept-alive pool would have neither,
+  which is eleven of each on Azure's worst refresh. The fix, if that ever
+  matters, is a session per provider with an explicit close between
+  refreshes, which trades the isolation away.
 
   Two things surfaced in the doing, and are worth not re-learning. First,
   `Response.iter_content(chunk_size=N)` cannot implement this. urllib3's

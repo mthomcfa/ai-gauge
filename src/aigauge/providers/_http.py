@@ -42,10 +42,14 @@ from requests.adapters import HTTPAdapter
 from urllib3.exceptions import DecodeError, ProtocolError, ReadTimeoutError
 from urllib3.exceptions import SSLError as _Urllib3SSLError
 
-# One line, one fixed literal, and only from the timer thread: see
-# _DeadlineShutdown._note_missed_hook. The URL this module is handed is never
-# logged - an ARM URL carries the subscription id and a Copilot one carries
-# the GitHub username - and neither is any header, body or exception text.
+# Three lines and three fixed literals, and nothing else: the deadline came
+# due with no connection recorded (_DeadlineShutdown._note_missed_hook), a
+# re-arm could not start a thread (_arm_in), and the pool hook could not be
+# taken off again (bounded_request's finally). The first two are written from
+# the timer thread and the third from the caller's. The URL this module is
+# handed is never logged - an ARM URL carries the subscription id and a
+# Copilot one carries the GitHub username - and neither is any header, body
+# or exception text.
 log = logging.getLogger("aigauge.providers.http")
 
 # How long one call may spend between "about to connect" and "body fully read".
