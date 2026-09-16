@@ -1378,10 +1378,10 @@ def test_git_is_never_asked_for_a_worktree_diff_or_a_status(tmp_path, monkeypatc
 def test_the_git_child_runs_with_no_git_environment_variables(monkeypatch):
     """`GIT_EXTERNAL_DIFF`, `GIT_PAGER`, `GIT_SSH`, `GIT_ASKPASS` and
     `GIT_CONFIG_PARAMETERS` each name a program or inject configuration."""
-    monkeypatch.setenv("GIT_EXTERNAL_DIFF", "/tmp/evil.sh")
-    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'diff.external=/tmp/evil.sh'")
-    monkeypatch.setenv("GIT_PAGER", "/tmp/evil.sh")
-    monkeypatch.setenv("SSH_ASKPASS", "/tmp/evil.sh")
+    monkeypatch.setenv("GIT_EXTERNAL_DIFF", "planted-evil-script")
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'diff.external=planted-evil-script'")
+    monkeypatch.setenv("GIT_PAGER", "planted-evil-script")
+    monkeypatch.setenv("SSH_ASKPASS", "planted-evil-script")
     env = eg._git_env()
     assert "GIT_EXTERNAL_DIFF" not in env
     assert "GIT_CONFIG_PARAMETERS" not in env
