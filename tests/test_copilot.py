@@ -505,6 +505,7 @@ def _username_rows():
     instead of answering.
     """
     from aigauge.providers._http import (
+        DeadlineUnavailable,
         ResponseDeadlineExceeded,
         ResponseEncodingRefused,
         ResponseRedirected,
@@ -542,6 +543,15 @@ def _username_rows():
             "GitHub request failed: The endpoint redirected (301); "
             "this app does not follow redirects.",
             id="redirect",
+        ),
+        pytest.param(
+            DeadlineUnavailable(
+                "Could not start the response deadline timer."
+            ),
+            SnapshotStatus.ERROR,
+            "GitHub request failed: Could not start the response "
+            "deadline timer.",
+            id="unarmed",
         ),
         pytest.param(
             requests.exceptions.InvalidJSONError("not json"),
@@ -607,9 +617,12 @@ def test_the_username_path_blames_the_pat_only_when_github_refused_it(
     snapshot = captured[0]
     assert snapshot.status == status, snapshot.error
     assert snapshot.error == message
-    # The four the helper raises carry a status, a count or a bound; the rest
+    # The five the helper raises carry a status, a count or a bound; the rest
     # are reported by type name, because a `requests` message is the URL it
-    # failed on and a Copilot URL carries the account name.
+    # failed on and a Copilot URL carries the account name. The `unarmed` row
+    # is the one that pins `DeadlineUnavailable`'s membership of
+    # `HELPER_EXCEPTIONS`: drop it from the tuple and this tile falls back to
+    # "GitHub request failed (DeadlineUnavailable)."
     assert "api.github.com" not in (snapshot.error or "")
 
 

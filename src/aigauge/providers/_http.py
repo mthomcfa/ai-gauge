@@ -372,8 +372,16 @@ class _DeadlineShutdown:
             # to being bounded by nothing (measured: 40 s and 70 s against a
             # 4.0 s bound, ended only by the harness). So the timer tries
             # again shortly, and keeps trying until the call ends.
-            self._note_missed_hook(connection)
+            #
+            # The re-arm goes first and the line second, because this runs on
+            # the timer's own thread and `logging.Handler.handle` does not
+            # wrap `emit`: a third-party handler that raises propagates out of
+            # `log.warning`, and with the line first that killed the thread
+            # before it could arm the next timer - one raising handler, and
+            # the bound is gone for the rest of the call. Neither handler this
+            # app installs can do it, but the order costs nothing.
             self._arm_in(REARM_SECONDS)
+            self._note_missed_hook(connection)
             return
         try:
             sock.shutdown(socket.SHUT_RDWR)
@@ -493,22 +501,36 @@ def _unwatch_pools(session: requests.Session) -> None:
     ``poolmanager.pools``, because a proxied call's pool is in
     ``adapter.proxy_manager`` instead - and a proxy is the configuration this
     app runs in on a corporate desktop.
+
+    One pool that refuses is not the rest of them. Each is taken off under its
+    own guard, so the loop finishes and ``_watched`` is cleared whatever the
+    middle one does; without that, a pool whose ``del`` raised left every pool
+    after it wrapped, which is the reference cycle above for each of them. The
+    first failure is re-raised once the loop is done, because the caller's
+    ``finally`` is where the one log line for it belongs.
     """
+    first_failure: Exception | None = None
     for adapter in session.adapters.values():
         watched = getattr(adapter, "_watched", None)
         if not watched:
             continue
         for pool in watched:
-            # Not every watched pool was wrapped: _watch_pool declines one
-            # that has no _get_conn of its own, and the adapter records the
-            # pool either way. `__dict__` rather than `vars()` because this
-            # is a third-party class and one without an instance dictionary
-            # would make `vars()` raise - out of a `finally`, where anything
-            # raised replaces the call's own exception.
-            if "_get_conn" in getattr(pool, "__dict__", ()):
-                del pool._get_conn
-                pool._aigauge_watched = False
+            try:
+                # Not every watched pool was wrapped: _watch_pool declines one
+                # that has no _get_conn of its own, and the adapter records
+                # the pool either way. `__dict__` rather than `vars()` because
+                # this is a third-party class and one without an instance
+                # dictionary would make `vars()` raise - out of a `finally`,
+                # where anything raised replaces the call's own exception.
+                if "_get_conn" in getattr(pool, "__dict__", ()):
+                    del pool._get_conn
+                    pool._aigauge_watched = False
+            except Exception as exc:  # noqa: BLE001
+                if first_failure is None:
+                    first_failure = exc
         watched.clear()
+    if first_failure is not None:
+        raise first_failure
 
 
 def _new_session(deadline: _DeadlineShutdown) -> requests.Session:
@@ -548,7 +570,8 @@ def bounded_request(
     are all unchanged, so no call site has to know this helper is in the way.
 
     Raises ``ResponseDeadlineExceeded``, ``ResponseTooLarge``,
-    ``ResponseRedirected`` or ``ResponseEncodingRefused`` - all
+    ``ResponseRedirected``, ``ResponseEncodingRefused`` or
+    ``DeadlineUnavailable`` - all of ``HELPER_EXCEPTIONS``, and all
     ``requests.RequestException`` - and closes the response first, so the
     socket is released rather than left to the garbage collector. Every other
     ``requests`` exception propagates as before, *except* one raised by a read
@@ -620,21 +643,28 @@ def bounded_request(
         # blocked with no bytes to count - so it is cancelled here, once the
         # body is drained or the call has failed, and never when the request
         # returns.
-        deadline.cancel()
+        # `cancel()` is inside the chain rather than above it: it only sets an
+        # `Event` and cancels a timer today, but it sat outside the `try`,
+        # where the day it raises is the day the un-watch and `session.close()`
+        # are both skipped by it - measured, session closed False. Nested, so
+        # the close runs whatever either of them does.
         try:
-            _unwatch_pools(session)
-        except Exception:  # noqa: BLE001
-            # This runs in the `finally`, so anything raised here would
-            # replace the call's own exception and skip the close with it -
-            # measured: a `TypeError` from `vars()` on a pool with no
-            # instance dictionary, in place of the `AttributeError` that
-            # actually failed the call, and a leaked `Session` every time.
-            # The hook reaches into urllib3's private surface, so the day it
-            # stops fitting is a dependency upgrade, and the honest answer is
-            # one line and a pool left wrapped for the collector.
-            log.warning("provider http deadline_unwatch_failed=True")
+            deadline.cancel()
         finally:
-            session.close()
+            try:
+                _unwatch_pools(session)
+            except Exception:  # noqa: BLE001
+                # This runs in the `finally`, so anything raised here would
+                # replace the call's own exception and skip the close with it -
+                # measured: a `TypeError` from `vars()` on a pool with no
+                # instance dictionary, in place of the `AttributeError` that
+                # actually failed the call, and a leaked `Session` every time.
+                # The hook reaches into urllib3's private surface, so the day
+                # it stops fitting is a dependency upgrade, and the honest
+                # answer is one line and a pool left wrapped for the collector.
+                log.warning("provider http deadline_unwatch_failed=True")
+            finally:
+                session.close()
 
     # The idiom requests itself uses when it has consumed a streamed body and
     # wants the Response to behave like a buffered one (see Response.content,
@@ -791,7 +821,7 @@ def _cut_by_the_deadline(
     A socket the timer shut down surfaces as whatever the broken read raised -
     a ``ChunkedEncodingError`` on a truncated body, a ``ConnectionError`` on a
     cut header block - which would tell the call site the endpoint failed when
-    in fact this app gave up. The four refusals below are already the right
+    in fact this app gave up. The five refusals below are already the right
     answer and keep their own names; ``KeyboardInterrupt`` and ``SystemExit``
     are not transport failures and keep theirs.
     """

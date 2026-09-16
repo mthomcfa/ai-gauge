@@ -94,9 +94,19 @@ def _resolve_username(pat: str, configured: str | None) -> str | None:
     this release took two of those routes off the list one at a time; the
     rule behind them is what was wrong, so it is the rule that changed.
 
-    A 200 gives the login. Every other reply and every transport failure -
-    the four this package's helper raises included - leaves ``work()``'s
-    branch to say what actually happened.
+    A 200 with a ``login`` gives the login. Every other reply and every
+    transport failure - the five this package's helper raises included -
+    leaves ``work()``'s branch to say what actually happened.
+
+    Two 2xx shapes are the exception, and still read as a refusal today: a
+    2xx other than 200 (a 201 or a 204, whose body is not the user object)
+    and a 200 whose JSON carries no ``login`` both come back as ``None``, so
+    the tile says "PAT may lack read:user" where GitHub answered and did not
+    refuse. Neither is reachable against ``api.github.com``, which answers
+    ``/user`` with 200 and a ``login`` or with the 401/403 above, so this is
+    recorded rather than fixed: the honest answer needs a shape the rule can
+    report as "GitHub answered something else", which is `work()`'s branch
+    and a change to what this function returns.
     """
     if configured:
         return configured
@@ -593,7 +603,7 @@ class CopilotProvider(Provider):
                     type(exc).__name__,
                 )
                 # The type name is the rule because a `requests` exception's
-                # message is the URL it failed on. The four the bounded
+                # message is the URL it failed on. The five the bounded
                 # helper raises are built from a status, a count or a bound
                 # and carry no URL by construction, so those say what
                 # actually happened - as OpenRouter's and Azure's tiles do.

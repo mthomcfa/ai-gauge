@@ -1086,6 +1086,27 @@ def test_a_call_that_cannot_have_a_deadline_is_not_made(monkeypatch):
     assert "://" not in str(excinfo.value)
 
 
+def test_every_refusal_this_module_raises_is_in_helper_exceptions():
+    """The tuple is what a call site reads a message off rather than a type.
+
+    Membership is the whole difference between a tile that says *"Could not
+    start the response deadline timer."* and one that says
+    *"GitHub request failed (DeadlineUnavailable)."*, and a refusal left out
+    of it changes nothing else - so the omission is invisible to every other
+    test in this file, which is how `DeadlineUnavailable` came to be in the
+    tuple with nothing asserting it. All five, by name."""
+    assert set(_http.HELPER_EXCEPTIONS) == {
+        _http.ResponseDeadlineExceeded,
+        _http.ResponseTooLarge,
+        _http.ResponseRedirected,
+        _http.ResponseEncodingRefused,
+        _http.DeadlineUnavailable,
+    }
+    assert len(_http.HELPER_EXCEPTIONS) == 5, "a duplicate or a missing entry"
+    for refusal in _http.HELPER_EXCEPTIONS:
+        assert issubclass(refusal, requests.RequestException), refusal
+
+
 def test_a_re_arm_that_cannot_start_says_so_and_ends_the_call_in_band(
     monkeypatch, caplog
 ):
@@ -1256,8 +1277,9 @@ def test_a_real_send_reaches_the_pool_hook(monkeypatch):
     other transport test in this file injects at `Session.request`, which is
     above the adapter, so that override was covered by nothing: renaming it
     left the suite at 1 805 passed while a TLS header drip went from 3.00 s
-    back to 14.03 s and stuck. Here `requests` runs its own `Session.send`
-    and only the pool below it is a fake.
+    to unbounded - still in the call when the harness gave up watching. Here
+    `requests` runs its own `Session.send` and only the pool below it is a
+    fake.
     """
     assert hasattr(
         requests.adapters.HTTPAdapter, "get_connection_with_tls_context"
@@ -1349,36 +1371,102 @@ def test_a_healthy_calls_pool_is_handed_back_unwrapped(monkeypatch):
     assert pool._get_conn() is connection
 
 
-def test_a_pool_the_hook_declined_is_left_alone_by_the_un_watch(caplog):
+class _NoGetConn:
+    """A pool the hook declines, with an instance dictionary."""
+
+
+class _SlottedNoGetConn:
+    """The same, from a urllib3 whose pools carry no instance dictionary.
+
+    `vars()` on one of these raises `TypeError`, which is why the un-watch
+    asks `getattr(pool, "__dict__", ())` instead.
+    """
+
+    __slots__ = ()
+
+
+class _FakeSession:
+    def __init__(self, adapter):
+        self.adapters = {"https://": adapter}
+
+
+@pytest.mark.parametrize(
+    "pool_type", [_NoGetConn, _SlottedNoGetConn], ids=["dict", "slots"]
+)
+def test_a_pool_the_hook_declined_is_left_alone_by_the_un_watch(
+    caplog, pool_type
+):
     """The adapter records every pool it is handed, wrapped or not.
 
     `_watch_pool` declines one with no `_get_conn` of its own, so the
     un-watch meets pools it never wrapped and must not delete blind: that
     raises `AttributeError` from `bounded_request`'s `finally`, where it
     would replace the call's own failure and take `session.close()` with it.
+
+    The `slots` row is the one the membership test is written the way it is
+    for: a pool with no instance dictionary at all, where `vars(pool)` raises
+    `TypeError` in the same `finally` rather than answering the question.
     """
-    class _NoGetConn:
-        pass
-
-    class _Session:
-        def __init__(self, adapter):
-            self.adapters = {"https://": adapter}
-
-    pool = _NoGetConn()
+    pool = pool_type()
     deadline = _http._DeadlineShutdown(30.0)
     assert _http._watch_pool(pool, deadline) is pool
     adapter = _http._ConnectionRecordingAdapter(deadline)
     adapter._watched.append(pool)
 
     with caplog.at_level(logging.WARNING, logger="aigauge"):
-        _http._unwatch_pools(_Session(adapter))
+        _http._unwatch_pools(_FakeSession(adapter))
 
     assert "deadline_unwatch_failed" not in caplog.text
     assert adapter._watched == []
 
 
+def test_one_pool_that_refuses_the_un_watch_does_not_keep_the_others_wrapped():
+    """The loop is total: every pool is taken off under its own guard.
+
+    Without one, a pool whose `del` raised ended the loop where it stood, so
+    every pool after it kept the closure that makes it a reference cycle and
+    `_watched` was never cleared - the leak this function exists to remove,
+    for all of them, because one of them did not fit. The failure is still
+    reported: it comes back out once the loop is done, to the one place that
+    logs it.
+    """
+
+    class _Stubborn:
+        def _get_conn(self, timeout=None):  # noqa: ARG002
+            return None
+
+        def __delattr__(self, name):
+            raise AttributeError(f"this pool will not give up {name}")
+
+    class _Ordinary:
+        def _get_conn(self, timeout=None):  # noqa: ARG002
+            return None
+
+    deadline = _http._DeadlineShutdown(30.0)
+    stubborn, ordinary = _Stubborn(), _Ordinary()
+    _http._watch_pool(stubborn, deadline)
+    _http._watch_pool(ordinary, deadline)
+    adapter = _http._ConnectionRecordingAdapter(deadline)
+    adapter._watched.extend([stubborn, ordinary])
+
+    with pytest.raises(AttributeError):
+        _http._unwatch_pools(_FakeSession(adapter))
+
+    assert "_get_conn" not in ordinary.__dict__, "a later pool stayed wrapped"
+    assert ordinary._aigauge_watched is False
+    assert adapter._watched == [], "the adapter's list outlived the call"
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [
+        TypeError("vars() argument must have __dict__ attribute"),
+        AttributeError("_get_conn"),
+    ],
+    ids=["type", "attr"],
+)
 def test_a_failing_un_watch_hides_neither_the_call_nor_the_close(
-    monkeypatch, caplog
+    monkeypatch, caplog, raised
 ):
     """The `finally` runs three things, and the middle one reaches into
     another project's private surface: `_watch_pool` assigns
@@ -1386,14 +1474,19 @@ def test_a_failing_un_watch_hides_neither_the_call_nor_the_close(
     either - a urllib3 whose pools have no instance dictionary - made the
     un-watch raise where it replaced the call's real exception and skipped
     the close, so every call leaked a `Session` and reported a type name no
-    call site can classify."""
+    call site can classify.
+
+    Both rows, because the guard is deliberately as wide as `Exception`: the
+    two shapes this hook can meet on a dependency upgrade are a `TypeError`
+    from `vars()` and an `AttributeError` from the `del`, and narrowing it to
+    the one the fix was found by would leave the other where it started."""
     closed: list = []
     monkeypatch.setattr(
         _http.requests.Session, "close", lambda self: closed.append(self)
     )
 
     def unwatch_boom(session):  # noqa: ARG001
-        raise TypeError("vars() argument must have __dict__ attribute")
+        raise raised
 
     monkeypatch.setattr(_http, "_unwatch_pools", unwatch_boom)
 
@@ -1411,6 +1504,42 @@ def test_a_failing_un_watch_hides_neither_the_call_nor_the_close(
     assert len(closed) == 1, "the session was left open by a failed un-watch"
     assert caplog.text.count("deadline_unwatch_failed=True") == 1
     assert "://" not in caplog.text
+
+
+def test_a_cancel_that_raises_still_leaves_the_session_closed(monkeypatch):
+    """`cancel()` sat outside the guarded chain, so it could skip the close.
+
+    It only sets an `Event` and cancels a timer, so nothing raises there
+    today - which is exactly why it was above the `try` and why nothing would
+    have noticed the day it stopped being true: measured with a raising
+    `cancel()`, the un-watch never ran and the session was never closed, so
+    every such call leaked one. It is inside the chain now, and the close is
+    in a `finally` under it."""
+    _patch_timer(monkeypatch)
+    closed: list = []
+    unwatched: list = []
+    monkeypatch.setattr(
+        _http.requests.Session, "close", lambda self: closed.append(self)
+    )
+    monkeypatch.setattr(
+        _http, "_unwatch_pools", lambda session: unwatched.append(session)
+    )
+
+    def cancel_boom(self):
+        raise RuntimeError("the cancel itself failed")
+
+    monkeypatch.setattr(_http._DeadlineShutdown, "cancel", cancel_boom)
+    monkeypatch.setattr(
+        _http.requests.Session,
+        "request",
+        lambda self, method, url, **kwargs: _fake_response(_FakeRaw([b"{}"])),
+    )
+
+    with pytest.raises(RuntimeError):
+        _http.bounded_request("GET", "https://example.invalid/x", timeout=15)
+
+    assert len(closed) == 1, "a raising cancel took the close with it"
+    assert len(unwatched) == 1, "a raising cancel took the un-watch with it"
 
 
 def test_a_deadline_that_never_learned_a_connection_says_so_once(caplog):
@@ -1451,6 +1580,32 @@ def test_a_call_that_is_merely_still_connecting_says_nothing(caplog):
     assert "deadline_hook_missed" not in caplog.text
     # And it did not give up either: the socket is still to come.
     assert deadline.fired is True
+
+
+def test_the_re_arm_is_armed_before_the_line_is_written(monkeypatch):
+    """Order, because one of the two can raise and the other is the bound.
+
+    `_fire` runs on the timer's own thread and `logging.Handler.handle` does
+    not wrap `emit`, so a third-party handler that raises comes back out of
+    `log.warning` and kills that thread. With the line written first, it took
+    the re-arm with it: one timer, and the status line, the header block and
+    the body bounded by nothing for the rest of the call. Nothing this app
+    installs raises there - both of its own handlers were driven failing and
+    the loop stayed alive - so this pins the ordering rather than a fix to
+    the handlers."""
+    made = _patch_timer(monkeypatch)
+    deadline = _http._DeadlineShutdown(30.0)
+
+    def emit_boom(msg, *args, **kwargs):  # noqa: ARG001
+        raise RuntimeError("a handler that raises out of emit")
+
+    monkeypatch.setattr(_http.log, "warning", emit_boom)
+
+    with pytest.raises(RuntimeError):
+        deadline._fire()
+
+    assert len(made) == 1, "the log line was written before the re-arm"
+    assert made[0].started, "the re-arm was lost to the log line"
 
 
 def test_every_call_gets_its_own_session_on_the_deadlines_adapter(monkeypatch):
