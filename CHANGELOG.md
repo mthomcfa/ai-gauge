@@ -80,7 +80,10 @@ call that answers in under a second answers exactly as it did.
   own thread - a traceback to stderr, which the packaged build discards -
   leaving the exchange bounded by nothing and the log empty; it now writes
   one `provider http deadline_rearm_failed=True` and marks the deadline, so
-  the next in-band check ends the call.
+  the next in-band check ends the call. That is not the bound restored: a
+  call already stalled in a header read never reaches an in-band check, so it
+  stays unbounded in that state - measured, still inside the call at a 14 s
+  give-up against a 4.0 s bound. What changed is that it is no longer silent.
 
   Measured on a dripping loopback server with the constants scaled down
   (1 s socket timeout, 3 s total, so the promised bound is 4.0 s). Before, on
@@ -218,7 +221,7 @@ call that answers in under a second answers exactly as it did.
   did not.
 
   The type name is the rule for a `requests` exception, whose message *is*
-  the URL it failed on. The four the bounded helper raises are built out of a
+  the URL it failed on. The five the bounded helper raises are built out of a
   status, a count or a bound and carry no URL by construction, so those reach
   the tile as themselves - `GitHub request failed: The endpoint redirected
   (301); this app does not follow redirects.` - as OpenRouter's and Azure's
@@ -239,7 +242,7 @@ call that answers in under a second answers exactly as it did.
   That was the second route closed one at a time, and the rule behind them
   was what was wrong: `_resolve_username` answered `None` - "PAT may lack
   read:user" - for **every** transport failure it did not name, which still
-  covered three of the four exceptions this release's own helper raises, a
+  covered four of the five exceptions this release's own helper raises, a
   500, and an ordinary offline machine. The rule is now the one the message
   is a diagnosis of: GitHub answered and refused, which is a 401 or a 403 on
   `/user`. Measured through the tile, the deadline, an oversized reply, a
@@ -260,7 +263,10 @@ call that answers in under a second answers exactly as it did.
   had finished, which is the one thing `_new_session`'s docstring says cannot
   happen. The wrapper is taken off again in the same `finally` that cancels
   the timer, before the close: **0 after**, with nothing left for the
-  collector to free.
+  collector to free. That loop is total - each pool comes off under its own
+  guard, so one that refuses does not leave the pools after it wrapped - and
+  the `finally` now runs the cancel inside the same guarded chain, so the
+  un-watch and `session.close()` cannot be skipped by it.
 
 - **`Config.save()` is atomic.** It was a bare `path.write_text`, which
   truncates before it writes. That was tolerable while the only writes were
@@ -334,10 +340,10 @@ call that answers in under a second answers exactly as it did.
 
 ### Notes
 
-- The suite is **1 852 tests**, from 1 729. `tests/test_http.py` is new and
-  holds 79 of them; the Copilot file is at 33, OpenRouter's at 38, Azure's at
-  232, the config file at 138, and the egress guard's at 460. Eighty-three of
-  the hundred and twenty-three came from the three review rounds. Round 1's
+- The suite is **1 859 tests**, from 1 729. `tests/test_http.py` is new and
+  holds 85 of them; the Copilot file is at 34, OpenRouter's at 38, Azure's at
+  232, the config file at 138, and the egress guard's at 460. Ninety of
+  the hundred and thirty came from the review rounds. Round 1's
   thirty-six: the out-of-band deadline (12), the urllib3 floor and the
   nested-coding refusal (5), Copilot's named transport failures (2), the
   redirect refusal (10), the five mutation survivors the code lane found (6)
@@ -352,7 +358,13 @@ call that answers in under a second answers exactly as it did.
   and two the mutation runs walked through - the re-arm interval against the
   read timeouts, and the count inside the refusal message. One existing test
   also had its derivation completed rather than left with a magic constant
-  in it.
+  in it. The confirmation pass's seven, all of them pins on lines round 3
+  added: a pool with `__slots__` against the un-watch's `__dict__` default
+  (1), `DeadlineUnavailable` in `HELPER_EXCEPTIONS` and on Copilot's tile
+  (2), the un-watch guard's breadth against an `AttributeError` (1), the
+  un-watch loop finishing past a pool that refuses (1), a `cancel()` that
+  raises leaving the session closed (1), and the re-arm being armed before
+  the missed-hook line is written (1).
 - **The hook the whole bound rests on is now driven by `requests`.** Every
   other transport test injects at `Session.request`, which is above the
   adapter, so `_ConnectionRecordingAdapter.get_connection_with_tls_context` -

@@ -4,7 +4,7 @@ State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#1
 610 tests passing, all five providers reading.
 
 > **Updated 2026-09-16** by the REST-deadline follow-up (`1.3.2+cfa.7`,
-> 1 852 tests), which closed the three residuals that release left in
+> 1 859 tests), which closed the three residuals that release left in
 > [§8.3](#83-known-soft-spots-in-what-was-built): the unbounded REST socket,
 > the non-atomic `Config.save()`, and what `SECURITY.md` did not say about
 > "Clear all browser data". It also gave the egress guard's glob-side case
@@ -762,7 +762,11 @@ unnecessary source of behaviour change.
   letting a bare `RuntimeError` past every caller's `except
   requests.RequestException`, and a failed re-arm writes
   `provider http deadline_rearm_failed=True` and marks the deadline instead
-  of dying in `threading.excepthook`. What the bound
+  of dying in `threading.excepthook`. The mark is not the bound back: it
+  bites at the next in-band check, and a call already stalled in a header
+  read never reaches one, so that call stays unbounded - measured, still
+  inside it at a 14 s give-up against a 4.0 s bound. What changed there is
+  that it is no longer silent. What the bound
   does **not** cover is name resolution: `getaddrinfo` runs before any socket
   exists, so neither the connect timeout nor the timer reaches it and the OS
   resolver's own timeout is what ends it - added to the 45 s rather than
@@ -794,7 +798,7 @@ unnecessary source of behaviour change.
   a busy flag on the provider, is still moot: the park does that job from the
   App side, without writing a provider attribute from a pool thread.
 
-  Three residuals of the transport itself, recorded rather than fixed. **Name
+  The residuals of the transport itself, recorded rather than fixed. **Name
   resolution is outside the bound** - the paragraph above - so a worker can
   be held for the OS resolver's own timeout on top of the 130/135/495 s these
   budgets promise, and a watchdog can therefore still fire inside a refresh
@@ -825,6 +829,45 @@ unnecessary source of behaviour change.
   which is eleven of each on Azure's worst refresh. The fix, if that ever
   matters, is a session per provider with an explicit close between
   refreshes, which trades the isolation away.
+
+  The rest of the list, a sentence each, from the two confirmation reviews.
+  **The comma rule refuses more than urllib3 would** - `Content-Encoding: ,`
+  builds no decoder there and is refused here - which is over-refusal in the
+  fail-closed direction, is stated in the docstring, and reaches no host this
+  app speaks to. **A single-layer gzip bomb is still open on a sub-floor
+  urllib3**: `pyproject.toml` declares `urllib3>=2.6` and `release.yml`
+  builds in a fresh venv, but `build.sh` and `build.ps1` install nothing, so
+  a developer `.venv` left on 2.5 is not caught - one `pip install -e .` line
+  closes it. **`cancel()` cannot stop a `_fire` already past its `_ended`
+  check**, so a shutdown can land after the `finally` has run; harmless
+  because the session, the pool and the connection are that call's own and
+  are being closed, and the class docstring now says why rather than leaving
+  it to luck. **`_watch_pool` is still unguarded**, deliberately: a pool
+  shape it cannot wrap fails the call closed with its own `AttributeError`,
+  a non-`RequestException` that each provider's blanket handler takes. **A
+  2xx on `/user` that is not a 200, and a 200 whose JSON has no `login`,
+  still read as "PAT may lack read:user"** - GitHub answered and did not
+  refuse, so the rule's own wording does not quite cover them; neither is
+  reachable against `api.github.com`, and `_resolve_username`'s docstring
+  records both. **The CHANGELOG's own test counts are pinned by nothing**,
+  by decision: a test that asserted them would have to re-collect the suite
+  from inside it, and the counts are re-collected by hand each round
+  instead. **Pre-existing and unchanged by this release**: `snapshot.raw`
+  reaches Copy diagnostics by design, `x-github-request-id` is still logged,
+  OpenRouter's tile still shows `str(exc)` for a `RequestException` (a host,
+  no identifier) and its blanket handler still logs a traceback, and the
+  `QThreadPool` is still shared, so the three REST providers still compete
+  for slots - for a bounded time now.
+
+  Two of that list closed in the confirmation pass rather than being
+  recorded. `_unwatch_pools` was guarded from the caller but not total
+  inside, so one pool that refused the `del` left every pool after it wrapped
+  and `_watched` uncleared - each pool comes off under its own guard now, and
+  the first failure is re-raised once the loop is done so the one log line is
+  still written where it was. And `deadline.cancel()` sat above the guarded
+  chain, where a `cancel()` that raised would have skipped the un-watch and
+  `session.close()` with it (measured: session closed False); it is inside
+  the chain now, with the close in a `finally` under it.
 
   Two things surfaced in the doing, and are worth not re-learning. First,
   `Response.iter_content(chunk_size=N)` cannot implement this. urllib3's

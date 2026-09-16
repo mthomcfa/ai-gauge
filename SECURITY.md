@@ -206,9 +206,9 @@ until there is one — which is what covers the connect and the handshake, where
 there is either no socket yet or one the TLS layer has already detached. It
 covers the exchange from the socket onwards and not before it: name resolution
 happens before there is a socket at all, and is bounded by the operating
-system's resolver alone, on top of those 45 seconds. The helper also imposes an 8 MiB ceiling on the
-response, follows no redirect and hands no 3xx back to a caller as though it
-were a reply, and retries nothing of any kind.
+system's resolver alone, on top of those 45 seconds. The helper also imposes
+an 8 MiB ceiling on the response, follows no redirect and hands no 3xx back to
+a caller as though it were a reply, and retries nothing of any kind.
 
 Diagnostic logs are written locally to `<app-data>/ai-gauge.log`. Logs
 are intended to avoid recording
