@@ -1138,13 +1138,57 @@ def test_the_app_can_actually_be_constructed(qapp, tmp_path, monkeypatch):
     monkeypatch.setattr(config_module, "app_data_dir", lambda: tmp_path)
 
     app = App()
+    try:
+        # __init__ already reaches _schedule_next_refresh via _restart_timer;
+        # call it again explicitly so the failing path is named in the test,
+        # not just traversed by construction.
+        app._schedule_next_refresh()  # noqa: SLF001
 
-    # __init__ already reaches _schedule_next_refresh via _restart_timer; call
-    # it again explicitly so the failing path is named in the test, not just
-    # traversed by construction.
-    app._schedule_next_refresh()  # noqa: SLF001
+        assert app._error_retry == {}  # noqa: SLF001
+    finally:
+        # A real App arms a 500 ms startup refresh, a cadence timer and a
+        # heartbeat. Left running, the startup refresh fired inside whichever
+        # later test next ran the event loop and started a real scrape there.
+        app.shutdown()
+        app.deleteLater()
+        qapp.processEvents()
 
-    assert app._error_retry == {}  # noqa: SLF001
+
+def test_a_shut_down_app_never_fires_its_startup_refresh(
+    qapp, qtbot, tmp_path, monkeypatch
+):
+    """The startup refresh is a parented, stoppable timer, not a bare single-shot.
+
+    `QTimer.singleShot(500, lambda: self.refresh_now(...))` held the App alive
+    through the lambda and fired wherever the event loop next ran. In the test
+    suite that was a later test: a real cycle dispatched real providers, a
+    `QWebEnginePage` appeared out of nowhere, and pytest-qt pinned the
+    exception it raised on whichever test happened to be running. Once
+    `shutdown()` has run, nothing the constructor armed can fire.
+    """
+    import aigauge.app as app_module
+    import aigauge.config as config_module
+
+    monkeypatch.setattr(app_module, "app_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(config_module, "app_data_dir", lambda: tmp_path)
+    fired = []
+    monkeypatch.setattr(App, "refresh_now", lambda self, **kw: fired.append(kw))
+
+    app = App()
+    try:
+        assert app._startup_timer.isActive()  # noqa: SLF001
+        assert app._timer.isActive()  # noqa: SLF001
+        assert app._heartbeat.isActive()  # noqa: SLF001
+        app.shutdown()
+        assert not app._startup_timer.isActive()  # noqa: SLF001
+        assert not app._timer.isActive()  # noqa: SLF001
+        assert not app._heartbeat.isActive()  # noqa: SLF001
+        qtbot.wait(app_module._STARTUP_REFRESH_DELAY_MS + 300)  # noqa: SLF001
+        assert fired == [], "the startup refresh fired after shutdown"
+        app.shutdown()  # idempotent
+    finally:
+        app.deleteLater()
+        qapp.processEvents()
 
 
 class _SnapshotWidget:

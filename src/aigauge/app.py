@@ -78,6 +78,13 @@ _NO_FAST_RETRY_ERROR_CLASSES = ("throttled", "resume_artifact")
 # the wake a provider's retry bought can find nothing due and fall through.
 _RETRY_WAKE_TOLERANCE_SECONDS = 2
 _HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000
+# The first refresh after construction. A timer rather than a bare
+# `QTimer.singleShot`: a single-shot with a lambda holds the App alive and
+# fires wherever the event loop next runs, which in the test suite was a
+# later test - a real scrape started out of nowhere, and the stray page was
+# what Qt meant by "Release of profile requested but WebEnginePage still not
+# deleted". Parented to the App, it dies with it and `shutdown()` can stop it.
+_STARTUP_REFRESH_DELAY_MS = 500
 _LOG_VALUE_LIMIT = 300
 # What a tile says when the user asks for a refresh the App cannot start yet.
 # Fixed text: nothing a provider chose reaches the tile through this.
@@ -737,7 +744,10 @@ class App(QObject):
         # Always start with a refresh — fresh installs see provider tiles in
         # their auth-required state with a Sign in button instead of a
         # surprise modal popup.
-        QTimer.singleShot(500, lambda: self.refresh_now(manual=True))
+        self._startup_timer = QTimer(self)
+        self._startup_timer.setSingleShot(True)
+        self._startup_timer.timeout.connect(self._startup_refresh)
+        self._startup_timer.start(_STARTUP_REFRESH_DELAY_MS)
 
         # On Windows/Linux the floating widget is the headline UI; on macOS
         # the menu-bar item is, and the widget appears as a popover only
@@ -746,6 +756,48 @@ class App(QObject):
             self._widget.show()
 
     # ----- Lifecycle helpers -----
+
+    def _startup_refresh(self) -> None:
+        self.refresh_now(manual=True)
+
+    def _quit(self) -> None:
+        self.shutdown()
+        QApplication.instance().quit()
+
+    def shutdown(self) -> None:
+        """Stop everything that could still fire after the App is let go.
+
+        Quit and the test that constructs a real `App` both need this: the
+        startup timer, the cadence timer, the heartbeat and every armed
+        watchdog are parented to the App, but a Python reference that goes
+        out of scope does not delete a QObject whose timers still hold slots
+        on it. Idempotent, and safe on an App whose C++ half is already gone.
+        """
+        for name in ("_startup_timer", "_timer", "_heartbeat"):
+            timer = getattr(self, name, None)
+            if timer is None:
+                continue
+            try:
+                timer.stop()
+            except RuntimeError:
+                pass
+        for timer in list(getattr(self, "_watchdogs", {}).values()):
+            self._retire_watchdog(timer)
+        if hasattr(self, "_watchdogs"):
+            self._watchdogs.clear()
+        tray = getattr(self, "_tray", None)
+        if tray is not None:
+            try:
+                tray.hide()
+            except RuntimeError:
+                pass
+        widget = getattr(self, "_widget", None)
+        if widget is not None:
+            try:
+                widget.hide()
+            except (RuntimeError, AttributeError):
+                pass
+        log.info("app shutdown timers_stopped=True")
 
     def _install_lifecycle_logging(self) -> None:
         qt_app = QApplication.instance()
@@ -2384,7 +2436,7 @@ class App(QObject):
         menu.addAction("Settings…", self.open_settings)
         menu.addSeparator()
         quit_act = QAction("Quit", menu)
-        quit_act.triggered.connect(QApplication.instance().quit)
+        quit_act.triggered.connect(self._quit)
         menu.addAction(quit_act)
         return menu
 
