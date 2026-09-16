@@ -1033,6 +1033,88 @@ def test_a_socket_the_handshake_detached_is_looked_at_again(monkeypatch):
     assert sock.shutdowns == [socket.SHUT_RDWR, socket.SHUT_RDWR]
 
 
+def _patch_unstartable_timer(monkeypatch) -> list:
+    """`threading.Timer` whose `start()` raises, which is what a process out
+    of threads looks like from here (`Thread.start` raises `RuntimeError`)."""
+    made: list = []
+
+    class _Timer:
+        def __init__(self, interval, function):
+            self.interval = interval
+            self.function = function
+            self.daemon = False
+            made.append(self)
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+        def cancel(self):
+            pass
+
+    monkeypatch.setattr(_http.threading, "Timer", _Timer)
+    return made
+
+
+def test_a_call_that_cannot_have_a_deadline_is_not_made(monkeypatch):
+    """No bound, no request - and it says so as a `RequestException`.
+
+    `timer.start()` was unguarded, so a process that cannot make a thread
+    raised a bare `RuntimeError` out of `bounded_request`. That walks past
+    every `except requests.RequestException` branch the three providers have
+    and lands in their blanket handler, which is failing closed by accident
+    rather than by contract.
+    """
+    _patch_unstartable_timer(monkeypatch)
+    sent: list = []
+
+    def fake_request(session, method, url, **kwargs):  # noqa: ARG001
+        sent.append(url)
+        return _fake_response(_FakeRaw([b"{}"]))
+
+    monkeypatch.setattr(_http.requests.Session, "request", fake_request)
+
+    with pytest.raises(_http.DeadlineUnavailable) as excinfo:
+        _http.bounded_request("GET", "https://example.invalid/x", timeout=15)
+
+    assert isinstance(excinfo.value, requests.RequestException)
+    assert sent == [], "the request went out with no bound on it"
+    # The message reaches the tile: a fixed literal, no URL.
+    assert "://" not in str(excinfo.value)
+
+
+def test_a_re_arm_that_cannot_start_says_so_and_ends_the_call_in_band(
+    monkeypatch, caplog
+):
+    """The other half, and the worse one.
+
+    A re-arm runs on the timer's own thread, so a `RuntimeError` there died
+    in `threading.excepthook` - a traceback to stderr, which a windowed build
+    discards - and the loop simply ended: no timer, no log line, and the
+    exchange bounded by nothing (measured, still inside the call when a 30 s
+    harness gave up). One line now, and the in-band check ends the call at
+    its next read.
+    """
+    deadline = _http._DeadlineShutdown(30.0)
+    deadline.record(_FakeConnection(None))
+    _patch_unstartable_timer(monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="aigauge"):
+        deadline._fire()
+
+    assert caplog.text.count("deadline_rearm_failed=True") == 1
+    assert "://" not in caplog.text
+    assert deadline._timer is None
+    assert deadline.fired is True
+    with pytest.raises(_http.ResponseDeadlineExceeded):
+        _http._check_deadline(0.0, 30.0, lambda: 1.0, deadline)
+    # The branch marks the deadline itself rather than leaning on `_fire`
+    # having done it first: a re-arm that cannot start is the end of the loop
+    # whichever way it was reached.
+    fresh = _http._DeadlineShutdown(30.0)
+    fresh._arm_in(_http.REARM_SECONDS)
+    assert fresh.fired is True
+
+
 def test_a_timer_that_fires_after_the_call_ended_does_nothing():
     """`cancel()` is the only thing that ends the re-arm loop, so a timer that
     was already running when it ran has to be a no-op: the pool it would reach

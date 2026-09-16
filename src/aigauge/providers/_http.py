@@ -151,17 +151,31 @@ class ResponseEncodingRefused(requests.RequestException):
     """
 
 
-# The four exceptions this module raises, as a tuple a call site can
-# `isinstance` against. Every one of their messages is built here out of a
-# status, a count or a bound, so - unlike a `requests` exception, whose
-# message carries the URL it failed on - they can be shown to a user as they
-# stand. Copilot's `work()` is the caller that needs the distinction: an ARM
-# URL carries the subscription id and a Copilot one the GitHub username.
+class DeadlineUnavailable(requests.RequestException):
+    """The deadline timer could not be started, so the call was not made.
+
+    ``threading.Timer.start()`` raises ``RuntimeError`` when the process
+    cannot make a thread - thread exhaustion, or an interpreter shutting
+    down. The bound is the whole reason this helper exists, so a call that
+    cannot have one does not go out at all. It is a ``RequestException`` so
+    that it fails closed *by contract* rather than by accident: a bare
+    ``RuntimeError`` walks past every ``except requests.RequestException``
+    branch the three providers have and lands in their blanket handler.
+    """
+
+
+# The exceptions this module raises, as a tuple a call site can `isinstance`
+# against. Every one of their messages is built here out of a status, a count
+# or a bound, so - unlike a `requests` exception, whose message carries the
+# URL it failed on - they can be shown to a user as they stand. Copilot's
+# `work()` is the caller that needs the distinction: an ARM URL carries the
+# subscription id and a Copilot one the GitHub username.
 HELPER_EXCEPTIONS = (
     ResponseDeadlineExceeded,
     ResponseTooLarge,
     ResponseRedirected,
     ResponseEncodingRefused,
+    DeadlineUnavailable,
 )
 
 
@@ -268,9 +282,14 @@ class _DeadlineShutdown:
             self._connection = connection
 
     def arm(self) -> None:
-        self._arm_in(self._seconds)
+        """Start the call's deadline, or refuse the call.
 
-    def _arm_in(self, seconds: float) -> None:
+        Raises ``DeadlineUnavailable`` if the timer thread cannot be started:
+        see ``_arm_in``.
+        """
+        self._arm_in(self._seconds, first=True)
+
+    def _arm_in(self, seconds: float, *, first: bool = False) -> None:
         timer = threading.Timer(seconds, self._fire)
         # Daemon so a timer that somehow outlives its call cannot hold the
         # process open at exit.
@@ -279,7 +298,32 @@ class _DeadlineShutdown:
             if self._ended:
                 return
             self._timer = timer
-        timer.start()
+        try:
+            timer.start()
+        except RuntimeError as exc:
+            # `Thread.start()` raises this when the process cannot make a
+            # thread: thread exhaustion, or an interpreter shutting down.
+            # Nothing above catches it, and the two halves need different
+            # answers.
+            with self._lock:
+                self._timer = None
+                if not first:
+                    # The in-band checks are all that is left, so make the
+                    # next one end the call. `_fire` has already set this on
+                    # the only path that re-arms; setting it here is what the
+                    # branch relies on, rather than that coincidence.
+                    self.fired = True
+            if first:
+                # No bound is available, so no request goes out. Failing
+                # closed by contract, not by landing in a blanket handler.
+                raise DeadlineUnavailable(
+                    "Could not start the response deadline timer."
+                ) from exc
+            # A re-arm, on the timer's own thread, where the exception would
+            # otherwise die in `threading.excepthook` - a traceback to stderr,
+            # which a windowed build discards. Once per call: this was the
+            # only live timer, so nothing arms another.
+            log.warning("provider http deadline_rearm_failed=True")
 
     def cancel(self) -> None:
         with self._lock:
@@ -718,6 +762,7 @@ def _cut_by_the_deadline(
             ResponseTooLarge,
             ResponseRedirected,
             ResponseEncodingRefused,
+            DeadlineUnavailable,
         ),
     ):
         return False
