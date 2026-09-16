@@ -1092,6 +1092,32 @@ def test_a_real_send_lets_the_deadline_cut_the_socket_it_learned(monkeypatch):
     assert sock.shutdowns == [socket.SHUT_RDWR]
 
 
+def test_a_healthy_calls_pool_is_handed_back_unwrapped(monkeypatch):
+    """The wrapper is a closure over the pool's own bound method, so leaving
+    it on makes the pool part of a reference cycle: `session.close()` drops
+    it, refcounting does not free it, and the connection it holds - with its
+    socket - waits for the cyclic collector. Measured, 300 healthy calls left
+    17 sockets open at once where plain `requests` left none, against a
+    docstring that says no connection survives a refresh."""
+    connection = _FakeConnection(_FakeSocket())
+    pool = _SendablePool(connection, _SendableRaw([b"{}"]))
+    _patch_pool_manager(monkeypatch, pool)
+
+    _http.bounded_request(
+        "GET",
+        "https://example.invalid/x",
+        timeout=15,
+        proxies={"http": None, "https": None},
+    )
+
+    assert pool.calls == 1, "the hook was not on for the call itself"
+    assert "_get_conn" not in pool.__dict__, "the pool was left in a cycle"
+    assert pool._aigauge_watched is False
+    # And the pool still works: what was removed is the instance attribute,
+    # not the method under it.
+    assert pool._get_conn() is connection
+
+
 def test_a_deadline_that_never_learned_a_connection_says_so_once(caplog):
     """The failure mode the line above exists for is silent by construction:
     `_fire` finds no connection and returns. One warning, from the timer

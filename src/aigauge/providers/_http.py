@@ -343,6 +343,9 @@ class _ConnectionRecordingAdapter(HTTPAdapter):
 
     def __init__(self, deadline: _DeadlineShutdown, **kwargs: Any) -> None:
         self._deadline = deadline
+        # Every pool this adapter watched, so the wrapper can be taken off
+        # again at the end of the call (see _unwatch_pools).
+        self._watched: list[Any] = []
         super().__init__(**kwargs)
 
     def get_connection_with_tls_context(
@@ -351,6 +354,7 @@ class _ConnectionRecordingAdapter(HTTPAdapter):
         pool = super().get_connection_with_tls_context(
             request, verify, proxies=proxies, cert=cert
         )
+        self._watched.append(pool)
         return _watch_pool(pool, self._deadline)
 
 
@@ -368,6 +372,39 @@ def _watch_pool(pool: Any, deadline: _DeadlineShutdown) -> Any:
     pool._get_conn = _get_conn
     pool._aigauge_watched = True
     return pool
+
+
+def _unwatch_pools(session: requests.Session) -> None:
+    """Put back the ``_get_conn`` ``_watch_pool`` replaced, before the close.
+
+    The wrapper is a closure over the pool's own bound method, so
+    pool -> closure -> cell -> bound method -> pool is a reference cycle: the
+    pool is not freed by refcounting when ``session.close()`` drops it, and
+    the connection it holds - with its socket - lives on until the cyclic
+    collector runs. Measured against a loopback server, 300 healthy calls
+    left 17 established sockets open at once where plain ``requests`` left
+    none; they were always reclaimed, but until then the app holds open
+    connections to the four hosts after the refresh that opened them has
+    finished, which is the one thing ``_new_session``'s docstring says cannot
+    happen. Restoring the attribute breaks the cycle, and the pool is freed
+    with the call that made it.
+
+    The pools come from the adapter's own list rather than from
+    ``poolmanager.pools``, because a proxied call's pool is in
+    ``adapter.proxy_manager`` instead - and a proxy is the configuration this
+    app runs in on a corporate desktop.
+    """
+    for adapter in session.adapters.values():
+        watched = getattr(adapter, "_watched", None)
+        if not watched:
+            continue
+        for pool in watched:
+            # Not every watched pool was wrapped: _watch_pool declines one
+            # that has no _get_conn of its own.
+            if "_get_conn" in vars(pool):
+                del pool._get_conn
+                pool._aigauge_watched = False
+        watched.clear()
 
 
 def _new_session(deadline: _DeadlineShutdown) -> requests.Session:
@@ -480,6 +517,7 @@ def bounded_request(
         # body is drained or the call has failed, and never when the request
         # returns.
         deadline.cancel()
+        _unwatch_pools(session)
         session.close()
 
     # The idiom requests itself uses when it has consumed a streamed body and
