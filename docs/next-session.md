@@ -1048,9 +1048,10 @@ or `b` is matched by its suffix.
 
 The second review by execution took the nine fixes apart again and found two of
 them had been made at the instance rather than at the class, plus six smaller
-findings. All of them are addressed on this branch — the scanner is linear on
-every adversarial filler and a test fails the build on any unbounded quantifier
-in any pattern; `--include-diff` diffs commit trees, runs no workspace-planted
+findings. All of them are addressed on this branch — the scanner is linear in
+the size of the payload and in the number of findings it produces, on fillers
+that match nothing and on fillers that match almost everywhere, and a test fails
+the build on any unbounded quantifier in any pattern; `--include-diff` diffs commit trees, runs no workspace-planted
 command on twelve vectors, and no longer runs `git status`; a `block` can no
 longer be silenced by an overlapping `redact`; a redirect off the pinned host is
 refused rather than followed with the server password attached; `scan` refuses a

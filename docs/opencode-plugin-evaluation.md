@@ -358,7 +358,13 @@ and `secret_edit = QLineEdit()` are not findings. The keyring rule needs the
 lookup and not just the two names. Every pattern is bounded or possessive and a
 test fails the build on any that is not: an unbounded quantifier over a class
 the next term can also match is quadratic, and a hook that cannot answer inside
-its timeout does not block anything. Path rules fire on the *mention* of a
+its timeout does not block anything. Bounding the patterns is not on its own
+enough for that, and the first two rounds of this work stopped there: the scan
+is linear in the size of the payload *and* in the number of findings it
+produces, because the loop that resolves overlapping findings was itself
+quadratic in them — 400 KB of ordinary short email addresses is 57 143 findings
+and took 58 s, on bounded patterns. Both axes are tested, on fillers that match
+nothing and on fillers that match almost everywhere. Path rules fire on the *mention* of a
 denied path, so "read `config/.env` and tell me what's in it" is caught even
 though no secret is in the text yet. Each rule is `block`, `redact`, `warn` or
 `off`, overridable per repository; the unnamed-credential catch-all defaults to

@@ -414,6 +414,23 @@ _ADVERSARIAL_FILLERS = {
     "mixed alphabet": "aZ9._%+-@:/=~ \t\n",
 }
 
+# The fillers above are the *byte* axis, and every one of them produces at most
+# 1 482 findings; eighteen of the nineteen produce none at all. The overlap
+# filter that resolves the findings was O(k^2) in the number of them, so the
+# suite tested the axis that was fixed and not the axis that was not: 400 KB of
+# `a@b.co ` is 57 143 findings and took 58.0 s in `scan()` and 58.4 s in the
+# hook - against the documented 10 s hook timeout, on ordinary text. None of
+# these is an adversarial construction: they are a contact list, a CSV export,
+# an `.env` file, and a request to read a file that happens to have an address
+# in its path.
+_FINDING_DENSE_FILLERS = {
+    "short emails": "a@b.co ",
+    "contact csv": "x,alice@corp.io,y\n",
+    "env block": "SECRET=abcd1234abcd\n",
+    "assignments": "token:abcd1234 ",
+}
+_ADVERSARIAL_FILLERS.update(_FINDING_DENSE_FILLERS)
+
 
 def _filled(filler: str, size: int = 400_000) -> str:
     return (filler * (size // len(filler) + 1))[:size]
@@ -424,6 +441,16 @@ def _adversarial_payloads() -> list:
     # A payload nobody would call adversarial: a list of dotted, hyphenated
     # service identifiers. It cost 73.7 s.
     payloads.append(("identifier list", "-".join(f"svc.{i}" for i in range(80_000))[:400_000]))
+    # Blocks and redactions overlapping each other, at the cap: each line holds
+    # a distinct denied path with an address inside it - the round-2 N3 shape -
+    # and a second address beside it, so the severity bands both fill up and the
+    # overlap filter has to resolve every one of them.
+    payloads.append((
+        "blocks and redactions",
+        "".join(
+            f"read /srv/ops{i}@example.org/.env and {i}@mail.io\n" for i in range(12_000)
+        )[:400_000],
+    ))
     # The label is the test id. Without `id=`, pytest builds the id from both
     # values and the 400 000-character payload lands in it; pytest then puts
     # that id in PYTEST_CURRENT_TEST at every setup and teardown, and Windows
@@ -484,6 +511,58 @@ def test_the_hook_answers_a_400kb_prompt_inside_its_documented_timeout(
     started = time.monotonic()
     eg.cmd_hook(args)
     assert time.monotonic() - started < 5.0, label
+
+
+@pytest.mark.parametrize("label", sorted(_FINDING_DENSE_FILLERS))
+def test_a_finding_dense_filler_really_does_produce_findings(label):
+    """The linearity tests above are only worth their runtime if their fillers
+    reach the code after the patterns.
+
+    Eighteen of the nineteen original fillers produce zero findings and the
+    nineteenth produces 1 482, so the overlap filter - which was O(k^2) in the
+    number of findings - was never asked to resolve more than a handful.
+    """
+    findings = eg.scan(_filled(_ADVERSARIAL_FILLERS[label]), policy())
+    assert len(findings) >= 10_000, f"{label} produced only {len(findings)} findings"
+
+
+def test_scan_stays_linear_in_the_number_of_findings():
+    """Doubling a payload that is all findings must not quadruple the time.
+
+    `scan()` resolved overlaps against a list of every claim already made, so k
+    findings cost O(k^2) however cheap each pattern was: 0.8 s at 100 KB, 3.3 s
+    at 200 KB, 12.9 s at 400 KB - and 58.0 s on 400 KB of `a@b.co `, in a hook
+    whose documented timeout is 10 s. The absolute budgets in the parametrised
+    tests above are the regression test; this one names the shape.
+    """
+    import time
+
+    filler = _FINDING_DENSE_FILLERS["short emails"]
+    elapsed = {}
+    for size in (100_000, 400_000):
+        payload = _filled(filler, size)
+        started = time.monotonic()
+        findings = eg.scan(payload, policy())
+        elapsed[size] = time.monotonic() - started
+        assert len(findings) > size // 20, (size, len(findings))
+    # Four times the input is four times the work when the loop is linear and
+    # sixteen when it is quadratic. Eight is comfortably between them.
+    assert elapsed[400_000] <= 8 * max(elapsed[100_000], 0.005), elapsed
+
+
+def test_redacting_every_finding_does_not_copy_the_payload_once_each():
+    """`redact()` rebuilt the whole string once per finding, which is O(k*n) on
+    top of the scan: 13.0 s for the 57 143 redactions on 400 KB of `a@b.co `,
+    and that is what `preflight` pays before it dispatches anything."""
+    import time
+
+    payload = _filled(_FINDING_DENSE_FILLERS["short emails"])
+    findings = eg.scan(payload, policy())
+    started = time.monotonic()
+    out, count = eg.redact(payload, findings)
+    assert time.monotonic() - started < 5.0
+    assert count > 10_000
+    assert "@" not in out.replace("[redacted:email-address]", "")
 
 
 def _quantifiers(pattern: str, verbose: bool = False):

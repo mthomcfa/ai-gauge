@@ -435,6 +435,10 @@ def _mask(matched: str) -> str:
 # would have blocked on - and the path was still in the text that went out.
 _SEVERITY = {BLOCK: 0, REDACT: 1, WARN: 2}
 
+# The mark `scan()` writes into its claim map for a character some finding has
+# already taken. Any non-zero byte would do.
+_CLAIMED = 1
+
 
 def scan(text: str, policy: Policy) -> list[Finding]:
     candidates: list[tuple[int, int, Finding]] = []
@@ -479,14 +483,24 @@ def scan(text: str, policy: Policy) -> list[Finding]:
     # wins between two claims that mean the same thing - a Postgres URL is one
     # finding, not also a basic-auth URL - while a block always displaces a
     # redaction rather than the other way round.
+    #
+    # The claims are a byte per character of the payload, not a list of spans.
+    # A list meant `any(...)` walked every claim already made for every
+    # candidate, so k findings cost O(k^2) however cheap each pattern was: 400 KB
+    # of `a@b.co ` is 57 143 findings and took 58 s - in the hook, against its
+    # documented 10 s timeout, and a hook killed at its timeout blocks nothing.
+    # Round 1 and round 2 bounded every pattern; nothing bounded the loop over
+    # what they found. Marking is O(1) per character claimed and a claim is
+    # never overwritten, so the whole sweep is linear in the payload and the
+    # sort is the only term in k.
     findings: list[Finding] = []
-    claimed: list[tuple[int, int]] = []
+    claimed = bytearray(len(text))
     for _severity, _order, finding in sorted(
         candidates, key=lambda candidate: (candidate[0], candidate[1], candidate[2].start)
     ):
-        if any(finding.start < end and start < finding.end for start, end in claimed):
+        if claimed.find(_CLAIMED, finding.start, finding.end) != -1:
             continue
-        claimed.append((finding.start, finding.end))
+        claimed[finding.start : finding.end] = bytes([_CLAIMED]) * (finding.end - finding.start)
         findings.append(finding)
 
     findings.sort(key=lambda f: f.start)
@@ -594,7 +608,7 @@ def _path_excerpt(path: str) -> str:
 
 
 def redact(text: str, findings: Iterable[Finding]) -> tuple[str, int]:
-    """Replace redact-action matches with a fixed placeholder, right to left.
+    """Replace redact-action matches with a fixed placeholder, in one pass.
 
     The placeholder names the detector and nothing else. It used to carry
     `sha256(value)[:8]`, unsalted, in the text that was *dispatched* - handing
@@ -602,13 +616,21 @@ def redact(text: str, findings: Iterable[Finding]) -> tuple[str, int]:
     dictionary-verifiable oracle for it. Any hash stays in the local report,
     where `_mask` salts it per run.
     """
-    targets = sorted(
-        (f for f in findings if f.action == REDACT), key=lambda f: f.start, reverse=True
-    )
-    out = text
+    targets = sorted((f for f in findings if f.action == REDACT), key=lambda f: f.start)
+    # One pass, left to right, into a list of pieces. Rebuilding the whole
+    # string once per finding - which is what working right to left off a
+    # single `out` did - copies the payload k times: 57 143 redactions on a
+    # 400 KB payload was 13.0 s on top of the scan, and that is what `preflight`
+    # pays. `scan()` guarantees the spans do not overlap, so the cursor only
+    # ever moves forward and the offsets need no adjusting either way.
+    pieces: list[str] = []
+    cursor = 0
     for finding in targets:
-        out = f"{out[: finding.start]}[redacted:{finding.rule}]{out[finding.end :]}"
-    return out, len(targets)
+        pieces.append(text[cursor : finding.start])
+        pieces.append(f"[redacted:{finding.rule}]")
+        cursor = finding.end
+    pieces.append(text[cursor:])
+    return "".join(pieces), len(targets)
 
 
 def destination_allowed(model: str, policy: Policy) -> bool:
