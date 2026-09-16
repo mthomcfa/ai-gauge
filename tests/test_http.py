@@ -8,6 +8,7 @@ injected, the stream is a fake, and nothing here opens a socket.
 
 from __future__ import annotations
 
+import errno
 import gzip
 import logging
 import socket
@@ -745,6 +746,27 @@ class _SignallingSocket(_FakeSocket):
         self.cut.set()
 
 
+class _DetachedSocket(_FakeSocket):
+    """The plain socket urllib3 keeps in `conn.sock` during a TLS handshake.
+
+    `ssl.SSLContext.wrap_socket` builds the SSLSocket on the same descriptor
+    and detaches the original before the handshake runs, so `fileno()` is -1
+    and `shutdown` raises EBADF for the whole of it. The second look is the
+    one that finds a socket it can reach - here the same object, working, as
+    the SSLSocket that replaces it would be.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.cut = threading.Event()
+
+    def shutdown(self, how):
+        self.shutdowns.append(how)
+        if len(self.shutdowns) == 1:
+            raise OSError(errno.EBADF, "Bad file descriptor")
+        self.cut.set()
+
+
 class _LateSocketConnection:
     """A connection whose socket appears only after the deadline has passed.
 
@@ -931,7 +953,7 @@ def test_the_deadline_shuts_the_recorded_socket_down():
         pytest.param(None, True, id="none"),
         pytest.param(_FakeConnection(None), True, id="no sock"),
         pytest.param(
-            _FakeConnection(_FakeSocket(OSError("gone"))), False, id="raises"
+            _FakeConnection(_FakeSocket(OSError("gone"))), True, id="raises"
         ),
     ],
 )
@@ -939,10 +961,11 @@ def test_the_deadline_fires_cleanly_with_nothing_to_shut_down(
     connection, re_arms
 ):
     """A timer that fires during DNS or connect finds no socket; one that
-    fires on a socket the peer already closed gets an OSError. Neither is a
-    crash in a background thread - and the first of the two does not give up:
-    it arms another timer, because the socket it has nothing to shut down yet
-    is the socket the rest of the exchange happens on."""
+    fires on a socket the peer already closed - or on one a TLS handshake has
+    detached - gets an OSError. Neither is a crash in a background thread, and
+    neither gives up: both arm another timer, because the socket there is
+    nothing to shut down on yet is the socket the rest of the exchange happens
+    on."""
     deadline = _http._DeadlineShutdown(30.0)
     if connection is not None:
         deadline.record(connection)
@@ -981,6 +1004,33 @@ def test_a_timer_that_finds_no_socket_tries_again_rather_than_giving_up():
 
     assert sock.shutdowns == [socket.SHUT_RDWR]
     assert connection.looks == 2
+
+
+def test_a_socket_the_handshake_detached_is_looked_at_again(monkeypatch):
+    """The way the round-1 stall came back over TLS.
+
+    urllib3 puts the plain socket in `conn.sock` before it upgrades the
+    connection and only swaps in the `SSLSocket` after the handshake returns,
+    and `wrap_socket` detaches that plain object first - so for the whole
+    handshake the timer's `shutdown` raises EBADF. Swallowing it ended the
+    deadline for the rest of the call on the path all four hosts use
+    (measured: 23.05 s and 22.53 s against a 12.0 s bound, and unbounded on a
+    dripped header line). The second look is the one that works.
+    """
+    monkeypatch.setattr(_http, "REARM_SECONDS", 0.01)
+    sock = _DetachedSocket()
+    deadline = _http._DeadlineShutdown(30.0)
+    deadline.record(_FakeConnection(sock))
+
+    deadline._fire()
+    try:
+        assert deadline._timer is not None, "the timer gave up on an EBADF"
+        assert deadline._timer.interval == _http.REARM_SECONDS
+        assert sock.cut.wait(10), "the re-armed timer never looked again"
+    finally:
+        deadline.cancel()
+
+    assert sock.shutdowns == [socket.SHUT_RDWR, socket.SHUT_RDWR]
 
 
 def test_a_timer_that_fires_after_the_call_ended_does_nothing():

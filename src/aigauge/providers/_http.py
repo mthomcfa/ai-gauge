@@ -314,9 +314,22 @@ class _DeadlineShutdown:
         try:
             sock.shutdown(socket.SHUT_RDWR)
         except OSError:
-            # Already closed, never connected, or refused by the platform.
-            # The read this was meant to unblock has ended on its own.
-            pass
+            # Three different things, and only one of them is over. Already
+            # closed or refused by the platform: the read this was meant to
+            # unblock has ended on its own, and the re-arm below costs a
+            # quarter-second timer until the call's own `finally` ends it.
+            # DETACHED is the one that matters: for the whole of a TLS
+            # handshake the object urllib3 leaves in `conn.sock` is the plain
+            # socket, and `ssl.SSLContext.wrap_socket` builds the SSLSocket on
+            # that descriptor and calls `detach()` on the original BEFORE the
+            # handshake runs - so `fileno()` is -1 and this raises EBADF.
+            # Giving up there abandoned the deadline for the rest of the call,
+            # over the TLS path all four hosts use: measured 23.05 s and
+            # 22.53 s against a 12.0 s bound, and still inside the call at a
+            # 25 s give-up on a dripped header line. So this looks again, like
+            # the branch above, and catches the SSLSocket the handshake puts
+            # in its place.
+            self._arm_in(REARM_SECONDS)
 
     def _note_missed_hook(self) -> None:
         """Say once that the deadline came due with no socket to shut down.

@@ -196,14 +196,17 @@ this table; see [Embedded Browser](#embedded-browser). No Azure traffic goes
 through the embedded browser — it is `requests`, like Copilot and OpenRouter,
 and since 1.3.2+cfa.7 every one of those calls goes through one bounded
 helper: a 15-second per-socket timeout (10 seconds on Copilot's `/user`) and a
-30-second deadline on the whole exchange — the connect, the response headers
-and the body — so one call returns or raises within **45 seconds** (40 on
-Copilot's `/user`): the deadline plus the one read it can leave in flight. The
-deadline is enforced by shutting the socket down from a timer rather than by
-hoping a read returns, which is also why it covers the exchange from the
-socket onwards and not before it: name resolution happens before there is a
-socket to shut down, and is bounded by the operating system's resolver alone,
-on top of those 45 seconds. The helper also imposes an 8 MiB ceiling on the
+30-second deadline on the whole exchange — the connect, the TLS handshake, the
+response headers and the body — so one call returns or raises within
+**45 seconds** (40 on Copilot's `/user`): the deadline plus the one read it can
+leave in flight. The deadline is enforced by shutting the socket down from a
+timer rather than by hoping a read returns, and a deadline that comes due
+before there is a socket the timer can reach keeps trying every quarter-second
+until there is one — which is what covers the connect and the handshake, where
+there is either no socket yet or one the TLS layer has already detached. It
+covers the exchange from the socket onwards and not before it: name resolution
+happens before there is a socket at all, and is bounded by the operating
+system's resolver alone, on top of those 45 seconds. The helper also imposes an 8 MiB ceiling on the
 response, follows no redirect and hands no 3xx back to a caller as though it
 were a reply, and retries nothing of any kind.
 
