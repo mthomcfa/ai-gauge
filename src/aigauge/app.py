@@ -158,7 +158,14 @@ _LOG_ID_SAMPLE = 3
 
 
 def _clip_for_log(value: object) -> str:
-    text = str(value)
+    try:
+        text = str(value)
+    except Exception:  # noqa: BLE001 - a log line must never raise
+        # The same rule `_error_for_log` and the two key walks follow.
+        # Unreachable through the two callers, because `_coerce_pending_purges`
+        # keeps only `str` - but this is the helper that prints ids onto four
+        # records, and it was the one of the four that could still raise.
+        return "<unprintable id>"
     if len(text) > _LOG_ID_LIMIT:
         text = text[:_LOG_ID_LIMIT] + "..."
     # Flattened for the reason `_error_for_log` flattens: the coercion bounds

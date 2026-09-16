@@ -2478,11 +2478,17 @@ def test_a_newline_inside_a_short_id_cannot_forge_a_log_record(
     a hand-edited `config.json`, and it lands in the app's own log rather
     than anywhere a user acts on, but the fix was invented next door -
     `_error_for_log` flattens for exactly this reason.
+
+    The planted id carries a carriage return *and* a newline: the assertion
+    has always looked for both, and with two newlines in it a mutation that
+    flattened only `\n` survived the whole suite. A bare `\r` is the classic
+    way to make a record overwrite the one before it in a terminal or a log
+    viewer, which is the anti-forensic half of the same defect.
     """
     from aigauge.config import Config as RealConfig
 
     monkeypatch.setattr(app_module, "purge_profile", lambda account_id: None)
-    forged = "a\nERROR aigauge.app: balance=0.00 key=sk-ant-x\nWARN x"
+    forged = "a\rERROR aigauge.app: balance=0.00 key=sk-ant-x\nWARN x"
     assert len(forged) <= 64, "the validator would have dropped this id"
     app = _app({})
     app._config = RealConfig(  # noqa: SLF001

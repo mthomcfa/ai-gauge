@@ -138,8 +138,11 @@ allowed to cost.
   not its characters, and four records print ids through `_clip_for_log`. A
   53-character id from a hand-edited `config.json` carrying two newlines
   read as three records in the file — a forged `ERROR … balance=0.00
-  key=sk-ant-x` among them. Flattened exactly as `snapshot.error` is: 6
-  forged lines to 0 on the same poisoned config.
+  key=sk-ant-x` among them. Both a carriage return and a newline, because a
+  bare `\r` makes a record overwrite the one before it. Flattened exactly as
+  `snapshot.error` is: 6 forged lines to 0 on the same poisoned config, and
+  the helper that does it is guarded end to end like the three beside it —
+  its `str()` was the last one on that record outside a `try`.
 - **Smaller ones.** A settings save no longer writes "Waiting for the
   previous refresh to finish." onto a parked tile — it refreshes without the
   user having asked, exactly like a scheduled cycle — while a sign-in queued

@@ -1742,6 +1742,17 @@ def test_the_whole_snapshot_error_log_call_is_total():
         assert isinstance(_error_for_log(error), str)
     assert _error_for_log(_StrRaises("x")) == "<unprintable error>"
 
+    # The fourth helper on the same rule. `_clip_for_log` is what prints ids
+    # onto the two purge records and the two deferral ones, and its `str()`
+    # was the one left outside a guard while the three beside it were closed.
+    # Unreachable through `_coerce_pending_purges`, which keeps only `str`,
+    # but "a log line must never raise" is the rule and this was the gap.
+    from aigauge.app import _LOG_ID_LIMIT, _clip_for_log, _ids_for_log
+
+    assert _clip_for_log(_StrRaises("x")) == "<unprintable id>"
+    assert _ids_for_log([_StrRaises("x"), "claude"]) == "<unprintable id>,claude"
+    assert _clip_for_log("z" * 500) == "z" * _LOG_ID_LIMIT + "..."
+
 
 def test_an_error_string_costs_the_log_one_bounded_line():
     """`snapshot.error` is the fourth provider-influenced argument on that
