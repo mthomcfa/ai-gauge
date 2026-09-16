@@ -581,9 +581,11 @@ def _trim_brackets_and_query(text: str, start: int, end: int) -> tuple[int, int]
 
     A path was recognised only when it *ended* its token, and `?` is not a path
     character at all, so `/home/u/.aws/credentials?x=1` was dropped before it
-    reached a glob and `[creds](/home/u/.aws/credentials)` was dropped with it.
-    Only brackets and the query are trimmed: a trailing comma or full stop is
-    still what tells prose about a file from a file.
+    reached a glob and `(/home/u/.aws/credentials)` was dropped with it. Only
+    brackets and the query are trimmed: a trailing comma or full stop is still
+    what tells prose about a file from a file, and a markdown link is still not
+    matched, because `[name](path)` is one token whose *middle* is `](` - the
+    parked list records that as open.
     """
     while start < end and text[start] in _PATH_OPENERS:
         start += 1
