@@ -419,12 +419,18 @@ def _filled(filler: str, size: int = 400_000) -> str:
     return (filler * (size // len(filler) + 1))[:size]
 
 
-def _adversarial_payloads() -> list[tuple[str, str]]:
+def _adversarial_payloads() -> list:
     payloads = [(label, _filled(filler)) for label, filler in _ADVERSARIAL_FILLERS.items()]
     # A payload nobody would call adversarial: a list of dotted, hyphenated
     # service identifiers. It cost 73.7 s.
     payloads.append(("identifier list", "-".join(f"svc.{i}" for i in range(80_000))[:400_000]))
-    return payloads
+    # The label is the test id. Without `id=`, pytest builds the id from both
+    # values and the 400 000-character payload lands in it; pytest then puts
+    # that id in PYTEST_CURRENT_TEST at every setup and teardown, and Windows
+    # refuses an environment variable over 32 767 characters - every case
+    # errored twice and the job spent 45 minutes printing 450 000-character
+    # ids before it was cancelled.
+    return [pytest.param(label, payload, id=label) for label, payload in payloads]
 
 
 @pytest.mark.parametrize("label, payload", _adversarial_payloads())
