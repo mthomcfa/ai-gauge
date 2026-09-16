@@ -46,6 +46,72 @@ def _safe_url(value: Any) -> str:
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))[:300]
 
 
+# What a page is allowed to cost one log line. `document.title` is chosen by
+# the page and nothing bounded it: with a 1 MB title the `scrape ok` record
+# measured 11 079 134 characters and `scrape fail` 1 000 367, against a
+# 512 KiB x 3 rotation - one scrape erasing the whole diagnostic history that
+# the error dialog asks the user to attach.
+_LOG_TITLE_LIMIT = 200
+# The extractor's key names are page data too. Both numbers are app.py's
+# `_LOG_KEY_LEN_LIMIT` and `_LOG_DICT_KEY_LIMIT`, by value rather than by
+# import: the same shape of list on the same log ring, and this module is
+# deliberately free of app imports.
+_LOG_KEY_LEN_LIMIT = 60
+_LOG_KEY_COUNT_LIMIT = 50
+# Chromium's own `errorString`. Measured against real QtWebEngine it is a Qt
+# string-table message, not the server's reason phrase - 49 characters for an
+# HTTP failure, 20 for `net::ERR_UNSAFE_PORT` - so this bound costs nothing
+# today. It closes the assumption rather than a hole: forcing the field to
+# 500 000 characters produced a 500 353-character `scrape fail` record,
+# 0.32x the whole 512 KiB x 3 rotation, and it is the largest argument
+# on that record with no cap of its own.
+_LOG_ERROR_LIMIT = 300
+
+
+def _clip(text: Any, limit: int) -> str:
+    text = str(text or "")
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _key_text(raw_key: Any) -> str:
+    """A key as a string, from a result whose keys the page chose.
+
+    `str()` runs the key's own `__str__`, and `_clip` runs its `__bool__`
+    first. app.py routes the same walk through a guard of this shape; this
+    module had `_clip(key, ...)` directly, so one key that refuses to be
+    printed replaced the whole `scrape ok` record with "the diagnostics
+    could not be read".
+    """
+    try:
+        return str(raw_key)
+    except Exception:  # noqa: BLE001 - a log line must never raise
+        return "<key>"
+
+
+def _result_keys_for_log(result: Any) -> str:
+    """The extractor's top-level key names, bounded like app.py's.
+
+    Guarded end to end, like app.py's `_raw_keys_for_log`: `_key_text`
+    covers a key that refuses to be printed, but the walk itself runs the
+    payload's `__iter__` and a `dict` subclass can refuse that too. The
+    caller catches what escapes and replaces the whole `scrape ok` record
+    with "the diagnostics could not be read", so one refusing payload cost
+    the diagnostics of a scrape that had worked.
+    """
+    try:
+        if not isinstance(result, dict):
+            # The class name is the payload's too, and nothing bounds a class
+            # name: clipped to the same limit as a key.
+            return type(result).__name__[:_LOG_KEY_LEN_LIMIT]
+        keys = sorted(_key_text(key)[:_LOG_KEY_LEN_LIMIT] for key in result)
+        shown = keys[:_LOG_KEY_COUNT_LIMIT]
+        if len(keys) > _LOG_KEY_COUNT_LIMIT:
+            shown.append(f"... {len(keys) - _LOG_KEY_COUNT_LIMIT} more")
+        return str(shown)
+    except Exception:  # noqa: BLE001 - a log line must never raise
+        return "[]"
+
+
 # A timeout is bounded by a QTimer, so a scrape cannot legitimately run for
 # several times its own budget. When it reports that it did, the clock moved
 # under it: the machine suspended mid-scrape. Observed on a laptop resumed
@@ -188,7 +254,7 @@ class HeadlessScraper(QObject):
             _enum_name(status),
             exit_code,
             _safe_url(self._page.url()),
-            self._page.title(),
+            _clip(self._page.title(), _LOG_TITLE_LIMIT),
             self._max_progress,
         )
 
@@ -208,7 +274,7 @@ class HeadlessScraper(QObject):
                 self._last_load_url,
                 self._last_load_error_code,
                 self._last_load_error_domain,
-                self._last_load_error_string,
+                _clip(self._last_load_error_string, _LOG_ERROR_LIMIT),
                 self._last_load_is_error_page,
             )
 
@@ -221,7 +287,7 @@ class HeadlessScraper(QObject):
             self._provider,
             ok,
             _safe_url(self._page.url()),
-            self._page.title(),
+            _clip(self._page.title(), _LOG_TITLE_LIMIT),
             self._max_progress,
             self._last_load_status,
             self._last_load_is_error_page,
@@ -395,9 +461,9 @@ class HeadlessScraper(QObject):
                     self._last_load_url,
                     self._last_load_error_code,
                     self._last_load_error_domain,
-                    self._last_load_error_string,
+                    _clip(self._last_load_error_string, _LOG_ERROR_LIMIT),
                     self._last_load_is_error_page,
-                    self._page.title(),
+                    _clip(self._page.title(), _LOG_TITLE_LIMIT),
                     self._max_progress,
                     self._url_change_count,
                     self._render_terminated,
@@ -414,12 +480,12 @@ class HeadlessScraper(QObject):
                     self._last_load_status,
                     self._last_load_url,
                     self._last_load_is_error_page,
-                    self._page.title(),
+                    _clip(self._page.title(), _LOG_TITLE_LIMIT),
                     self._max_progress,
                     self._url_change_count,
                     self._render_terminated,
                     self._attempt,
-                    sorted(result.keys()) if isinstance(result, dict) else type(result).__name__,
+                    _result_keys_for_log(result),
                 )
         except Exception:  # noqa: BLE001
             log.warning(

@@ -3,8 +3,15 @@
 State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#16,
 610 tests passing, all five providers reading.
 
+> **Updated 2026-09-15** by the hardening follow-up (`1.3.1+cfa.6`,
+> 1 277 tests), which closed most of what the refresh-cadence work left in
+> [§8.3](#83-known-soft-spots-in-what-was-built): the REST park, the
+> "Clear all browser data" purge, the dispatch epoch's name, the log
+> summariser and the scraper's uncapped log lines. What is still open there
+> is marked as such.
+>
 > **Updated 2026-09-15** by the refresh-cadence work (`1.3.0+cfa.5`,
-> 1 216 tests). Its residuals are folded into
+> 1 216 tests). Its residuals were folded into
 > [§8.3](#83-known-soft-spots-in-what-was-built) rather than given a section
 > of their own, because they are the same scheduler.
 >
@@ -600,6 +607,19 @@ unnecessary source of behaviour change.
   The heartbeat restarts a timer that is not running while nothing is in
   flight, and ends a cycle that is open with nothing in flight, nothing
   queued and no watchdog left.
+- **An account dropped by the reserved-id rule leaves its profile and its
+  keyring entry behind.** `Config._migrate` drops a `BrowserAccount` whose id
+  is one of `copilot`, `openrouter`, `opencode_go` or `azure` - the provider
+  keys `_build_providers` creates that are not accounts - so the account is
+  gone from the model and no removal path will ever queue its
+  `profiles/<id>` directory or its `ai-gauge` keyring cookie. Settings'
+  "Clear all browser data" is what reaches them, because it sweeps every
+  directory in `profiles/` as well as the configured accounts. Acceptable as
+  it stands: a config the app itself wrote cannot carry such an id
+  (generated ids are `<kind>-<uuid4>` and the fixed ones are
+  `claude`/`codex`), so reaching this needs a hand-edited or hostile
+  `config.json`, and whoever can write that can write the profile directory
+  too.
 - **`BrowserAccount.enabled` is parsed and ignored, on purpose.** F13 made
   `_enabled_providers` and `_build_providers` honour it. That was reverted
   before merge: nothing in the app ever *writes* the field except the config
@@ -650,42 +670,48 @@ unnecessary source of behaviour change.
   `Config.load()` — the migration always re-inserts both fixed accounts — so
   the fallback was left alone and its test renamed to claim only what it
   checks.
-- **Only the browser providers refuse a re-entrant refresh; Copilot and
-  OpenRouter do not, and that is now a thread-pool question.** The App parks a
-  provider whose dispatch its watchdog abandoned, but the assumed-dead ceiling
-  has to let it go eventually, and for the browser providers the account-keyed
-  live-scrape registry then catches it. Azure is covered by its own
-  `state.in_flight` gate. Copilot and OpenRouter have neither, and `requests`'
-  `timeout` is per socket operation rather than a total, so a server that
-  sends one byte every 14 s against a 15 s timeout holds a worker forever.
+- **A hung REST worker no longer accumulates siblings, but the socket
+  itself is still unbounded.** Copilot and OpenRouter refuse nothing of
+  their own (Azure has its `state.in_flight` gate), and `requests`' `timeout`
+  is per socket operation rather than a total, so a server that sends one
+  byte every 14 s against a 15 s timeout holds a worker forever. The
+  assumed-dead ceiling used to hand that endpoint a fresh worker every time
+  it expired.
 
-  **The bound is the pool, not the request rate.** Copilot, OpenRouter and
-  Azure all submit to `QThreadPool.globalInstance()`, so the live socket count
-  can never exceed `maxThreadCount`; measured over six fake hours against a
-  byte-dripping server, every pool slot ends up stuck (1 of 1, 2 of 2, 4 of 4,
-  8 of 8) with an unbounded FIFO of queued runnables growing about four or
-  five objects an hour. The request *rate* falls rather than amplifies -
-  queued runnables never get a thread, so nothing is sent.
+  **Option (c) was taken in 1.3.1+cfa.6.** A provider whose `uses_browser`
+  is False stays parked until its worker reports back - any snapshot for
+  that name, live or late - or until `_REST_PARK_BACKSTOP_SECONDS` (one
+  hour), whichever is first; the browser providers keep the 2x ceiling,
+  because the account-keyed live-scrape registry catches the one case it
+  lets through. Six fake hours against a wedged REST worker with the app in
+  its active five-minute cadence: **50 dispatches before, 6 after**, no two
+  closer than 3 680 s, with the browser sibling unchanged at 26 and 28. An
+  idle app is 11 and 6 over the same six hours, and 28 and 24 over a day,
+  because its own backoff already spaces the cycles out. The `abandoned` log line names the rule that
+  applied (`ceiling=browser_2x` / `ceiling=rest_backstop`). This was safe to
+  do only because all three REST providers always call `on_done` unless
+  `work()` never returns - Copilot's and OpenRouter's `_run_async` wrap
+  `work()` in try/except, Azure's does the same and its `work()` has a
+  `finally`.
 
-  **The consequence is availability.** All three REST tiles are dead for the
-  life of the process, with no recovery path; before the watchdog work the
-  same server produced one stuck worker and a stalled app, so this converts a
-  one-slot leak into an all-slots leak plus a growing queue. Measured in the
-  six-hour fuzz with a double that never answers and never refuses: browser
-  providers went from 19 concurrent to **1**, the REST ones to 15 in that
-  model, and 9 live workers against the dripping server.
+  **The bound was the pool, and the pool still fills if the socket never
+  closes.** Copilot, OpenRouter and Azure all submit to
+  `QThreadPool.globalInstance()`, so the live socket count can never exceed
+  `maxThreadCount`; measured over six fake hours against a byte-dripping
+  server, every pool slot ends up stuck (1 of 1, 2 of 2, 4 of 4, 8 of 8)
+  with an unbounded FIFO of queued runnables growing about four or five
+  objects an hour, after which all three REST tiles are dead for the life of
+  the process. What the park change removes is the *supply* of new stuck
+  workers - one an hour per provider instead of one every few minutes - not
+  the wedged worker itself.
 
-  **Fix options, for the maintainer to pick.** (a) A total-response deadline
-  on the REST side - `stream=True` plus an elapsed check while reading - which
-  is the only one that actually bounds the socket. (b) A dedicated
-  `QThreadPool` per provider, so one wedged provider cannot starve the other
-  two; cheapest containment, and it does not free the wedged worker. (c) Keep
-  the assumed-dead ceiling for browser providers only, and require a REST
-  worker to report back before its park is released. (d) A busy flag on the
-  provider - the smallest change, but it means writing a provider attribute
-  from a pool thread, which is the one thing this scheduler currently never
-  does: every provider `on_done` only emits a queued signal. Any of these
-  deserves its own change rather than a tail-end addition here.
+  **What is left is option (a): a total-response deadline on the REST
+  side** - `stream=True` plus an elapsed check while reading - which is the
+  only one that actually bounds the socket, and the only one that frees a
+  worker already stuck. (b), a dedicated `QThreadPool` per provider, is
+  still available as containment and still does not free anything. (d), a
+  busy flag on the provider, is now moot: the park does that job from the
+  App side, without writing a provider attribute from a pool thread.
 
   **Every dispatch of a hung REST provider costs a slot, which is why the
   kept retry is folded into the cadence.** An earlier draft of the retry
@@ -693,8 +719,10 @@ unnecessary source of behaviour change.
   measured against the round-2 tree with the same seeds that was 4→5 and 6→7
   dispatches an hour and 15→17 worst concurrent REST workers in the 60-seed
   six-hour fuzz. Owing the due no earlier than the next cadence wake puts all
-  three numbers back (4, 6, 15/14/15). It does not contain the leak; it just
-  stops this feature widening it.
+  three numbers back (4, 6, 15/14/15). With an hour-long park the same rule
+  is what keeps the due riding ordinary cadence wakes - pinned over eleven
+  five-minute wakes inside one park - rather than arming an hour-long timer
+  of its own.
 - **On a one-core host every REST watchdog is about six minutes.**
   `_pool_wait_slack` adds `sum(every other REST budget) / maxThreadCount` to a
   dispatch's watchdog, because the cycle hands openrouter, copilot and azure
@@ -712,84 +740,108 @@ unnecessary source of behaviour change.
   to catch, and feeds the parking machinery - but the alternative is to scale
   the allowance by pool size (or to have providers report when their work
   actually starts, which is a Provider-API change: the API is one callback).
-- **"Clear all browser data" still purges a profile the App may be scraping.**
-  Profile deletion moved out of the settings dialog for the *removal* path,
-  because only the App knows whether a scrape of that account is still holding
-  the directory. `settings_dialog._clear_all_browser_data` still calls
-  `purge_profile` synchronously for every configured account, every account on
-  disk and the three fixed ids - including one whose scrape is live. That is
-  the same `deleteLater()`-then-`rmtree` under a live `QuietWebEnginePage`
-  that `_run_profile_purges` exists to prevent, and it is the most reachable
-  way to produce the destroyed page that used to strand the live-scrape guard
-  (that half is fixed: the guard expires, and `_finish` no longer loses its
-  emit to a diagnostic). Left as is because it is an explicit, confirmed user
-  action behind a warning dialog, unlike a settings save; the fix is to emit
-  the id list to the App the way `removed_profile_ids` now does and let
-  `_purge_removed_profiles` defer it, and/or to have both purge paths ask
-  `account_is_busy()` - the signal now exists and neither caller consults it.
+- ~~**"Clear all browser data" still purges a profile the App may be
+  scraping.**~~ **Closed in 1.3.1+cfa.6.** The dialog emits the id list on
+  `browser_data_clear_requested` and the App defers each one exactly as it
+  defers a removal; both purge paths now also ask `account_is_busy()`. The
+  clear-all ids are held on a separate list, `config.pending_data_clears`,
+  because the `pending_profile_purges` drain skips an id that is also a
+  configured account by design - which is right for a removal a restored
+  backup has undone and would drop every deferred clear at the next start.
+  That second list is persisted too, and drained at startup beside the
+  first, before any cookie is hydrated and before any provider exists, with
+  no configured-account skip: the user asked for those profiles to be gone.
+  It was in memory only for one round, which meant a quit inside the
+  deferral window left the live provider session cookie on disk with the
+  keyring copy already deleted - nothing in the UI would mention it again
+  and clicking the button a second time was the only thing that reached it.
+  The two lists are kept *disjoint*: an id owed both - one dialog session
+  removing an account and clearing all browser data puts it on each, as two
+  separate calls - stays on the clear list only, because both end in the
+  same `purge_profile` and the clear's drain skips nothing. Carrying both
+  cost a second deletion and, while that account's scrape was out, a second
+  `deferred` line at every heartbeat. The cost of "skips nothing" is that a
+  `config.json` restored from a backup taken inside the deferral window, or
+  synced from another machine, signs the user out of every account it names
+  at the next start with only an `info` line to explain it - the alternative
+  drops every deferred clear instead, which is the defect the list exists to
+  fix. The dialog also stops asking twice:
+  `removed_profile_ids` drops whatever the clear-all set already covered.
 - **A deferred purge makes the app write `config.json` on its own.**
   `_run_profile_purges` records what is still owed, and it is called from
   `App.__init__` and from the five-minute heartbeat - so while a purge is
   deferred the app rewrites the user's settings file without the user asking,
-  which nothing else in it does. It is well guarded: `_persist_pending_profile_purges`
-  early-returns when the list is unchanged, so the steady state (an empty
-  list) writes nothing and a normal start writes nothing. What a write costs
+  which nothing else in it does. It is well guarded: `_persist_pending_purges`
+  early-returns when neither list has changed, so the steady state (two empty
+  lists) writes nothing and a normal start writes nothing. What a write costs
   is that `Config.save()` serialises the whole model, so a key an older or
   newer build wrote that this one does not model is dropped, and a concurrent
-  hand-edit is overwritten. Worth knowing before adding a second such writer;
-  not worth a mechanism on its own. (It also means an ad-hoc harness that
+  hand-edit is overwritten. **1.3.1+cfa.6 put a second deferral list through
+  the same writer** - `pending_data_clears`, for "Clear all browser data" -
+  so there are now two reasons the app writes `config.json` unasked, through
+  one helper and one `Config.save()` per drain. The alternative was leaving
+  that list in memory, which loses a live account's session cookie to a quit
+  inside the deferral window, and the write is the cheaper of the two.
+  A third writer is still worth thinking twice about. **It is also not
+  atomic** - a bare `path.write_text` - so a crash or a power cut inside one
+  of those unasked writes truncates the file that holds every setting; the
+  loader survives it (`config.json.corrupt` and defaults, executed) but the
+  settings are gone, and `tmp` plus `os.replace` is six lines. (It also means
+  an ad-hoc harness that
   drives `_run_profile_purges` must set `APPDATA` - an override on every OS,
   which `tests/conftest.py` sets for the suite - or it edits the developer's
   real config.)
-- **The log summariser's shared budget does not cover `repr()` values or
-  large numbers, and `_raw_summary` catches only `TypeError`.** The budget is
-  charged for strings, for dict keys and for elided nodes, but the numeric
-  branch charges a flat eight characters whatever the magnitude and the
-  `repr()` fallback is charged after the fact and never clipped: a 5 MB
-  `bytes` value still produces a record 9.5x the rotation, and fifty
-  4 200-digit JSON integers produce 210 KB. Separately, three inputs make the
-  walk raise something `except TypeError` does not catch - an object whose
-  `__repr__` raises, a dict key whose `__str__` raises, and a `dict` subclass
-  whose `items()` raises - and that escapes into `_on_snapshot`. None of it is
-  reachable today: browser payloads arrive through the QtWebEngine JS bridge
-  (no bytes, no integers), `json.loads` itself refuses a number of more than
-  4 300 digits, and the two REST providers that keep a verbatim server dict do
-  so only on an OK snapshot while `raw_summary=` prints only on
-  ERROR/AUTH_REQUIRED. It would bite the first time an extractor or a provider
-  returns something that is not plain JSON. Fix:
-  `budget[0] -= max(8, len(str(value)))` in the numeric branch, clip the
-  `repr()` to `_LOG_VALUE_LIMIT` the way the string branch already does, and
-  widen the `except` - a log line must never be able to raise.
-- **The dispatch epoch is matched against the name the payload carries.**
-  `_dispatch`'s `_emit` forwards the provider's own `snapshot.provider` and
-  pairs it with the dispatch's epoch; every gate downstream keys on that name.
-  Epochs advance in lockstep across a cycle, so a snapshot mislabelled with a
-  *sibling account's* id is accepted as that sibling's live answer - clearing
-  its `_inflight` entry, destroying its watchdog, joining the cycle's verdict
-  and painting its tile with another account's numbers; the late path now has
-  the same reach. Unreachable today, and checked rather than assumed:
-  `ScrapeRunner` sets `provider=self._account_id`, the browser builders take
-  `account_id=` from the App, and the three REST providers hardcode their
-  literal, so no extractor's output reaches the field. The fix belongs in one
-  place - `replace(snap, provider=_name)` in `_emit`, so the App's own notion
+- ~~**The log summariser's shared budget does not cover `repr()` values or
+  large numbers, and `_raw_summary` catches only `TypeError`.**~~ **Closed in
+  1.3.1+cfa.6**, with one correction to the fix sketched here:
+  `len(str(value))` is itself the crash, because CPython 3.11+ raises
+  `ValueError` on `str()` of an int over 4 300 digits and `json.dumps` hits
+  the same limit from the inside. The length is estimated from
+  `bit_length()` and a number past `_LOG_VALUE_LIMIT` digits never reaches
+  the serialiser at all. The `repr()` fallback is wrapped and clipped, the
+  key walk is guarded in both functions that do it (`_raw_keys_for_log` is
+  evaluated in the same log call and would have raised first), and
+  `_raw_summary` catches `Exception` with a *bounded* literal - `repr(raw)`
+  was the unbounded thing it exists to prevent. Measured before and after:
+  5 MB `bytes` 5 000 012 → 312 characters, fifty 4 200-digit integers
+  210 440 → 50, and the three raising inputs return a string.
+- ~~**The dispatch epoch is matched against the name the payload
+  carries.**~~ **Closed in 1.3.1+cfa.6.** `_emit` compares the payload's own
+  `provider` with the name the App dispatched and re-stamps it with
+  `replace(snap, provider=_name)` when they differ, so the App's own notion
   of what it dispatched is the only thing that can decide which tile is
-  touched.
-- **The resume-artifact threshold is still unreachable on an awake machine,
-  and two `scraper.py` log lines still carry uncapped page text.** Both
-  pre-date this work; `webview/scraper.py` is touched by it only in `_finish`,
-  where the diagnostics now give way to the `done` signal. The threshold: the scraper calls a timeout a resume artifact past
+  touched, and a payload that named something else is logged once - naming
+  the dispatched provider and a fixed literal, never the payload's own
+  string. The comparison is a `getattr(snap, "provider", _name)` rather than
+  an unconditional `replace`, deliberately: `dataclasses.replace` raises on
+  anything that is not a dataclass, and a diagnostic must not be the thing
+  that breaks a dispatch. What that leaves is a payload object with no
+  `provider` attribute at all, which skips the stamp and then raises
+  `AttributeError` at `_on_snapshot`'s `name = snapshot.provider` - the same
+  failure it had before this change, and no provider in the tree can produce
+  it (each one constructs a `UsageSnapshot`).
+- **The resume-artifact threshold is still unreachable on an awake
+  machine.** The scraper calls a timeout a resume artifact past
   `timeout_ms x max_attempts x RESUME_ARTIFACT_FACTOR`, which for Claude is
   40 x 2 x 3 = 240 s, while the App's watchdog for the same provider is
   160 + 20 s - so the watchdog always wins and the classification only ever
   fires across a real machine suspend, which is what it was written for.
   `self._started_at` is also set once in `__init__` and not reset in
-  `_begin_attempt`. The log lines: `title=%r` and `result_keys=%s` print
-  `document.title` and the extractor's key names with no length cap, the
-  healthy one at INFO - worst case measured at 1.5 MB for a single record,
-  2.9x the 512 KiB rotation. The fix is the same one-line clip applied at
-  three call sites (`self._page.title()[:200]`, `sorted(result)[:50]` with
-  clipped names). Suppressive or diagnostic only, with no request-rate
-  consequence, so both are left for a scraper-scoped change.
+  `_begin_attempt`. Comparing against the App's budget rather than the
+  scraper's, and bypassing the retry branch for a classified resume
+  artifact, is the rest of the fix; it is scraper *timing* and was left for
+  its own change.
+
+  ~~**Two `scraper.py` log lines carry uncapped page text.**~~ **Closed in
+  1.3.1+cfa.6**, and there were four title sites rather than the three the
+  earlier note counted. Titles clip at 200 and the key list takes
+  `raw_keys=`'s shape (50 names of 60, with the true count beside them).
+  Measured by driving `_finish` with a 1 MB `document.title` and 10 000 keys
+  of 1 000 characters: `scrape ok` 11 079 134 → 3 664 characters and
+  `scrape fail` 1 000 367 → 570. `_safe_url` was checked and was already
+  bounded at 300. Note that `_load_failure_context` still puts the raw title
+  into the *payload*, which is bounded downstream by `_raw_summary` and by
+  `error_dialog._sanitize_raw` rather than at source.
 - **`CopilotProvider` and `OpenRouterProvider` do not declare
   `refresh_budget_seconds`.** Both take the flat 60 s default. Copilot's real
   nominal ceiling is 10 + 15 + 15 s of `requests` timeouts, each per socket
@@ -815,6 +867,83 @@ unnecessary source of behaviour change.
   countdown) with one clamp; the label half is the same repo-wide `key`
   decision and does not belong bundled with a cadence fix.
 
+- **300 characters of provider-chosen text still reach the log verbatim.**
+  `_error_for_log` bounds an error's length, flattens its line breaks and
+  redacts Azure identifiers, but it does not run `_redact_emails`, which the
+  error dialog's blob does - so an email, a bearer token or a balance a
+  provider page puts in `snapshot.error` is written into the rotating file
+  users are asked to attach to bug reports. Base behaves identically; this
+  release bounded the cost of that record, not its content. The fix is one
+  more call beside `_redact_azure_ids`, on an already-clipped string.
+- **Less of a long error reaches the log than before.** The clip-before-
+  redact window is 500 characters and the redaction shrinks what it keeps, so
+  an error that is nothing but Azure identifiers now produces a ~200-character
+  record where redact-then-clip produced 300. It is bounded either way and
+  what is lost is identifiers, so it is the price of taking four regex passes
+  over a 1.2 MB provider string off the GUI thread (163 ms to 0.08 ms).
+- **`scrape fail`'s `error=%s` still has no cap.** Every other argument on
+  that record is clipped and this one is not; all five callers pass a fixed
+  literal (`"timeout"`, `"extractor retry limit exceeded"`), so nothing
+  unbounded reaches it today. It bites the first time someone passes an
+  exception's text there; the fix is the `_clip` helper already beside it.
+- **200 characters of page-chosen title reach the log and 2 000 the
+  clipboard.** A 1.45 MB `document.title` gives a 968-character log record
+  and a 2 540-character copy-diagnostics blob with the title sanitized to
+  2 012; a planted email is redacted there and an API-key-shaped string is
+  not. Identical at base and unchanged by this release.
+- **"Clear all browser data" is linear in the raw `profiles/` entry count, on
+  the GUI thread.** One `resolve()` and one keyring write per entry: 12
+  entries cost 5 ms of click, 1 002 cost 73 ms and 10 002 cost 714 ms with
+  the keyring stubbed, and on Windows each of those writes decrypts and
+  rewrites the whole secrets file. A real install has a handful of
+  directories; the fix is to hoist the resolved root out of the loop and to
+  skip names no keyring can hold.
+- **`_begin_cycle` counts names that are not configured providers.**
+  `requested = len(names)` is taken before the filter and `requested >
+  len(dispatched)` is what marks a cycle partial, so a caller passing a stale
+  name would make every cycle look partial and stop the idle backoff
+  advancing. Unreachable today - every caller filters through `_providers` -
+  and the fix is `len(set(names) & self._providers.keys())`.
+- **A queued sign-in is answered by the settings save's refresh, not its
+  own.** `_run_pending_manual` tests `full` first, so a queued full refresh
+  discards `_pending_manual_providers` entirely; 1.3.1+cfa.6 made the tile
+  speak for the user in that case but the per-provider refresh still does not
+  run as itself. The full cycle covers that provider anyway, so the loss is
+  ordering; the fix is to move the queued names to the front of the full
+  cycle's order.
+- **`_is_abandoned` mutates state from inside a predicate.** It pops the
+  `_abandoned` entry and logs `abandoned worker assumed dead` once the
+  deadline has passed, and `_purge_blocked_reason` calls it at every
+  five-minute heartbeat - so *asking* whether a profile can be deleted can
+  un-park a provider and write a WARNING. Correct wherever it happens; a pure
+  `_is_abandoned_at(now)` for the predicate is the tidy version.
+- **`providers/catalog.py` still imports the private
+  `config._is_safe_profile_id`.** The settings dialog was given the public
+  `is_usable_profile_id`; the catalog wants the *name* rule only, which is
+  what it takes, so the fix is to publish `is_safe_profile_id` beside it
+  rather than route the catalog through a predicate that touches the
+  filesystem.
+- **Three `inspect.getsource` assertions remain in the suite.**
+  `test_app_logging.py`, `test_scraper.py` and `test_api_capture.py` each
+  still grep a function's source. The two that were load-bearing were
+  converted to behavioural tests; none of these three is the sole killer of
+  any mutation, so they are redundancy rather than a gap, and they bite when
+  someone moves the code they grep for.
+- **`test_a_parked_provider_does_not_freeze_the_idle_backoff` is only
+  measured at REST-sized budgets.** Its floor is derived from the run's own
+  arithmetic now, so a re-tuned budget moves it - but at a 900 s budget the
+  *ceiling* itself stops holding: the wedged run makes 31 dispatches against
+  a control of 12 over the same six hours, because a watchdog wait longer
+  than the cycle spacing keeps `_unchanged_cycles` down and the app on its
+  short cadence. No provider in the tree has a budget near that (Azure's is
+  225 s and it has its own in-flight gate), so this is a note about the
+  fixture's reach rather than a live rate defect - but it is the shape a
+  future long-budget provider would arrive in.
+- **`SECURITY.md` does not describe "Clear all browser data".** It covers
+  egress, secrets and the Azure rate floor, but not the one button that
+  deletes a directory tree and a set of keyring entries, and not that the
+  request is now persisted across a quit in `config.json`. Two sentences
+  under the existing local-data heading.
 - **One CI job segfaulted in a native thread, once, and the cause is not
   pinned.** Run 67 on `aab1de9` died with `Fatal Python error: Segmentation
   fault` in the Ubuntu 22.04 / 3.11 job while the other five jobs and every

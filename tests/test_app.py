@@ -108,12 +108,14 @@ def _refresh_app_stub() -> App:
     app._cycle_reason = "startup"  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
     app._dispatch_epoch = {}  # noqa: SLF001
+    app._dispatch_browser = {}  # noqa: SLF001
     app._abandoned = {}  # noqa: SLF001
     app._pool_wait_budgets = {}  # noqa: SLF001
     app._pending_profile_purges = []  # noqa: SLF001
     app._dispatching = False  # noqa: SLF001
     app._watchdogs = {}  # noqa: SLF001
     app._pending_manual_refresh = False  # noqa: SLF001
+    app._pending_manual_asked = False  # noqa: SLF001
     app._pending_manual_providers = []  # noqa: SLF001
     app._next_refresh_reason = "startup"  # noqa: SLF001
     app._widget = _Widget()  # noqa: SLF001
@@ -1094,6 +1096,7 @@ def test_the_watchdog_timers_do_not_accumulate(qapp):
     app._watchdogs = {}  # noqa: SLF001
     app._abandoned = {}  # noqa: SLF001
     app._dispatch_epoch = {}  # noqa: SLF001
+    app._dispatch_browser = {}  # noqa: SLF001
     app._pool_wait_budgets = {}  # noqa: SLF001
     app._pending_profile_purges = []  # noqa: SLF001
     provider = SimpleNamespace(uses_browser=False, refresh_budget_seconds=60.0)
@@ -1215,6 +1218,7 @@ def test_the_snapshot_error_log_line_redacts_azure_identifiers(qapp, caplog):
     app._cycle_active = False  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
     app._dispatch_epoch = {}  # noqa: SLF001
+    app._dispatch_browser = {}  # noqa: SLF001
     app._abandoned = {}  # noqa: SLF001
     app._pool_wait_budgets = {}  # noqa: SLF001
     app._pending_profile_purges = []  # noqa: SLF001
@@ -1418,6 +1422,7 @@ def test_a_provider_that_raises_out_of_refresh_is_redacted_too(qapp, monkeypatch
     app._watchdogs = {}  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
     app._dispatch_epoch = {}  # noqa: SLF001
+    app._dispatch_browser = {}  # noqa: SLF001
     app._abandoned = {}  # noqa: SLF001
     app._pool_wait_budgets = {}  # noqa: SLF001
     app._pending_profile_purges = []  # noqa: SLF001
@@ -1470,6 +1475,7 @@ def _provider_app(config: Config) -> App:
     app._error_retry = {}  # noqa: SLF001
     app._dispatch_times = {}  # noqa: SLF001
     app._dispatch_epoch = {}  # noqa: SLF001
+    app._dispatch_browser = {}  # noqa: SLF001
     app._watchdogs = {}  # noqa: SLF001
     app._build_providers()  # noqa: SLF001
     return app
@@ -1505,6 +1511,41 @@ def test_a_settings_save_keeps_the_provider_objects_it_did_not_change():
         assert app._providers[name] is provider, (  # noqa: SLF001
             f"{name} was rebuilt although nothing about it changed"
         )
+
+
+def test_a_park_does_not_outlive_the_provider_the_user_removed():
+    """Nothing else clears `_abandoned` for a name the user turned off.
+
+    `_dispatch_refusal` answers `not_configured` before it ever reaches
+    `_is_abandoned`, so the entry - and the `_dispatch_times` /
+    `_dispatch_epoch` / `_dispatch_browser` rows the rebuild holds open for
+    anything still parked - would live for the process. A name still in flight keeps its park: that
+    dispatch is what it bounds.
+    """
+    config = Config()
+    config.providers.openrouter = True
+    app = _provider_app(config)
+    far_future = 10.0**18
+    app._abandoned["copilot"] = (3, far_future)  # noqa: SLF001
+    app._dispatch_epoch["copilot"] = 3  # noqa: SLF001
+    app._dispatch_browser["copilot"] = False  # noqa: SLF001
+    app._abandoned["openrouter"] = (1, far_future)  # noqa: SLF001
+    app._dispatch_epoch["openrouter"] = 1  # noqa: SLF001
+    app._dispatch_browser["openrouter"] = False  # noqa: SLF001
+    app._inflight.add("openrouter")  # noqa: SLF001
+
+    config.providers.copilot = False
+    config.providers.openrouter = False
+    app._build_providers()  # noqa: SLF001
+
+    assert "copilot" not in app._abandoned, "a park outlived its provider"  # noqa: SLF001
+    assert "copilot" not in app._dispatch_epoch  # noqa: SLF001
+    assert "copilot" not in app._dispatch_browser  # noqa: SLF001
+    assert "openrouter" in app._abandoned, (  # noqa: SLF001
+        "a dispatch that is still out lost the park that bounds it"
+    )
+    assert "openrouter" in app._dispatch_epoch  # noqa: SLF001
+    assert "openrouter" in app._dispatch_browser  # noqa: SLF001
 
 
 def test_a_provider_the_user_switched_off_and_on_again_is_a_new_object():
@@ -1618,3 +1659,332 @@ def test_raw_summary_still_says_what_it_dropped():
 
     assert "more keys" in line
     assert len(line) < 6_000
+
+
+class _ReprRaises:
+    def __repr__(self):
+        raise ValueError("this object refuses to be printed")
+
+
+class _KeyStrRaises:
+    def __str__(self):
+        raise ValueError("this key refuses to be printed")
+
+    def __hash__(self):
+        return 7
+
+
+class _ItemsRaises(dict):
+    def items(self):
+        raise RuntimeError("this mapping refuses to be walked")
+
+
+def test_the_log_summariser_bounds_a_value_it_has_to_repr():
+    """The shared budget was charged for strings, keys and elided nodes, and
+    the `repr()` fallback was charged *after the fact* and never clipped.
+    Measured on the tree before this: one 5 MB `bytes` value produced a
+    5 000 012-character record, 9.5x the whole 512 KiB rotation, and it is
+    the browser payload path - `snapshot.raw` is the extractor's own dict."""
+    from decimal import Decimal
+
+    for label, raw in (
+        ("bytes", {"k": b"B" * 5_000_000}),
+        ("bytearray", {"k": bytearray(b"C" * 5_000_000)}),
+        ("set", {"k": set(range(50_000))}),
+        ("frozenset", {"k": frozenset(range(50_000))}),
+        ("Decimal", {"k": Decimal("1" * 5_000)}),
+    ):
+        line = _raw_summary(raw)
+        assert len(line) < 20_000, f"{label} produced a {len(line)}-char record"
+
+
+def test_the_log_summariser_never_converts_a_big_integer():
+    """CPython 3.11+ raises `ValueError` on `str()` of an int over 4 300
+    digits, and `json.dumps` hits the same limit from the inside - so asking
+    how long the number is is itself the crash. Its length is estimated from
+    `bit_length()` and the number never reaches the serialiser.
+
+    Measured before: fifty 4 200-digit integers produced a 210 440-character
+    record, and one 6 000-digit integer raised `ValueError` out of
+    `_on_snapshot`, which `except TypeError` did not catch.
+    """
+    fifty = _raw_summary({f"n{index}": int("9" * 4_200) for index in range(50)})
+    assert len(fifty) < 20_000, f"{len(fifty)} characters"
+
+    huge = _raw_summary({"n": 10**5_999})  # 6 000 digits: str() itself raises
+    assert len(huge) < 20_000
+    assert "digits" in huge, "the record does not say a number was elided"
+
+    # Ordinary numbers are still numbers, and bool is still bool.
+    assert _raw_summary({"n": 42, "f": 1.5, "b": True, "z": None}) == (
+        '{"b": true, "f": 1.5, "n": 42, "z": null}'
+    )
+
+
+def test_the_whole_snapshot_error_log_call_is_total():
+    """Every argument of one `log.warning` is built from the same payload.
+
+    `_raw_summary` was total; the two things evaluated beside it were not.
+    `_raw_keys_for_log` walked the payload with only its keys guarded, and
+    the call site's own `if snapshot.raw` ran the payload's `__len__` - so a
+    `dict` subclass that refuses either raised out of `_on_snapshot` before
+    the guarded argument was ever reached.
+    """
+    from aigauge.app import _error_for_log, _raw_keys_for_log
+
+    class _IterRaises(dict):
+        def __iter__(self):
+            raise RuntimeError("this mapping refuses to be iterated")
+
+    class _LenRaises(dict):
+        def __len__(self):
+            raise RuntimeError("this mapping refuses to be measured")
+
+    for raw in (_IterRaises(a=1), _LenRaises(a=1), _ItemsRaises(a=1), None, {}):
+        assert isinstance(_raw_keys_for_log(raw), str)
+        assert isinstance(_raw_summary(raw), str)
+
+    # A key that refuses to print costs that key its name and nothing else.
+    # The end-to-end guard above would otherwise hide a missing per-key one,
+    # which throws the whole list away on a payload that is mostly readable.
+    class _KeyStrRaises:
+        def __str__(self):
+            raise ValueError("this key refuses to be printed")
+
+        def __hash__(self):
+            return 11
+
+    keys = _raw_keys_for_log({_KeyStrRaises(): 1, "usage": 2, "limit": 3})
+    assert "'usage'" in keys and "'limit'" in keys, keys
+    assert "'<key>'" in keys, keys
+    assert '"<key>"' in _raw_summary({_KeyStrRaises(): 1, "usage": 2}), (
+        "one unprintable key cost the whole summary"
+    )
+    # An empty or absent payload still reads as an empty one.
+    assert _raw_summary(None) == "{}" and _raw_summary({}) == "{}"
+    assert _raw_keys_for_log(None) == "[]"
+
+    # A class name is chosen by the payload and is not bounded by anything:
+    # the "bounded literal" fallback measured 1 000 017 characters.
+    huge = type("D" * 1_000_000, (dict,), {"items": _ItemsRaises.items})(a=1)
+    assert len(_raw_summary(huge)) < 200
+
+    # And the third argument, the one this release added. `UsageSnapshot` is
+    # a plain dataclass, so `error: str | None` is a hint and not a check:
+    # `error or ""` runs the object's `__bool__` and `str()` runs its
+    # `__str__`, both outside any guard, on the record the release is named
+    # for being total.
+    class _BoolRaises(str):
+        def __bool__(self):
+            raise RuntimeError("this error refuses to be truth-tested")
+
+    class _StrRaises(str):
+        def __str__(self):
+            raise RuntimeError("this error refuses to be printed")
+
+    for error in (_BoolRaises("x"), _StrRaises("x"), None, "", "plain"):
+        assert isinstance(_error_for_log(error), str)
+    assert _error_for_log(_StrRaises("x")) == "<unprintable error>"
+
+    # The fourth helper on the same rule. `_clip_for_log` is what prints ids
+    # onto the two purge records and the two deferral ones, and its `str()`
+    # was the one left outside a guard while the three beside it were closed.
+    # Unreachable through `_coerce_pending_purges`, which keeps only `str`,
+    # but "a log line must never raise" is the rule and this was the gap.
+    from aigauge.app import _LOG_ID_LIMIT, _clip_for_log, _ids_for_log
+
+    assert _clip_for_log(_StrRaises("x")) == "<unprintable id>"
+    assert _ids_for_log([_StrRaises("x"), "claude"]) == "<unprintable id>,claude"
+    assert _clip_for_log("z" * 500) == "z" * _LOG_ID_LIMIT + "..."
+
+
+def test_an_error_string_costs_the_log_one_bounded_line():
+    """`snapshot.error` is the fourth provider-influenced argument on that
+    record, and the only one still uncapped. Copilot's and OpenRouter's
+    transport failures carry `str(exc)` from `requests`, so its length and
+    its newlines are not the app's to assume: a 2 480 000-character error
+    measured a 2 480 065-character record for `provider=copilot` - 1.58x the
+    whole 512 KiB x 3 rotation - with 20 000 embedded newlines that each
+    read like a record of their own. The tile, the tray
+    tooltip and the error dialog still get the string whole; this is the log
+    line only."""
+    from aigauge.app import _LOG_VALUE_LIMIT, _error_for_log
+
+    forged = "x\nWARNING aigauge.app: forged line provider=evil\r\n" * 20_000
+    line = _error_for_log(forged)
+
+    assert len(line) <= _LOG_VALUE_LIMIT + 3
+    assert "\n" not in line and "\r" not in line
+    assert _error_for_log(None) == "" and _error_for_log("plain") == "plain"
+
+
+def test_the_error_clip_runs_before_the_redaction(monkeypatch):
+    """Four regex passes over an unbounded string, to keep 300 characters.
+
+    `_redact_azure_ids` is a scalpel for Azure resource paths and it ran
+    over the whole `snapshot.error` before anything clipped it - on the GUI
+    thread, inside `_on_snapshot`, for a string whose length is `str(exc)`
+    from `requests`. The order is the other way round now, with a margin so
+    an identifier that straddles the limit is redacted rather than cut in
+    half: what the redaction sees is bounded, what it returns is clipped.
+    """
+    import aigauge.app as app_module
+    from aigauge.app import _LOG_VALUE_LIMIT, _error_for_log
+
+    seen: list[int] = []
+
+    def _spy(text):
+        seen.append(len(text))
+        return text
+
+    monkeypatch.setattr(app_module, "_redact_azure_ids", _spy)
+    line = _error_for_log("X" * 2_000_000)
+
+    assert seen and max(seen) < 1_000, (
+        f"the redaction pass was handed {max(seen)} characters to produce "
+        f"{_LOG_VALUE_LIMIT}"
+    )
+    assert len(line) == _LOG_VALUE_LIMIT + 3
+
+    # A subscription id that begins inside the limit is still redacted, which
+    # is what the margin is for.
+    guid = "12345678-1234-1234-1234-123456789abc"
+    monkeypatch.undo()
+    padded = "y" * (_LOG_VALUE_LIMIT - 20) + "/subscriptions/" + guid + "/x"
+    assert guid not in _error_for_log(padded)
+
+
+def test_no_fragment_of_a_subscription_id_survives_the_clip():
+    """The margin's own cut is the one the margin cannot help with.
+
+    `_redact_azure_ids` *shrinks* what it keeps - `/subscriptions/<36-char
+    guid>` becomes 21 characters - so material that sat past the 300-character
+    limit before the pass sits inside it after, including the front half of
+    the identifier the 500-character window cut in two. Measured before the
+    tail drop: a subscription id straddling that window reached the record
+    with 26 of its 36 characters, where both redact-then-clip and the release
+    before it wrote `<guid>`.
+
+    Swept rather than sampled, because which offsets leak depends on how much
+    the redaction shrank the text in front of the cut: the id is walked across
+    every offset the window can cut it at, and no run of eight hex-or-dash
+    characters of it may reach the record at any of them.
+    """
+    import re as _re
+
+    from aigauge.app import _LOG_VALUE_LIMIT, _LOG_REDACT_MARGIN, _error_for_log
+
+    guid = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+    window = _LOG_VALUE_LIMIT + _LOG_REDACT_MARGIN
+    # Each filler unit redacts to `/subscriptions/<guid>`, which is the
+    # shrinkage that drags the cut fragment into the kept 300 characters.
+    # How many of them there are decides how much shrinkage there is, and
+    # so whether the redacted window lands under the 300-character limit or
+    # a little over it - the second is the case where the final clip does
+    # the cutting rather than the window, and it leaks too.
+    unit = "/subscriptions/" + guid + "."
+
+    for units in range(10):
+        filler = unit * units
+        for offset in range(window - 60, window + 61):
+            pad = offset - len(filler) - len("/subscriptions/")
+            if pad < 0:
+                continue
+            head = filler + "." * pad
+            record = _error_for_log(
+                head + "/subscriptions/" + guid + "/resourceGroups/rg-real/x"
+                + "y" * 4000
+            )
+            for run in _re.findall(r"[0-9A-Fa-f-]{8,}", record):
+                for size in range(len(run), 7, -1):
+                    pieces = (
+                        run[at : at + size] for at in range(len(run) - size + 1)
+                    )
+                    assert not any(piece in guid for piece in pieces), (
+                        f"{size} characters of the subscription id reached "
+                        f"the record with {units} ids in front of it and this "
+                        f"one starting at offset {offset}: {record!r}"
+                    )
+
+    # The drop is for the cut token only. An error the window did not truncate
+    # ends on whatever it ends on, and a hex run the redaction deliberately
+    # keeps - an md5, a request id - is not an Azure identifier.
+    kept = "cache miss for 9e107d9d372bb6826bd81d3542a419d6"
+    assert _error_for_log(kept) == kept
+    # And it is bounded at the length of the longest identifier, so a record
+    # that is one very long hex run still costs the log its full 300.
+    assert len(_error_for_log("a" * 2_000_000)) == _LOG_VALUE_LIMIT + 3
+
+
+def test_the_log_summariser_charges_a_big_integer_what_it_costs():
+    """The budget is shared, so every branch has to charge honestly.
+
+    The numeric branch charged a flat 8 whatever the magnitude, which is how
+    fifty 4 200-digit integers bought a 210 440-character record. Fifty
+    299-digit ones are *under* the value limit, so they are printed in full
+    and the only thing holding the record down is what they are charged:
+    measured 345 characters here, against 1 340 with a flat charge.
+    """
+    line = _raw_summary({f"k{index}": int("9" * 299) for index in range(50)})
+    assert len(line) < 600, f"{len(line)} characters"
+
+
+def test_the_log_summarisers_digit_estimate_never_under_counts():
+    """`bit_length() // 3 + 2` stands in for `len(str(value))`, which cannot
+    be asked past 4 300 digits without raising. An estimate that came in
+    *under* the true length would under-charge the budget and under-report
+    the elision, so the property is one-sided: never below.
+
+    Read off the placeholder the summariser itself emits, so it is the
+    shipped estimate being checked and not a copy of it here.
+    """
+    import re
+
+    for digits in (301, 500, 1_000, 2_048, 4_000):
+        for value in (10 ** (digits - 1), -(10 ** (digits - 1))):
+            line = _raw_summary({"n": value})
+            match = re.search(r"<int (\d+) digits>", line)
+            assert match, f"{digits} digits produced {line[:80]!r}"
+            assert int(match.group(1)) >= len(str(abs(value))), (
+                f"the estimate under-counts a {digits}-digit integer"
+            )
+
+
+def test_the_log_summariser_keeps_the_rest_of_a_payload_it_cannot_repr():
+    """The guard around `repr()` is inside the walk, so one hostile value
+    costs one value. Without it the exception unwinds to `_raw_summary`'s
+    own catch and the whole payload becomes the fallback literal - the other
+    keys, which are the diagnostic, are gone."""
+    line = _raw_summary({"k": _ReprRaises(), "useful": 1, "also": "here"})
+
+    assert '"useful": 1' in line, line
+    assert '"also": "here"' in line, line
+    assert "<unrepresentable _ReprRaises>" in line, line
+    assert "unsummarisable" not in line, "one bad value cost the whole payload"
+
+
+def test_the_log_summariser_cannot_raise():
+    """It runs inside `_on_snapshot`, so anything it raises escapes into the
+    scheduler. Three payloads got past `except TypeError`: an object whose
+    `__repr__` raises, a dict key whose `__str__` raises, and a `dict`
+    subclass whose `items()` raises."""
+    from aigauge.app import _raw_keys_for_log
+
+    for label, raw in (
+        ("__repr__ raises", {"k": _ReprRaises()}),
+        ("key __str__ raises", {_KeyStrRaises(): 1}),
+        ("items() raises", _ItemsRaises(a=1)),
+    ):
+        line = _raw_summary(raw)
+        assert isinstance(line, str) and line, label
+        assert len(line) < 20_000, label
+        # Both fields of that log line are built from the same payload, so
+        # the key one has to survive it too.
+        keys = _raw_keys_for_log(raw)
+        assert isinstance(keys, str), label
+
+    # The fallback is a bounded literal. `repr(raw)` was the unbounded thing
+    # this function exists to prevent.
+    assert _raw_summary(_ItemsRaises(a="z" * 5_000_000)) == (
+        "<unsummarisable _ItemsRaises>"
+    )
