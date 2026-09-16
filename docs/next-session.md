@@ -1119,8 +1119,9 @@ class of defect for the third time, at a third site: round 1 bounded the path
 scanner, round 2 bounded every other pattern, and the loop that resolves
 *overlapping findings* — added by round 2's own fix — was still quadratic, this
 time in the number of findings rather than in the bytes. It checked each
-candidate span against a list of every claim already made, so 400 KB of `a@b.co `
-— a contact list, not an attack — is 57 143 findings and took 58.0 s in `scan()`
+candidate span against a list of every claim already made, so 400 KB of
+seven-character email addresses separated by spaces — a contact list, not an
+attack — is 57 143 findings and took 58.0 s in `scan()`
 and 58.4 s in the hook, against the hook's own documented 10 s timeout, and a
 hook killed at its timeout blocks nothing. A CSV of addresses was 9.1 s and a
 400 KB `.env`-shaped block 7.9 s. The claims are now a byte per character of the
@@ -1150,9 +1151,10 @@ server on a path other than `/session` — finally has a test.
 What this round leaves open, deliberately:
 
 - **Two overlapping redactions still resolve to one of them, not to their
-  union.** `api_key=aaaaaaa1@example.com` is dispatched as
-  `[redacted:secret-assignment]@example.com`: the credential-shaped part is
-  removed and the domain of the address survives. Merging the spans would be
+  union.** An `api_key=` assignment whose value runs straight into an email
+  address is dispatched as `[redacted:secret-assignment]` followed by the tail
+  of that address: the credential-shaped part is removed and the domain
+  survives. Merging the spans would be
   strictly better, but every way of doing it inside five lines changes which
   rule is *reported* for an overlap — a longer `opaque-token` run would start
   displacing the named rule beside it — and that is a worse report for a
