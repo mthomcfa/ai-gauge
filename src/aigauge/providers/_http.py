@@ -88,6 +88,15 @@ MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 # 1 MiB page is about eighteen reads.
 CHUNK_BYTES = 64 * 1024
 
+# How long the deadline timer waits before looking again when it fires and
+# finds no socket to shut down (see _DeadlineShutdown._fire). A quarter of a
+# second is short enough that the exposure it buys back is a fraction of one
+# read rather than a whole protocol phase, and long enough that the retry
+# costs four short-lived timer threads a second in a window that only exists
+# once a call has already outrun its deadline - and that window is closed by
+# the call's own `finally`, not by a count here.
+REARM_SECONDS = 0.25
+
 
 class ResponseDeadlineExceeded(requests.RequestException):
     """The whole exchange outran ``total_seconds``.
@@ -151,8 +160,7 @@ def request_worst_case_seconds(
     a read timeout - one number means both. The clock starts before the call,
     and the deadline timer is armed with it, so:
 
-    * connect blocks at most ``connect``. A timer cannot shut down a socket
-      that does not exist yet, so this phase is bounded by ``connect`` alone;
+    * connect blocks at most ``connect``;
     * once the socket exists, the shutdown at ``total_seconds`` ends whatever
       read is in flight - status line, header or body - and every read after
       it returns at once, so no phase after the connect outlives
@@ -160,10 +168,13 @@ def request_worst_case_seconds(
       before the timer, each byte of a dripping header reset the per-socket
       timeout and nothing re-checked the clock until the headers were
       complete;
-    * the slack is one read. The timer fires once, and it can fire in the
-      window between the connection being handed out and its socket being
-      created, where it finds nothing to shut down; the read after that
-      window blocks at most ``read``.
+    * the slack is one read plus one re-arm interval. A timer cannot shut
+      down a socket that does not exist yet, so a timer that fires before
+      there is one does not give up: it re-arms every ``REARM_SECONDS``
+      until the call ends (``_DeadlineShutdown._fire``), which catches the
+      exchange within a quarter-second of the socket appearing rather than
+      leaving everything after it unbounded. The read that catch interrupts
+      blocks at most ``read``.
 
     So the call returns or raises by ``max(connect, total_seconds) + read``.
     Note this is NOT ``connect + read + total_seconds + read``: that sum
@@ -171,6 +182,18 @@ def request_worst_case_seconds(
     covers. At every timeout this package uses ``total_seconds`` is the larger
     term, so in practice the bound is ``total_seconds + read``: 45 s at a 15 s
     timeout and 40 s at a 10 s one.
+
+    One phase is outside all of it: **name resolution**.
+    ``urllib3.util.connection.create_connection`` calls ``socket.getaddrinfo``
+    before it makes a socket, so neither ``connect`` (which is set on a
+    socket) nor the timer (which needs one to shut down) reaches it, and the
+    resolver's own timeout is the only bound - a glibc default of
+    ``timeout:5 attempts:2`` against three nameservers is 30 s on its own.
+    That time is added to the number above rather than counted inside it, on
+    this helper and on plain ``requests`` alike. The App's watchdog is the
+    backstop and not a fix: it ends the App's wait, while the worker stays in
+    ``getaddrinfo`` until the resolver gives up. Resolving on a thread is the
+    only real answer, and is a larger change than this one.
     """
     if isinstance(timeout, tuple):
         connect, read = float(timeout[0]), float(timeout[1])
@@ -192,8 +215,9 @@ class _DeadlineShutdown:
     (documented on both; the loopback proof for Windows-style behaviour lives
     in the review drivers rather than the suite, which opens no sockets).
 
-    One timer thread per call, cancelled in ``bounded_request``'s ``finally``
-    whether the call succeeded or failed, so nothing outlives the call.
+    One timer thread at a time per call, cancelled in ``bounded_request``'s
+    ``finally`` whether the call succeeded or failed, so nothing outlives the
+    call.
     """
 
     def __init__(self, seconds: float) -> None:
@@ -201,9 +225,18 @@ class _DeadlineShutdown:
         self._lock = threading.Lock()
         self._connection: Any = None
         self._timer: threading.Timer | None = None
+        # Set by cancel(), under the lock: the call has ended, so no timer
+        # may be armed again and one already running is a no-op. It is what
+        # bounds the re-arm loop below - the call's own `finally`, not a
+        # count of attempts here.
+        self._ended = False
         # Read by bounded_request: a socket this timer cut must surface as
         # ResponseDeadlineExceeded rather than as whatever the broken read
-        # raised, however the two clocks round.
+        # raised, however the two clocks round. Written here under the lock
+        # and read without it, which needs no lock of its own: it is one-way
+        # (never cleared), and an attribute read is atomic in CPython, so the
+        # worst a bare read can see is one stale False that the elapsed-time
+        # check beside it covers.
         self.fired = False
 
     def record(self, connection: Any) -> None:
@@ -212,29 +245,47 @@ class _DeadlineShutdown:
             self._connection = connection
 
     def arm(self) -> None:
-        timer = threading.Timer(self._seconds, self._fire)
+        self._arm_in(self._seconds)
+
+    def _arm_in(self, seconds: float) -> None:
+        timer = threading.Timer(seconds, self._fire)
         # Daemon so a timer that somehow outlives its call cannot hold the
         # process open at exit.
         timer.daemon = True
         with self._lock:
+            if self._ended:
+                return
             self._timer = timer
         timer.start()
 
     def cancel(self) -> None:
         with self._lock:
+            self._ended = True
             timer, self._timer = self._timer, None
         if timer is not None:
             timer.cancel()
 
     def _fire(self) -> None:
         with self._lock:
+            if self._ended:
+                # The call is over and this is a timer it already cancelled,
+                # racing the cancel. Shutting a socket down now would reach
+                # whatever the pool handed out next.
+                return
             self.fired = True
             connection = self._connection
         sock = getattr(connection, "sock", None)
         if sock is None:
-            # Still in DNS or connect: there is nothing to shut down, and the
-            # connect timeout is what bounds that phase (see
-            # request_worst_case_seconds).
+            # Still resolving or connecting: there is nothing to shut down
+            # YET. Giving up here is what left the rest of the exchange
+            # unbounded - `HTTPConnection.connect()` assigns `sock` only
+            # after the TCP connect, and `getaddrinfo` runs before that and
+            # outside every timeout, so a resolver slower than the deadline
+            # meant the status line, the header block and the body were back
+            # to being bounded by nothing (measured: 40 s and 70 s against a
+            # 4.0 s bound, ended only by the harness). So the timer tries
+            # again shortly, and keeps trying until the call ends.
+            self._arm_in(REARM_SECONDS)
             return
         try:
             sock.shutdown(socket.SHUT_RDWR)

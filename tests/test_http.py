@@ -659,6 +659,39 @@ class _FakeConnection:
         self.sock = sock
 
 
+class _SignallingSocket(_FakeSocket):
+    """A `_FakeSocket` that says when it was shut down, so a test can wait for
+    a timer thread instead of sleeping for one."""
+
+    def __init__(self):
+        super().__init__()
+        self.cut = threading.Event()
+
+    def shutdown(self, how):
+        super().shutdown(how)
+        self.cut.set()
+
+
+class _LateSocketConnection:
+    """A connection whose socket appears only after the deadline has passed.
+
+    What a slow resolver looks like from the timer's side:
+    `HTTPConnection.connect()` assigns `sock` after the TCP connect, and
+    `getaddrinfo` runs before that and outside every timeout, so a timer armed
+    with the deadline can reach `sock` while it is still `None`.
+    """
+
+    def __init__(self, sock, *, appears_at: int = 2):
+        self._sock = sock
+        self._appears_at = appears_at
+        self.looks = 0
+
+    @property
+    def sock(self):
+        self.looks += 1
+        return self._sock if self.looks >= self._appears_at else None
+
+
 class _FakePool:
     """The urllib3 pool the adapter hooks: `_get_conn` is the one place a
     connection passes through, new or reused."""
@@ -772,17 +805,23 @@ def test_the_deadline_shuts_the_recorded_socket_down():
 
 
 @pytest.mark.parametrize(
-    "connection",
+    "connection, re_arms",
     [
-        pytest.param(None, id="none"),
-        pytest.param(_FakeConnection(None), id="no sock"),
-        pytest.param(_FakeConnection(_FakeSocket(OSError("gone"))), id="raises"),
+        pytest.param(None, True, id="none"),
+        pytest.param(_FakeConnection(None), True, id="no sock"),
+        pytest.param(
+            _FakeConnection(_FakeSocket(OSError("gone"))), False, id="raises"
+        ),
     ],
 )
-def test_the_deadline_fires_cleanly_with_nothing_to_shut_down(connection):
+def test_the_deadline_fires_cleanly_with_nothing_to_shut_down(
+    connection, re_arms
+):
     """A timer that fires during DNS or connect finds no socket; one that
     fires on a socket the peer already closed gets an OSError. Neither is a
-    crash in a background thread, and the connect timeout bounds that phase."""
+    crash in a background thread - and the first of the two does not give up:
+    it arms another timer, because the socket it has nothing to shut down yet
+    is the socket the rest of the exchange happens on."""
     deadline = _http._DeadlineShutdown(30.0)
     if connection is not None:
         deadline.record(connection)
@@ -790,6 +829,105 @@ def test_the_deadline_fires_cleanly_with_nothing_to_shut_down(connection):
     deadline._fire()
 
     assert deadline.fired is True
+    assert (deadline._timer is not None) is re_arms
+    # However it went, the call's own cancel takes whichever timer is current.
+    deadline.cancel()
+    assert deadline._timer is None
+
+
+def test_a_timer_that_finds_no_socket_tries_again_rather_than_giving_up():
+    """The narrow way the round-1 stall came back.
+
+    `getaddrinfo` runs before any socket exists and outside every timeout, so
+    a resolver slower than the deadline left the timer firing into a
+    connection with no `sock`. It used to return there, and was never armed
+    again: the status line, the header block and the body after it were
+    bounded by nothing (measured, 40 s and 70 s against a 4.0 s bound, ended
+    by the harness rather than by the app). Now it looks again.
+    """
+    sock = _SignallingSocket()
+    connection = _LateSocketConnection(sock)
+    deadline = _http._DeadlineShutdown(30.0)
+    deadline.record(connection)
+
+    deadline._fire()
+    try:
+        assert deadline._timer is not None, "the timer gave up with no socket"
+        assert deadline._timer.interval == _http.REARM_SECONDS
+        assert sock.cut.wait(10), "the re-armed timer never fired"
+    finally:
+        deadline.cancel()
+
+    assert sock.shutdowns == [socket.SHUT_RDWR]
+    assert connection.looks == 2
+
+
+def test_a_timer_that_fires_after_the_call_ended_does_nothing():
+    """`cancel()` is the only thing that ends the re-arm loop, so a timer that
+    was already running when it ran has to be a no-op: the pool it would reach
+    into is being closed, and the next socket at that address is another
+    call's."""
+    sock = _FakeSocket()
+    deadline = _http._DeadlineShutdown(30.0)
+    deadline.record(_FakeConnection(sock))
+
+    deadline.cancel()
+    deadline._fire()
+
+    assert sock.shutdowns == []
+    assert deadline.fired is False
+    assert deadline._timer is None
+
+
+def test_the_re_arm_loop_is_ended_by_the_call_and_leaves_no_thread(monkeypatch):
+    """Nothing counts the re-arms, so what stops them is `bounded_request`'s
+    own `finally` - here on the failure path, with a socket that never
+    appears at all (a resolver that never answers). The real `threading.Timer`
+    is used, so these are threads and not doubles."""
+    monkeypatch.setattr(_http, "REARM_SECONDS", 0.01)
+    made: list = []
+    real = _http.threading.Timer
+
+    class _Spy(real):  # type: ignore[misc, valid-type]
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            made.append(self)
+
+    monkeypatch.setattr(_http.threading, "Timer", _Spy)
+    looked_twice = threading.Event()
+
+    class _NeverConnected:
+        def __init__(self):
+            self.looks = 0
+
+        @property
+        def sock(self):
+            self.looks += 1
+            if self.looks >= 2:
+                looked_twice.set()
+            return None
+
+    def fake_request(session, method, url, **kwargs):  # noqa: ARG001
+        session.get_adapter(url)._deadline.record(_NeverConnected())
+        assert looked_twice.wait(10), "the timer was not armed a second time"
+        return _fake_response(_FakeRaw([b"{}"]))
+
+    monkeypatch.setattr(_http.requests.Session, "request", fake_request)
+
+    with pytest.raises(_http.ResponseDeadlineExceeded):
+        _http.bounded_request(
+            "GET",
+            "https://example.invalid/x",
+            timeout=15,
+            total_seconds=0.01,
+            monotonic=lambda: 1234.5,
+        )
+
+    assert len(made) >= 2, "the timer was armed once and never again"
+    for timer in made:
+        if timer.is_alive():
+            timer.join(5)
+    assert not any(timer.is_alive() for timer in made), "a timer outlived the call"
 
 
 def test_the_pool_hook_records_the_connection_once():

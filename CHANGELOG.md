@@ -50,6 +50,19 @@ call that answers in under a second answers exactly as it did.
   no pool, cookie jar or connection survives a refresh, exactly as
   `requests.request` already behaved.
 
+  **A timer that fires before the socket exists looks again**, every 0.25 s
+  until the call ends. `getaddrinfo` runs before any socket is made and
+  outside every timeout this app sets, so a resolver slower than the deadline
+  used to leave the timer with nothing to shut down - and, because it fired
+  only once, with nothing bounding the status line, the header block or the
+  body after it either. Measured at the scaled constants, that was 40 s and
+  70 s against a 4.0 s bound, both ended by the harness rather than by the
+  app; with the re-arm it is 3.75 s. Name resolution itself is still outside
+  the bound, here as in plain `requests`, and the docstring, `SECURITY.md`
+  and `docs/next-session.md` 8.3 now say so instead of implying otherwise:
+  one call returns or raises within 45 s **of the socket**, plus whatever the
+  resolver spends before it.
+
   Measured on a dripping loopback server with the constants scaled down
   (1 s socket timeout, 3 s total, so the promised bound is 4.0 s). Before, on
   the body: a 40-byte drip - 8 s of server - returned after **7.81 s**, the
@@ -62,8 +75,11 @@ call that answers in under a second answers exactly as it did.
   `iter_content(1)` fallback no better. After: **`ResponseDeadlineExceeded`
   at 3.00 s on every one of them**, and on the body drips, inside the
   predicted 4.0 s. In the shipped units (30 s total, 15 s timeout, declared
-  worst case 45 s) a header drip of one byte every 10 s went from **90.0 s**
-  to **30.0 s**. A server flooding chunked data against a 1 MiB cap:
+  worst case 45 s) a header drip of one byte every 10 s went from
+  **unbounded** - still inside the call when a 100 s harness gave up watching
+  - to **30.0 s**. (An earlier draft of this entry said 90.0 s there. That is
+  the second at which the harness's server stopped dripping, not the one at
+  which the call ended.) A server flooding chunked data against a 1 MiB cap:
   `ResponseTooLarge` at 0.00 s. (An earlier draft of this entry said how many
   bytes that server had managed to push; that number says how fast the server
   got going, not anything about the bound, and it did not reproduce.)

@@ -718,7 +718,8 @@ unnecessary source of behaviour change.
   same deadline that shuts the connection's socket down from another thread.
   It is the only one of the four that bounds the socket, and the only one
   that frees a worker already stuck. The bound covers **connect, headers and
-  body**: the in-band check cannot see inside one read, and two phases live
+  body** - everything from the socket onwards, name resolution excepted (see
+  below): the in-band check cannot see inside one read, and two phases live
   there - the header block (every arriving byte resets the per-socket
   timeout, and `bounded_request`'s own clock is not reached until the headers
   are complete) and a `Content-Encoding` body that decodes to nothing
@@ -738,9 +739,23 @@ unnecessary source of behaviour change.
   130 s for Copilot, 135 s for OpenRouter and 495 s for Azure, and each
   provider tells the App that number. The formula did not move when the timer
   landed - `total_seconds` is the larger term at every timeout here, so the
-  bound is `total_seconds + read`, and the `+ read` is the one read that can
-  begin after a timer which fired between the connection being handed out and
-  its socket existing. What moved is that it is now a bound. Measured against
+  bound is `total_seconds + read`, and the `+ read` is the one read the cut
+  socket can leave in flight. A timer that fires before the socket exists
+  cannot cut anything, so it **re-arms every 0.25 s until the call ends**
+  rather than giving up: the first cut of this release gave up there, and a
+  resolver slower than the deadline then left the status line, the header
+  block and the body bounded by nothing again (measured at the scaled
+  constants: 40 s and 70 s against a 4.0 s bound, ended by the harness rather
+  than by the app, and 3.75 s once the timer looks again). What the bound
+  does **not** cover is name resolution: `getaddrinfo` runs before any socket
+  exists, so neither the connect timeout nor the timer reaches it and the OS
+  resolver's own timeout is what ends it - added to the 45 s rather than
+  counted inside it, through plain `requests` just the same (a resolver
+  blocking 20 s held both for 20.00 s against a 4.0 s bound). The App
+  watchdog is the backstop there and not a fix: it ends the App's wait, and
+  the worker stays in `getaddrinfo` until the resolver gives up; the real
+  answer is resolution on a thread, which is a bigger change than this one.
+  What moved is that it is now a bound. Measured against
   a dripping loopback server with the constants scaled down (1 s socket
   timeout, 3 s total, promised bound 4.0 s): a 40-byte body drip returned
   after 7.81 s with the timeout never firing and a 5 000-byte drip still held
@@ -748,8 +763,11 @@ unnecessary source of behaviour change.
   block, a header block that never ends and a chunked or `Content-Length`
   gzip-of-nothing each held the worker to the harness's 40 s cap before, and
   all of them raise `ResponseDeadlineExceeded` at 3.00 s after. In shipped
-  units a header drip of a byte every 10 s went from 90.0 s to 30.0 s against
-  a declared 45 s.
+  units a header drip of a byte every 10 s went from unbounded - still inside
+  the call when a 100 s harness gave up watching - to 30.0 s against a
+  declared 45 s. (An earlier draft of this paragraph said "90.0 s" there.
+  That was the second at which the *server* stopped dripping, not the one at
+  which the call ended, so it understated the before-state.)
 
   What is still true: **the pool is still shared**. Three REST providers
   still submit to `QThreadPool.globalInstance()`, so they still compete for
@@ -759,6 +777,22 @@ unnecessary source of behaviour change.
   available as containment for that, and still frees nothing on its own. (d),
   a busy flag on the provider, is still moot: the park does that job from the
   App side, without writing a provider attribute from a pool thread.
+
+  Two residuals of the transport itself, recorded rather than fixed. **Name
+  resolution is outside the bound** - the paragraph above - so a worker can
+  be held for the OS resolver's own timeout on top of the 130/135/495 s these
+  budgets promise, and a watchdog can therefore still fire inside a refresh
+  that has not exceeded its own bound. Fixing it means resolving on a thread
+  and cancelling that, which is a change to how every call is made rather
+  than a clause in this one. **A server that closes the connection inside the
+  header block is a successful, empty 200** - `http.client` treats EOF as the
+  end of the headers, so `bounded_request` hands back a 200 with no body and
+  the call site reports whatever `.json()` says about an empty document
+  (plain `requests` does the same, so it is not this release's doing). The
+  helper cannot tell that from a legitimate empty body - a 204, or a HEAD -
+  so the judgement belongs at the call sites; Copilot's username resolve,
+  where it produced "PAT may lack read:user" for a truncated reply, is the
+  one that had it wrong and is fixed.
 
   Two things surfaced in the doing, and are worth not re-learning. First,
   `Response.iter_content(chunk_size=N)` cannot implement this. urllib3's
