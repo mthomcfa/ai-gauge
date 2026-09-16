@@ -18,6 +18,7 @@ from pydantic import (
     model_validator,
 )
 
+from .atomic_write import atomic_write
 from .platforms import APP_NAME, get_platform
 
 log = logging.getLogger("aigauge.config")
@@ -714,7 +715,7 @@ def _quarantine_config(path: Path, raw: str) -> None:
     """
     backup = path.with_suffix(path.suffix + ".corrupt")
     try:
-        backup.write_text(raw, encoding="utf-8")
+        atomic_write(backup, raw.encode("utf-8"), prefix=".config-corrupt-")
     except OSError:
         log.exception("config: could not preserve %s", path)
         return
@@ -951,11 +952,35 @@ class Config(BaseModel):
             copilot["monthly_quota"] = 1500
 
     def save(self) -> None:
+        """Write the whole model to ``config.json``, atomically.
+
+        A temp file in the same directory plus ``os.replace``, the same
+        discipline ``secrets.dat`` and the meter catalog already use, so a
+        reader sees the old document or the new one and never half of either.
+        A bare ``write_text`` truncates first, and since 1.3.1+cfa.6 the app
+        writes this file *on its own* - at every deferred-purge drain, from
+        ``App.__init__`` and from the five-minute heartbeat - so a crash or a
+        power cut inside a write the user never asked for could take every
+        setting with it. The loader survives that (``config.json.corrupt``
+        plus defaults) but the settings are gone.
+
+        No ``mode``: ``config.json`` holds no secret - the ids in it are not
+        credentials, and every credential lives in the OS store - and the
+        catalog's ``0600`` is for page-derived data. On Windows it relies on
+        the user-scoped ``%APPDATA%`` location exactly as it always has.
+
+        Raises ``OSError`` on a full disk or a refused write, which is what it
+        raised before; callers that swallow it still do and callers that do
+        not still do not. On Windows ``os.replace`` over a file another
+        process holds open raises ``PermissionError``, which is an ``OSError``
+        and follows the same contract.
+        """
         path = config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(self.model_dump(), indent=2, default=str),
-            encoding="utf-8",
+        atomic_write(
+            path,
+            json.dumps(self.model_dump(), indent=2, default=str).encode("utf-8"),
+            prefix=".config-",
         )
 
 

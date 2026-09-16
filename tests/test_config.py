@@ -891,3 +891,117 @@ def test_the_pending_purge_list_is_bounded_in_length_and_in_entries():
     ).pending_profile_purges
     assert len(many) == _PENDING_PURGE_LIMIT
     assert many[0] == "codex-00000000", "the cap took the wrong end of the list"
+
+
+# --- config.json is written atomically --------------------------------------
+#
+# Since 1.3.1+cfa.6 the app writes this file on its own - at every deferred
+# purge drain, from `App.__init__` and from the five-minute heartbeat - so a
+# crash inside a write the user never asked for could truncate the file that
+# holds every setting plus both pending lists. The loader survives that and
+# the settings do not.
+
+
+def _write_a_config(**kwargs) -> str:
+    cfg = Config(**kwargs)
+    cfg.save()
+    return config_path().read_text(encoding="utf-8")
+
+
+def test_a_save_that_cannot_replace_leaves_the_previous_file_intact():
+    import os
+
+    before = _write_a_config(refresh_interval_minutes=42)
+    real_replace = os.replace
+
+    def refuse(src, dst):
+        raise OSError(28, "No space left on device")
+
+    try:
+        os.replace = refuse
+        with pytest.raises(OSError):
+            Config(refresh_interval_minutes=7).save()
+    finally:
+        os.replace = real_replace
+
+    assert config_path().read_text(encoding="utf-8") == before
+    assert list(config_path().parent.glob("*.tmp")) == [], "a temp file was left behind"
+
+
+def test_a_save_interrupted_before_the_replace_leaves_the_old_file():
+    """The window a bare `write_text` could not survive: the bytes are down but
+    the rename has not happened."""
+    import os
+
+    before = _write_a_config(active_refresh_interval_minutes=3)
+    real_fsync = os.fsync
+
+    def refuse(fd):
+        raise OSError(5, "Input/output error")
+
+    try:
+        os.fsync = refuse
+        with pytest.raises(OSError):
+            Config(active_refresh_interval_minutes=9).save()
+    finally:
+        os.fsync = real_fsync
+
+    assert config_path().read_text(encoding="utf-8") == before
+    assert list(config_path().parent.glob("*.tmp")) == []
+
+
+def test_a_normal_save_round_trips_and_leaves_nothing_beside_it():
+    Config(refresh_interval_minutes=33, expanded_tiles=["claude"]).save()
+
+    loaded = Config.load()
+    assert loaded.refresh_interval_minutes == 33
+    assert loaded.expanded_tiles == ["claude"]
+    assert [p.name for p in config_path().parent.iterdir()] == ["config.json"]
+
+
+def test_the_file_arrives_by_replace_rather_than_by_truncating_it():
+    """The property, not the spelling: the previous document is replaced whole
+    rather than opened for writing."""
+    import os
+
+    seen: list = []
+    real_replace = os.replace
+
+    def spy(src, dst):
+        seen.append((str(src), str(dst)))
+        return real_replace(src, dst)
+
+    try:
+        os.replace = spy
+        Config().save()
+    finally:
+        os.replace = real_replace
+
+    assert len(seen) == 1
+    src, dst = seen[0]
+    assert dst == str(config_path())
+    assert src != dst and ".config-" in src
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+def test_the_saved_file_is_owner_only_on_posix():
+    """Not asked for - `mkstemp` creates 0600 and `os.replace` carries the temp
+    file's mode across. Pinned rather than left implicit: it is a tightening
+    (a bare `write_text` gave 0644 under the usual umask) and the one thing
+    about the write that a reader could be surprised by.
+    """
+    import stat
+
+    Config().save()
+    assert stat.S_IMODE(config_path().stat().st_mode) == 0o600
+
+
+def test_a_quarantined_config_is_written_the_same_way():
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text("{ not json", encoding="utf-8")
+
+    Config.load()
+
+    backup = config_path().with_suffix(config_path().suffix + ".corrupt")
+    assert backup.read_text(encoding="utf-8") == "{ not json"
+    assert list(config_path().parent.glob("*.tmp")) == []
