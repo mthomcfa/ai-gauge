@@ -9,6 +9,7 @@ import requests
 
 from ..config import Config, get_github_pat
 from ..models import SnapshotStatus, UsageMetric, UsageSnapshot
+from ._http import bounded_request, request_worst_case_seconds
 from .base import Provider
 
 GITHUB_API = "https://api.github.com"
@@ -17,6 +18,22 @@ COPILOT_PRODUCT = "copilot"
 COPILOT_AI_CREDITS_SKU = "copilot_ai_credits"
 COPILOT_AI_UNIT_SKU = "copilot_ai_unit"
 LEGACY_PREMIUM_REQUEST_SKU = "copilot_premium_request"
+# Per-socket timeouts, unchanged. They bound one connect or one read; what
+# bounds the whole exchange is bounded_request's own deadline - see _http.py.
+USERNAME_TIMEOUT = 10
+USAGE_TIMEOUT = 15
+# What one refresh may spend on the wire, so the App's watchdog can be told
+# the truth instead of the flat 60 s default. work() makes at most three
+# sequential calls: the username resolve, the credit-usage read, and the
+# legacy premium fallback (reached either from a 400/404 on the credit read
+# or from a credit read that came back with no credit rows - never both).
+#   40 + 45 + 45 = 130 s
+# Before this release the same sum was unbounded, because a dripping server
+# held any one of those three forever; the flat 60 s was a guess at a nominal
+# ceiling (10 + 15 + 15 of per-socket timeouts) that nothing enforced.
+REFRESH_WORST_CASE_SECONDS = request_worst_case_seconds(
+    USERNAME_TIMEOUT
+) + 2 * request_worst_case_seconds(USAGE_TIMEOUT)
 log = logging.getLogger("aigauge.providers.copilot")
 
 
@@ -58,10 +75,11 @@ def _resolve_username(pat: str, configured: str | None) -> str | None:
     if configured:
         return configured
     try:
-        r = requests.get(
+        r = bounded_request(
+            "GET",
             f"{GITHUB_API}/user",
             headers=_github_headers(pat),
-            timeout=10,
+            timeout=USERNAME_TIMEOUT,
         )
         if r.status_code == 200:
             return r.json().get("login")
@@ -71,11 +89,12 @@ def _resolve_username(pat: str, configured: str | None) -> str | None:
 
 
 def _fetch_user_premium_usage(pat: str, username: str) -> dict:
-    r = requests.get(
+    r = bounded_request(
+        "GET",
         f"{GITHUB_API}/users/{username}/settings/billing/premium_request/usage",
         params=_usage_params(),
         headers=_github_headers(pat),
-        timeout=15,
+        timeout=USAGE_TIMEOUT,
     )
     r.raise_for_status()
     payload = r.json()
@@ -84,11 +103,12 @@ def _fetch_user_premium_usage(pat: str, username: str) -> dict:
 
 
 def _fetch_user_credit_usage(pat: str, username: str) -> dict:
-    r = requests.get(
+    r = bounded_request(
+        "GET",
         f"{GITHUB_API}/users/{username}/settings/billing/usage/summary",
         params=_summary_params(),
         headers=_github_headers(pat),
-        timeout=15,
+        timeout=USAGE_TIMEOUT,
     )
     r.raise_for_status()
     payload = r.json()
@@ -97,11 +117,12 @@ def _fetch_user_credit_usage(pat: str, username: str) -> dict:
 
 
 def _fetch_org_premium_usage(pat: str, org: str, username: str) -> dict:
-    r = requests.get(
+    r = bounded_request(
+        "GET",
         f"{GITHUB_API}/organizations/{org}/settings/billing/premium_request/usage",
         params=_usage_params(username),
         headers=_github_headers(pat),
-        timeout=15,
+        timeout=USAGE_TIMEOUT,
     )
     r.raise_for_status()
     payload = r.json()
@@ -110,11 +131,12 @@ def _fetch_org_premium_usage(pat: str, org: str, username: str) -> dict:
 
 
 def _fetch_org_credit_usage(pat: str, org: str) -> dict:
-    r = requests.get(
+    r = bounded_request(
+        "GET",
         f"{GITHUB_API}/organizations/{org}/settings/billing/usage/summary",
         params=_summary_params(),
         headers=_github_headers(pat),
-        timeout=15,
+        timeout=USAGE_TIMEOUT,
     )
     r.raise_for_status()
     payload = r.json()
@@ -369,6 +391,10 @@ def _log_snapshot_decision(
 class CopilotProvider(Provider):
     name = "copilot"
     display_name = "Copilot"
+    # Declared rather than taking app.py's flat _REST_REFRESH_BUDGET_SECONDS:
+    # three bounded calls do not fit 60 s, and the watchdog must not fire
+    # inside a refresh that is still inside its own bound.
+    refresh_budget_seconds = REFRESH_WORST_CASE_SECONDS
 
     def __init__(self, config: Config, pool=None):
         self._config = config

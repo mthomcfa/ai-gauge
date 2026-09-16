@@ -3069,3 +3069,115 @@ def test_a_forecast_equal_to_the_spend_so_far_is_still_shown():
         AzureConfig(monthly_allowance=150.0),
     )
     assert snapshot.metrics[-1].label == "Forecast end of month"
+
+
+# --- the total-response deadline -------------------------------------------
+
+
+@responses.activate
+def test_a_response_deadline_is_recorded_like_any_other_transport_failure(
+    monkeypatch, config
+):
+    """A dripping ARM endpoint held a pool slot until the process exited.
+
+    It now ends the refresh as an ERROR, and - the part that matters here -
+    it is *remembered*, so the hourly floor is not switched off by it. An
+    exception that leaves `_State` blank is an exception that turns a
+    tenant-wide rate-limit promise into a fetch every five minutes.
+    """
+    from aigauge.providers._http import ResponseDeadlineExceeded
+
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    responses.add(
+        responses.POST,
+        TOKEN_URL,
+        json={"access_token": "tok", "expires_in": 3600},
+        status=200,
+    )
+
+    def boom(token, url, body, what):
+        raise ResponseDeadlineExceeded("Response deadline exceeded (30s).")
+
+    monkeypatch.setattr(az, "arm_post", boom)
+
+    pool = _InlinePool()
+    provider = az.AzureProvider(config, pool=pool)
+    captured: list = []
+    provider.refresh(captured.append)
+
+    assert pool.started == 1
+    assert len(captured) == 1, "on_done was not called exactly once"
+    snapshot = captured[0]
+    assert snapshot.status == SnapshotStatus.ERROR
+    # `_exception_summary`, so the type name and never the message: every ARM
+    # URL in this module carries /subscriptions/<guid>/.
+    assert "ResponseDeadlineExceeded" in (snapshot.error or "")
+    assert "management.azure.com" not in (snapshot.error or "")
+    assert SUB not in (snapshot.error or "")
+
+    state = az.state_for(SUB)
+    assert state.last_error is not None, "the hourly floor was switched off"
+    assert state.blocked_until is not None
+    assert state.consecutive_errors == 1
+    assert state.in_flight is False
+
+    # And the next refresh inside the hour serves the remembered error rather
+    # than going back to the network.
+    calls = len(responses.calls)
+    second: list = []
+    provider.refresh(second.append)
+    assert len(responses.calls) == calls, "a second refresh reached the network"
+    assert second[0] is state.last_error
+    assert pool.started == 1, "a second work item was dispatched inside the window"
+
+
+@responses.activate
+def test_a_response_too_large_is_recorded_the_same_way(monkeypatch, config):
+    """The other half of the bound, on the call that can actually produce a
+    large body: a Cost Management page."""
+    from aigauge.providers._http import ResponseTooLarge
+
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    responses.add(
+        responses.POST,
+        TOKEN_URL,
+        json={"access_token": "tok", "expires_in": 3600},
+        status=200,
+    )
+
+    def boom(token, url, body, what):
+        raise ResponseTooLarge("Response exceeded the 8388608-byte limit.")
+
+    monkeypatch.setattr(az, "arm_post", boom)
+
+    snapshot = _run_through_pool(az.AzureProvider(config, pool=_InlinePool()))
+
+    assert snapshot.status == SnapshotStatus.ERROR
+    assert "ResponseTooLarge" in (snapshot.error or "")
+    assert az.state_for(SUB).blocked_until is not None
+
+
+@responses.activate
+def test_an_entra_token_deadline_does_not_read_as_a_rejected_registration(
+    monkeypatch, config
+):
+    """`get_token` raises AzureAuthError for a refusal and RequestException for
+    a transport failure. A deadline is the second, so the tile must not tell
+    the user to go and fix their app registration."""
+    from aigauge.providers import _azure_auth
+    from aigauge.providers._http import ResponseDeadlineExceeded
+
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+
+    def boom(*args, **kwargs):
+        raise ResponseDeadlineExceeded("Response deadline exceeded (30s).")
+
+    monkeypatch.setattr(_azure_auth, "bounded_request", boom)
+
+    snapshot = _run_through_pool(az.AzureProvider(config, pool=_InlinePool()))
+
+    assert snapshot.status == SnapshotStatus.ERROR
+    assert "Could not reach Entra ID" in (snapshot.error or "")
+    assert "ResponseDeadlineExceeded" in (snapshot.error or "")
+    assert TENANT not in (snapshot.error or "")
+    assert az.state_for(SUB).last_error is not None

@@ -765,16 +765,28 @@ def test_the_watchdog_budget_follows_the_providers_own_bound():
     from aigauge.providers.azure import (
         MAX_FIXED_REQUESTS_PER_REFRESH,
         REFRESH_DEADLINE_SECONDS,
-        REQUEST_TIMEOUT,
+        REQUEST_WORST_CASE_SECONDS,
     )
 
+    # The per-request term is a whole *call's* worst case, not the per-socket
+    # REQUEST_TIMEOUT it used to be: a timeout bounds one read, and until
+    # 1.3.2+cfa.7 nothing bounded the exchange the watchdog has to allow for.
     assert _refresh_budget_seconds(AzureProvider) == (
         REFRESH_DEADLINE_SECONDS
-        + (MAX_FIXED_REQUESTS_PER_REFRESH + 1) * REQUEST_TIMEOUT
+        + (MAX_FIXED_REQUESTS_PER_REFRESH + 1) * REQUEST_WORST_CASE_SECONDS
     )
     assert _refresh_budget_seconds(AzureProvider) > REFRESH_DEADLINE_SECONDS
-    # A plain REST provider gets the flat budget.
-    assert _refresh_budget_seconds(CopilotProvider) == 60
+    # Copilot and OpenRouter now name their own bound too - three bounded
+    # calls do not fit the flat 60 s default.
+    from aigauge.providers.copilot import REFRESH_WORST_CASE_SECONDS as COPILOT_WORST
+    from aigauge.providers.openrouter import (
+        OpenRouterProvider,
+        REFRESH_WORST_CASE_SECONDS as OPENROUTER_WORST,
+    )
+
+    assert _refresh_budget_seconds(CopilotProvider) == COPILOT_WORST
+    assert _refresh_budget_seconds(OpenRouterProvider) == OPENROUTER_WORST
+    assert COPILOT_WORST > 60 and OPENROUTER_WORST > 60
 
 
 def test_a_retry_wake_refreshes_only_the_providers_that_are_due(caplog):

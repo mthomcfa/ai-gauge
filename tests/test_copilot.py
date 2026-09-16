@@ -221,3 +221,99 @@ def test_config_smoke():
     # Don't actually call refresh — needs Qt event loop.
     provider = CopilotProvider(cfg, pool=None)
     assert provider.name == "copilot"
+
+
+# --- the total-response deadline -------------------------------------------
+
+
+class _InlinePool:
+    """A QThreadPool double that runs the runnable on this thread.
+
+    The real `_Worker.run` - and with it the blanket handler that turns an
+    unexpected exception into an ERROR snapshot - is otherwise never executed
+    by the suite.
+    """
+
+    def __init__(self):
+        self.started = 0
+
+    def start(self, runnable):
+        self.started += 1
+        runnable.run()
+
+
+def test_a_response_deadline_ends_the_refresh_as_an_error(monkeypatch, caplog):
+    """A dripping GitHub endpoint used to hold a pool slot forever.
+
+    It now fails like any other transport failure: an ERROR tile, not
+    AUTH_REQUIRED - the PAT is fine - and one call to `on_done`.
+    """
+    import logging
+
+    import aigauge.providers.copilot as copilot_mod
+    from aigauge.providers._http import ResponseDeadlineExceeded
+    from aigauge.providers.copilot import CopilotProvider
+
+    monkeypatch.setattr(copilot_mod, "get_github_pat", lambda: "ghp_test")
+
+    def boom(*args, **kwargs):
+        raise ResponseDeadlineExceeded("Response deadline exceeded (30s).")
+
+    monkeypatch.setattr(copilot_mod, "bounded_request", boom)
+
+    cfg = Config()
+    # Configured, so the failure lands on the usage read rather than on the
+    # username resolve - which answers AUTH_REQUIRED for any transport error
+    # by design.
+    cfg.copilot.username = "octocat"
+    captured: list = []
+    pool = _InlinePool()
+    with caplog.at_level(logging.INFO, logger="aigauge"):
+        CopilotProvider(cfg, pool=pool).refresh(captured.append)
+
+    assert pool.started == 1
+    assert len(captured) == 1, "on_done was not called exactly once"
+    snap = captured[0]
+    assert snap.status == SnapshotStatus.ERROR
+    assert "deadline" in (snap.error or "").lower()
+    # The string reaches the tile tooltip, which does not redact.
+    assert "api.github.com" not in (snap.error or "")
+
+    line = next(
+        record.getMessage()
+        for record in caplog.records
+        if "classification=unexpected_exception" in record.getMessage()
+    )
+    # The type name, never the message: this record goes to the file users are
+    # invited to attach to a bug report.
+    assert "type=ResponseDeadlineExceeded" in line
+    assert "deadline exceeded (30s)" not in line
+
+
+def test_a_username_resolve_that_outruns_the_deadline_is_not_a_crash(monkeypatch):
+    """`_resolve_username` already swallows every RequestException; the two new
+    ones must land in the same branch rather than escaping to the worker."""
+    import aigauge.providers.copilot as copilot_mod
+    from aigauge.providers._http import ResponseTooLarge
+    from aigauge.providers.copilot import _resolve_username
+
+    def boom(*args, **kwargs):
+        raise ResponseTooLarge("Response exceeded the 8388608-byte limit.")
+
+    monkeypatch.setattr(copilot_mod, "bounded_request", boom)
+    assert _resolve_username("ghp_test", configured=None) is None
+
+
+def test_copilot_advertises_the_budget_its_three_calls_need():
+    from aigauge.providers._http import request_worst_case_seconds
+    from aigauge.providers.copilot import (
+        REFRESH_WORST_CASE_SECONDS,
+        USAGE_TIMEOUT,
+        USERNAME_TIMEOUT,
+        CopilotProvider,
+    )
+
+    assert CopilotProvider.refresh_budget_seconds == REFRESH_WORST_CASE_SECONDS
+    assert REFRESH_WORST_CASE_SECONDS == request_worst_case_seconds(
+        USERNAME_TIMEOUT
+    ) + 2 * request_worst_case_seconds(USAGE_TIMEOUT)

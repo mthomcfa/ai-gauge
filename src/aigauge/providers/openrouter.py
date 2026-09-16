@@ -9,9 +9,21 @@ import requests
 
 from ..config import Config, get_openrouter_key, get_openrouter_mgmt_key
 from ..models import SnapshotStatus, UsageMetric, UsageSnapshot
+from ._http import bounded_request, request_worst_case_seconds
 from .base import Provider
 
 OPENROUTER_API = "https://openrouter.ai/api/v1"
+# Per-socket timeout, unchanged: it bounds one connect or one read. What bounds
+# the whole exchange is bounded_request's own deadline - see _http.py.
+REQUEST_TIMEOUT = 15
+# What one refresh may spend on the wire. work() makes three sequential calls
+# when a management key is configured - /credits, /key, /activity - and two
+# without one, so three is the worst case:
+#   3 x 45 = 135 s
+# Declared for the same reason Copilot declares its own: three bounded calls do
+# not fit app.py's flat 60 s default, and a watchdog firing inside a refresh
+# that is still inside its own bound manufactures the failure it catches.
+REFRESH_WORST_CASE_SECONDS = 3 * request_worst_case_seconds(REQUEST_TIMEOUT)
 # The key NAMES in a response are chosen by openrouter.ai, unbounded in both
 # count and length, and these lines are written to the file handler on every
 # healthy refresh. That handler is a RotatingFileHandler of 512 KiB x 3
@@ -64,10 +76,11 @@ def _fetch_credits(api_key: str) -> dict | None:
     the configured management key is invalid, which the caller surfaces as
     AUTH_REQUIRED rather than silently hiding the credits row.
     """
-    r = requests.get(
+    r = bounded_request(
+        "GET",
         f"{OPENROUTER_API}/credits",
         headers=_headers(api_key),
-        timeout=15,
+        timeout=REQUEST_TIMEOUT,
     )
     r.raise_for_status()
     payload = r.json()
@@ -84,10 +97,11 @@ def _fetch_credits(api_key: str) -> dict | None:
 
 
 def _fetch_key_info(api_key: str) -> dict:
-    r = requests.get(
+    r = bounded_request(
+        "GET",
         f"{OPENROUTER_API}/key",
         headers=_headers(api_key),
-        timeout=15,
+        timeout=REQUEST_TIMEOUT,
     )
     r.raise_for_status()
     payload = r.json()
@@ -116,11 +130,12 @@ def _fetch_activity(
     /activity requires a management key per OpenRouter docs.
     """
     try:
-        r = requests.get(
+        r = bounded_request(
+            "GET",
             f"{OPENROUTER_API}/activity",
             headers=_headers(api_key),
             params={"date": activity_date} if activity_date else None,
-            timeout=15,
+            timeout=REQUEST_TIMEOUT,
         )
     except requests.RequestException as exc:
         log.warning(
@@ -386,6 +401,7 @@ def _build_snapshot(
 class OpenRouterProvider(Provider):
     name = "openrouter"
     display_name = "OpenRouter"
+    refresh_budget_seconds = REFRESH_WORST_CASE_SECONDS
 
     def __init__(self, config: Config, pool=None):
         self._config = config

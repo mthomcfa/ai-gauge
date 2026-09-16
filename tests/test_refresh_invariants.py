@@ -302,8 +302,16 @@ def _run_azure_hour(clock, caplog, *, watchdog_route: bool) -> int:
         app.refresh_now(manual=True)
         assert app._inflight == {"azure"}  # noqa: SLF001
         # Azure's watchdog budget is its real worst case, so give the
-        # watchdog time to fire before the hour under test starts.
-        clock.run_until(400.0)
+        # watchdog time to fire before the hour under test starts. Derived
+        # from the provider's own bound rather than written out: 1.3.2+cfa.7
+        # re-derived that bound from a per-*call* worst case instead of a
+        # per-socket timeout, and a hard-coded 400 s silently stopped waiting
+        # long enough for the watchdog to fire at all.
+        from aigauge.app import _WATCHDOG_SLACK_SECONDS
+
+        clock.run_until(
+            az.REFRESH_WORST_CASE_SECONDS + _WATCHDOG_SLACK_SECONDS + 100.0
+        )
         assert app._snapshots["azure"].status is SnapshotStatus.ERROR  # noqa: SLF001
     else:
         # The ordinary user sequence. The offline burst: one live fetch that

@@ -48,6 +48,7 @@ import requests
 from ..config import Config, get_azure_client_secret, validate_azure_guid
 from ..models import SnapshotStatus, UsageMetric, UsageSnapshot
 from ._azure_auth import AzureAuthError, clear_cache, get_token, invalidate
+from ._http import bounded_request, request_worst_case_seconds
 from .base import Provider
 
 log = logging.getLogger("aigauge.providers.azure")
@@ -62,7 +63,15 @@ SUBSCRIPTIONS_API_VERSION = "2022-12-01"
 # would share a single bucket with every other caller in the world that also
 # omits it.
 CLIENT_TYPE = "ai-gauge"
+# Per-socket timeout, unchanged: it bounds one connect or one read.
 REQUEST_TIMEOUT = 15
+# What one ARM call may actually take, end to end. `requests`' timeout is per
+# socket operation, so before 1.3.2+cfa.7 this number did not exist: a server
+# dripping a byte every 14 s held the call - and a slot of the global
+# QThreadPool - forever. bounded_request gives it a total, and the worst case
+# is derived from that bound rather than restated here:
+#   max(connect 15, total 30) + read 15 = 45 s
+REQUEST_WORST_CASE_SECONDS = request_worst_case_seconds(REQUEST_TIMEOUT)
 
 # The floor between two live fetches. See the module docstring: the refresh
 # scheduler above us is far more eager than this API tolerates, and the quota
@@ -146,9 +155,14 @@ MAX_FIXED_REQUESTS_PER_REFRESH = 8
 # more request timeout because _RequestBudget.spend() checks *before* a
 # request - the one already in flight when the deadline passes still runs to
 # its own timeout.
+# The per-request term is the helper's worst case, not REQUEST_TIMEOUT: the
+# timeout bounds one socket read, and what the watchdog has to allow for is a
+# whole call. 90 + 9 x 45 = 495 s, against 90 + 9 x 15 = 225 before - the
+# number grew because it is now true, where the old one assumed a per-socket
+# timeout was a per-call bound.
 REFRESH_WORST_CASE_SECONDS = (
     REFRESH_DEADLINE_SECONDS
-    + (MAX_FIXED_REQUESTS_PER_REFRESH + 1) * REQUEST_TIMEOUT
+    + (MAX_FIXED_REQUESTS_PER_REFRESH + 1) * REQUEST_WORST_CASE_SECONDS
 )
 # A ceiling on what one response can cost us in memory and time. A period with
 # 50 000 daily ResourceId x ServiceName rows is already outside this tile's
@@ -1102,7 +1116,10 @@ def _json(response: requests.Response) -> Any:
 def arm_post(token: str, url: str, body: dict, what: str) -> requests.Response:
     # allow_redirects=False on every ARM call: the only host this module
     # speaks to is fixed, so a redirect is a failure, never something to follow.
-    response = requests.post(
+    # It is bounded_request's default now, and still passed explicitly here so
+    # the call site says what it relies on.
+    response = bounded_request(
+        "POST",
         url,
         json=body,
         headers=_headers(token),
@@ -1114,8 +1131,12 @@ def arm_post(token: str, url: str, body: dict, what: str) -> requests.Response:
 
 
 def arm_get(token: str, url: str, what: str) -> requests.Response:
-    response = requests.get(
-        url, headers=_headers(token), timeout=REQUEST_TIMEOUT, allow_redirects=False
+    response = bounded_request(
+        "GET",
+        url,
+        headers=_headers(token),
+        timeout=REQUEST_TIMEOUT,
+        allow_redirects=False,
     )
     _check(response, what)
     return response
