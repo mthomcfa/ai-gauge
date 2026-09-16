@@ -1345,6 +1345,70 @@ def test_a_healthy_calls_pool_is_handed_back_unwrapped(monkeypatch):
     assert pool._get_conn() is connection
 
 
+def test_a_pool_the_hook_declined_is_left_alone_by_the_un_watch(caplog):
+    """The adapter records every pool it is handed, wrapped or not.
+
+    `_watch_pool` declines one with no `_get_conn` of its own, so the
+    un-watch meets pools it never wrapped and must not delete blind: that
+    raises `AttributeError` from `bounded_request`'s `finally`, where it
+    would replace the call's own failure and take `session.close()` with it.
+    """
+    class _NoGetConn:
+        pass
+
+    class _Session:
+        def __init__(self, adapter):
+            self.adapters = {"https://": adapter}
+
+    pool = _NoGetConn()
+    deadline = _http._DeadlineShutdown(30.0)
+    assert _http._watch_pool(pool, deadline) is pool
+    adapter = _http._ConnectionRecordingAdapter(deadline)
+    adapter._watched.append(pool)
+
+    with caplog.at_level(logging.WARNING, logger="aigauge"):
+        _http._unwatch_pools(_Session(adapter))
+
+    assert "deadline_unwatch_failed" not in caplog.text
+    assert adapter._watched == []
+
+
+def test_a_failing_un_watch_hides_neither_the_call_nor_the_close(
+    monkeypatch, caplog
+):
+    """The `finally` runs three things, and the middle one reaches into
+    another project's private surface: `_watch_pool` assigns
+    `pool._get_conn` and the un-watch deletes it. A pool shape that refuses
+    either - a urllib3 whose pools have no instance dictionary - made the
+    un-watch raise where it replaced the call's real exception and skipped
+    the close, so every call leaked a `Session` and reported a type name no
+    call site can classify."""
+    closed: list = []
+    monkeypatch.setattr(
+        _http.requests.Session, "close", lambda self: closed.append(self)
+    )
+
+    def unwatch_boom(session):  # noqa: ARG001
+        raise TypeError("vars() argument must have __dict__ attribute")
+
+    monkeypatch.setattr(_http, "_unwatch_pools", unwatch_boom)
+
+    def fake_request(session, method, url, **kwargs):  # noqa: ARG001
+        raise requests.ConnectionError("the call's own failure")
+
+    monkeypatch.setattr(_http.requests.Session, "request", fake_request)
+
+    with caplog.at_level(logging.WARNING, logger="aigauge"):
+        with pytest.raises(requests.ConnectionError):
+            _http.bounded_request(
+                "GET", "https://example.invalid/x", timeout=15
+            )
+
+    assert len(closed) == 1, "the session was left open by a failed un-watch"
+    assert caplog.text.count("deadline_unwatch_failed=True") == 1
+    assert "://" not in caplog.text
+
+
 def test_a_deadline_that_never_learned_a_connection_says_so_once(caplog):
     """The failure mode the line above exists for is silent by construction:
     `_fire` finds no connection and returns. One warning, from the timer

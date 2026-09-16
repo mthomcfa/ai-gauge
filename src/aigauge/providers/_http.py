@@ -480,8 +480,12 @@ def _unwatch_pools(session: requests.Session) -> None:
             continue
         for pool in watched:
             # Not every watched pool was wrapped: _watch_pool declines one
-            # that has no _get_conn of its own.
-            if "_get_conn" in vars(pool):
+            # that has no _get_conn of its own, and the adapter records the
+            # pool either way. `__dict__` rather than `vars()` because this
+            # is a third-party class and one without an instance dictionary
+            # would make `vars()` raise - out of a `finally`, where anything
+            # raised replaces the call's own exception.
+            if "_get_conn" in getattr(pool, "__dict__", ()):
                 del pool._get_conn
                 pool._aigauge_watched = False
         watched.clear()
@@ -597,8 +601,20 @@ def bounded_request(
         # body is drained or the call has failed, and never when the request
         # returns.
         deadline.cancel()
-        _unwatch_pools(session)
-        session.close()
+        try:
+            _unwatch_pools(session)
+        except Exception:  # noqa: BLE001
+            # This runs in the `finally`, so anything raised here would
+            # replace the call's own exception and skip the close with it -
+            # measured: a `TypeError` from `vars()` on a pool with no
+            # instance dictionary, in place of the `AttributeError` that
+            # actually failed the call, and a leaked `Session` every time.
+            # The hook reaches into urllib3's private surface, so the day it
+            # stops fitting is a dependency upgrade, and the honest answer is
+            # one line and a pool left wrapped for the collector.
+            log.warning("provider http deadline_unwatch_failed=True")
+        finally:
+            session.close()
 
     # The idiom requests itself uses when it has consumed a streamed body and
     # wants the Response to behave like a buffered one (see Response.content,
