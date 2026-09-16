@@ -498,18 +498,119 @@ def test_an_exception_that_is_not_a_request_failure_names_its_type_too(caplog):
     ), "a traceback whose last line is the exception message"
 
 
-def test_a_username_resolve_that_outruns_the_deadline_is_not_a_crash(monkeypatch):
-    """`_resolve_username` already swallows every RequestException; the two new
-    ones must land in the same branch rather than escaping to the worker."""
+def _username_rows():
+    """The failure classes a refresh can meet on `/user`.
+
+    An int is a reply GitHub sent; anything else is raised by the transport
+    instead of answering.
+    """
+    from aigauge.providers._http import (
+        ResponseDeadlineExceeded,
+        ResponseEncodingRefused,
+        ResponseRedirected,
+        ResponseTooLarge,
+    )
+
+    refused = "Could not resolve GitHub username (PAT may lack read:user)."
+    return [
+        pytest.param(
+            ResponseDeadlineExceeded("Response deadline exceeded (30s)."),
+            SnapshotStatus.ERROR,
+            "GitHub request failed: Response deadline exceeded (30s).",
+            id="deadline",
+        ),
+        pytest.param(
+            ResponseTooLarge("Response exceeded the 8388608-byte limit."),
+            SnapshotStatus.ERROR,
+            "GitHub request failed: Response exceeded the 8388608-byte limit.",
+            id="large",
+        ),
+        pytest.param(
+            ResponseEncodingRefused(
+                "Response declared 2 content encodings; this app reads at most one."
+            ),
+            SnapshotStatus.ERROR,
+            "GitHub request failed: Response declared 2 content encodings; "
+            "this app reads at most one.",
+            id="coding",
+        ),
+        pytest.param(
+            ResponseRedirected(
+                "The endpoint redirected (301); this app does not follow redirects."
+            ),
+            SnapshotStatus.ERROR,
+            "GitHub request failed: The endpoint redirected (301); "
+            "this app does not follow redirects.",
+            id="redirect",
+        ),
+        pytest.param(
+            requests.exceptions.InvalidJSONError("not json"),
+            SnapshotStatus.ERROR,
+            "GitHub request failed (InvalidJSONError).",
+            id="json",
+        ),
+        pytest.param(
+            requests.ConnectionError("offline"),
+            SnapshotStatus.ERROR,
+            "GitHub request failed (ConnectionError).",
+            id="offline",
+        ),
+        pytest.param(
+            requests.ReadTimeout("slow"),
+            SnapshotStatus.ERROR,
+            "GitHub request failed (ReadTimeout).",
+            id="timeout",
+        ),
+        pytest.param(401, SnapshotStatus.AUTH_REQUIRED, refused, id="401"),
+        pytest.param(403, SnapshotStatus.AUTH_REQUIRED, refused, id="403"),
+        pytest.param(
+            500,
+            SnapshotStatus.ERROR,
+            "GitHub request failed (HTTPError).",
+            id="500",
+        ),
+    ]
+
+
+@responses.activate
+@pytest.mark.parametrize("failure, status, message", _username_rows())
+def test_the_username_path_blames_the_pat_only_when_github_refused_it(
+    monkeypatch, failure, status, message
+):
+    """One rule, not a list of exceptions.
+
+    "PAT may lack read:user" is a diagnosis of a credential, so it is the
+    answer for a reply that refuses one - a 401 or a 403 - and for nothing
+    else. Every other failure leaves the question unanswered: a deadline, an
+    oversized reply, a refused encoding, a redirect, a reply that was not
+    JSON, a 500 and an ordinary offline machine all used to arrive on the
+    tile as the same wrong advice, which is to re-issue a PAT that is fine.
+    """
     import aigauge.providers.copilot as copilot_mod
-    from aigauge.providers._http import ResponseTooLarge
-    from aigauge.providers.copilot import _resolve_username
+    from aigauge.providers.copilot import CopilotProvider
 
-    def boom(*args, **kwargs):
-        raise ResponseTooLarge("Response exceeded the 8388608-byte limit.")
+    if isinstance(failure, int):
+        responses.add(
+            responses.GET, f"{GITHUB_API}/user", json={}, status=failure
+        )
+    else:
 
-    monkeypatch.setattr(copilot_mod, "bounded_request", boom)
-    assert _resolve_username("ghp_test", configured=None) is None
+        def boom(*args, **kwargs):
+            raise failure
+
+        monkeypatch.setattr(copilot_mod, "bounded_request", boom)
+
+    captured: list = []
+    monkeypatch.setattr(copilot_mod, "get_github_pat", lambda: "ghp_test")
+    CopilotProvider(Config(), pool=_InlinePool()).refresh(captured.append)
+
+    snapshot = captured[0]
+    assert snapshot.status == status, snapshot.error
+    assert snapshot.error == message
+    # The four the helper raises carry a status, a count or a bound; the rest
+    # are reported by type name, because a `requests` message is the URL it
+    # failed on and a Copilot URL carries the account name.
+    assert "api.github.com" not in (snapshot.error or "")
 
 
 def test_copilot_advertises_the_budget_its_three_calls_need():

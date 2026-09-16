@@ -11,7 +11,6 @@ from ..config import Config, get_github_pat
 from ..models import SnapshotStatus, UsageMetric, UsageSnapshot
 from ._http import (
     HELPER_EXCEPTIONS,
-    ResponseRedirected,
     bounded_request,
     request_worst_case_seconds,
 )
@@ -76,37 +75,44 @@ def _next_month_start_utc(now_utc: datetime) -> datetime:
     return datetime(now_utc.year, now_utc.month + 1, 1, tzinfo=timezone.utc)
 
 
-def _resolve_username(pat: str, configured: str | None) -> str | None:
-    """The username behind the PAT, or ``None`` if the PAT cannot say.
+# The two replies that are GitHub refusing this PAT: 401 for a credential it
+# will not take at all, 403 for one it takes without the scope this call
+# reads. They are the whole of what "PAT may lack read:user" is a diagnosis
+# of - see _resolve_username.
+_PAT_REFUSED_STATUSES = frozenset({401, 403})
 
-    ``None`` is reported as "PAT may lack read:user", so it is the answer for
-    a refusal and for a transport failure that leaves the question open - but
-    not for a redirect, and not for a reply that was not JSON.
-    ``api.github.com`` answers a renamed user or org with a 301, and this app
-    does not follow one; a server or a middlebox that drops the connection
-    inside the header block produces an ordinary 200 with no body at all
-    (``http.client`` reads EOF as the end of the headers), whose ``.json()``
-    raises ``requests.exceptions.JSONDecodeError`` - itself a
-    ``RequestException``, so the blanket branch below used to swallow it and
-    the tile sent the user to re-issue a credential that is fine. Both are
-    left to ``work()``'s branch, which reports what happened.
+
+def _resolve_username(pat: str, configured: str | None) -> str | None:
+    """The username behind the PAT, or ``None`` if GitHub refused to say.
+
+    ``None`` is reported as "PAT may lack read:user", and the rule for it is
+    that GitHub answered and refused: a 401 or a 403 on ``/user``. Nothing
+    else is an answer about the credential, and everything else used to be
+    turned into one - a deadline, an oversized reply, a refused encoding, a
+    redirect, a reply that was not JSON, a 500, and an ordinary offline
+    machine all told the user to re-issue a PAT that was fine. Two rounds of
+    this release took two of those routes off the list one at a time; the
+    rule behind them is what was wrong, so it is the rule that changed.
+
+    A 200 gives the login. Every other reply and every transport failure -
+    the four this package's helper raises included - leaves ``work()``'s
+    branch to say what actually happened.
     """
     if configured:
         return configured
-    try:
-        r = bounded_request(
-            "GET",
-            f"{GITHUB_API}/user",
-            headers=_github_headers(pat),
-            timeout=USERNAME_TIMEOUT,
-        )
-        if r.status_code == 200:
-            return r.json().get("login")
-    except (ResponseRedirected, requests.exceptions.InvalidJSONError):
-        raise
-    except requests.RequestException:
+    r = bounded_request(
+        "GET",
+        f"{GITHUB_API}/user",
+        headers=_github_headers(pat),
+        timeout=USERNAME_TIMEOUT,
+    )
+    if r.status_code in _PAT_REFUSED_STATUSES:
         return None
-    return None
+    # Any other non-2xx is a `requests.HTTPError`, which `work()` reports by
+    # type name - its message is the URL it failed on, and a Copilot URL
+    # carries the GitHub username.
+    r.raise_for_status()
+    return r.json().get("login")
 
 
 def _fetch_user_premium_usage(pat: str, username: str) -> dict:
