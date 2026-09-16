@@ -641,8 +641,15 @@ class _HealthyProvider:
         on_done(UsageSnapshot(provider=self.name, status=SnapshotStatus.OK))
 
 
-def _healthy_sibling_run(monkeypatch, *, wedged: bool) -> tuple[int, int]:
-    """Six fake hours at the shipped cadence; how often the healthy one ran."""
+_SIX_HOURS = 6 * 3600.0
+
+
+def _healthy_sibling_run(monkeypatch, *, wedged: bool) -> tuple[list[float], int]:
+    """Six fake hours at the shipped cadence; *when* the healthy one ran.
+
+    The times, not the count: the floor the test below asserts is derived
+    from how far the wedged run's dispatches slid, which only the times say.
+    """
     clk = _install_clock(monkeypatch)
     config = Config()  # the shipped cadence: 5 minutes active, 60 idle
     healthy = _HealthyProvider("openrouter", clock=clk)
@@ -656,8 +663,8 @@ def _healthy_sibling_run(monkeypatch, *, wedged: bool) -> tuple[int, int]:
     # measures is the idle backoff rather than the active cadence.
     app._active_until = clk.now()  # noqa: SLF001
     app.refresh_now(manual=False)
-    clk.run_until(6 * 3600.0)
-    return len(healthy.dispatches), app._unchanged_cycles  # noqa: SLF001
+    clk.run_until(_SIX_HOURS)
+    return list(healthy.dispatches), app._unchanged_cycles  # noqa: SLF001
 
 
 def test_a_parked_provider_does_not_freeze_the_idle_backoff(monkeypatch):
@@ -677,29 +684,36 @@ def test_a_parked_provider_does_not_freeze_the_idle_backoff(monkeypatch):
     refresh), so a full scheduled cycle stays full however many names the
     park filter takes out of it.
     """
-    wedged_count, wedged_unchanged = _healthy_sibling_run(monkeypatch, wedged=True)
-    control_count, control_unchanged = _healthy_sibling_run(monkeypatch, wedged=False)
+    wedged_times, wedged_unchanged = _healthy_sibling_run(monkeypatch, wedged=True)
+    control_times, control_unchanged = _healthy_sibling_run(monkeypatch, wedged=False)
+    wedged_count, control_count = len(wedged_times), len(control_times)
 
     # Not equality: a cycle carrying the wedged provider stays open until its
-    # watchdog gives up, which pushes each cadence wake out by that wait and
-    # costs the run its last dispatch.
-    #
-    # The property is `wedged <= control`. The lower bound is *not* a
-    # property - it is the size of that one wait, which is this fixture's
-    # `budget=60.0` (plus the pool-queue slack): the first healthy dispatch
-    # after the park lands at 300 + budget + 95 s. Measured over the same six
-    # hours at other budgets, the same run gives 11 of 12 at 30 s and 60 s,
-    # 11 at 240 s and 10 at 900 s, and a wedged *browser* provider at 240 s
-    # gives 9. So a floor of 2 is what a re-tuned fixture can carry; the
-    # ceiling is what this test exists for.
+    # watchdog gives up, so every wake after it slides by that wait, and the
+    # dispatches the accumulated slide pushes past the end of the six hours
+    # are gone. The property this test exists for is the ceiling,
+    # `wedged <= control`.
     assert wedged_count <= control_count, (
         f"a parked provider raised a healthy sibling's rate: {wedged_count} "
         f"dispatches in six hours against {control_count} with nothing parked"
     )
-    assert wedged_count >= control_count - 2, (
+    # The floor is not a property at all, and a constant one pins this
+    # fixture's arithmetic: the wait is `budget` plus a pool-queue slack that
+    # `_pool_wait_slack` derives from the host's own core count, so a
+    # re-tuned budget - or a different machine - moves it. Derived instead,
+    # from what this run measured: take how far the wedged run's last
+    # dispatch slid past the control's, and require every control dispatch
+    # that still fits inside six hours carrying that slide. Measured here:
+    # 10 of 12 with a 30 s, 60 s or 240 s REST budget and with a browser
+    # provider at 240 s, each time exactly the number this arithmetic
+    # predicts - where the constant left no margin at all.
+    slide = wedged_times[-1] - control_times[min(wedged_count, control_count) - 1]
+    still_fit = sum(1 for when in control_times if when + slide <= _SIX_HOURS)
+    assert wedged_count >= still_fit, (
         f"a parked provider cost a healthy sibling {control_count - wedged_count} "
-        f"of {control_count} dispatches in six hours, which is more than the "
-        "one watchdog wait this fixture's 60 s budget buys"
+        f"of {control_count} dispatches in six hours, where the {slide:.0f}s its "
+        f"watchdog waits cost the run accounts for only "
+        f"{control_count - still_fit}"
     )
     assert wedged_unchanged >= control_unchanged - 1, (
         f"the idle backoff stalled at {wedged_unchanged} unchanged cycles "
