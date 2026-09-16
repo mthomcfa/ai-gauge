@@ -338,6 +338,8 @@ def test_an_offline_failure_keeps_the_github_username_out_of_every_sink(caplog):
 
     snapshot = captured[0]
     assert snapshot.status == SnapshotStatus.ERROR
+    # A `requests` exception, so the type name and nothing else: its own
+    # message is the URL it failed on.
     assert snapshot.error == "GitHub request failed (ConnectionError)."
     diagnostics = _format_diagnostics("copilot", snapshot)
     for sink in (snapshot.error or "", caplog.text, diagnostics):
@@ -375,10 +377,61 @@ def test_a_redirect_on_the_username_path_is_an_error_not_a_bad_pat(caplog):
     snapshot = captured[0]
     assert snapshot.status == SnapshotStatus.ERROR, snapshot.error
     assert snapshot.status != SnapshotStatus.AUTH_REQUIRED
-    assert snapshot.error == "GitHub request failed (ResponseRedirected)."
+    assert snapshot.error == (
+        "GitHub request failed: The endpoint redirected (301); "
+        "this app does not follow redirects."
+    )
     for sink in (snapshot.error or "", caplog.text):
         assert "api.github.invalid" not in sink
         assert "renamed" not in sink
+
+
+@responses.activate
+def test_a_truncated_reply_on_the_username_path_is_an_error_not_a_bad_pat():
+    """A reply cut inside the header block is a 200 with no body.
+
+    `http.client` reads EOF as the end of the headers, so a server or a
+    middlebox that drops the connection there produces an ordinary 200 whose
+    body is empty - measured against a loopback server, on this release and
+    on the one before it. `.json()` then raises
+    `requests.exceptions.JSONDecodeError`, which is a `RequestException`, so
+    `_resolve_username` answered `None` and the tile read "PAT may lack
+    read:user": the same wrong diagnosis the redirect fix removed, reached by
+    a different route. It is left to `work()`'s branch, which says what
+    happened; a real refusal (a non-200) is still `None`.
+    """
+    import aigauge.providers.copilot as copilot_mod
+    from aigauge.providers.copilot import CopilotProvider
+
+    responses.add(responses.GET, f"{GITHUB_API}/user", body="", status=200)
+
+    captured: list = []
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(copilot_mod, "get_github_pat", lambda: "ghp_test")
+        CopilotProvider(Config(), pool=_InlinePool()).refresh(captured.append)
+
+    snapshot = captured[0]
+    assert snapshot.status == SnapshotStatus.ERROR, snapshot.error
+    assert snapshot.status != SnapshotStatus.AUTH_REQUIRED
+    assert snapshot.error == "GitHub request failed (JSONDecodeError)."
+
+
+@responses.activate
+def test_a_refusal_on_the_username_path_is_still_a_pat_diagnosis():
+    """The other half: a 401 is GitHub saying no, which is exactly what
+    "PAT may lack read:user" is for."""
+    import aigauge.providers.copilot as copilot_mod
+    from aigauge.providers.copilot import CopilotProvider
+
+    responses.add(responses.GET, f"{GITHUB_API}/user", json={}, status=401)
+
+    captured: list = []
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(copilot_mod, "get_github_pat", lambda: "ghp_test")
+        CopilotProvider(Config(), pool=_InlinePool()).refresh(captured.append)
+
+    assert captured[0].status == SnapshotStatus.AUTH_REQUIRED
+    assert "read:user" in (captured[0].error or "")
 
 
 @responses.activate
@@ -404,7 +457,14 @@ def test_a_redirect_on_the_usage_path_is_reported_as_a_redirect():
         CopilotProvider(cfg, pool=_InlinePool()).refresh(captured.append)
 
     assert captured[0].status == SnapshotStatus.ERROR
-    assert captured[0].error == "GitHub request failed (ResponseRedirected)."
+    # The helper's own message, not its type name: it is built from the
+    # status and carries neither the URL nor the `Location`, which is what
+    # the type-name rule exists to keep off the tile.
+    assert captured[0].error == (
+        "GitHub request failed: The endpoint redirected (301); "
+        "this app does not follow redirects."
+    )
+    assert "api.github" not in (captured[0].error or "")
 
 
 def test_an_exception_that_is_not_a_request_failure_names_its_type_too(caplog):

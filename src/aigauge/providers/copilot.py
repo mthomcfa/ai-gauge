@@ -10,6 +10,7 @@ import requests
 from ..config import Config, get_github_pat
 from ..models import SnapshotStatus, UsageMetric, UsageSnapshot
 from ._http import (
+    HELPER_EXCEPTIONS,
     ResponseRedirected,
     bounded_request,
     request_worst_case_seconds,
@@ -80,11 +81,15 @@ def _resolve_username(pat: str, configured: str | None) -> str | None:
 
     ``None`` is reported as "PAT may lack read:user", so it is the answer for
     a refusal and for a transport failure that leaves the question open - but
-    not for a redirect. ``api.github.com`` answers a renamed user or org with
-    a 301, and this app does not follow one; telling the user to re-issue a
-    perfectly good credential for that would be a wrong diagnosis, so
-    ``ResponseRedirected`` is left to ``work()``'s branch, which reports what
-    happened.
+    not for a redirect, and not for a reply that was not JSON.
+    ``api.github.com`` answers a renamed user or org with a 301, and this app
+    does not follow one; a server or a middlebox that drops the connection
+    inside the header block produces an ordinary 200 with no body at all
+    (``http.client`` reads EOF as the end of the headers), whose ``.json()``
+    raises ``requests.exceptions.JSONDecodeError`` - itself a
+    ``RequestException``, so the blanket branch below used to swallow it and
+    the tile sent the user to re-issue a credential that is fine. Both are
+    left to ``work()``'s branch, which reports what happened.
     """
     if configured:
         return configured
@@ -97,7 +102,7 @@ def _resolve_username(pat: str, configured: str | None) -> str | None:
         )
         if r.status_code == 200:
             return r.json().get("login")
-    except ResponseRedirected:
+    except (ResponseRedirected, requests.exceptions.InvalidJSONError):
         raise
     except requests.RequestException:
         return None
@@ -581,10 +586,19 @@ class CopilotProvider(Provider):
                     "classification=request_failed type=%s",
                     type(exc).__name__,
                 )
+                # The type name is the rule because a `requests` exception's
+                # message is the URL it failed on. The four the bounded
+                # helper raises are built from a status, a count or a bound
+                # and carry no URL by construction, so those say what
+                # actually happened - as OpenRouter's and Azure's tiles do.
+                if isinstance(exc, HELPER_EXCEPTIONS):
+                    detail = f": {exc}"
+                else:
+                    detail = f" ({type(exc).__name__})."
                 return UsageSnapshot(
                     provider="copilot",
                     status=SnapshotStatus.ERROR,
-                    error=f"GitHub request failed ({type(exc).__name__}).",
+                    error=f"GitHub request failed{detail}",
                 )
 
         self._run_async(work, on_done)

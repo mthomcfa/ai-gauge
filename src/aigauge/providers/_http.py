@@ -151,6 +151,20 @@ class ResponseEncodingRefused(requests.RequestException):
     """
 
 
+# The four exceptions this module raises, as a tuple a call site can
+# `isinstance` against. Every one of their messages is built here out of a
+# status, a count or a bound, so - unlike a `requests` exception, whose
+# message carries the URL it failed on - they can be shown to a user as they
+# stand. Copilot's `work()` is the caller that needs the distinction: an ARM
+# URL carries the subscription id and a Copilot one the GitHub username.
+HELPER_EXCEPTIONS = (
+    ResponseDeadlineExceeded,
+    ResponseTooLarge,
+    ResponseRedirected,
+    ResponseEncodingRefused,
+)
+
+
 def request_worst_case_seconds(
     timeout: float | tuple[float, float],
     *,
