@@ -419,6 +419,7 @@ def _refuse_redirect(response: requests.Response, allow_redirects: bool) -> None
         "this app does not follow redirects."
     )
 
+
 def _refuse_nested_encoding(response: requests.Response) -> None:
     """Refuse ``Content-Encoding: gzip, gzip`` before reading a byte of it."""
     codings = [
@@ -431,6 +432,7 @@ def _refuse_nested_encoding(response: requests.Response) -> None:
             f"Response declared {len(codings)} content encodings; "
             "this app reads at most one."
         )
+
 
 def _body_chunks(response: requests.Response, chunk_bytes: int) -> Iterator[bytes]:
     """Yield body bytes as soon as any of them arrive.

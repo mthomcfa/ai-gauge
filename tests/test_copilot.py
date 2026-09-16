@@ -406,6 +406,7 @@ def test_a_redirect_on_the_usage_path_is_reported_as_a_redirect():
     assert captured[0].status == SnapshotStatus.ERROR
     assert captured[0].error == "GitHub request failed (ResponseRedirected)."
 
+
 def test_an_exception_that_is_not_a_request_failure_names_its_type_too(caplog):
     """The blanket handler is the last resort, not the usual path, and it
     reported `str(exc)` - which for a transport failure is the URL. It says
@@ -435,6 +436,7 @@ def test_an_exception_that_is_not_a_request_failure_names_its_type_too(caplog):
     assert not any(
         record.exc_info for record in caplog.records
     ), "a traceback whose last line is the exception message"
+
 
 def test_a_username_resolve_that_outruns_the_deadline_is_not_a_crash(monkeypatch):
     """`_resolve_username` already swallows every RequestException; the two new
