@@ -649,13 +649,20 @@ def _quantifiers(pattern: str, verbose: bool = False):
 
 @pytest.mark.parametrize(
     "label, pattern, verbose",
-    [(rule, pattern, False) for rule, _a, pattern in eg._DETECTORS]
+    # `id=label`, so the id is the detector's name rather than its pattern.
+    # Windows refuses an environment variable over 32 767 characters and pytest
+    # puts the node id in `PYTEST_CURRENT_TEST` at every setup and teardown; a
+    # pattern is short today, and a pattern that grows grows the id with it.
+    [
+        pytest.param(rule, pattern, False, id=rule)
+        for rule, _a, pattern in eg._DETECTORS
+    ]
     + [
-        ("opaque-token", eg._OPAQUE_TOKEN_RE.pattern, False),
-        ("bypass", eg._BYPASS_RE.pattern, True),
-        ("agent endpoint", eg._AGENT_ENDPOINT_RE.pattern, False),
-        ("http client", eg._HTTP_CLIENT_RE.pattern, False),
-        ("base ref", eg._BASE_REF_RE.pattern, False),
+        pytest.param("opaque-token", eg._OPAQUE_TOKEN_RE.pattern, False, id="opaque-token"),
+        pytest.param("bypass", eg._BYPASS_RE.pattern, True, id="bypass"),
+        pytest.param("agent endpoint", eg._AGENT_ENDPOINT_RE.pattern, False, id="agent-endpoint"),
+        pytest.param("http client", eg._HTTP_CLIENT_RE.pattern, False, id="http-client"),
+        pytest.param("base ref", eg._BASE_REF_RE.pattern, False, id="base-ref"),
     ],
 )
 def test_every_quantifier_is_bounded_or_possessive(label, pattern, verbose):
@@ -776,6 +783,29 @@ def test_redacting_several_matches_does_not_corrupt_later_offsets():
     out, count = eg.redact(text, eg.scan(text, policy()))
     assert count == 3
     assert "@" not in out.replace("[redacted:email-address]", "")
+
+
+@pytest.mark.parametrize(
+    "line",
+    ['PASSWORD="hunter2"', "PASSWORD='hunter2'", 'api_key = "s3cr3t"', 'token: "abcdef"'],
+    ids=["double quoted", "single quoted", "spaced", "colon"],
+)
+def test_a_short_quoted_secret_is_still_redacted(line):
+    """The quoted value gate wanted eight characters, so `hunter2` - and every
+    password of eight or fewer, quoted - was dispatched intact."""
+    out, count = eg.redact(line, eg.scan(line, policy()))
+    assert count == 1, f"{line!r} produced {count} redactions"
+    assert "hunter2" not in out and "s3cr3t" not in out and "abcdef" not in out
+
+
+@pytest.mark.parametrize(
+    "line",
+    ['PASSWORD="short"', 'password=""', "password=${VAR}", "password=$SECRET",
+     "secret=self.compute()"],
+    ids=["five chars", "empty", "brace expansion", "variable", "call"],
+)
+def test_lowering_the_quoted_floor_does_not_redact_what_is_not_a_secret(line):
+    assert not [f for f in eg.scan(line, policy()) if f.rule == "secret-assignment"], line
 
 
 def test_the_placeholder_sent_to_the_provider_carries_no_hash_of_the_value():
@@ -1041,6 +1071,21 @@ def test_a_tightened_opencode_config_raises_no_permission_fault(tmp_path, monkey
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     monkeypatch.setenv("OPENCODE_SERVER_PASSWORD", "x")
     assert not [p for p in eg.posture(policy(), tmp_path) if "permission" in p or "bash" in p]
+
+
+def test_posture_names_the_policy_it_checked(tmp_path, monkeypatch, capsys):
+    """`scan`, `preflight` and `dispatch` all print `policy: <source>`. The one
+    command whose whole job is to say what it checked did not."""
+    (tmp_path / ".egress-policy.json").write_text(
+        json.dumps({"posture": {"forbid_permission_allow": [], "require_server_password": False}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    args = eg.build_parser().parse_args(["--workspace", str(tmp_path), "posture"])
+    eg.cmd_posture(args)
+    out = capsys.readouterr().out
+    assert "policy: " in out
+    assert ".egress-policy.json" in out
 
 
 def test_a_non_loopback_server_is_a_fault(tmp_path, monkeypatch):
@@ -1325,7 +1370,6 @@ def test_audit_appends_rather_than_truncates(tmp_path):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
 def test_every_directory_the_audit_trail_creates_is_owner_only(tmp_path):
     """`mkdir(parents=True, mode=0o700)` applies the mode to the last directory
     only, so a default audit path created `~/.local/state` world-readable."""
@@ -1335,7 +1379,11 @@ def test_every_directory_the_audit_trail_creates_is_owner_only(tmp_path):
         assert directory.stat().st_mode & 0o077 == 0, directory
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
 def test_a_new_audit_file_is_owner_only(tmp_path):
+    """NTFS has no POSIX mode bits - `os.chmod(0o600)` only toggles read-only
+    there, and the file reads back 0o666 - so this is a POSIX guarantee. The
+    Windows caveat is documented with the rest of the audit trail's promises."""
     target = tmp_path / "audit.jsonl"
     eg.audit(policy(audit={"path": str(target)}), {"verdict": "allowed"})
     assert target.stat().st_mode & 0o077 == 0
@@ -1721,6 +1769,73 @@ def test_hook_refuses_a_direct_post_to_the_agents_own_server(command):
     server, documented in this PR. The regex hunted for the binary, so a Bash
     call that speaks the API directly skipped the guard entirely."""
     assert eg._bypasses_guard(command, "http://127.0.0.1:4096") is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "curl http://127.0.0.2:4096/anything",
+        "wget http://127.0.0.2:4096/",
+        "curl -X POST http://127.0.0.2:4096/config -d '{}'",
+    ],
+    ids=["curl other path", "wget root", "curl config"],
+)
+def test_a_post_to_the_pinned_server_is_refused_on_any_path(command):
+    """The policy's own `host:port`, matched literally, is the only thing that
+    catches a call to the pinned server on a path other than `/session`: the
+    endpoint regex wants `/session` and the loopback regex only knows the four
+    spellings of `127.0.0.1`. A control with no test is a control the next
+    refactor deletes - deleting this branch survived the whole suite.
+    """
+    assert eg._bypasses_guard(command, "http://127.0.0.2:4096") is True
+
+
+def test_the_hook_refuses_a_bash_call_to_the_pinned_server_on_another_path(
+    tmp_path, monkeypatch
+):
+    """The same branch, end to end through `cmd_hook` and a workspace policy."""
+    (tmp_path / ".egress-policy.json").write_text(
+        json.dumps({"destinations": {"allow": [], "server": "http://127.0.0.2:4096"}}),
+        encoding="utf-8",
+    )
+    event = {
+        "cwd": str(tmp_path),
+        "tool_name": "Bash",
+        "tool_input": {"command": "curl -X POST http://127.0.0.2:4096/config -d @payload.json"},
+    }
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(json.dumps(event)))
+    assert eg.cmd_hook(eg.build_parser().parse_args(["hook"])) == 2
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "nc 127.0.0.1 4096 < request.txt",
+        "printf 'POST /session HTTP/1.1\\r\\n' | nc localhost 4096",
+        "ncat 127.0.0.1 4096 < request.txt",
+        "socat - TCP:127.0.0.1:4096 < request.txt",
+    ],
+    ids=["nc redirect", "nc pipe", "ncat", "socat"],
+)
+def test_a_netcat_conversation_with_the_agent_server_is_refused(command):
+    """`nc` and `socat` take the port as a separate argument, so the `host:port`
+    the other branches look for is never written - and `nc` was already in the
+    client list, which says these are meant to be in scope."""
+    assert eg._bypasses_guard(command, "http://127.0.0.1:4096") is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "nc example.org 4096 < request.txt",
+        "docker run -p 4096:4096 myimage",
+        "ssh host 'uptime'",
+        "grep -rn '/session' src/",
+    ],
+    ids=["nc elsewhere", "docker", "ssh", "grep"],
+)
+def test_the_netcat_rule_leaves_ordinary_commands_alone(command):
+    assert eg._bypasses_guard(command, "http://127.0.0.1:4096") is False
 
 
 def test_a_post_to_the_configured_server_is_refused_on_any_port():

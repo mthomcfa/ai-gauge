@@ -1110,3 +1110,66 @@ What that round leaves open, deliberately:
 - **The audit file's mode is POSIX-only**, as `SECURITY.md` says of the app's
   own stores, and the guard's doc repeats. The directory chain is now `0700` at
   every level on POSIX; on Windows the file inherits the parent ACL.
+
+### What the third review found, and what this branch leaves open
+
+The third review by execution closed all fifteen round-2 findings on their own
+terms and found one High plus three Lows and six nits. The High was the same
+class of defect for the third time, at a third site: round 1 bounded the path
+scanner, round 2 bounded every other pattern, and the loop that resolves
+*overlapping findings* — added by round 2's own fix — was still quadratic, this
+time in the number of findings rather than in the bytes. It checked each
+candidate span against a list of every claim already made, so 400 KB of `a@b.co `
+— a contact list, not an attack — is 57 143 findings and took 58.0 s in `scan()`
+and 58.4 s in the hook, against the hook's own documented 10 s timeout, and a
+hook killed at its timeout blocks nothing. A CSV of addresses was 9.1 s and a
+400 KB `.env`-shaped block 7.9 s. The claims are now a byte per character of the
+payload instead of a list of spans, which is O(1) per claim, and `redact()`
+builds the redacted text in one pass instead of rebuilding the whole string once
+per finding. The same payloads are 0.44 s, 0.25 s and 0.22 s, and `redact()` on
+57 143 spans went from 13.5 s to 0.02 s. The reason the suite could not see any
+of it is recorded in the tests: eighteen of its nineteen linearity fillers
+produced zero findings and the nineteenth produced 1 482, so the byte axis was
+tested exhaustively and the finding-density axis not at all. Four fillers that
+are almost all findings, and one that fills both severity bands with overlapping
+blocks and redactions, are now in the same parametrised tests.
+
+Also taken in that round: an ambiguous or wrong `--base` is a fault rather than a
+silently empty diff (git's own "refname is ambiguous" warning was being thrown
+away, so `--base amb` diffed whichever ref git picked and reported it clean);
+the shipped `tools/egress-policy.example.json` carries the built-in deny list in
+full, because a policy file *replaces* `paths.deny` rather than adding to it and
+the example was quietly four globs weaker than the defaults; a denied path
+followed by `:12`, `#L4`, `?x=1` or a closing bracket is matched; `nc`/`socat`
+conversations with the agent's own port are refused; a quoted secret of six
+characters or more is redacted, where the floor used to be eight; `posture`
+prints the policy source the other commands already print; and the hook's
+literal-endpoint branch — the only thing that catches a POST to the pinned
+server on a path other than `/session` — finally has a test.
+
+What this round leaves open, deliberately:
+
+- **Two overlapping redactions still resolve to one of them, not to their
+  union.** `api_key=aaaaaaa1@example.com` is dispatched as
+  `[redacted:secret-assignment]@example.com`: the credential-shaped part is
+  removed and the domain of the address survives. Merging the spans would be
+  strictly better, but every way of doing it inside five lines changes which
+  rule is *reported* for an overlap — a longer `opaque-token` run would start
+  displacing the named rule beside it — and that is a worse report for a
+  cosmetic gain. Left for a round that can measure the report quality.
+
+- **The bypass regex is still not a shell parser**, and `deno run -A
+  opencode.ts` and a port held in a shell variable (`S=4096; curl …:$S/session`)
+  join the list above. The netcat pair was worth one more alternative because
+  `nc` was already in the client list; the rest are the same trade as before.
+
+- **A denied path inside a markdown link is not matched.** `[creds](/home/u/
+  .aws/credentials)` is one token whose middle is `](`, and neither character is
+  a path character, so the token is dropped before any glob sees it. Trimming
+  brackets off the *ends* of a token, which is what this round added, does not
+  reach it.
+
+- **An over-cap payload is still hashed in full and scanned only to the cap**,
+  and the `a/`/`b/` diff-prefix strip is still redundant given that `fnmatch`'s
+  `*` crosses `/`. Both were recorded in the round-2 list above and neither
+  moved.

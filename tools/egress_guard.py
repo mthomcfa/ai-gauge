@@ -144,10 +144,14 @@ _DETECTORS: tuple[tuple[str, str, str], ...] = (
         # never a call, which is what the possessive run plus `(?!\()` says.
         # `[ \t]` rather than `\s`, because an assignment's value is on the same
         # line as its name; `\s` walked over the newline into the next
-        # statement.
+        # statement. The quoted floor is six, not eight: `PASSWORD="hunter2"` is
+        # seven characters, and so was every password the gate let through
+        # quoted. Six costs nothing on this repository's own source - the same
+        # 15 findings, none of them blocking - because the name in front of the
+        # separator is what does the work.
         r"(?i)(?:password|passwd|secret|token|api[_-]?key|private[_-]?key|credential)"
         r"[A-Za-z0-9_]{0,64}[ \t]{0,16}[:=][ \t]{0,16}"
-        r"(?:[\"'][^\"'\n]{8,256}+[\"']"
+        r"(?:[\"'][^\"'\n]{6,256}+[\"']"
         r"|(?=[A-Za-z0-9._+/=~\-]{0,63}[0-9+/=~])[A-Za-z0-9._+/=~\-]{8,256}+(?!\())",
     ),
     ("certificate", WARN, r"-----BEGIN CERTIFICATE-----"),
@@ -1192,6 +1196,9 @@ def cmd_scan(args: argparse.Namespace) -> int:
 def cmd_posture(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace or os.getcwd())
     policy = Policy.load(args.policy, workspace)
+    # Every other command that decides anything says which policy decided it.
+    # The one command whose whole job is to tell you what it checked did not.
+    print(f"policy: {policy.source}")
     problems = posture(policy, workspace)
     if not problems:
         print("posture ok")
@@ -1499,8 +1506,17 @@ def _posts_to_the_agent_server(command: str, server: str = "") -> bool:
         endpoint = ""
     port = endpoint.rsplit(":", 1)[1] if ":" in endpoint else ""
     loopback = ""
+    netcat = ""
     if port.isdigit():
         loopback = rf"(?:127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0):{port}\b"
+        # `nc`, `socat` and `telnet` take the port as a separate argument, so
+        # the `host:port` the other two branches look for is never written:
+        # `nc 127.0.0.1 4096 < request.txt` speaks the same two-call REST
+        # conversation the guard exists to be the only user of.
+        netcat = (
+            rf"\b(?:nc|ncat|socat|telnet)\b[^\n]{{0,80}}?"
+            rf"(?:127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0)[ \t]{{1,8}}{port}\b"
+        )
     for line in command.splitlines():
         if not _HTTP_CLIENT_RE.search(line):
             continue
@@ -1509,6 +1525,8 @@ def _posts_to_the_agent_server(command: str, server: str = "") -> bool:
         if endpoint and endpoint.lower() in line.lower():
             return True
         if loopback and re.search(loopback, line, re.IGNORECASE):
+            return True
+        if netcat and re.search(netcat, line, re.IGNORECASE):
             return True
     return False
 
