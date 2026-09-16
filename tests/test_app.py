@@ -1798,6 +1798,58 @@ def test_the_error_clip_runs_before_the_redaction(monkeypatch):
     assert guid not in _error_for_log(padded)
 
 
+def test_no_fragment_of_a_subscription_id_survives_the_clip():
+    """The margin's own cut is the one the margin cannot help with.
+
+    `_redact_azure_ids` *shrinks* what it keeps - `/subscriptions/<36-char
+    guid>` becomes 21 characters - so material that sat past the 300-character
+    limit before the pass sits inside it after, including the front half of
+    the identifier the 500-character window cut in two. Measured before the
+    tail drop: a subscription id straddling that window reached the record
+    with 26 of its 36 characters, where both redact-then-clip and the release
+    before it wrote `<guid>`.
+
+    Swept rather than sampled, because which offsets leak depends on how much
+    the redaction shrank the text in front of the cut: the id is walked across
+    every offset the window can cut it at, and no run of eight hex-or-dash
+    characters of it may reach the record at any of them.
+    """
+    import re as _re
+
+    from aigauge.app import _LOG_VALUE_LIMIT, _LOG_REDACT_MARGIN, _error_for_log
+
+    guid = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+    window = _LOG_VALUE_LIMIT + _LOG_REDACT_MARGIN
+    # Each filler unit redacts to `/subscriptions/<guid>`, which is the
+    # shrinkage that drags the cut fragment into the kept 300 characters.
+    unit = "/subscriptions/" + guid + "."
+
+    for offset in range(window - 60, window + 61):
+        filler = ""
+        while len(filler) + len(unit) + len("/subscriptions/") <= offset:
+            filler += unit
+        head = filler + "." * (offset - len(filler) - len("/subscriptions/"))
+        record = _error_for_log(
+            head + "/subscriptions/" + guid + "/resourceGroups/rg-real/x" + "y" * 4000
+        )
+        for run in _re.findall(r"[0-9A-Fa-f-]{8,}", record):
+            for size in range(len(run), 7, -1):
+                pieces = (run[at : at + size] for at in range(len(run) - size + 1))
+                assert not any(piece in guid for piece in pieces), (
+                    f"{size} characters of the subscription id reached the "
+                    f"record with the id starting at offset {offset}: {record!r}"
+                )
+
+    # The drop is for the cut token only. An error the window did not truncate
+    # ends on whatever it ends on, and a hex run the redaction deliberately
+    # keeps - an md5, a request id - is not an Azure identifier.
+    kept = "cache miss for 9e107d9d372bb6826bd81d3542a419d6"
+    assert _error_for_log(kept) == kept
+    # And it is bounded at the length of the longest identifier, so a record
+    # that is one very long hex run still costs the log its full 300.
+    assert len(_error_for_log("a" * 2_000_000)) == _LOG_VALUE_LIMIT + 3
+
+
 def test_the_log_summariser_charges_a_big_integer_what_it_costs():
     """The budget is shared, so every branch has to charge honestly.
 

@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -31,7 +32,7 @@ from .config import (
     qt_scale_factor_env,
 )
 from .cookie_dialog import CookieDialog
-from .error_dialog import ErrorDetailsDialog, _redact_azure_ids
+from .error_dialog import ErrorDetailsDialog, _ID_START, _redact_azure_ids
 from .history import HistoryStore
 from .logging_setup import setup_logging
 from .gauge import highest_indicator
@@ -317,8 +318,26 @@ _LOG_KEY_LEN_LIMIT = 60
 _LOG_SUMMARY_BUDGET = 4000
 # How much past the value limit the redaction pass is allowed to see. Long
 # enough for any single identifier it matches - a GUID is 36 characters, its
-# compact form 32 - so clipping first cannot leave half of one in the record.
+# compact form 32 - so an identifier straddling the *value* limit is still
+# whole when the redaction runs.
 _LOG_REDACT_MARGIN = 200
+# The margin does not help the identifier straddling the margin's *own* cut,
+# and that one is the dangerous half: redaction shrinks what sits in front of
+# it (`/subscriptions/<36-char guid>` becomes 21 characters), so material that
+# sat past the value limit before the pass sits inside it after - including the
+# front half of the identifier the window cut in two. A subscription id
+# straddling the 500-character cut reached the log with 26 of its 36
+# characters, where redact-then-clip wrote `<guid>`.
+#
+# Only the record's *last* token can be one of these: every other token in the
+# window was seen whole by the redaction, and a cut identifier is a prefix of a
+# GUID or of its compact form, so at most 35 characters of hex and dashes
+# beginning where `_redact_azure_ids` allows one to begin. Matched after the
+# redaction, so a token that survived the cut intact is already `<guid>` and
+# nothing is dropped from it; built from the redaction's own `_ID_START`, so
+# the two cannot drift; bounded at 35, so a record that is one long hex run -
+# an md5, a request id - keeps its 300 characters.
+_CUT_ID_TAIL_RE = re.compile(_ID_START + r"[0-9A-Fa-f][0-9A-Fa-f-]{0,34}$")
 
 
 def _error_for_log(error: object) -> str:
@@ -342,13 +361,19 @@ def _error_for_log(error: object) -> str:
     try:
         # Clipped before the redaction, not after: `_redact_azure_ids` is
         # four regex passes and it ran over the whole unbounded string on the
-        # GUI thread to produce 300 characters. The margin is what keeps an
-        # identifier straddling the limit redacted rather than cut in half.
-        text = _redact_azure_ids(
-            str(error or "")[: _LOG_VALUE_LIMIT + _LOG_REDACT_MARGIN]
-        )
-        if len(text) > _LOG_VALUE_LIMIT:
-            text = text[:_LOG_VALUE_LIMIT] + "..."
+        # GUI thread to produce 300 characters. The margin keeps an identifier
+        # straddling the value limit whole for the redaction; the tail drop
+        # keeps the one straddling the margin's own cut out of the record.
+        raw = str(error or "")
+        window = raw[: _LOG_VALUE_LIMIT + _LOG_REDACT_MARGIN]
+        text = _redact_azure_ids(window)
+        clipped = len(text) > _LOG_VALUE_LIMIT
+        if clipped:
+            text = text[:_LOG_VALUE_LIMIT]
+        if len(window) < len(raw):
+            text = _CUT_ID_TAIL_RE.sub("", text)
+        if clipped:
+            text += "..."
         return text.replace("\r", " ").replace("\n", " ")
     except Exception:  # noqa: BLE001 - a log line must never raise
         return "<unprintable error>"

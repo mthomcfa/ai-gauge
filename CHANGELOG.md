@@ -123,8 +123,13 @@ allowed to cost.
   painted — until the helper caught it and answered
   `<unprintable error>`. The clip runs *before* the redaction rather than
   after, so four regex passes see 500 characters rather than the whole
-  string; the margin past the 300-character limit is there so an identifier
-  straddling it is redacted rather than cut in half. The scraper's
+  string (0.08 ms for a 1.2 MB error against 163 ms): the margin past the
+  300-character limit keeps an identifier straddling *that* limit whole for
+  the redaction, and a cut identifier left at the end of the 500-character
+  window is dropped after it, because redaction shrinks the text in front of
+  such a fragment and pulled 26 characters of a subscription id into the
+  record. Swept across every offset the window can cut an id at, no run of
+  eight hex-or-dash characters of it now reaches the log. The scraper's
   `_result_keys_for_log` gets the same outer guard as app.py's twin, because
   `for key in result` runs the payload's `__iter__` and a `dict` subclass
   can refuse it.
