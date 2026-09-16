@@ -1281,6 +1281,28 @@ def test_a_deadline_that_never_learned_a_connection_says_so_once(caplog):
     assert "example.invalid" not in caplog.text
 
 
+def test_a_call_that_is_merely_still_connecting_says_nothing(caplog):
+    """The line says the hook was missed, so it has to mean that.
+
+    `record()` runs when the pool hands the connection out, which is before
+    `connect()` assigns `sock`, so an ordinary slow resolver reaches the same
+    branch with a connection recorded and no socket yet. Writing the line
+    there made it fire on every stalled refresh on a network whose DNS is
+    slower than the deadline - three providers at a time - and made the one
+    signal that the bound had been silently removed impossible to read.
+    """
+    deadline = _http._DeadlineShutdown(30.0)
+    deadline.record(_FakeConnection(None))
+
+    with caplog.at_level(logging.WARNING, logger="aigauge"):
+        deadline._fire()
+        deadline.cancel()
+
+    assert "deadline_hook_missed" not in caplog.text
+    # And it did not give up either: the socket is still to come.
+    assert deadline.fired is True
+
+
 def test_every_call_gets_its_own_session_on_the_deadlines_adapter(monkeypatch):
     """`requests.request` opened and discarded a Session per call, so no pool,
     cookie jar or connection survived a refresh. That property is kept - the

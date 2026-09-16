@@ -308,7 +308,7 @@ class _DeadlineShutdown:
             # to being bounded by nothing (measured: 40 s and 70 s against a
             # 4.0 s bound, ended only by the harness). So the timer tries
             # again shortly, and keeps trying until the call ends.
-            self._note_missed_hook()
+            self._note_missed_hook(connection)
             self._arm_in(REARM_SECONDS)
             return
         try:
@@ -331,24 +331,33 @@ class _DeadlineShutdown:
             # in its place.
             self._arm_in(REARM_SECONDS)
 
-    def _note_missed_hook(self) -> None:
-        """Say once that the deadline came due with no socket to shut down.
+    def _note_missed_hook(self, connection: Any) -> None:
+        """Say once that the deadline came due with no connection recorded.
 
-        Two different things look like this from here. The ordinary one is a
-        call still in ``getaddrinfo`` or in the TCP connect, which the re-arm
-        above picks up the moment a socket exists. The other is the failure
-        this module cannot detect for itself: ``record()`` was never called at
-        all, because the single seam that calls it - an
-        ``HTTPAdapter.get_connection_with_tls_context`` override (a
-        ``requests`` 2.32 method; ``pyproject.toml`` pins only
+        Two different things reach the branch above, and only one of them is
+        a lost bound. The ordinary one is a call still in ``getaddrinfo`` or
+        in the TCP connect: the pool handed a connection out and ``record()``
+        ran, ``connect()`` has simply not assigned ``sock`` yet, and the
+        re-arm picks it up the moment it does. That is a slow network, not a
+        fault, and it says nothing - a corporate resolver that stops
+        answering would otherwise write this line on every stalled refresh,
+        three providers at a time, and send whoever grepped for it looking
+        for a dependency change that never happened.
+
+        The other is the failure this module cannot detect for itself:
+        ``record()`` was never called at all, because the single seam that
+        calls it - an ``HTTPAdapter.get_connection_with_tls_context``
+        override (a ``requests`` 2.32 method; ``pyproject.toml`` pins only
         ``requests>=2.32``) wrapping urllib3's private ``_get_conn`` - moved
         under a dependency upgrade. That silently removes the whole bound:
         measured by renaming the override, the suite stayed green at 1 805
-        while a TLS header drip went from 3.00 s to 14.03 s and stuck. So it
-        costs one line in the log instead of nothing. A fixed literal, like
-        every other line this package writes: no URL, no host, no header, no
-        exception text.
+        while a TLS header drip went from 3.00 s to unbounded - still inside
+        the call when the harness gave up watching. So it costs one line in
+        the log instead of nothing. A fixed literal, like every other line
+        this package writes: no URL, no host, no header, no exception text.
         """
+        if connection is not None:
+            return
         with self._lock:
             if self._noted_missed_hook:
                 return
