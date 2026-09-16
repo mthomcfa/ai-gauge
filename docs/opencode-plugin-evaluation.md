@@ -298,7 +298,12 @@ enforcement layer. Both are covered next.
 `tools/egress_guard.py` is the implementation. Stdlib-only Python 3.11+, so it
 runs on Windows, macOS and Linux from a bare interpreter without the app's
 dependencies. `tools/egress-policy.example.json` is a starting policy;
-`tests/test_egress_guard.py` covers it.
+`tests/test_egress_guard.py` covers it. A policy file **replaces** each list it
+names rather than adding to the built-in defaults, so the example ships the
+default `paths.deny` list in full and a test fails the build if it ever falls
+behind it: drop a glob from your copy deliberately, not by inheriting a shorter
+list. (For this repository the deliberate drop is `**/secrets.dat`, which
+`SECURITY.md`'s own store table trips — override that one glob, not the list.)
 
 ### The idea
 

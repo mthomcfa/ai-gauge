@@ -11,15 +11,19 @@
     "email-address": "redact"
   },
   "paths": {
-    "//deny": "Naming one of these in a payload is itself the finding.",
+    "//deny": "Naming one of these in a payload is itself the finding. This list REPLACES the built-in defaults rather than adding to them, so it is the built-in list in full: drop a glob from it only deliberately, and keep the rest.",
     "deny": [
       "**/.env",
       "**/.env.*",
       "**/*.pem",
+      "**/*.p12",
       "**/*.pfx",
+      "**/*.keystore",
       "**/id_rsa",
       "**/id_ed25519",
       "**/.npmrc",
+      "**/.pypirc",
+      "**/credentials.json",
       "**/.aws/credentials",
       "**/.claude/.credentials.json",
       "**/secrets/**",

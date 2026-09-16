@@ -237,6 +237,14 @@ _TOKEN_BREAKS = frozenset(" \t\n\r\f\v\"'`")
 # so a payload with no whitespace in it still has its paths scanned.
 _PATH_TOKEN_CAP = 4096
 _PATH_TOKEN_OVERLAP = 512
+# Brackets a path can be written inside, and how many `:`/`#` citation suffixes
+# are taken off the end of a token before the deny list gives up on it. Both
+# ends are trimmed rather than the whole token being widened, because what the
+# token scanner buys is that `secrets.dat,` in a sentence is prose about a file
+# rather than a path handed to an agent - and sentence punctuation stays out.
+_PATH_OPENERS = "([{<"
+_PATH_CLOSERS = ")]}>"
+_PATH_CITATION_CUTS = 3
 
 _DEFAULT_POLICY: dict[str, Any] = {
     "destinations": {
@@ -552,14 +560,56 @@ def _path_like_spans(text: str) -> Iterable[tuple[int, int]]:
                 for edge in range(start, index, step)
             ]
         for window_start, window_end in windows:
+            window_start, window_end = _trim_brackets_and_query(text, window_start, window_end)
             span = text[window_start:window_end]
-            if not _PATH_TOKEN_CHARS.issuperset(span):
+            if not span or not _PATH_TOKEN_CHARS.issuperset(span):
                 continue
             # A separator with nothing after it is a directory reference, not a
             # path: `trailing/ separator` is two words.
             if "/" not in span.rstrip("/\\") and "\\" not in span.rstrip("/\\"):
                 continue
             yield window_start, window_end
+
+
+def _trim_brackets_and_query(text: str, start: int, end: int) -> tuple[int, int]:
+    """Take brackets off the ends of a token, and a `?query` off its tail.
+
+    A path was recognised only when it *ended* its token, and `?` is not a path
+    character at all, so `/home/u/.aws/credentials?x=1` was dropped before it
+    reached a glob and `[creds](/home/u/.aws/credentials)` was dropped with it.
+    Only brackets and the query are trimmed: a trailing comma or full stop is
+    still what tells prose about a file from a file.
+    """
+    while start < end and text[start] in _PATH_OPENERS:
+        start += 1
+    while end > start and text[end - 1] in _PATH_CLOSERS:
+        end -= 1
+    query = text.find("?", start, end)
+    if query > start:
+        end = query
+    return start, end
+
+
+def _denied_glob_match(path: str, globs: Iterable[str]) -> str | None:
+    """The token, or the path a `:line`/`#fragment` citation follows.
+
+    `file:line` is how grep, every compiler and every stack trace names a file,
+    and the whole token is what gets globbed, so `/home/u/.aws/credentials:12`,
+    `...#L4` and a ripgrep citation all walked past the deny list. Each cut is a
+    whole-token match of its own and there are at most `_PATH_CITATION_CUTS` of
+    them, so this stays linear and sentence punctuation still does not count.
+    Returns the candidate that matched, for the excerpt.
+    """
+    candidate = path
+    for _ in range(_PATH_CITATION_CUTS + 1):
+        for glob in globs:
+            if _glob_match(candidate, glob):
+                return candidate
+        cut = max(candidate.rfind(":"), candidate.rfind("#"))
+        if cut <= 0:
+            return None
+        candidate = candidate[:cut]
+    return None
 
 
 def _scan_paths(text: str, policy: Policy) -> list[Finding]:
@@ -575,13 +625,10 @@ def _scan_paths(text: str, policy: Policy) -> list[Finding]:
         normalised = raw.removeprefix("a/").removeprefix("b/")
         if normalised in seen:
             continue
-        for glob in globs:
-            if _glob_match(normalised, glob):
-                seen.add(normalised)
-                found.append(
-                    Finding("denied-path", action, start, end, _path_excerpt(normalised))
-                )
-                break
+        matched = _denied_glob_match(normalised, globs)
+        if matched is not None:
+            seen.add(normalised)
+            found.append(Finding("denied-path", action, start, end, _path_excerpt(matched)))
     return found
 
 
@@ -898,7 +945,22 @@ def _verified_base(workspace: Path, base: str) -> str:
     """
     if base.startswith("-") or not _BASE_REF_RE.match(base):
         raise Fault(f"--base {base!r} is not a plain ref name")
-    _git(workspace, "rev-parse", "--verify", "--quiet", "--end-of-options", f"{base}^{{commit}}")
+    out, err = _git_output(
+        workspace, "rev-parse", "--verify", "--end-of-options", f"{base}^{{commit}}"
+    )
+    # `rev-parse` picks one of the refs a name resolves to and says so on
+    # stderr; `_git` threw that away, so in a repository with both a branch and
+    # a tag called `amb`, `--base amb` diffed the tag, the diff came out empty,
+    # and the guard reported a clean payload at exit 0. Round 1's L18 - "a user
+    # who believes they preflighted a diff must not have preflighted a nine-byte
+    # status line" - is the same principle. `--quiet` is gone because it
+    # suppresses that very warning; a ref that names nothing still exits
+    # non-zero, and `_git_output` still turns that into a fault.
+    warning = next((line for line in err.splitlines() if "ambiguous" in line), "")
+    if warning:
+        raise Fault(f"--base {base!r} does not name one commit: {warning.strip()}")
+    if len(out.split()) != 1:
+        raise Fault(f"--base {base!r} did not resolve to exactly one commit")
     return base
 
 
@@ -940,6 +1002,10 @@ def _git_env() -> dict[str, str]:
 
 
 def _git(workspace: Path, *args: str) -> str:
+    return _git_output(workspace, *args)[0]
+
+
+def _git_output(workspace: Path, *args: str) -> tuple[str, str]:
     """Run git so that nothing the workspace configures can execute.
 
     A workspace the delegated agent can write - which is the whole threat this
@@ -972,7 +1038,9 @@ def _git(workspace: Path, *args: str) -> str:
             f"git {args[0]} failed in {workspace} "
             f"(exit {result.returncode}): {detail[-1] if detail else 'no output'}"
         )
-    return result.stdout
+    # stderr comes back too: git says "warning: refname 'x' is ambiguous" there
+    # and still exits 0, and a caller that only reads stdout cannot tell.
+    return result.stdout, result.stderr
 
 
 def _mkdir_owner_only(directory: Path) -> None:

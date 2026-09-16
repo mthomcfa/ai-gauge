@@ -308,6 +308,47 @@ def test_the_narrower_earlier_rule_still_wins_between_equal_claims():
     assert [f.rule for f in findings] == ["connection-string"]
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "/home/u/.aws/credentials:12",
+        "/home/u/.aws/credentials#L4",
+        "/home/u/.aws/credentials?x=1",
+        "(see /home/u/.aws/credentials)",
+        "src/x.py:/home/u/.aws/credentials:12:match",
+        "/home/u/.env:3:17",
+    ],
+    ids=["line", "fragment", "query", "paren", "grep citation", "line and column"],
+)
+def test_a_citation_suffix_does_not_hide_a_denied_path(text):
+    """A path was globbed as a whole token, so it was matched only when it
+    *ended* one: `file:line` is how grep, every compiler and every stack trace
+    names a file, and `?` is not even a path character, so the token carrying it
+    was dropped before it reached a glob."""
+    findings = eg.scan(text, policy())
+    assert any(f.rule == "denied-path" and f.action == eg.BLOCK for f in findings), (
+        f"{text!r} -> {[(f.rule, f.action) for f in findings]}"
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "stored in %APPDATA%/ai-gauge/secrets.dat, encrypted",
+        "we keep it in ~/.aws/credentials.",
+        "the file is ~/.aws/credentials; rotate it",
+        "read src/aigauge/app.py:120 now",
+        "https://example.com/docs/guide.html?x=1",
+    ],
+    ids=["comma", "full stop", "semicolon", "ordinary path", "url"],
+)
+def test_prose_about_a_file_is_still_not_a_denied_path(text):
+    """Only brackets and a `?query` are trimmed. Stripping sentence punctuation
+    as well would put this repository's own docstrings and SECURITY.md back on
+    the blocked list, which is the trade §9 records."""
+    assert not [f for f in eg.scan(text, policy()) if f.rule == "denied-path"], text
+
+
 def test_a_denied_path_finding_does_not_carry_the_path(tmp_path):
     """`Finding.excerpt` promises it never carries the matched secret. The raw
     path carries the local username."""
@@ -955,6 +996,29 @@ def test_the_shipped_example_policy_names_no_destination():
     assert example["destinations"]["allow"] == []
 
 
+def test_the_shipped_example_policy_is_not_weaker_than_the_defaults():
+    """`_deep_update` replaces a list wholesale, so copying the example as the
+    doc's first step *replaces* `paths.deny`. It shipped 16 globs against the
+    built-in 20, so following the documented first step silently dropped
+    `**/*.p12`, `**/*.keystore`, `**/.pypirc` and `**/credentials.json`."""
+    example = json.loads((REPO_ROOT / "tools" / "egress-policy.example.json").read_text("utf-8"))
+    missing = set(eg._DEFAULT_DENY_GLOBS) - set(example["paths"]["deny"])
+    assert not missing, f"the example drops default deny globs: {sorted(missing)}"
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["read ~/certs/client.p12", "read /home/u/.pypirc", "read app/credentials.json",
+     "read a/b.keystore"],
+    ids=["p12", "pypirc", "credentials.json", "keystore"],
+)
+def test_the_example_policy_blocks_what_the_defaults_block(path, tmp_path):
+    example = (REPO_ROOT / "tools" / "egress-policy.example.json").read_text("utf-8")
+    (tmp_path / "policy.json").write_text(example, encoding="utf-8")
+    loaded = eg.Policy.load(str(tmp_path / "policy.json"), tmp_path)
+    assert any(f.rule == "denied-path" for f in eg.scan(path, loaded)), path
+
+
 # --- posture ---------------------------------------------------------------
 
 
@@ -1461,9 +1525,9 @@ def test_git_is_never_asked_for_a_worktree_diff_or_a_status(tmp_path, monkeypatc
 
     def record(workspace, *args):
         calls.append(args)
-        return "0000000000000000000000000000000000000000\n" if args[0] == "rev-parse" else ""
+        return ("0000000000000000000000000000000000000000\n" if args[0] == "rev-parse" else "", "")
 
-    monkeypatch.setattr(eg, "_git", record)
+    monkeypatch.setattr(eg, "_git_output", record)
     args = eg.build_parser().parse_args(["scan", "--include-diff", "--base", "main"])
     eg.build_payload(args, repo)
     assert calls, "no git call at all"
@@ -1568,7 +1632,7 @@ def test_a_base_that_is_not_a_plain_ref_never_reaches_git(base, tmp_path, monkey
     line, and a test that only sees the exception cannot tell them apart."""
     repo = _git_repo(tmp_path)
     calls: list[tuple] = []
-    monkeypatch.setattr(eg, "_git", lambda workspace, *args: calls.append(args) or "")
+    monkeypatch.setattr(eg, "_git_output", lambda workspace, *args: calls.append(args) or ("", ""))
     args = eg.build_parser().parse_args(["scan", "--include-diff", f"--base={base}"])
     with pytest.raises(SystemExit):
         eg.build_payload(args, repo)
@@ -1580,6 +1644,29 @@ def test_a_base_that_names_no_commit_is_refused(tmp_path):
     args = eg.build_parser().parse_args(["scan", "--include-diff", "--base", "no-such-ref"])
     with pytest.raises(SystemExit):
         eg.build_payload(args, repo)
+
+
+def test_an_ambiguous_base_is_a_fault_and_not_an_empty_diff(tmp_path):
+    """git resolves a name that is both a branch and a tag to one of them and
+    says "warning: refname 'x' is ambiguous" on stderr; the guard discarded that
+    stderr, diffed whichever git picked, and reported the result as clean at
+    exit 0. The same silence covers any `--base` pointing at the wrong commit.
+    """
+    repo = _git_repo(tmp_path)
+    _git(repo, "branch", "amb", "main")
+    _git(repo, "tag", "amb", "work")
+    args = eg.build_parser().parse_args(["scan", "--include-diff", "--base", "amb"])
+    with pytest.raises(eg.Fault) as raised:
+        eg.build_payload(args, repo)
+    assert raised.value.code == 3
+    assert "ambiguous" in raised.value.message
+
+
+def test_an_unambiguous_base_still_produces_its_diff(tmp_path):
+    """The control for the test above: the check must not refuse a plain ref."""
+    repo = _git_repo(tmp_path)
+    args = eg.build_parser().parse_args(["scan", "--include-diff", "--base", "main"])
+    assert "a.txt" in eg.build_payload(args, repo)
 
 
 def test_a_failed_git_call_is_a_fault_not_an_empty_diff(tmp_path):
@@ -2035,7 +2122,10 @@ def test_the_diff_never_runs_an_external_driver_even_if_one_is_configured(tmp_pa
 
     def record(argv, **kwargs):
         seen.append(argv)
-        return _subprocess.CompletedProcess(argv, 0, "", "")
+        # `rev-parse --verify` answers with the one commit it resolved; a stub
+        # that answers nothing is a base that resolved to nothing.
+        out = "0" * 40 + "\n" if "rev-parse" in argv else ""
+        return _subprocess.CompletedProcess(argv, 0, out, "")
 
     monkeypatch.setattr(eg.subprocess, "run", record)
     eg.build_payload(
@@ -2058,9 +2148,9 @@ def test_a_base_is_checked_against_the_repository_and_not_just_its_shape(tmp_pat
         calls.append(args)
         if args[0] == "rev-parse":
             raise eg.Fault("git rev-parse failed")
-        return ""
+        return ("", "")
 
-    monkeypatch.setattr(eg, "_git", record)
+    monkeypatch.setattr(eg, "_git_output", record)
     with pytest.raises(SystemExit):
         eg.build_payload(
             eg.build_parser().parse_args(

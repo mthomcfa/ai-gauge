@@ -1074,10 +1074,13 @@ What that round leaves open, deliberately:
   recognised.** The scanner takes whole whitespace- or quote-delimited tokens
   and requires every character to be a path character, which is what stops it
   blocking on every mention of a store path in prose and documentation. The
-  cost is that `read /home/u/.aws/credentials,` and `(/home/u/.aws/credentials)`
-  are not matched. A trailing `.` was already missed before this change. The
-  same trade-off in the other direction — stripping punctuation — puts the
-  repository's own docstrings back on the blocked list.
+  cost is that `read /home/u/.aws/credentials,` is not matched. A trailing `.`
+  was already missed before this change. The same trade-off in the other
+  direction — stripping punctuation — puts the repository's own docstrings back
+  on the blocked list. (The third round narrowed this: a trailing bracket, a
+  `?query` and a `:line`/`#fragment` citation *are* now taken off the token, so
+  `(/home/u/.aws/credentials)` and `…/credentials:12` are matched. Sentence
+  punctuation still is not.)
 
 - **The deny list blocks this repository's own documentation of its own
   store.** `SECURITY.md` names `%APPDATA%/ai-gauge/secrets.dat` in a table, so
