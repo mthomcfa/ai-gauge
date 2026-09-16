@@ -111,13 +111,17 @@ allowed to cost.
   fallbacks embed a class name the payload chose (1 MB in, 1 000 017
   characters out; now 77 in app.py and 60 in the scraper). `snapshot.error`
   on that record is clipped to 300 characters with its newlines flattened: a
-  2 MB error made one 2 480 074-character record — 4.73x the whole rotation
-  — carrying 20 000 lines that each read like a real one. The tile, the tray
-  tooltip and the error dialog still get the string whole. `scrape fail`'s
-  `load_error_string` is clipped the same way; measured against a real
-  QtWebEngine it is a Qt string-table message rather than the server's, so
-  that one closes an assumption rather than a hole. All three arguments are
-  guarded, `snapshot.error` included: `UsageSnapshot` is a plain dataclass,
+  2 480 000-character error — 20 000 forged lines — made one record of
+  2 480 065 characters with `provider=copilot` and 2 480 069 with the
+  longest provider name, 1.58x the whole 512 KiB × 3 rotation, every one of
+  those 20 000 lines reading like a real one. (Every multiplier in this
+  entry is against the whole rotation, 512 KiB × 3 = 1 572 864 bytes. An
+  earlier draft divided by one 512 KiB file and read 3× worse: 4.73x here.)
+  The tile, the tray tooltip and the error dialog still get the string
+  whole. `scrape fail`'s `load_error_string` is clipped the same way;
+  measured against a real QtWebEngine it is a Qt string-table message
+  rather than the server's, so that one closes an assumption rather than a
+  hole. All three arguments are guarded, `snapshot.error` included: `UsageSnapshot` is a plain dataclass,
   so `error or ""` runs the object's `__bool__` and `str()` its `__str__`,
   and either raised straight out of `_on_snapshot` — before the tile was
   painted — until the helper caught it and answered
@@ -190,7 +194,7 @@ allowed to cost.
   numeric branch charged a flat 8 whatever the magnitude and the `repr()`
   fallback was charged after the fact and never clipped. Measured, and then
   measured again after: a 5 MB `bytes` value **5 000 012 → 312** characters
-  (9.5x the whole 512 KiB rotation, to a fifth of a line), a 5 MB `bytearray`
+  (3.18x the whole rotation, to a fifth of a line), a 5 MB `bytearray`
   5 000 023 → 312, a 50 000-element `set` 338 899 → 312, fifty 4 200-digit
   integers **210 440 → 50**. An int's printed length is now estimated from
   `bit_length()` and the number is never converted: CPython 3.11+ raises on
@@ -204,17 +208,18 @@ allowed to cost.
   handed back the whole payload on the one path that had already gone wrong.
   The existing adversarial payloads are unmoved: the worst `raw_summary=`
   argument is 4 803 characters and the whole `snapshot error …` record it
-  sits in is 4 998 (`_nested(20, 4)`, measured on both trees; an earlier
-  draft of this entry, and the message of commit `21bd5be`, gave 4 283 and
-  called it the record — the claim was right, the number was not, and 4 803
-  is the argument rather than the line). None of it is reachable today; it bites the first time an
+  sits in is up to 4 998 — the record carries the provider's name, so it is
+  4 992 for `azure` and 4 998 for `opencode_go` (`_nested(20, 4)`, measured
+  on both trees; an earlier draft of this entry, and the message of commit
+  `21bd5be`, gave 4 283 and called it the record — the claim was right, the
+  number was not, and 4 803 is the argument rather than the line). None of it is reachable today; it bites the first time an
   extractor or a provider returns something that is not plain JSON.
 - **The scraper's log lines clip the text the page chose.** `title=%r` at
   four call sites and `result_keys=%s` at one had no length cap, and the
   healthy `scrape ok` line is at INFO. Driving `_finish` with a 1 MB
   `document.title` and an extractor result of 10 000 keys of 1 000
   characters: **11 079 134 characters for `scrape ok` and 1 000 367 for
-  `scrape fail`** — 21x and 1.9x the whole rotation, from one scrape, into
+  `scrape fail`** — 7.04x and 0.64x the whole rotation, from one scrape, into
   the file the error dialog asks the user to attach. The same inputs now
   produce 3 664 and 570 (3 814 until `_key_text(key)[:60]` stopped appending
   the `"..."` marker to each of 50 over-long key names). Titles clip at 200; the key list takes the shape
@@ -241,14 +246,20 @@ allowed to cost.
 
 ### Notes
 
-- **1 216 → 1 270 tests.** Including six fake hours of a wedged REST worker
+- **1 216 → 1 274 tests.** Including six fake hours of a wedged REST worker
   against a browser sibling, an hour-long park ridden out over eleven cadence
   wakes, a mislabelled answer that must not touch its sibling's dispatch, and
-  the three payloads that used to raise out of `_on_snapshot`. Twenty of them
-  are this release's own review: the idle backoff measured with a provider
-  parked and without, a removed browser account's park, the epoch guard on
-  the un-park, a deferred clear carried across a quit, and the payloads that
-  refuse to be iterated, measured or repr'd.
+  the three payloads that used to raise out of `_on_snapshot`. **Thirty-five**
+  of them are this release's own review, over three rounds: the idle backoff
+  measured with a provider parked and without, a removed browser account's
+  park, the epoch guard on the un-park, a deferred clear carried across a
+  quit and the payloads that refuse to be iterated, measured or repr'd
+  (round 1); the snapshot-error record bounded where it is written, a
+  sign-in queued behind a settings save, and an id on both deferral lists
+  purged once (round 2); and a subscription id swept across every offset the
+  log's clip can cut it at, a link in `profiles/` that is never a profile,
+  and the two arms of `is_usable_profile_id` the filesystem decides
+  (round 3).
 - **The REST socket itself is still unbounded.** This bounds how many workers
   a hung endpoint can accumulate, not how long one of them lives. A total
   response deadline — `stream=True` plus an elapsed check while reading — is

@@ -150,9 +150,9 @@ def _refresh_budget_seconds(provider) -> float:
 # is the one field this release adds to `config.json`, it is drained before
 # anything else at startup, and neither its length nor its entries are
 # bounded: a poisoned file carrying two 200 000-character ids wrote 800 KB of
-# records, of which one line was 0.76x the whole 512 KiB rotation - the same
-# anti-forensic outcome the `raw_summary=` cap closes, on the one path that
-# runs before the app has done anything else.
+# records, of which one line was 0.25x the whole 512 KiB x 3 rotation - the
+# same anti-forensic outcome the `raw_summary=` cap closes, on the one path
+# that runs before the app has done anything else.
 _LOG_ID_LIMIT = 64
 _LOG_ID_SAMPLE = 3
 
@@ -321,7 +321,7 @@ _LOG_KEY_LEN_LIMIT = 60
 # And a cap on the whole record, because the per-node caps multiply. Fifty
 # keys at each of three levels is 125 000 nodes, so a payload nested four
 # deep with a fan-out of 20 measured 2.2 MB and an api-capture-shaped one
-# 4.77 MB - 9x the entire 512 KiB x 3 rotation, from one ERROR scrape.
+# 4.77 MB - 3.03x the entire 512 KiB x 3 rotation, from one ERROR scrape.
 _LOG_SUMMARY_BUDGET = 4000
 # How much past the value limit the redaction pass is allowed to see. Long
 # enough for any single identifier it matches - a GUID is 36 characters, its
@@ -356,8 +356,9 @@ def _error_for_log(error: object) -> str:
     build the string from a fixed literal, but Copilot's and OpenRouter's
     transport failures carry `str(exc)` from `requests`, so neither its
     length nor its line breaks are the app's to assume: a 2 MB error measured
-    4.73x the whole rotation in one record, with 20 000 embedded newlines
-    that each read like a log line of their own.
+    1.58x the whole 512 KiB x 3 rotation in one record - 2 480 065
+    characters for `provider=copilot` - with 20 000 embedded newlines that
+    each read like a log line of their own.
 
     Guarded end to end like the two helpers it is evaluated beside:
     `UsageSnapshot` is a plain dataclass, so `error: str | None` is a hint
@@ -484,7 +485,7 @@ def _summarize_for_log(value, *, depth: int = 0, budget: list[int] | None = None
         text = f"<unrepresentable {type(value).__name__}>"
     # Clipped and charged exactly like the string branch. It was charged
     # after the fact and never clipped, so one 5 MB `bytes` value produced a
-    # record 9.5x the whole rotation - measured at 5 000 012 characters.
+    # record 3.18x the whole 512 KiB x 3 rotation - 5 000 012 characters.
     if len(text) > _LOG_VALUE_LIMIT:
         text = text[:_LOG_VALUE_LIMIT] + "..."
     budget[0] -= len(text)

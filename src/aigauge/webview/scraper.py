@@ -63,8 +63,8 @@ _LOG_KEY_COUNT_LIMIT = 50
 # HTTP failure, 20 for `net::ERR_UNSAFE_PORT` - so this bound costs nothing
 # today. It closes the assumption rather than a hole: forcing the field to
 # 500 000 characters produced a 500 353-character `scrape fail` record,
-# 0.95x the whole rotation, and it is the largest argument on that record
-# with no cap of its own.
+# 0.32x the whole 512 KiB x 3 rotation, and it is the largest argument
+# on that record with no cap of its own.
 _LOG_ERROR_LIMIT = 300
 
 

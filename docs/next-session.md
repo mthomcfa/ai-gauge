@@ -4,7 +4,7 @@ State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#1
 610 tests passing, all five providers reading.
 
 > **Updated 2026-09-15** by the hardening follow-up (`1.3.1+cfa.6`,
-> 1 270 tests), which closed most of what the refresh-cadence work left in
+> 1 274 tests), which closed most of what the refresh-cadence work left in
 > [§8.3](#83-known-soft-spots-in-what-was-built): the REST park, the
 > "Clear all browser data" purge, the dispatch epoch's name, the log
 > summariser and the scraper's uncapped log lines. What is still open there
@@ -760,7 +760,12 @@ unnecessary source of behaviour change.
   separate calls - stays on the clear list only, because both end in the
   same `purge_profile` and the clear's drain skips nothing. Carrying both
   cost a second deletion and, while that account's scrape was out, a second
-  `deferred` line at every heartbeat. The dialog also stops asking twice:
+  `deferred` line at every heartbeat. The cost of "skips nothing" is that a
+  `config.json` restored from a backup taken inside the deferral window, or
+  synced from another machine, signs the user out of every account it names
+  at the next start with only an `info` line to explain it - the alternative
+  drops every deferred clear instead, which is the defect the list exists to
+  fix. The dialog also stops asking twice:
   `removed_profile_ids` drops whatever the clear-all set already covered.
 - **A deferred purge makes the app write `config.json` on its own.**
   `_run_profile_purges` records what is still owed, and it is called from
@@ -777,8 +782,12 @@ unnecessary source of behaviour change.
   one helper and one `Config.save()` per drain. The alternative was leaving
   that list in memory, which loses a live account's session cookie to a quit
   inside the deferral window, and the write is the cheaper of the two.
-  A third writer is still worth thinking twice about. (It also means an
-  ad-hoc harness that
+  A third writer is still worth thinking twice about. **It is also not
+  atomic** - a bare `path.write_text` - so a crash or a power cut inside one
+  of those unasked writes truncates the file that holds every setting; the
+  loader survives it (`config.json.corrupt` and defaults, executed) but the
+  settings are gone, and `tmp` plus `os.replace` is six lines. (It also means
+  an ad-hoc harness that
   drives `_run_profile_purges` must set `APPDATA` - an override on every OS,
   which `tests/conftest.py` sets for the suite - or it edits the developer's
   real config.)
@@ -858,6 +867,83 @@ unnecessary source of behaviour change.
   countdown) with one clamp; the label half is the same repo-wide `key`
   decision and does not belong bundled with a cadence fix.
 
+- **300 characters of provider-chosen text still reach the log verbatim.**
+  `_error_for_log` bounds an error's length, flattens its line breaks and
+  redacts Azure identifiers, but it does not run `_redact_emails`, which the
+  error dialog's blob does - so an email, a bearer token or a balance a
+  provider page puts in `snapshot.error` is written into the rotating file
+  users are asked to attach to bug reports. Base behaves identically; this
+  release bounded the cost of that record, not its content. The fix is one
+  more call beside `_redact_azure_ids`, on an already-clipped string.
+- **Less of a long error reaches the log than before.** The clip-before-
+  redact window is 500 characters and the redaction shrinks what it keeps, so
+  an error that is nothing but Azure identifiers now produces a ~200-character
+  record where redact-then-clip produced 300. It is bounded either way and
+  what is lost is identifiers, so it is the price of taking four regex passes
+  over a 1.2 MB provider string off the GUI thread (163 ms to 0.08 ms).
+- **`scrape fail`'s `error=%s` still has no cap.** Every other argument on
+  that record is clipped and this one is not; all five callers pass a fixed
+  literal (`"timeout"`, `"extractor retry limit exceeded"`), so nothing
+  unbounded reaches it today. It bites the first time someone passes an
+  exception's text there; the fix is the `_clip` helper already beside it.
+- **200 characters of page-chosen title reach the log and 2 000 the
+  clipboard.** A 1.45 MB `document.title` gives a 968-character log record
+  and a 2 540-character copy-diagnostics blob with the title sanitized to
+  2 012; a planted email is redacted there and an API-key-shaped string is
+  not. Identical at base and unchanged by this release.
+- **"Clear all browser data" is linear in the raw `profiles/` entry count, on
+  the GUI thread.** One `resolve()` and one keyring write per entry: 12
+  entries cost 5 ms of click, 1 002 cost 73 ms and 10 002 cost 714 ms with
+  the keyring stubbed, and on Windows each of those writes decrypts and
+  rewrites the whole secrets file. A real install has a handful of
+  directories; the fix is to hoist the resolved root out of the loop and to
+  skip names no keyring can hold.
+- **`_begin_cycle` counts names that are not configured providers.**
+  `requested = len(names)` is taken before the filter and `requested >
+  len(dispatched)` is what marks a cycle partial, so a caller passing a stale
+  name would make every cycle look partial and stop the idle backoff
+  advancing. Unreachable today - every caller filters through `_providers` -
+  and the fix is `len(set(names) & self._providers.keys())`.
+- **A queued sign-in is answered by the settings save's refresh, not its
+  own.** `_run_pending_manual` tests `full` first, so a queued full refresh
+  discards `_pending_manual_providers` entirely; 1.3.1+cfa.6 made the tile
+  speak for the user in that case but the per-provider refresh still does not
+  run as itself. The full cycle covers that provider anyway, so the loss is
+  ordering; the fix is to move the queued names to the front of the full
+  cycle's order.
+- **`_is_abandoned` mutates state from inside a predicate.** It pops the
+  `_abandoned` entry and logs `abandoned worker assumed dead` once the
+  deadline has passed, and `_purge_blocked_reason` calls it at every
+  five-minute heartbeat - so *asking* whether a profile can be deleted can
+  un-park a provider and write a WARNING. Correct wherever it happens; a pure
+  `_is_abandoned_at(now)` for the predicate is the tidy version.
+- **`providers/catalog.py` still imports the private
+  `config._is_safe_profile_id`.** The settings dialog was given the public
+  `is_usable_profile_id`; the catalog wants the *name* rule only, which is
+  what it takes, so the fix is to publish `is_safe_profile_id` beside it
+  rather than route the catalog through a predicate that touches the
+  filesystem.
+- **Three `inspect.getsource` assertions remain in the suite.**
+  `test_app_logging.py`, `test_scraper.py` and `test_api_capture.py` each
+  still grep a function's source. The two that were load-bearing were
+  converted to behavioural tests; none of these three is the sole killer of
+  any mutation, so they are redundancy rather than a gap, and they bite when
+  someone moves the code they grep for.
+- **`test_a_parked_provider_does_not_freeze_the_idle_backoff` is only
+  measured at REST-sized budgets.** Its floor is derived from the run's own
+  arithmetic now, so a re-tuned budget moves it - but at a 900 s budget the
+  *ceiling* itself stops holding: the wedged run makes 31 dispatches against
+  a control of 12 over the same six hours, because a watchdog wait longer
+  than the cycle spacing keeps `_unchanged_cycles` down and the app on its
+  short cadence. No provider in the tree has a budget near that (Azure's is
+  225 s and it has its own in-flight gate), so this is a note about the
+  fixture's reach rather than a live rate defect - but it is the shape a
+  future long-budget provider would arrive in.
+- **`SECURITY.md` does not describe "Clear all browser data".** It covers
+  egress, secrets and the Azure rate floor, but not the one button that
+  deletes a directory tree and a set of keyring entries, and not that the
+  request is now persisted across a quit in `config.json`. Two sentences
+  under the existing local-data heading.
 - **One CI job segfaulted in a native thread, once, and the cause is not
   pinned.** Run 67 on `aab1de9` died with `Fatal Python error: Segmentation
   fault` in the Ubuntu 22.04 / 3.11 job while the other five jobs and every

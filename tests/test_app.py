@@ -1758,9 +1758,10 @@ def test_an_error_string_costs_the_log_one_bounded_line():
     """`snapshot.error` is the fourth provider-influenced argument on that
     record, and the only one still uncapped. Copilot's and OpenRouter's
     transport failures carry `str(exc)` from `requests`, so its length and
-    its newlines are not the app's to assume: a 2 MB error measured
-    2 480 074 characters - 4.73x the whole rotation - with 20 000 embedded
-    newlines that each read like a record of their own. The tile, the tray
+    its newlines are not the app's to assume: a 2 480 000-character error
+    measured a 2 480 065-character record for `provider=copilot` - 1.58x the
+    whole 512 KiB x 3 rotation - with 20 000 embedded newlines that each
+    read like a record of their own. The tile, the tray
     tooltip and the error dialog still get the string whole; this is the log
     line only."""
     from aigauge.app import _LOG_VALUE_LIMIT, _error_for_log
