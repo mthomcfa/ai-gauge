@@ -96,14 +96,30 @@ class ResponseDeadlineExceeded(requests.RequestException):
     has an ``except requests.RequestException`` branch that turns a transport
     failure into an ERROR snapshot, and a deadline is a transport failure.
     (Copilot's ``work()`` is the one that did not, and was given one in
-    1.3.2+cfa.7 rather than assumed.) The message carries the bound and nothing else - no URL (an ARM
-    URL carries the subscription id), no response text - because it reaches
-    ``snapshot.error``, the tile tooltip and ai-gauge.log.
+    1.3.2+cfa.7 rather than assumed.) The message carries the bound and
+    nothing else - no URL (an ARM URL carries the subscription id), no
+    response text - because it reaches ``snapshot.error``, the tile tooltip
+    and ai-gauge.log.
     """
 
 
 class ResponseTooLarge(requests.RequestException):
     """The body passed ``max_bytes``. Same contract as the class above."""
+
+
+class ResponseRedirected(requests.RequestException):
+    """A 3xx arrived, and this app does not follow redirects.
+
+    ``raise_for_status()`` does not raise on a 3xx, so without this the
+    redirect reached the call site as a body that will not parse: a
+    ``JSONDecodeError`` on the usage paths, and on Copilot's username resolve
+    a ``None`` that the tile reports as "PAT may lack read:user" - sending the
+    user to re-issue a credential that is fine. ``api.github.com`` issues a
+    301 for a renamed user or org, so this is not hypothetical; until
+    1.3.2+cfa.7 those were followed. The status is in the message; the
+    ``Location`` value and the URL are not, because this string reaches
+    ``snapshot.error``, the tile tooltip and ai-gauge.log.
+    """
 
 
 class ResponseEncodingRefused(requests.RequestException):
@@ -305,9 +321,9 @@ def bounded_request(
     ``.raise_for_status()`` (including the ``HTTPError.response`` back-link)
     are all unchanged, so no call site has to know this helper is in the way.
 
-    Raises ``ResponseDeadlineExceeded``, ``ResponseTooLarge`` or
-    ``ResponseEncodingRefused`` - all ``requests.RequestException`` - and
-    closes the response first, so the
+    Raises ``ResponseDeadlineExceeded``, ``ResponseTooLarge``,
+    ``ResponseRedirected`` or ``ResponseEncodingRefused`` - all
+    ``requests.RequestException`` - and closes the response first, so the
     socket is released rather than left to the garbage collector. Every other
     ``requests`` exception propagates as before, *except* one raised by a read
     the deadline timer cut: that is a deadline, and is re-raised as one with
@@ -317,7 +333,10 @@ def bounded_request(
     ``allow_redirects`` defaults to **False**: every host this app speaks to is
     fixed and documented in SECURITY.md, so a redirect is a failure, not
     something to follow. Azure already passed this explicitly; Copilot and
-    OpenRouter now get it too.
+    OpenRouter now get it too. Refusing to follow one is only half the job -
+    ``raise_for_status()`` says nothing about a 3xx - so a 3xx raises
+    ``ResponseRedirected`` here rather than reaching a call site as a body
+    that will not parse.
 
     ``monotonic`` is injectable so the tests can exhaust a deadline without
     waiting. Never use ``time.monotonic()`` as if it started at zero - the
@@ -349,6 +368,7 @@ def bounded_request(
         # headers has already spent the budget, and there is no reason to
         # wait out a whole chunk read to say so.
         _check_deadline(started, total_seconds, monotonic, deadline)
+        _refuse_redirect(response, allow_redirects)
         _refuse_nested_encoding(response)
         for chunk in _body_chunks(response, chunk_bytes):
             body += chunk
@@ -358,7 +378,7 @@ def bounded_request(
                 )
             _check_deadline(started, total_seconds, monotonic, deadline)
     except BaseException as exc:
-        # Covers the three bounds above and anything requests raises mid-stream
+        # Covers the four refusals above and anything requests raises mid-stream
         # (a chunked-encoding failure, a read timeout on one chunk). Abandoning
         # the generator stops the read; close() releases the connection.
         if response is not None:
@@ -389,6 +409,15 @@ def bounded_request(
     response._content_consumed = True
     return response
 
+
+def _refuse_redirect(response: requests.Response, allow_redirects: bool) -> None:
+    """A 3xx is a failure here, and has to be reported as the one it is."""
+    if allow_redirects or not 300 <= response.status_code < 400:
+        return
+    raise ResponseRedirected(
+        f"The endpoint redirected ({response.status_code}); "
+        "this app does not follow redirects."
+    )
 
 def _refuse_nested_encoding(response: requests.Response) -> None:
     """Refuse ``Content-Encoding: gzip, gzip`` before reading a byte of it."""
@@ -483,7 +512,7 @@ def _cut_by_the_deadline(
     A socket the timer shut down surfaces as whatever the broken read raised -
     a ``ChunkedEncodingError`` on a truncated body, a ``ConnectionError`` on a
     cut header block - which would tell the call site the endpoint failed when
-    in fact this app gave up. The three bounds below are already the right
+    in fact this app gave up. The four refusals below are already the right
     answer and keep their own names; ``KeyboardInterrupt`` and ``SystemExit``
     are not transport failures and keep theirs.
     """
@@ -492,6 +521,7 @@ def _cut_by_the_deadline(
         (
             ResponseDeadlineExceeded,
             ResponseTooLarge,
+            ResponseRedirected,
             ResponseEncodingRefused,
         ),
     ):

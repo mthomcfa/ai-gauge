@@ -3158,6 +3158,31 @@ def test_a_response_too_large_is_recorded_the_same_way(monkeypatch, config):
 
 
 @responses.activate
+def test_a_redirect_from_entra_id_is_reported_as_a_redirect(monkeypatch, config):
+    """The real helper, not a monkeypatched one: `responses` hands back a real
+    urllib3 handle, so the 3xx goes through `bounded_request`'s own refusal.
+    `raise_for_status()` never raised on a 3xx, so before this release a
+    redirect here surfaced as a JSON parse error."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    responses.add(
+        responses.POST,
+        TOKEN_URL,
+        body="",
+        status=302,
+        headers={"Location": "https://login.microsoftonline.invalid/evil"},
+    )
+
+    snapshot = _run_through_pool(az.AzureProvider(config, pool=_InlinePool()))
+
+    assert snapshot.status == SnapshotStatus.ERROR
+    assert "Could not reach Entra ID" in (snapshot.error or "")
+    assert "ResponseRedirected" in (snapshot.error or "")
+    assert "microsoftonline.invalid" not in (snapshot.error or "")
+    assert TENANT not in (snapshot.error or "")
+    assert az.state_for(SUB).last_error is not None
+
+
+@responses.activate
 def test_an_entra_token_deadline_does_not_read_as_a_rejected_registration(
     monkeypatch, config
 ):

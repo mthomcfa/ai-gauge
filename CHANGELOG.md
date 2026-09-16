@@ -115,11 +115,24 @@ call that answers in under a second answers exactly as it did.
   body never read. A single-layer gzip bomb is unchanged - `ResponseTooLarge`
   at the cap, with a `tracemalloc` peak the suite now pins under 32 MiB.
 
-- **`allow_redirects=False` on every REST call.** Every host this app speaks
-  to is fixed and listed in `SECURITY.md`, so a redirect is a failure, not
-  something to follow. Azure already said so; Copilot and OpenRouter get the
-  helper's default, and neither GitHub nor OpenRouter redirects the API paths
-  in question.
+- **`allow_redirects=False` on every REST call, and a 3xx is reported as
+  one.** Every host this app speaks to is fixed and listed in `SECURITY.md`,
+  so a redirect is a failure, not something to follow. Azure already said so;
+  Copilot and OpenRouter get the helper's default. Refusing the hop is only
+  half of it, though: `raise_for_status()` says nothing about a 3xx, so the
+  redirect went on to `.json()` and the tile read *"Expecting value: line 1
+  column 1 (char 0)"* - and on Copilot's username resolve it became a `None`,
+  which the tile reports as *"PAT may lack read:user"*, sending the user to
+  re-issue a credential that is fine. A 3xx now raises `ResponseRedirected`,
+  another `requests.RequestException`, carrying the status and neither the
+  URL nor the `Location`. `_resolve_username` lets that one through rather
+  than swallowing it, because "the PAT may lack read:user" is the wrong
+  diagnosis for a redirect.
+
+  Whether these paths ever redirect is an assumption, not a measurement: it
+  was not tested against the live hosts, and `api.github.com` is documented
+  to answer a renamed user or organisation with a 301. If one does, the tile
+  now says so instead of guessing.
 
 ### Fixed
 

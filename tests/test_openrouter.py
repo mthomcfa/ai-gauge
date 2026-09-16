@@ -715,6 +715,38 @@ def test_a_response_deadline_ends_the_refresh_as_an_error(monkeypatch):
     assert "openrouter.ai" not in (snap.error or "")
 
 
+@responses.activate
+def test_a_redirect_is_reported_as_one_rather_than_as_a_parse_error(monkeypatch):
+    """A 3xx is not followed, and `raise_for_status()` does not raise on one,
+    so before this release it reached `.json()` and the tile read "Expecting
+    value: line 1 column 1 (char 0)" - which names neither the redirect nor
+    the host."""
+    import aigauge.providers.openrouter as or_mod
+    from aigauge.providers.openrouter import OpenRouterProvider
+
+    monkeypatch.setattr(or_mod, "get_openrouter_key", lambda: "inference-key")
+    monkeypatch.setattr(or_mod, "get_openrouter_mgmt_key", lambda: "mgmt-key")
+    responses.add(
+        responses.GET,
+        f"{OPENROUTER_API}/credits",
+        body="",
+        status=307,
+        headers={"Location": "https://openrouter.invalid/credits"},
+    )
+
+    captured: list = []
+    OpenRouterProvider(Config(), pool=_InlinePool()).refresh(captured.append)
+
+    snapshot = captured[0]
+    assert snapshot.status == SnapshotStatus.ERROR
+    # This provider's branches report the message rather than the type name,
+    # which the redirect refusal is written for: it says what happened and
+    # names no host.
+    assert "redirected (307)" in (snapshot.error or "")
+    assert "openrouter.invalid" not in (snapshot.error or "")
+    assert "Expecting value" not in (snapshot.error or "")
+
+
 def test_the_activity_classification_line_names_the_type_not_the_message(
     monkeypatch, caplog
 ):

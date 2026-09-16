@@ -232,6 +232,73 @@ def test_a_body_exactly_at_the_cap_is_allowed(monkeypatch):
     assert response.content == b"z" * 64
 
 
+# --- a redirect this app will not follow ------------------------------------
+
+
+@responses.activate
+@pytest.mark.parametrize("status", [301, 302, 307, 308], ids=str)
+def test_a_redirect_is_refused_with_its_own_name(status):
+    """`allow_redirects=False` stops the hop; `raise_for_status()` says
+    nothing about a 3xx, so without this the redirect reached the call site as
+    a body that will not parse. `api.github.com` answers a renamed user or org
+    with a 301, so this is a real path, not a hypothetical one."""
+    responses.add(
+        responses.GET,
+        "https://example.invalid/moved",
+        body="",
+        status=status,
+        headers={"Location": "https://elsewhere.invalid/secret-path"},
+    )
+
+    with pytest.raises(_http.ResponseRedirected) as excinfo:
+        _http.bounded_request("GET", "https://example.invalid/moved", timeout=15)
+
+    message = str(excinfo.value)
+    assert str(status) in message
+    # The one thing a redirect carries is where it points, and that is the one
+    # thing this message must not: it reaches the tile and ai-gauge.log.
+    assert "elsewhere.invalid" not in message
+    assert "secret-path" not in message
+    assert "http" not in message.lower()
+    assert isinstance(excinfo.value, requests.RequestException)
+
+
+@responses.activate
+def test_a_caller_that_asks_to_follow_redirects_still_may():
+    """The refusal is of an unfollowed redirect, not of the status: a caller
+    that passes `allow_redirects=True` gets requests' own behaviour."""
+    responses.add(
+        responses.GET,
+        "https://example.invalid/moved",
+        body="",
+        status=302,
+        headers={"Location": "https://example.invalid/there"},
+    )
+    responses.add(
+        responses.GET, "https://example.invalid/there", json={"a": 1}, status=200
+    )
+
+    response = _http.bounded_request(
+        "GET",
+        "https://example.invalid/moved",
+        timeout=15,
+        allow_redirects=True,
+    )
+
+    assert response.json() == {"a": 1}
+
+
+def test_a_redirect_is_refused_before_the_body_is_read(monkeypatch):
+    raw = _FakeRaw([b"body that should never be read"])
+    _patch_request(monkeypatch, _fake_response(raw, status=301))
+
+    with pytest.raises(_http.ResponseRedirected):
+        _http.bounded_request("GET", "https://example.invalid/x", timeout=15)
+
+    assert raw.reads == 0
+    assert raw.closed == 1
+
+
 # --- what a Content-Encoding may cost -------------------------------------
 #
 # The cap above is on decoded bytes, and the count between reads only helps if

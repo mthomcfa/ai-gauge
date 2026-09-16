@@ -9,7 +9,11 @@ import requests
 
 from ..config import Config, get_github_pat
 from ..models import SnapshotStatus, UsageMetric, UsageSnapshot
-from ._http import bounded_request, request_worst_case_seconds
+from ._http import (
+    ResponseRedirected,
+    bounded_request,
+    request_worst_case_seconds,
+)
 from .base import Provider
 
 GITHUB_API = "https://api.github.com"
@@ -72,6 +76,16 @@ def _next_month_start_utc(now_utc: datetime) -> datetime:
 
 
 def _resolve_username(pat: str, configured: str | None) -> str | None:
+    """The username behind the PAT, or ``None`` if the PAT cannot say.
+
+    ``None`` is reported as "PAT may lack read:user", so it is the answer for
+    a refusal and for a transport failure that leaves the question open - but
+    not for a redirect. ``api.github.com`` answers a renamed user or org with
+    a 301, and this app does not follow one; telling the user to re-issue a
+    perfectly good credential for that would be a wrong diagnosis, so
+    ``ResponseRedirected`` is left to ``work()``'s branch, which reports what
+    happened.
+    """
     if configured:
         return configured
     try:
@@ -83,6 +97,8 @@ def _resolve_username(pat: str, configured: str | None) -> str | None:
         )
         if r.status_code == 200:
             return r.json().get("login")
+    except ResponseRedirected:
+        raise
     except requests.RequestException:
         return None
     return None

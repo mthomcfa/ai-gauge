@@ -347,6 +347,65 @@ def test_an_offline_failure_keeps_the_github_username_out_of_every_sink(caplog):
     assert "classification=request_failed type=ConnectionError" in caplog.text
 
 
+@responses.activate
+def test_a_redirect_on_the_username_path_is_an_error_not_a_bad_pat(caplog):
+    """GitHub answers a renamed user or org with a 301, and this app does not
+    follow one. `_resolve_username` answering `None` for that would put "PAT
+    may lack read:user" on the tile - a wrong diagnosis of a credential that
+    is fine - so the redirect is left to `work()`'s branch."""
+    import logging
+
+    import aigauge.providers.copilot as copilot_mod
+    from aigauge.providers.copilot import CopilotProvider
+
+    responses.add(
+        responses.GET,
+        f"{GITHUB_API}/user",
+        body="",
+        status=301,
+        headers={"Location": "https://api.github.invalid/user/renamed"},
+    )
+
+    captured: list = []
+    with caplog.at_level(logging.DEBUG, logger="aigauge"):
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(copilot_mod, "get_github_pat", lambda: "ghp_test")
+            CopilotProvider(Config(), pool=_InlinePool()).refresh(captured.append)
+
+    snapshot = captured[0]
+    assert snapshot.status == SnapshotStatus.ERROR, snapshot.error
+    assert snapshot.status != SnapshotStatus.AUTH_REQUIRED
+    assert snapshot.error == "GitHub request failed (ResponseRedirected)."
+    for sink in (snapshot.error or "", caplog.text):
+        assert "api.github.invalid" not in sink
+        assert "renamed" not in sink
+
+
+@responses.activate
+def test_a_redirect_on_the_usage_path_is_reported_as_a_redirect():
+    """The other half: before this release a 301 here reached `.json()` and
+    the tile read "Expecting value: line 1 column 1 (char 0)"."""
+    import aigauge.providers.copilot as copilot_mod
+    from aigauge.providers.copilot import CopilotProvider
+
+    responses.add(
+        responses.GET,
+        f"{GITHUB_API}/users/octocat/settings/billing/usage/summary",
+        body="",
+        status=301,
+        headers={"Location": "https://api.github.invalid/elsewhere"},
+    )
+
+    cfg = Config()
+    cfg.copilot.username = "octocat"
+    captured: list = []
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(copilot_mod, "get_github_pat", lambda: "ghp_test")
+        CopilotProvider(cfg, pool=_InlinePool()).refresh(captured.append)
+
+    assert captured[0].status == SnapshotStatus.ERROR
+    assert captured[0].error == "GitHub request failed (ResponseRedirected)."
+
 def test_an_exception_that_is_not_a_request_failure_names_its_type_too(caplog):
     """The blanket handler is the last resort, not the usual path, and it
     reported `str(exc)` - which for a transport failure is the URL. It says
