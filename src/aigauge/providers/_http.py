@@ -533,13 +533,29 @@ def bounded_request(
     return response
 
 
+# The 3xx statuses that are a redirect: a `Location` to follow, and the
+# reason this refusal exists. The rest of the range fails closed too - this
+# app reads a 2xx and nothing else - but saying "redirected" about them is
+# wrong. 304 Not Modified is the one that can arrive in practice: no call
+# site sends `If-None-Match` or `If-Modified-Since` today, so a conformant
+# origin will not send one, but a caching proxy can, and the first person to
+# add an ETag to a GitHub call would get "The endpoint redirected (304)" on
+# the tile for a perfectly ordinary reply.
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
+
 def _refuse_redirect(response: requests.Response, allow_redirects: bool) -> None:
     """A 3xx is a failure here, and has to be reported as the one it is."""
     if allow_redirects or not 300 <= response.status_code < 400:
         return
+    if response.status_code in _REDIRECT_STATUSES:
+        raise ResponseRedirected(
+            f"The endpoint redirected ({response.status_code}); "
+            "this app does not follow redirects."
+        )
     raise ResponseRedirected(
-        f"The endpoint redirected ({response.status_code}); "
-        "this app does not follow redirects."
+        f"The endpoint returned {response.status_code}; "
+        "this app reads only a 2xx."
     )
 
 

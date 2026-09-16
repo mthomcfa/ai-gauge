@@ -244,12 +244,29 @@ def test_a_body_exactly_at_the_cap_is_allowed(monkeypatch):
 
 
 @responses.activate
-@pytest.mark.parametrize("status", [301, 302, 307, 308], ids=str)
-def test_a_redirect_is_refused_with_its_own_name(status):
+@pytest.mark.parametrize(
+    "status, redirect",
+    [
+        pytest.param(300, False, id="300"),
+        pytest.param(301, True, id="301"),
+        pytest.param(302, True, id="302"),
+        pytest.param(303, True, id="303"),
+        pytest.param(304, False, id="304"),
+        pytest.param(307, True, id="307"),
+        pytest.param(308, True, id="308"),
+    ],
+)
+def test_a_redirect_is_refused_with_its_own_name(status, redirect):
     """`allow_redirects=False` stops the hop; `raise_for_status()` says
     nothing about a 3xx, so without this the redirect reached the call site as
     a body that will not parse. `api.github.com` answers a renamed user or org
-    with a 301, so this is a real path, not a hypothetical one."""
+    with a 301, so this is a real path, not a hypothetical one.
+
+    The whole range still fails closed, because this app reads a 2xx and
+    nothing else - but only the statuses that carry a `Location` are reported
+    as a redirect. A `304 Not Modified` is not one, and is what a caching
+    proxy or the first conditional request on these endpoints would produce.
+    """
     responses.add(
         responses.GET,
         "https://example.invalid/moved",
@@ -263,6 +280,7 @@ def test_a_redirect_is_refused_with_its_own_name(status):
 
     message = str(excinfo.value)
     assert str(status) in message
+    assert ("redirected" in message) is redirect, message
     # The one thing a redirect carries is where it points, and that is the one
     # thing this message must not: it reaches the tile and ai-gauge.log.
     assert "elsewhere.invalid" not in message
