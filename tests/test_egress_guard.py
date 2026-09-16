@@ -355,6 +355,19 @@ def test_no_padding_width_hides_a_denied_path(pad):
         assert eg._scan_paths(text, policy()), f"pad={pad} {text[:20]}... passed the deny list"
 
 
+def test_the_whole_band_around_the_old_window_is_covered():
+    """The review found the miss by sweeping the padding width, so the test
+    sweeps it too: every width from 200 to 300, the band the 256-character
+    window fell apart in."""
+    missed = [
+        (pad, tail)
+        for pad in range(200, 301)
+        for tail in ("/.aws/credentials", "/.env", "/.ssh/id_rsa", "/secrets/prod.yaml")
+        if not eg._scan_paths("/home/" + "a" * pad + tail, policy())
+    ]
+    assert not missed, f"{len(missed)} padding widths pass the deny list: {missed[:6]}"
+
+
 def test_a_token_longer_than_any_path_is_still_scanned():
     """A payload with no whitespace in it is one token; windowing it is what
     keeps the path at the end of it from being skipped as too long."""
@@ -1997,8 +2010,10 @@ def test_the_server_password_is_never_printed(tmp_path, monkeypatch, capsys):
     box; it must not be in the output either."""
     _clean_posture(tmp_path, monkeypatch)
     monkeypatch.setenv("OPENCODE_SERVER_PASSWORD", "super-secret-server-password")
-    recorder = _Recorder()
-    monkeypatch.setattr(eg, "_post_json", recorder)
+    # The real `_post_json`, behind a stand-in opener: stubbing `_post_json`
+    # means `_server_auth_headers()` never runs, and a test of what it prints
+    # that never calls it is a test that passes for the wrong reason.
+    monkeypatch.setattr(eg, "_OPENER", _FakeOpener())
     pol_file = tmp_path / "policy.json"
     pol_file.write_text(
         json.dumps(
