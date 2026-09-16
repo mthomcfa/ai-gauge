@@ -3158,6 +3158,36 @@ def test_a_response_too_large_is_recorded_the_same_way(monkeypatch, config):
 
 
 @responses.activate
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(lambda: az.fetch_quota_id("tok", SUB), id="quota"),
+        pytest.param(lambda: az.fetch_budget("tok", SUB), id="budget"),
+        pytest.param(
+            lambda: az.fetch_foundry_resource_ids("tok", SUB), id="foundry"
+        ),
+    ],
+)
+def test_every_arm_get_path_goes_through_the_bounded_helper(monkeypatch, call):
+    """`arm_get` is the one call site of the nine whose replacement nothing
+    pinned: reverting it to `requests.get` survived the whole suite, which
+    would drop the bound on Azure's entire GET path silently.
+
+    `responses` is active with nothing registered, so an unbounded
+    `requests.get` raises `ConnectionError` here rather than the deadline.
+    """
+    from aigauge.providers._http import ResponseDeadlineExceeded
+
+    def boom(*args, **kwargs):
+        raise ResponseDeadlineExceeded("Response deadline exceeded (30s).")
+
+    monkeypatch.setattr(az, "bounded_request", boom)
+
+    with pytest.raises(ResponseDeadlineExceeded):
+        call()
+
+
+@responses.activate
 def test_a_redirect_from_entra_id_is_reported_as_a_redirect(monkeypatch, config):
     """The real helper, not a monkeypatched one: `responses` hands back a real
     urllib3 handle, so the 3xx goes through `bounded_request`'s own refusal.

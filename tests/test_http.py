@@ -41,16 +41,23 @@ class _FakeRaw:
         self.reads = 0
         self.streamed = 0
         self.closed = 0
+        # What the helper asked for, recorded rather than discarded: the
+        # amount is the cap on one read and the granularity the deadline is
+        # checked at, so a test that never sees it cannot see the bound.
+        self.amounts: list = []
+        self.chunk_sizes: list = []
 
     def _next(self) -> bytes:
         self.reads += 1
         return self._chunks.pop(0) if self._chunks else b""
 
     def read1(self, amt=None, decode_content=None):  # noqa: ARG002
+        self.amounts.append(amt)
         return self._next()
 
     def stream(self, chunk_size, decode_content=True):  # noqa: ARG002
         self.streamed += 1
+        self.chunk_sizes.append(chunk_size)
         while True:
             chunk = self._next()
             if not chunk:
@@ -377,6 +384,35 @@ def test_one_coding_is_still_read():
     )
 
     assert response.json() == {"a": 1}
+    # Through `read1`, with the real decoder: `responses` builds a real
+    # urllib3 handle. Nothing else in the suite sends a Content-Encoding
+    # through this helper, so `decode_content=True` -> `False` - which hands
+    # every provider compressed bytes as `.content` in production - survived
+    # the whole suite before this test.
+    assert isinstance(response.raw, urllib3.response.HTTPResponse)
+
+
+@responses.activate
+def test_one_coding_is_still_read_through_the_legacy_fallback(monkeypatch):
+    """The same round trip on the urllib3-1.x path, which `requests>=2.32`
+    still permits. `responses` builds a real urllib3 handle, so hiding
+    `read1` on it is what that version looks like from here - and
+    `iter_content` decodes content-encoding of its own accord, which is the
+    property this pins."""
+    monkeypatch.setattr(urllib3.response.HTTPResponse, "read1", None)
+    responses.add(
+        responses.GET,
+        "https://example.invalid/ok",
+        body=gzip.compress(b'{"a": 1}'),
+        status=200,
+        headers={"Content-Encoding": "gzip"},
+    )
+
+    response = _http.bounded_request(
+        "GET", "https://example.invalid/ok", timeout=15
+    )
+
+    assert response.json() == {"a": 1}
 
 
 @responses.activate
@@ -514,11 +550,14 @@ def test_the_body_is_drained_through_read1_when_the_handle_has_it(monkeypatch):
     _patch_request(monkeypatch, _fake_response(raw))
 
     response = _http.bounded_request(
-        "GET", "https://example.invalid/x", timeout=15
+        "GET", "https://example.invalid/x", timeout=15, chunk_bytes=4096
     )
 
     assert response.content == b"{}"
     assert raw.streamed == 0, "the blocking reader was used"
+    # The cap reaches the read: it is both the most one read may ask for and
+    # how often the deadline and the size cap are checked.
+    assert raw.amounts == [4096, 4096]
 
 
 def test_a_handle_without_read1_still_gets_a_bounded_read(monkeypatch):
@@ -541,6 +580,49 @@ def test_a_handle_without_read1_still_gets_a_bounded_read(monkeypatch):
     assert raw.streamed == 1, "the fallback did not reach the stream"
     assert raw.reads == 2, raw.reads
     assert raw.closed == 1
+    # One byte, and not `chunk_bytes`: urllib3 1.x's `stream()` blocks until
+    # the whole chunk has arrived, so any larger granularity here puts the
+    # deadline back behind a drip. The fake's `stream` ignores the argument,
+    # exactly as urllib3's does not, so it is asserted rather than inferred.
+    assert raw.chunk_sizes == [1]
+
+
+def test_a_handle_whose_read1_is_not_urllib3s_takes_the_fallback(monkeypatch):
+    """`io.BytesIO` and `BufferedReader` both have a `read1`, and both reject
+    the keywords - a `TypeError`, which is not a `requests.RequestException`
+    and so would walk past every branch at the call sites into a worker's
+    blanket handler. Unreachable through real HTTP today, reachable through a
+    fixture or a future adapter."""
+
+    class _KeywordlessRaw(_FakeRaw):
+        def read1(self, amt=-1):  # noqa: ARG002 - no decode_content, as in io
+            self.amounts.append(amt)
+            return self._next()
+
+    raw = _KeywordlessRaw([b'{"a": ', b"1}"])
+    _patch_request(monkeypatch, _fake_response(raw))
+
+    response = _http.bounded_request(
+        "GET", "https://example.invalid/x", timeout=15
+    )
+
+    assert response.json() == {"a": 1}
+    assert raw.streamed == 1, "the fallback was not taken"
+    assert raw.amounts == [], "the keyword read was retried"
+
+
+def test_the_two_constants_are_what_the_arithmetic_and_the_docs_say():
+    """Both survived the round-1 mutation run: every test that uses them
+    derives both sides from the constant, so 30 s -> 3 000 s and 8 MiB -> 1 GiB
+    moved nothing. They are a promise made in `SECURITY.md`, in the changelog
+    and in three providers' refresh budgets, so they are pinned bare."""
+    # Twice the largest per-socket timeout any caller sets, and the term the
+    # providers' worst cases (130/135/495 s) are derived from.
+    assert _http.REQUEST_TOTAL_SECONDS == 30.0
+    # The memory ceiling against a hostile endpoint, an order of magnitude
+    # over the largest response this app can legitimately receive.
+    assert _http.MAX_RESPONSE_BYTES == 8 * 1024 * 1024
+    assert _http.CHUNK_BYTES == 64 * 1024
 
 
 def test_both_failures_are_request_exceptions():
