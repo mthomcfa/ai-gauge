@@ -126,12 +126,26 @@ call that answers in under a second answers exactly as it did.
 
   Both halves are taken. `pyproject.toml` declares `urllib3>=2.6` - requests'
   own transitive dependency made explicit, not a new one - and a response
-  whose `Content-Encoding` names more than one coding is refused before a
+  whose `Content-Encoding` header contains a **comma** is refused before a
   byte of its body is read, with `ResponseEncodingRefused`, another
   `requests.RequestException`. No host this app speaks to serves nested
   codings. After: **0.2 MiB and 0.01 s** on 2.6.3 *and* on 2.5.0, with the
   body never read. A single-layer gzip bomb is unchanged - `ResponseTooLarge`
   at the cap, with a `tracemalloc` peak the suite now pins under 32 MiB.
+
+  The comma, rather than a count of the codings named, because the comma is
+  what urllib3 decides on: `_init_decoder` sends any header containing one to
+  `MultiDecoder`, which splits without dropping empty entries and gives every
+  name it does not recognise - `""` included - a `DeflateDecoder`. A first cut
+  of this refusal counted the non-empty names, which made
+  `Content-Encoding: gzip,` one coding here and two decoder layers there:
+  measured, a `deflate(gzip(16 MiB of zeros))` body under that header walked
+  through the refusal and had both layers decoded (8.8 MiB of peak on the
+  shipped 2.6.3, and on 2.5.0 it is the 1 070 MiB shape the refusal exists to
+  stop). `identity, gzip` and `gzip, identity` are refused too, though each
+  names one real coding: urllib3 builds the same two-layer decoder for them,
+  whose `identity` layer is a `DeflateDecoder` that fails on the plain
+  output.
 
 - **`allow_redirects=False` on every REST call, and a 3xx is reported as
   one.** Every host this app speaks to is fixed and listed in `SECURITY.md`,
@@ -151,6 +165,15 @@ call that answers in under a second answers exactly as it did.
   was not tested against the live hosts, and `api.github.com` is documented
   to answer a renamed user or organisation with a 301. If one does, the tile
   now says so instead of guessing.
+
+  Only the statuses that carry a `Location` are called a redirect -
+  `{301, 302, 303, 307, 308}`. The rest of the 3xx range still fails closed,
+  because this app reads a 2xx and nothing else, but says "The endpoint
+  returned 304; this app reads only a 2xx." A `304 Not Modified` is not a
+  redirect, and it is the one status in that range a caller here could
+  actually meet: no call site sends `If-None-Match` today, but that is the
+  natural way to spend fewer of GitHub's rate-limit units, and a caching
+  proxy can send one unasked.
 
 ### Fixed
 
@@ -174,6 +197,41 @@ call that answers in under a second answers exactly as it did.
   also what makes the transport helper's own claim true: until now
   `_http.py` said every call site had a `RequestException` branch, and one
   did not.
+
+  The type name is the rule for a `requests` exception, whose message *is*
+  the URL it failed on. The four the bounded helper raises are built out of a
+  status, a count or a bound and carry no URL by construction, so those reach
+  the tile as themselves - `GitHub request failed: The endpoint redirected
+  (301); this app does not follow redirects.` - as OpenRouter's and Azure's
+  already do.
+
+- **A truncated reply no longer reads as a bad PAT.** A server or a middlebox
+  that drops the connection inside the header block produces an ordinary 200
+  with no body: `http.client` treats EOF as the end of the headers, so the
+  call gets `status_code=200`, `content=b''` (plain `requests` does the same
+  - not this release's doing). `.json()` on that raises
+  `requests.exceptions.JSONDecodeError`, which is a `RequestException`, so
+  `_resolve_username` turned it into `None` and the tile into *"Could not
+  resolve GitHub username (PAT may lack read:user)"* - the same wrong
+  diagnosis the redirect fix above removed, reached by a different route.
+  `InvalidJSONError` now goes to `work()`'s branch instead:
+  `GitHub request failed (JSONDecodeError).` A real refusal is untouched - a
+  401 on `/user` is still AUTH_REQUIRED with the read:user message, which is
+  what that message is for.
+
+- **A healthy call's socket no longer waits for the cyclic collector.** The
+  hook that learns the connection replaces `pool._get_conn` with a closure
+  over the pool's own bound method, and pool -> closure -> cell -> bound
+  method -> pool is a reference cycle: `session.close()` dropped the pool,
+  refcounting did not free it, and the connection it held - with its socket -
+  lived until a gen-2 collection. Measured over 300 healthy calls against a
+  loopback server, **17 established sockets open at once** where plain
+  `requests` left none. Bounded and always reclaimed, but until then the app
+  held open connections to the four hosts after the refresh that opened them
+  had finished, which is the one thing `_new_session`'s docstring says cannot
+  happen. The wrapper is taken off again in the same `finally` that cancels
+  the timer, before the close: **0 after**, with nothing left for the
+  collector to free.
 
 - **`Config.save()` is atomic.** It was a bare `path.write_text`, which
   truncates before it writes. That was tolerable while the only writes were
@@ -247,15 +305,30 @@ call that answers in under a second answers exactly as it did.
 
 ### Notes
 
-- The suite is **1 805 tests**, from 1 729. `tests/test_http.py` is new and
-  holds 43 of them; the Copilot file is at 22, OpenRouter's at 38, Azure's at
-  232, the config file at 138, and the egress guard's at 460. Thirty-six of
-  the seventy-six came from round 1 of the review: the out-of-band deadline
-  (12), the urllib3 floor and the nested-coding refusal (5), Copilot's named
-  transport failures (2), the redirect refusal (10), the five mutation
-  survivors the code lane found (6) and the symlinked-`config.json` note (1).
-  One existing test also had its derivation completed rather than left with a
-  magic constant in it.
+- The suite is **1 834 tests**, from 1 729. `tests/test_http.py` is new and
+  holds 70 of them; the Copilot file is at 24, OpenRouter's at 38, Azure's at
+  232, the config file at 138, and the egress guard's at 460. Sixty-five of
+  the hundred and five came from the two review rounds. Round 1's
+  thirty-six: the out-of-band deadline (12), the urllib3 floor and the
+  nested-coding refusal (5), Copilot's named transport failures (2), the
+  redirect refusal (10), the five mutation survivors the code lane found (6)
+  and the symlinked-`config.json` note (1). Round 2's twenty-nine: the
+  timer's re-arm (3), the adapter hook driven from `requests` itself (4), the
+  un-watched pool (1), the comma refusal (9 with its parameters), the 304
+  (3), Copilot's truncated reply (2) and four edges that survived the code
+  lane's mutations (7). One existing test also had its derivation completed
+  rather than left with a magic constant in it.
+- **The hook the whole bound rests on is now driven by `requests`.** Every
+  other transport test injects at `Session.request`, which is above the
+  adapter, so `_ConnectionRecordingAdapter.get_connection_with_tls_context` -
+  a `requests` 2.32 method feeding urllib3's private `_get_conn` - was
+  covered by nothing: renaming it left the suite green while a TLS header
+  drip went from 3.00 s back to 14.03 s and stuck. Two tests now run
+  `requests`' own send path with the urllib3 pool faked below the adapter,
+  and when the deadline comes due with no connection recorded the timer
+  writes one `provider http deadline_hook_missed=True` - a fixed literal, the
+  module's only log line - so a future `requests` that moves the seam shows
+  up somewhere rather than nowhere.
 - Not one `responses.add(...)` in the existing provider tests needed editing.
   `responses` supports `stream=True` and hands back a real urllib3 handle, so
   the whole transport change is invisible to them - which is the point.
