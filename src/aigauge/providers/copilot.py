@@ -419,7 +419,7 @@ class CopilotProvider(Provider):
 
         config = self._config
 
-        def work() -> UsageSnapshot:
+        def fetch() -> UsageSnapshot:
             username = _resolve_username(pat, config.copilot.username)
             if not username:
                 log.info(
@@ -540,6 +540,37 @@ class CopilotProvider(Provider):
             )
             return snapshot
 
+        def work() -> UsageSnapshot:
+            """``fetch``, with the transport failures named.
+
+            Every branch inside ``fetch`` catches ``requests.HTTPError`` - a
+            reply GitHub actually sent - and nothing caught the rest, so an
+            ordinary offline failure fell to the worker's blanket handler,
+            which reported ``str(exc)``. A ``requests`` connection error
+            carries the URL it failed on, and a Copilot URL carries the
+            GitHub username as a path segment, so going offline put an
+            account identifier in ai-gauge.log, on the tile and in Copy
+            diagnostics - the one thing SECURITY.md says never reaches them.
+            The type name says as much as the user can act on.
+
+            It wraps the username resolve as well as the two fetches, because
+            that call re-raises the failures whose diagnosis is not "the PAT
+            may lack read:user".
+            """
+            try:
+                return fetch()
+            except requests.RequestException as exc:
+                log.warning(
+                    "provider api diagnosis provider=copilot "
+                    "classification=request_failed type=%s",
+                    type(exc).__name__,
+                )
+                return UsageSnapshot(
+                    provider="copilot",
+                    status=SnapshotStatus.ERROR,
+                    error=f"GitHub request failed ({type(exc).__name__}).",
+                )
+
         self._run_async(work, on_done)
 
     def _run_async(
@@ -554,7 +585,14 @@ class CopilotProvider(Provider):
                 try:
                     snapshot = work()
                 except Exception as exc:  # noqa: BLE001
-                    log.exception(
+                    # The type name only, and no traceback: `log.exception`
+                    # prints one whose last line is the exception message,
+                    # and a message can carry the request URL - which on this
+                    # provider carries the GitHub username. Same shape as
+                    # azure's blanket handler, for the same reason. This line
+                    # goes to the file the error dialog invites the user to
+                    # attach to a bug report.
+                    log.warning(
                         "provider api diagnosis provider=copilot "
                         "classification=unexpected_exception type=%s",
                         type(exc).__name__,
@@ -562,7 +600,7 @@ class CopilotProvider(Provider):
                     snapshot = UsageSnapshot(
                         provider="copilot",
                         status=SnapshotStatus.ERROR,
-                        error=str(exc),
+                        error=f"Copilot refresh failed ({type(exc).__name__}).",
                     )
                 on_done(snapshot)
 

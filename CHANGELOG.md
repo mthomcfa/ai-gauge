@@ -29,8 +29,9 @@ call that answers in under a second answers exactly as it did.
   reads. Out of band: a `threading.Timer` armed with the same deadline, which
   shuts that connection's socket down from another thread. Copilot's five
   call sites, OpenRouter's three, Azure's two and the Entra ID token POST all
-  go through it. Both failures subclass `requests.RequestException`, so every
-  handler already at those sites takes them, and neither one retries.
+  go through it. Every failure here subclasses `requests.RequestException`, so
+  the handlers already at those sites take them, and none of them retries.
+  (One site did not have such a handler at all - see Copilot's, below.)
 
   **The timer is what makes it a bound**, and it is not belt and braces. A
   check between reads bounds nothing that happens *inside* one read, and two
@@ -121,6 +122,27 @@ call that answers in under a second answers exactly as it did.
   in question.
 
 ### Fixed
+
+- **Going offline no longer puts the GitHub username in the log, on the tile
+  and in Copy diagnostics.** Copilot's `work()` caught `requests.HTTPError` -
+  a reply GitHub actually sent - at each of its three branches, and nothing
+  caught the rest, so an unresolvable host or a dropped connection fell
+  through to the worker's blanket handler, which did `log.exception` (a
+  traceback whose last line is the exception message) and reported
+  `str(exc)`. A `requests` connection error carries the URL it failed on, and
+  a Copilot usage URL carries the username as a path segment, so the account
+  identifier reached all three sinks SECURITY.md says it never reaches - twice
+  in the log. Not a regression: byte-identical on 1.3.1+cfa.6. The PAT was
+  never in any of them.
+
+  `work()` now has its own `except requests.RequestException` branch -
+  `GitHub request failed (TypeName).`, with a
+  `classification=request_failed type=…` log line and no traceback - and it
+  wraps the username resolve as well as the two fetches. The blanket handler
+  behind it reports the type name too, the way azure's already did. This is
+  also what makes the transport helper's own claim true: until now
+  `_http.py` said every call site had a `RequestException` branch, and one
+  did not.
 
 - **`Config.save()` is atomic.** It was a bare `path.write_text`, which
   truncates before it writes. That was tolerable while the only writes were

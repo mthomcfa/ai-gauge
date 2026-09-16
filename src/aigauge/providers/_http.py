@@ -16,8 +16,10 @@ count between reads. Out of band: a ``threading.Timer`` armed with the same
 deadline shuts that connection's socket down from another thread, which is the
 only thing that reaches a stall *inside* one read - the status line, the
 response headers, or a ``Content-Encoding`` stream whose bytes decode to
-nothing. Both failures raise a ``requests.RequestException`` subclass, so they
-reach the call sites as a transport failure like any other.
+nothing. Every failure here raises a ``requests.RequestException`` subclass,
+and every call site has an ``except requests.RequestException`` branch to take
+it - though Copilot's ``work()`` did not when this module landed, and caught
+only ``HTTPError`` until 1.3.2+cfa.7 gave it one.
 
 Nothing here retries: a deadline is a failure, not a reason to ask again. No
 new host, no new request, no new dependency - stdlib plus ``requests``.
@@ -91,9 +93,10 @@ class ResponseDeadlineExceeded(requests.RequestException):
     """The whole exchange outran ``total_seconds``.
 
     A ``requests.RequestException`` on purpose: every call site in this package
-    already has an ``except requests.RequestException`` branch that turns a
-    transport failure into an ERROR snapshot, and a deadline is a transport
-    failure. The message carries the bound and nothing else - no URL (an ARM
+    has an ``except requests.RequestException`` branch that turns a transport
+    failure into an ERROR snapshot, and a deadline is a transport failure.
+    (Copilot's ``work()`` is the one that did not, and was given one in
+    1.3.2+cfa.7 rather than assumed.) The message carries the bound and nothing else - no URL (an ARM
     URL carries the subscription id), no response text - because it reaches
     ``snapshot.error``, the tile tooltip and ai-gauge.log.
     """

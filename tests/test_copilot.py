@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 import pytest
+import requests
 import responses
 
 from aigauge.config import Config
@@ -282,13 +283,99 @@ def test_a_response_deadline_ends_the_refresh_as_an_error(monkeypatch, caplog):
     line = next(
         record.getMessage()
         for record in caplog.records
-        if "classification=unexpected_exception" in record.getMessage()
+        if "classification=request_failed" in record.getMessage()
     )
     # The type name, never the message: this record goes to the file users are
-    # invited to attach to a bug report.
+    # invited to attach to a bug report. The branch is `work()`'s own named
+    # one - before this release the deadline fell through to the worker's
+    # blanket handler, which logged a traceback.
     assert "type=ResponseDeadlineExceeded" in line
     assert "deadline exceeded (30s)" not in line
+    assert not any(
+        record.exc_info for record in caplog.records
+    ), "a traceback whose last line is the exception message"
 
+
+@responses.activate
+def test_an_offline_failure_keeps_the_github_username_out_of_every_sink(caplog):
+    """The plainest failure there is: the user's network is down.
+
+    `work()` caught only `requests.HTTPError` - a reply GitHub actually sent -
+    so this fell to the worker's blanket handler, which did `log.exception`
+    and `error=str(exc)`. A `requests` connection error carries the URL it
+    failed on, and a Copilot usage URL carries the username as a path
+    segment, so going offline put an account identifier in the log, on the
+    tile and in Copy diagnostics. SECURITY.md says it never reaches them.
+    """
+    import logging
+
+    import aigauge.providers.copilot as copilot_mod
+    from aigauge.error_dialog import _format_diagnostics
+    from aigauge.providers.copilot import CopilotProvider
+
+    username = "octocat"
+    pat = "ghp_" + "A" * 36
+    url = (
+        f"{GITHUB_API}/users/{username}/settings/billing/usage/summary"
+    )
+    responses.add(
+        responses.GET,
+        url,
+        body=requests.ConnectionError(
+            f"HTTPSConnectionPool(host='api.github.com', port=443): Max "
+            f"retries exceeded with url: /users/{username}/settings/billing"
+            f"/usage/summary (Caused by NameResolutionError(...))"
+        ),
+    )
+
+    cfg = Config()
+    cfg.copilot.username = username
+    captured: list = []
+    with caplog.at_level(logging.DEBUG, logger="aigauge"):
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(copilot_mod, "get_github_pat", lambda: pat)
+            CopilotProvider(cfg, pool=_InlinePool()).refresh(captured.append)
+
+    snapshot = captured[0]
+    assert snapshot.status == SnapshotStatus.ERROR
+    assert snapshot.error == "GitHub request failed (ConnectionError)."
+    diagnostics = _format_diagnostics("copilot", snapshot)
+    for sink in (snapshot.error or "", caplog.text, diagnostics):
+        assert username not in sink
+        assert pat not in sink
+        assert "api.github.com" not in sink
+    assert "classification=request_failed type=ConnectionError" in caplog.text
+
+
+def test_an_exception_that_is_not_a_request_failure_names_its_type_too(caplog):
+    """The blanket handler is the last resort, not the usual path, and it
+    reported `str(exc)` - which for a transport failure is the URL. It says
+    the type now, like azure's, and logs no traceback."""
+    import logging
+
+    import aigauge.providers.copilot as copilot_mod
+    from aigauge.providers.copilot import CopilotProvider
+
+    caplog.set_level(logging.DEBUG, logger="aigauge")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(copilot_mod, "get_github_pat", lambda: "ghp_test")
+        patch.setattr(
+            copilot_mod,
+            "_resolve_username",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("secret-bearing message")
+            ),
+        )
+        captured: list = []
+        CopilotProvider(Config(), pool=_InlinePool()).refresh(captured.append)
+
+    assert captured[0].status == SnapshotStatus.ERROR
+    assert captured[0].error == "Copilot refresh failed (RuntimeError)."
+    assert "classification=unexpected_exception type=RuntimeError" in caplog.text
+    assert "secret-bearing message" not in caplog.text
+    assert not any(
+        record.exc_info for record in caplog.records
+    ), "a traceback whose last line is the exception message"
 
 def test_a_username_resolve_that_outruns_the_deadline_is_not_a_crash(monkeypatch):
     """`_resolve_username` already swallows every RequestException; the two new
