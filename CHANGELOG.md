@@ -149,11 +149,19 @@ allowed to cost.
   once across the two calls one dialog session makes, and one `deferred` line
   per drain rather than two while its scrape is still out. "Clear all browser
   data" counts the `profiles/` directories `purge_profile` will refuse — by
-  the rule it refuses them with, the resolved path and not the name alone, so
-  a symlink pointing out of `profiles/` is counted as left alone instead of
-  reported as removed — and says how many, without naming them. Its keyring
-  pass still takes every name on disk: only the directory sweep has a
-  containment question to answer.
+  the rule it refuses them with, the resolved path and not the name alone —
+  and says how many, without naming them. A **symlink** is never one it will
+  act on, whatever it resolves to: one pointing out of `profiles/` was
+  counted as removed where the purge refused it, and one pointing at another
+  profile *inside* it passed containment and deleted the account it aliased,
+  under a live scrape, because the deferral is keyed on the link's own name.
+  An entry resolving to the `profiles/` root is refused for the same reason —
+  `webview_profile_dir` permits it and `purge_profile` does not. Measured on
+  a hostile tree of eight entries: the predicate disagreed with the deletion
+  on five of them and now on none, the emitted set drops from six ids to
+  three, and the box's "left alone" count goes from 2 to the 5 that really
+  were. Its keyring pass still takes every name on disk: only the directory
+  sweep has a containment question to answer.
 - **Neither purge path asked whether a scrape was live.** Both now consult
   `account_is_busy()` from `providers/_scrape_runner.py` as well as
   `_inflight` and the abandoned-dispatch park. It is the only one of the

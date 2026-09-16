@@ -1310,10 +1310,13 @@ class SettingsDialog(QDialog):
         `profiles/` root - that refusal is the containment guarantee and it
         holds - but it refuses them one at a time, deep in the App, where
         the user never hears about it. `is_usable_profile_id` asks the same
-        two questions on the same resolved path, so the count the button
-        reports is the count that was really left alone: a symlink inside
-        `profiles/` pointing out of it has a legal *name*, and the name rule
-        on its own called it deleted.
+        questions on the same resolved path, so the count the button reports
+        is the count that was really left alone: a symlink inside `profiles/`
+        pointing out of it has a legal *name*, and the name rule on its own
+        called it deleted. It also refuses every link, whatever it resolves
+        to - one pointing at another profile passes containment and deletes
+        the account it aliases, under a live scrape, because the deferral is
+        keyed on the link's own name.
 
         Both lists come back, because the button's two halves want
         different ones. The stored credential is a keyring entry, nothing

@@ -139,22 +139,39 @@ def webview_profile_dir(provider: str) -> Path:
 def is_usable_profile_id(provider: str) -> bool:
     """Whether the profile sweep can act on this `profiles/` entry.
 
-    Exactly the two tests the deletion path applies, on the same resolved
-    path: the id rule, and containment inside the `profiles/` root. A name
-    can pass the first and fail the second - a symlink inside `profiles/`
-    that points out of it has a perfectly legal name - so anything that
-    wants to know what will actually be deleted has to ask for both, which
-    is what `webview_profile_dir` already answers. Public because the
-    settings dialog needs the same answer and was reaching for the name
-    rule alone.
+    The tests the deletion path applies, on the same resolved path: the id
+    rule, and containment inside the `profiles/` root. A name can pass the
+    first and fail the second - a symlink inside `profiles/` that points out
+    of it has a perfectly legal name - so anything that wants to know what
+    will actually be deleted has to ask for both, which is what
+    `webview_profile_dir` already answers. Public because the settings dialog
+    needs the same answer and was reaching for the name rule alone.
+
+    A link is never one of these, whatever it resolves to. `webview_profile_dir`
+    answers about the *target*, so a link inside `profiles/` pointing at
+    another profile passes containment and the sweep then deletes the account
+    it aliases - while the live-scrape deferral is keyed on the link's own
+    name and never sees it, which is the use-after-free that deferral exists
+    to prevent. This app writes no links here; refusing them costs nothing
+    and makes the predicate an answer about the entry rather than its target.
     """
     try:
-        webview_profile_dir(provider)
+        target = webview_profile_dir(provider)
+        if target.is_symlink():
+            return False
+        # And the root itself, which `webview_profile_dir` permits and
+        # `purge_profile` refuses - the one containment case where the two
+        # disagreed, in the "we deleted it" direction.
+        if target.resolve() == (app_data_dir() / "profiles").resolve():
+            return False
     except ValueError:
         return False
-    except OSError:
-        # `resolve()` touches the filesystem: a name the OS itself refuses
-        # is one `purge_profile` will not act on either.
+    except (OSError, RuntimeError):
+        # `resolve()` touches the filesystem: a name the OS itself refuses is
+        # one `purge_profile` will not act on either, and a symlink loop
+        # raises `RuntimeError` rather than `OSError` on CPython - which the
+        # only caller happens to filter out with `is_dir()`, but this is a
+        # public predicate and its contract is that it answers.
         return False
     return True
 

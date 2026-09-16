@@ -1,5 +1,6 @@
 import json
 import logging
+import sys
 
 import pytest
 from pydantic import ValidationError
@@ -121,6 +122,68 @@ def test_a_usable_profile_id_is_one_the_purge_will_actually_act_on():
     assert not is_usable_profile_id("escape"), (
         "a legal name resolving outside profiles/ counted as one to delete"
     )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs symlink privilege")
+def test_a_symlink_inside_the_profiles_directory_is_never_usable():
+    """The predicate has to answer about the entry, not about its target.
+
+    `webview_profile_dir` resolves, so a link inside `profiles/` that points
+    at *another* profile passes containment - and the sweep then hands that
+    id to `purge_profile`, which rmtree's the target. The live-scrape
+    deferral is keyed on the link's own name, so an account mid-scrape has
+    its `QWebEngineProfile` directory deleted under it through an alias the
+    deferral never sees. A link to the root itself is the complementary
+    case: `webview_profile_dir` permits it and `purge_profile` refuses it,
+    so the entry was counted as deleted and then left alone.
+
+    This app writes no links under `profiles/`, so refusing every one of
+    them costs nothing real and makes the count the button reports the count
+    that was really left behind.
+    """
+    profiles = app_data_dir() / "profiles"
+    profiles.mkdir(parents=True, exist_ok=True)
+    (profiles / "live_one").mkdir(exist_ok=True)
+    try:
+        (profiles / "alias").symlink_to(profiles / "live_one", True)
+        (profiles / "selfroot").symlink_to(profiles, True)
+        (profiles / "dangling").symlink_to(profiles / "nothere", True)
+        (profiles / "loop_a").symlink_to(profiles / "loop_b")
+        (profiles / "loop_b").symlink_to(profiles / "loop_a")
+    except (OSError, NotImplementedError):  # pragma: no cover - CI/Windows
+        pytest.skip("this filesystem does not allow symlinks")
+
+    assert is_usable_profile_id("live_one"), "a real profile directory"
+    for name, why in (
+        ("alias", "a link to another account's profile"),
+        ("selfroot", "a link to the profiles/ root, which the purge refuses"),
+        ("dangling", "a link to nothing"),
+        ("loop_a", "a symlink loop, where resolve() raises RuntimeError"),
+    ):
+        assert not is_usable_profile_id(name), why
+    assert (profiles / "live_one").is_dir(), "the predicate deleted something"
+
+
+def test_is_usable_profile_id_answers_where_the_filesystem_refuses(monkeypatch):
+    """A public predicate returns a bool or it is not one.
+
+    `resolve()` touches the filesystem, and both arms of that are reachable
+    from a directory nothing in this app created: a name the OS refuses
+    raises `OSError`, and a symlink loop raises `RuntimeError`, which is not
+    an `OSError` at all. Today's only caller filters on `is_dir()` first,
+    which is False for a loop, so neither escapes the dialog - but the
+    branch is what makes that filter optional rather than load-bearing.
+    """
+    from pathlib import Path
+
+    for error in (OSError("refused"), RuntimeError("Symlink loop from ...")):
+
+        def _raise(self, *args, _error=error, **kwargs):
+            raise _error
+
+        monkeypatch.setattr(Path, "resolve", _raise)
+        assert is_usable_profile_id("claude-deadbeef") is False, error
+        monkeypatch.undo()
 
 
 @pytest.mark.parametrize(

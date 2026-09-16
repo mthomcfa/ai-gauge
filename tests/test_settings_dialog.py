@@ -1,3 +1,6 @@
+import sys
+
+import pytest
 from PyQt6.QtWidgets import QPushButton
 
 from aigauge import settings_dialog
@@ -622,6 +625,63 @@ def test_clear_all_browser_data_says_what_it_left_behind(qtbot, monkeypatch):
     assert {"not an id", "also.bad!"} <= set(cleared), (
         "the sweep's filter narrowed the keyring pass too"
     )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs symlink privilege")
+def test_clear_all_browser_data_does_not_delete_through_a_link(qtbot, monkeypatch):
+    """The one entry in `profiles/` that deletes something that is not it.
+
+    A link inside `profiles/` pointing at another profile resolves *inside*
+    the root, so it passed the containment half and was emitted - and
+    `purge_profile` then rmtree's the target. The App's live-scrape deferral
+    is keyed on the link's own name, so the account it aliases is deferred
+    and deleted in the same heartbeat, through the alias. A link to the root
+    itself is the other half: emitted, counted as removed, and refused by
+    `purge_profile` where nobody reads the reason.
+
+    Driven through the real button, because it is the count in the
+    completion box that was wrong in the "we deleted it" direction.
+    """
+    from aigauge.config import app_data_dir
+
+    monkeypatch.setattr(
+        settings_dialog.QMessageBox,
+        "question",
+        lambda *a, **k: settings_dialog.QMessageBox.StandardButton.Yes,
+    )
+    said: list[str] = []
+    monkeypatch.setattr(
+        settings_dialog.QMessageBox,
+        "information",
+        lambda parent, title, text, *a, **k: said.append(text),
+    )
+    cleared: list[str] = []
+    monkeypatch.setattr(
+        settings_dialog,
+        "set_provider_cookie",
+        lambda account_id, value: cleared.append(account_id),
+    )
+    profiles = app_data_dir() / "profiles"
+    (profiles / "claude-deadbeef").mkdir(parents=True)
+    try:
+        (profiles / "alias").symlink_to(profiles / "claude-deadbeef", True)
+        (profiles / "selfroot").symlink_to(profiles, True)
+    except (OSError, NotImplementedError):  # pragma: no cover - CI/Windows
+        pytest.skip("this filesystem does not allow symlinks")
+
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    with qtbot.waitSignal(dialog.browser_data_clear_requested) as signal:
+        _button(dialog, "clear_browser_data_btn").click()
+
+    ids = signal.args[0]
+    assert "claude-deadbeef" in ids, "a usable leftover was not swept"
+    assert "alias" not in ids, "the sweep emitted a link to another profile"
+    assert "selfroot" not in ids, "the sweep emitted a link to the root"
+    assert "2 folder(s)" in said[0], said[0]
+    # The keyring half is unfiltered on purpose: a stored cookie has no
+    # containment question to answer and this button promises everything.
+    assert {"alias", "selfroot"} <= set(cleared)
 
 
 def test_the_settings_dialog_no_longer_deletes_profiles_itself(
