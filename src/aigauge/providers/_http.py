@@ -544,17 +544,35 @@ def _refuse_redirect(response: requests.Response, allow_redirects: bool) -> None
 
 
 def _refuse_nested_encoding(response: requests.Response) -> None:
-    """Refuse ``Content-Encoding: gzip, gzip`` before reading a byte of it."""
-    codings = [
-        coding.strip()
-        for coding in response.headers.get("Content-Encoding", "").split(",")
-        if coding.strip()
-    ]
-    if len(codings) > 1:
-        raise ResponseEncodingRefused(
-            f"Response declared {len(codings)} content encodings; "
-            "this app reads at most one."
-        )
+    """Refuse ``Content-Encoding: gzip, gzip`` before reading a byte of it.
+
+    The test is the comma, not the names around it, because the comma is
+    exactly what urllib3 decides on: ``HTTPResponse._init_decoder`` sends any
+    header containing one to ``MultiDecoder``, which splits on ``","``
+    *without* dropping empty entries and maps every entry it does not
+    recognise - ``""`` included - to a ``DeflateDecoder``. So a tidier parse
+    disagrees with it at the edges, and disagreeing downwards is a bypass:
+    ``Content-Encoding: gzip,`` is one coding to a parse that drops empties
+    and two decoder layers to urllib3, and a ``deflate(gzip(16 MiB))`` body
+    under that header walked straight through the count this used to do -
+    both layers decoded, 8.8 MiB of peak on the shipped urllib3 and the
+    1 070 MiB shape on the 2.5.0 the floor forbids.
+
+    ``identity, gzip`` and ``gzip, identity`` are refused for the same
+    reason, though each names one real coding: urllib3 builds the same
+    two-layer decoder for them, and its ``identity`` layer is a
+    ``DeflateDecoder`` that fails on the plain output - so accepting them
+    would only move the failure inside urllib3 and cost a body read on the
+    way. No host this app speaks to sends either.
+    """
+    header = response.headers.get("Content-Encoding", "")
+    if "," not in header:
+        return
+    codings = header.count(",") + 1
+    raise ResponseEncodingRefused(
+        f"Response declared {codings} content encodings; "
+        "this app reads at most one."
+    )
 
 
 def _body_chunks(response: requests.Response, chunk_bytes: int) -> Iterator[bytes]:

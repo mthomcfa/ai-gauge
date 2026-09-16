@@ -338,19 +338,42 @@ def test_the_urllib3_floor_is_declared_as_a_dependency():
 
 
 @responses.activate
+@pytest.mark.parametrize(
+    "coding",
+    [
+        pytest.param("gzip, gzip", id="two"),
+        pytest.param("gzip,gzip", id="tight"),
+        pytest.param("gzip,", id="trailing"),
+        pytest.param(", gzip", id="leading"),
+        pytest.param("identity, gzip", id="identity"),
+        pytest.param("GZIP, GZIP", id="upper"),
+    ],
+)
 def test_a_body_under_more_than_one_coding_is_refused_before_it_is_read(
-    monkeypatch,
+    monkeypatch, coding
 ):
     """`gzip, gzip` is 988 bytes on the wire and 1 070 MiB in a worker on a
     urllib3 the floor above now forbids. No host this app speaks to serves
     nested codings, so the body is never read at all - which is also the only
-    bound that does not depend on the resolved urllib3."""
+    bound that does not depend on the resolved urllib3.
+
+    The test is the comma, because that is what urllib3 decides on: any
+    comma sends the header to `MultiDecoder`, which splits without dropping
+    empty entries and gives every unrecognised one - `""` and `identity`
+    alike - a `DeflateDecoder`. `gzip,` is therefore two decoder layers
+    there and was one coding here, and a `deflate(gzip(16 MiB))` body under
+    it went through both of them (8.8 MiB peak measured; the 1 070 MiB shape
+    on 2.5.0). `identity, gzip` names one real coding and is refused too:
+    urllib3's `identity` layer is a `DeflateDecoder` that fails on the plain
+    output, so accepting it would only move the failure into urllib3 after a
+    body read.
+    """
     responses.add(
         responses.GET,
         "https://example.invalid/nested",
         body=gzip.compress(gzip.compress(b'{"a": 1}')),
         status=200,
-        headers={"Content-Encoding": "gzip, gzip"},
+        headers={"Content-Encoding": coding},
     )
 
     def no_reads(response, chunk_bytes):  # noqa: ARG001
@@ -366,6 +389,36 @@ def test_a_body_under_more_than_one_coding_is_refused_before_it_is_read(
     # endpoint's own header text.
     assert "gzip" not in str(excinfo.value)
     assert "http" not in str(excinfo.value).lower()
+
+
+@responses.activate
+@pytest.mark.parametrize(
+    "coding",
+    [
+        pytest.param("gzip", id="gzip"),
+        pytest.param("x-gzip", id="x-gzip"),
+        pytest.param("GZIP", id="upper"),
+        pytest.param(None, id="absent"),
+    ],
+)
+def test_one_coding_or_none_is_read_as_it_always_was(coding):
+    """The refusal is of the comma, so everything without one still goes
+    through the drain and its decoder: the header urllib3 lower-cases and
+    the two names it treats as gzip, and a response that declares nothing."""
+    body = b'{"a": 1}' if coding is None else gzip.compress(b'{"a": 1}')
+    responses.add(
+        responses.GET,
+        "https://example.invalid/ok",
+        body=body,
+        status=200,
+        headers={} if coding is None else {"Content-Encoding": coding},
+    )
+
+    response = _http.bounded_request(
+        "GET", "https://example.invalid/ok", timeout=15
+    )
+
+    assert response.json() == {"a": 1}
 
 
 @responses.activate
