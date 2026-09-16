@@ -23,21 +23,47 @@ call that answers in under a second answers exactly as it did.
   how many such workers could pile up and what one cost the log; nothing
   bounded how long one lived, and the pool is global, so a stuck worker was a
   stuck slot until the process exited. One helper,
-  `providers/_http.py`, now starts a clock, asks with `stream=True`, drains
-  the body itself and checks the elapsed time and the running byte count
-  between reads; Copilot's five call sites, OpenRouter's three, Azure's two
-  and the Entra ID token POST all go through it. Both failures subclass
-  `requests.RequestException`, so every handler already at those sites takes
-  them, and neither one retries.
+  `providers/_http.py`, now bounds the exchange in both halves it has. In
+  band: a clock started before the call, `stream=True`, and the body drained
+  here, with the elapsed time and the running byte count checked between
+  reads. Out of band: a `threading.Timer` armed with the same deadline, which
+  shuts that connection's socket down from another thread. Copilot's five
+  call sites, OpenRouter's three, Azure's two and the Entra ID token POST all
+  go through it. Both failures subclass `requests.RequestException`, so every
+  handler already at those sites takes them, and neither one retries.
 
-  Measured on a byte-dripping loopback server with the constants scaled down
-  (0.2 s per byte, 1 s socket timeout, 3 s total). Before: a 40-byte drip -
-  8 s of server - returned after **7.81 s**, the 1 s timeout never firing
-  once; a 5 000-byte drip **still held the worker when the harness gave up
-  watching at 30.0 s**, and would have held it for 1 000 s. After:
-  `ResponseDeadlineExceeded` at **3.00 s**, inside the predicted 4.0 s. A
-  server flooding chunked data against a 1 MiB cap: `ResponseTooLarge` at
-  0.00 s with 2 162 688 bytes pushed.
+  **The timer is what makes it a bound**, and it is not belt and braces. A
+  check between reads bounds nothing that happens *inside* one read, and two
+  things do: the response headers (`http.client` reads them with repeated
+  `readline()`s, and each arriving byte resets the per-socket timeout) and a
+  `Content-Encoding` body whose bytes decode to nothing (urllib3's `read1`
+  loops internally until the decoder yields, and an empty DEFLATE stored
+  block is five bytes in and zero bytes out). `requests` asks for
+  `gzip, deflate` on every call, so both are reachable everywhere. urllib3's
+  own `Timeout(total=…)` does not help - it clamps the value of the per-read
+  timeout, which every byte resets; measured, a 30 s header drip returned at
+  30.01 s against a 3 s total. Shutting the socket down is the one thing that
+  reaches a thread blocked in `recv`, on POSIX and on Windows alike. The
+  connection to shut down is learned from a small `HTTPAdapter` subclass
+  mounted on a `Session` built for that one call and discarded with it - so
+  no pool, cookie jar or connection survives a refresh, exactly as
+  `requests.request` already behaved.
+
+  Measured on a dripping loopback server with the constants scaled down
+  (1 s socket timeout, 3 s total, so the promised bound is 4.0 s). Before, on
+  the body: a 40-byte drip - 8 s of server - returned after **7.81 s**, the
+  1 s timeout never firing once; a 5 000-byte drip **still held the worker
+  when the harness gave up watching at 30.0 s**, and would have held it for
+  1 000 s. Before, in the phases a between-reads check cannot see: a dripped
+  status line, a dripped header block, a header block that never ends, and a
+  chunked or `Content-Length` gzip stream that decodes to nothing all **held
+  the worker to the 40 s cap the harness watched to**, with the
+  `iter_content(1)` fallback no better. After: **`ResponseDeadlineExceeded`
+  at 3.00 s on every one of them**, and on the body drips, inside the
+  predicted 4.0 s. In the shipped units (30 s total, 15 s timeout, declared
+  worst case 45 s) a header drip of one byte every 10 s went from **90.0 s**
+  to **30.0 s**. A server flooding chunked data against a 1 MiB cap:
+  `ResponseTooLarge` at 0.00 s with 2 162 688 bytes pushed.
 
   The obvious implementation does not work, which is the part worth knowing.
   `iter_content(chunk_size=N)` goes through urllib3's `stream()`, which

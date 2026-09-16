@@ -714,16 +714,42 @@ unnecessary source of behaviour change.
 
   **Option (a) was taken in 1.3.2+cfa.7: a total-response deadline on the
   REST side** - `providers/_http.py`, `stream=True` plus an elapsed check
-  and a byte count while reading. It is the only one of the four that bounds
-  the socket, and the only one that frees a worker already stuck. One call
-  now returns or raises by `max(connect, total_seconds) + read`, which is
-  45 s at a 15 s timeout and 40 s at a 10 s one; a whole refresh is 130 s for
-  Copilot, 135 s for OpenRouter and 495 s for Azure, and each provider tells
-  the App that number. Measured against a byte-dripping loopback server with
-  the constants scaled down (0.2 s per byte, 1 s socket timeout, 3 s total):
-  a 40-byte drip returned after 7.81 s with the timeout never firing, a
-  5 000-byte drip still held the worker when the harness gave up watching at
-  30.0 s, and the bounded call raised `ResponseDeadlineExceeded` at 3.00 s.
+  and a byte count while reading, *and* a `threading.Timer` armed with the
+  same deadline that shuts the connection's socket down from another thread.
+  It is the only one of the four that bounds the socket, and the only one
+  that frees a worker already stuck. The bound covers **connect, headers and
+  body**: the in-band check cannot see inside one read, and two phases live
+  there - the header block (every arriving byte resets the per-socket
+  timeout, and `bounded_request`'s own clock is not reached until the headers
+  are complete) and a `Content-Encoding` body that decodes to nothing
+  (urllib3's `read1` loops internally until the decoder yields). Both were
+  found by the round-1 reviews after the first cut of this release shipped
+  with the check only, and both are the same failure the release exists to
+  remove, one protocol phase earlier. The socket shutdown is the only thing
+  that reaches a thread blocked in `recv`; urllib3's `Timeout(total=…)` does
+  not (it clamps the value of the per-read timeout, which every byte resets -
+  measured, a 30 s header drip returned at 30.01 s against a 3 s total). The
+  connection is learned by mounting a small `HTTPAdapter` subclass on a
+  `Session` built for the one call, which also keeps the property
+  `requests.request` had: no pool, cookie jar or connection across refreshes.
+
+  One call now returns or raises by `max(connect, total_seconds) + read`,
+  which is 45 s at a 15 s timeout and 40 s at a 10 s one; a whole refresh is
+  130 s for Copilot, 135 s for OpenRouter and 495 s for Azure, and each
+  provider tells the App that number. The formula did not move when the timer
+  landed - `total_seconds` is the larger term at every timeout here, so the
+  bound is `total_seconds + read`, and the `+ read` is the one read that can
+  begin after a timer which fired between the connection being handed out and
+  its socket existing. What moved is that it is now a bound. Measured against
+  a dripping loopback server with the constants scaled down (1 s socket
+  timeout, 3 s total, promised bound 4.0 s): a 40-byte body drip returned
+  after 7.81 s with the timeout never firing and a 5 000-byte drip still held
+  the worker at 30.0 s, both before; a dripped status line, a dripped header
+  block, a header block that never ends and a chunked or `Content-Length`
+  gzip-of-nothing each held the worker to the harness's 40 s cap before, and
+  all of them raise `ResponseDeadlineExceeded` at 3.00 s after. In shipped
+  units a header drip of a byte every 10 s went from 90.0 s to 30.0 s against
+  a declared 45 s.
 
   What is still true: **the pool is still shared**. Three REST providers
   still submit to `QThreadPool.globalInstance()`, so they still compete for
@@ -734,7 +760,7 @@ unnecessary source of behaviour change.
   a busy flag on the provider, is still moot: the park does that job from the
   App side, without writing a provider attribute from a pool thread.
 
-  One thing that surfaced in the doing, and is worth not re-learning:
+  Two things surfaced in the doing, and are worth not re-learning. First,
   `Response.iter_content(chunk_size=N)` cannot implement this. urllib3's
   `stream()` blocks until `N` bytes have arrived or the connection closes,
   and the per-socket read timeout never fires on a server dripping inside it,
@@ -742,7 +768,12 @@ unnecessary source of behaviour change.
   Measured at one byte per 50 ms behind a 2 s socket timeout,
   `iter_content(64 KiB)` never yielded at all. The drain is `raw.read1()`,
   with `iter_content(1)` behind it for a handle that has none (urllib3 1.x):
-  correct there too, and 3 854 ms per MiB against `read1`'s 0.5 ms.
+  correct there too, and 3 854 ms per MiB against `read1`'s 0.5 ms. Second,
+  *no* read granularity bounds a read that never returns. `read1` loops
+  inside urllib3 until the decoder yields something, and `iter_content(1)`
+  goes through the same decode, so a stream of empty DEFLATE stored blocks
+  (five bytes in, zero bytes out) blocked both paths until the harness gave
+  up. Between-reads checks are for the size cap; the clock needs the socket.
 
   **Every dispatch of a hung REST provider costs a slot, which is why the
   kept retry is folded into the cadence.** An earlier draft of the retry
