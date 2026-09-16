@@ -3,6 +3,13 @@
 State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#16,
 610 tests passing, all five providers reading.
 
+> **Updated 2026-09-16** by the REST-deadline follow-up (`1.3.2+cfa.7`,
+> 1 769 tests), which closed the three residuals that release left in
+> [§8.3](#83-known-soft-spots-in-what-was-built): the unbounded REST socket,
+> the non-atomic `Config.save()`, and what `SECURITY.md` did not say about
+> "Clear all browser data". It also gave the egress guard's glob-side case
+> fold the test that mutation S6a walked through ([§9](#9-delegating-to-opencode--evaluated-guarded-not-adopted)).
+>
 > **Updated 2026-09-15** by the hardening follow-up (`1.3.1+cfa.6`,
 > 1 277 tests), which closed most of what the refresh-cadence work left in
 > [§8.3](#83-known-soft-spots-in-what-was-built): the REST park, the
@@ -705,13 +712,37 @@ unnecessary source of behaviour change.
   workers - one an hour per provider instead of one every few minutes - not
   the wedged worker itself.
 
-  **What is left is option (a): a total-response deadline on the REST
-  side** - `stream=True` plus an elapsed check while reading - which is the
-  only one that actually bounds the socket, and the only one that frees a
-  worker already stuck. (b), a dedicated `QThreadPool` per provider, is
-  still available as containment and still does not free anything. (d), a
-  busy flag on the provider, is now moot: the park does that job from the
+  **Option (a) was taken in 1.3.2+cfa.7: a total-response deadline on the
+  REST side** - `providers/_http.py`, `stream=True` plus an elapsed check
+  and a byte count while reading. It is the only one of the four that bounds
+  the socket, and the only one that frees a worker already stuck. One call
+  now returns or raises by `max(connect, total_seconds) + read`, which is
+  45 s at a 15 s timeout and 40 s at a 10 s one; a whole refresh is 130 s for
+  Copilot, 135 s for OpenRouter and 495 s for Azure, and each provider tells
+  the App that number. Measured against a byte-dripping loopback server with
+  the constants scaled down (0.2 s per byte, 1 s socket timeout, 3 s total):
+  a 40-byte drip returned after 7.81 s with the timeout never firing, a
+  5 000-byte drip still held the worker when the harness gave up watching at
+  30.0 s, and the bounded call raised `ResponseDeadlineExceeded` at 3.00 s.
+
+  What is still true: **the pool is still shared**. Three REST providers
+  still submit to `QThreadPool.globalInstance()`, so they still compete for
+  slots with each other and with anything else that uses it - what has
+  changed is that a slot is now held for a bounded time rather than for the
+  life of the process. (b), a dedicated `QThreadPool` per provider, is still
+  available as containment for that, and still frees nothing on its own. (d),
+  a busy flag on the provider, is still moot: the park does that job from the
   App side, without writing a provider attribute from a pool thread.
+
+  One thing that surfaced in the doing, and is worth not re-learning:
+  `Response.iter_content(chunk_size=N)` cannot implement this. urllib3's
+  `stream()` blocks until `N` bytes have arrived or the connection closes,
+  and the per-socket read timeout never fires on a server dripping inside it,
+  so the elapsed check would not run again until 64 KiB had been dripped.
+  Measured at one byte per 50 ms behind a 2 s socket timeout,
+  `iter_content(64 KiB)` never yielded at all. The drain is `raw.read1()`,
+  with `iter_content(1)` behind it for a handle that has none (urllib3 1.x):
+  correct there too, and 3 854 ms per MiB against `read1`'s 0.5 ms.
 
   **Every dispatch of a hung REST provider costs a slot, which is why the
   kept retry is folded into the cadence.** An earlier draft of the retry
@@ -723,23 +754,35 @@ unnecessary source of behaviour change.
   is what keeps the due riding ordinary cadence wakes - pinned over eleven
   five-minute wakes inside one park - rather than arming an hour-long timer
   of its own.
-- **On a one-core host every REST watchdog is about six minutes.**
+- **On a one-core host every REST watchdog is thirteen minutes.**
   `_pool_wait_slack` adds `sum(every other REST budget) / maxThreadCount` to a
   dispatch's watchdog, because the cycle hands openrouter, copilot and azure
   to the shared pool in one burst and a budget that starts at dispatch would
   otherwise fire inside a refresh that has not exceeded its own bound. With
-  the real numbers (openrouter 60, copilot 60, azure 225) that is 365 s at
-  capacity 1, 222 s at 2 and 151 s at 4 for the two REST providers, and
-  365/305/275 s for Azure - so on a single-core machine a REST watchdog is
-  six minutes (up from 80 s) and the park ceiling twelve. While that cycle is
-  open the scheduler timer is stopped, so one wedged REST provider blocks
-  every refresh for six minutes rather than eighty seconds. The model is also
-  pessimistic by construction: it assumes full serialisation of every other
-  budget even at capacity 3, where the real wait is zero. It is still the
-  right trade - a watchdog that fires early manufactures the failure it exists
-  to catch, and feeds the parking machinery - but the alternative is to scale
-  the allowance by pool size (or to have providers report when their work
-  actually starts, which is a Provider-API change: the API is one callback).
+  1.3.2+cfa.7's numbers (openrouter 135, copilot 130, azure 495) that is
+  **780 s for all three at capacity 1** - the sum plus the slack, whoever is
+  waiting - 465/468/648 s at capacity 2 and 308/311/581 s at 4. The
+  1.3.1+cfa.6 numbers were 365/365/365, 222/222/305 and 151/151/275, so this
+  is up by a factor of two; the reason is that the per-request term used to be
+  a per-socket timeout, which bounded nothing, and is now a whole call.
+
+  It reads worse than it is. A watchdog ends the App's wait, not the
+  provider's work, and until 1.3.2+cfa.7 it was the *only* thing that ended a
+  wedged REST refresh - the worker itself never came back. A REST provider now
+  gives up on its own at 130, 135 or 495 s and closes its own cycle, so the
+  watchdog is a ceiling that is reached less often than before rather than
+  more. What has not changed: while a cycle is open the scheduler timer is
+  stopped, and a REST park still lasts until the worker reports back or one
+  hour (`_REST_PARK_BACKSTOP_SECONDS`), whichever comes first, rather than
+  twice the budget.
+
+  The model is also pessimistic by construction: it assumes full serialisation
+  of every other budget even at capacity 3, where the real wait is zero. It is
+  still the right trade - a watchdog that fires early manufactures the failure
+  it exists to catch, and feeds the parking machinery - but the alternative is
+  to scale the allowance by pool size (or to have providers report when their
+  work actually starts, which is a Provider-API change: the API is one
+  callback).
 - ~~**"Clear all browser data" still purges a profile the App may be
   scraping.**~~ **Closed in 1.3.1+cfa.6.** The dialog emits the id list on
   `browser_data_clear_requested` and the App defers each one exactly as it
@@ -782,11 +825,15 @@ unnecessary source of behaviour change.
   one helper and one `Config.save()` per drain. The alternative was leaving
   that list in memory, which loses a live account's session cookie to a quit
   inside the deferral window, and the write is the cheaper of the two.
-  A third writer is still worth thinking twice about. **It is also not
-  atomic** - a bare `path.write_text` - so a crash or a power cut inside one
-  of those unasked writes truncates the file that holds every setting; the
-  loader survives it (`config.json.corrupt` and defaults, executed) but the
-  settings are gone, and `tmp` plus `os.replace` is six lines. (It also means
+  A third writer is still worth thinking twice about. **It was made atomic
+  in 1.3.2+cfa.7** - `atomic_write.py`, a same-directory temp plus `fsync`
+  plus `os.replace`, the helper `secrets.dat` and the meter catalog already
+  used - so a crash or a power cut inside one of those unasked writes no
+  longer truncates the file that holds every setting. It moved out of
+  `secret_storage` to get there: that module imports `config`, so `config`
+  cannot import it. One consequence to know about: the file is now `0600` on
+  POSIX rather than `0644`, because `mkstemp` creates at `0600` and
+  `os.replace` carries the temp file's mode across. (It still means
   an ad-hoc harness that
   drives `_run_profile_purges` must set `APPDATA` - an override on every OS,
   which `tests/conftest.py` sets for the suite - or it edits the developer's
@@ -842,12 +889,12 @@ unnecessary source of behaviour change.
   bounded at 300. Note that `_load_failure_context` still puts the raw title
   into the *payload*, which is bounded downstream by `_raw_summary` and by
   `error_dialog._sanitize_raw` rather than at source.
-- **`CopilotProvider` and `OpenRouterProvider` do not declare
-  `refresh_budget_seconds`.** Both take the flat 60 s default. Copilot's real
-  nominal ceiling is 10 + 15 + 15 s of `requests` timeouts, each per socket
-  operation rather than total, so the flat number happens to be about right;
-  making it explicit would keep them inside the "read the budget off the
-  provider" doctrine and was not done here.
+- ~~**`CopilotProvider` and `OpenRouterProvider` do not declare
+  `refresh_budget_seconds`.**~~ **Closed in 1.3.2+cfa.7**, and the flat 60 s
+  turned out not to be about right after all. It was read off the nominal
+  sum of per-socket timeouts (10 + 15 + 15), which is not a bound on
+  anything; with a real per-call bound the same three calls are 130 s for
+  Copilot and 135 s for OpenRouter, so both now name their own.
 - **The tile and tray tooltips rely on `snapshot.error` being clean at
   source.** `_exception_summary` is what keeps a request URL out of it;
   `widget.py` renders the string as-is, and only `app.py`'s log lines and the
@@ -935,15 +982,14 @@ unnecessary source of behaviour change.
   *ceiling* itself stops holding: the wedged run makes 31 dispatches against
   a control of 12 over the same six hours, because a watchdog wait longer
   than the cycle spacing keeps `_unchanged_cycles` down and the app on its
-  short cadence. No provider in the tree has a budget near that (Azure's is
-  225 s and it has its own in-flight gate), so this is a note about the
-  fixture's reach rather than a live rate defect - but it is the shape a
-  future long-budget provider would arrive in.
-- **`SECURITY.md` does not describe "Clear all browser data".** It covers
-  egress, secrets and the Azure rate floor, but not the one button that
-  deletes a directory tree and a set of keyring entries, and not that the
-  request is now persisted across a quit in `config.json`. Two sentences
-  under the existing local-data heading.
+  short cadence. **1.3.2+cfa.7 moved Azure's budget to 495 s**, which is
+  closer to that shape than anything in the tree has been - it still has its
+  own in-flight gate, and its worker now returns inside that budget rather
+  than never, so the watchdog wait is a ceiling it rarely reaches. It is
+  still a note about the fixture's reach rather than a live rate defect, but
+  the margin is half what it was.
+- ~~**`SECURITY.md` does not describe "Clear all browser data".**~~
+  **Closed in 1.3.2+cfa.7**, under its own heading beside the local-data one.
 - **One CI job segfaulted in a native thread, once, and the cause is not
   pinned.** Run 67 on `aab1de9` died with `Fatal Python error: Segmentation
   fault` in the Ubuntu 22.04 / 3.11 job while the other five jobs and every
@@ -1276,6 +1322,15 @@ characters or more is redacted, where the floor used to be eight; `posture`
 prints the policy source the other commands already print; and the hook's
 literal-endpoint branch — the only thing that catches a POST to the pinned
 server on a path other than `/session` — finally has a test.
+
+One finding of the round-3 *confirmation* pass is closed in 1.3.2+cfa.7:
+mutation S6a - dropping `.lower()` from the deny-glob compile side - survived
+the whole suite, because every built-in deny glob is already lower-case and
+lowering it again changes nothing. `paths.deny` is operator-editable and this
+repository is told below to edit it, so eight parametrised cases now cover
+both halves of the fold. Run both ways against `tests/test_egress_guard.py`
+(460 tests): pattern side unlowered, 4 fail; candidate side unlowered, 5 fail,
+one of which is the pre-existing `C:\Users\m\.AWS\CREDENTIALS` case.
 
 What this round leaves open, deliberately:
 

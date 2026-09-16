@@ -6,6 +6,131 @@
 > earlier `0.6.4` entry predates that convention and **is not** upstream's
 > `v0.6.4`, which is different code.
 
+## 1.3.2+cfa.7 - 2026-09-16
+
+The residuals of the hardening follow-up: the socket itself, the write that
+holds every setting, and two things the documents did not say. No behaviour
+changes for a healthy provider - the same requests to the same hosts, and a
+call that answers in under a second answers exactly as it did.
+
+### Changed
+
+- **A REST request is bounded end to end, not per socket read.** `requests`'
+  `timeout=` bounds one connect or one read, never the exchange, so a server
+  sending a byte every 14 s against a 15 s timeout is a healthy connection as
+  far as `requests` is concerned - and it held the `QThreadPool` worker
+  reading it for as long as it cared to keep dripping. 1.3.1+cfa.6 bounded
+  how many such workers could pile up and what one cost the log; nothing
+  bounded how long one lived, and the pool is global, so a stuck worker was a
+  stuck slot until the process exited. One helper,
+  `providers/_http.py`, now starts a clock, asks with `stream=True`, drains
+  the body itself and checks the elapsed time and the running byte count
+  between reads; Copilot's five call sites, OpenRouter's three, Azure's two
+  and the Entra ID token POST all go through it. Both failures subclass
+  `requests.RequestException`, so every handler already at those sites takes
+  them, and neither one retries.
+
+  Measured on a byte-dripping loopback server with the constants scaled down
+  (0.2 s per byte, 1 s socket timeout, 3 s total). Before: a 40-byte drip -
+  8 s of server - returned after **7.81 s**, the 1 s timeout never firing
+  once; a 5 000-byte drip **still held the worker when the harness gave up
+  watching at 30.0 s**, and would have held it for 1 000 s. After:
+  `ResponseDeadlineExceeded` at **3.00 s**, inside the predicted 4.0 s. A
+  server flooding chunked data against a 1 MiB cap: `ResponseTooLarge` at
+  0.00 s with 2 162 688 bytes pushed.
+
+  The obvious implementation does not work, which is the part worth knowing.
+  `iter_content(chunk_size=N)` goes through urllib3's `stream()`, which
+  blocks "until `amt` bytes have been read from the connection or until the
+  connection is closed" - and the per-socket timeout never fires on a server
+  dripping inside it. Against a loopback server at one byte per 50 ms behind
+  a 2 s socket timeout, `iter_content(64 KiB)` **never yielded at all**,
+  `iter_content(1)` yielded at once, and `raw.read1()` yielded at once; on a
+  1 MiB body delivered in one go the three cost 0.8 ms, **3 854 ms** and
+  0.5 ms. So the drain is `read1`, with `iter_content(1)` behind it for a
+  handle that has none.
+
+- **The three REST providers now tell the App a budget that is true.** One
+  call returns or raises by `max(connect, total) + read`, which at a 30 s
+  total is 45 s for a 15 s timeout and 40 s for a 10 s one. Azure's
+  `REFRESH_WORST_CASE_SECONDS` was 90 + 9 x 15 = **225 s** with the
+  per-request term a socket timeout; it is 90 + 9 x 45 = **495 s** with the
+  per-request term a whole call. The number grew because it is now true.
+  Copilot's three sequential calls are 40 + 45 + 45 = **130 s** and
+  OpenRouter's three are 3 x 45 = **135 s**, neither of which fits the flat
+  60 s a plain REST provider used to take, so both now declare
+  `refresh_budget_seconds` the way Azure does - which also closes the
+  "neither declares one" note in `docs/next-session.md` 8.3. A longer
+  watchdog is the right direction: the watchdog ends the App's wait, and
+  until now it was the only thing that ended a wedged REST refresh at all. A
+  provider that gives up on its own at 130, 135 or 495 s closes its own cycle,
+  so the ceiling is reached less often than before rather than more.
+
+- **`allow_redirects=False` on every REST call.** Every host this app speaks
+  to is fixed and listed in `SECURITY.md`, so a redirect is a failure, not
+  something to follow. Azure already said so; Copilot and OpenRouter get the
+  helper's default, and neither GitHub nor OpenRouter redirects the API paths
+  in question.
+
+### Fixed
+
+- **`Config.save()` is atomic.** It was a bare `path.write_text`, which
+  truncates before it writes. That was tolerable while the only writes were
+  the user's own, and 1.3.1+cfa.6 gave the app two reasons to write this file
+  unasked - the deferred-purge drain runs from `App.__init__` and from the
+  five-minute heartbeat - so a crash or a power cut inside a write nobody
+  asked for truncated the file holding every setting plus both pending lists.
+  The loader survives that (`config.json.corrupt` and defaults, executed) and
+  the settings do not. Same discipline as `secrets.dat` and the meter
+  catalog: a temp file in the same directory, `fsync`, `os.replace`, temp
+  unlinked on any failure. The helper moved to `atomic_write.py` rather than
+  being imported where it was, because `secret_storage` imports `config` and
+  so cannot be imported from it. One side effect, pinned rather than left as
+  a surprise: the file is now `0600` on macOS and Linux, where a bare
+  `write_text` gave `0644` under the usual umask - `mkstemp` creates at
+  `0600` and `os.replace` carries that across. Windows is unaffected and
+  still relies on the user-scoped `%APPDATA%` location. The exception
+  contract does not move: `save()` still raises `OSError`, and the nine
+  callers - four of which swallow it, five of which do not - are unchanged.
+
+- **The glob side of the egress guard's case fold has a test.** The deny
+  matcher lowers both the pattern and the candidate, because `fnmatch` is
+  case-sensitive on POSIX and insensitive on Windows. Only the candidate half
+  was covered, and the round-3 confirmation of PR #23 found that removing
+  `.lower()` from the *pattern* side survived the whole suite - every
+  built-in deny glob is already lower-case, so lowering it again changes
+  nothing. `paths.deny` is operator-editable and this repository is told to
+  edit it, so an operator's `**/Secrets/**` has to deny `x/secrets/y`. Eight
+  parameters, run both ways against `tests/test_egress_guard.py`: with the
+  pattern side unlowered, **4 fail and 456 pass** - the four upper-case globs
+  and nothing else in the file; with the candidate side unlowered, **5 fail
+  and 455 pass** - the four mirrors plus the existing
+  `C:\Users\m\.AWS\CREDENTIALS` case that was already there.
+
+### Documentation
+
+- **`SECURITY.md` describes "Clear all browser data".** It covered egress,
+  secrets and the Azure rate floor, and said nothing about the one button
+  that deletes a directory tree and a set of keyring entries - or that since
+  1.3.1+cfa.6 the request is written into `config.json` and carried out at
+  the next start. A new heading says what it removes and for which accounts,
+  that the cookie secrets go at the click while the profile directories are
+  handed to the app (Qt requires a profile to outlive its pages, so one being
+  refreshed is deleted when that refresh finishes), and that the deferral is
+  a list of account ids only - bounded at 64 entries of 64 characters, never
+  a cookie or anything from a provider page, with a symlink never followed or
+  deleted through. The "written atomically" paragraph now covers
+  `config.json` as well.
+
+### Notes
+
+- The suite is **1 769 tests**, from 1 729: `tests/test_http.py` is new (17),
+  with 3 additions each to the Copilot and OpenRouter files, 3 to Azure's, 6
+  to the config file and 8 parameters to the egress guard's.
+- Not one `responses.add(...)` in the existing provider tests needed editing.
+  `responses` supports `stream=True` and hands back a real urllib3 handle, so
+  the whole transport change is invisible to them - which is the point.
+
 ## 1.3.1+cfa.6 - 2026-09-15
 
 The residuals of the refresh-cadence release, and two coercions on
