@@ -703,10 +703,10 @@ def test_a_parked_provider_does_not_freeze_the_idle_backoff(monkeypatch):
     # re-tuned budget - or a different machine - moves it. Derived instead,
     # from what this run measured: take how far the wedged run's last
     # dispatch slid past the control's, and require every control dispatch
-    # that still fits inside six hours carrying that slide. Measured here:
-    # 10 of 12 with a 30 s, 60 s or 240 s REST budget and with a browser
-    # provider at 240 s, each time exactly the number this arithmetic
-    # predicts - where the constant left no margin at all.
+    # that still fits inside six hours carrying that slide. How many that is
+    # depends on the host's core count (10 or 11 of 12 on the machines this
+    # ran on) and on the budget; each time it is exactly the number this
+    # arithmetic predicts, where the constant left no margin at all.
     slide = wedged_times[-1] - control_times[min(wedged_count, control_count) - 1]
     still_fit = sum(1 for when in control_times if when + slide <= _SIX_HOURS)
     assert wedged_count >= still_fit, (

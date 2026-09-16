@@ -162,6 +162,8 @@ allowed to cost.
   counted as removed where the purge refused it, and one pointing at another
   profile *inside* it passed containment and deleted the account it aliased,
   under a live scrape, because the deferral is keyed on the link's own name.
+  `purge_profile` itself refuses a link too, so an id that reaches it from
+  `config.json`'s two pending lists cannot delete through one either.
   An entry resolving to the `profiles/` root is refused for the same reason —
   `webview_profile_dir` permits it and `purge_profile` does not. Measured on
   a hostile tree of eight entries: the predicate disagreed with the deletion
@@ -246,7 +248,7 @@ allowed to cost.
 
 ### Notes
 
-- **1 216 → 1 275 tests.** Including six fake hours of a wedged REST worker
+- **1 216 → 1 277 tests.** Including six fake hours of a wedged REST worker
   against a browser sibling, an hour-long park ridden out over eleven cadence
   wakes, a mislabelled answer that must not touch its sibling's dispatch, and
   the three payloads that used to raise out of `_on_snapshot`. **Thirty-six**
@@ -260,7 +262,9 @@ allowed to cost.
   log's clip can cut it at, a link in `profiles/` that is never a profile,
   and the two arms of `is_usable_profile_id` the filesystem decides
   (round 3). Counted by collection: 1 216 at `origin/main`, 1 239 when the
-  release was tagged, 1 275 after the three review rounds.
+  release was tagged, 1 275 after the three review rounds, and 1 277 once
+  `main`'s suite-teardown fix (#26) was merged in and `purge_profile` learned
+  to refuse a link.
 - **The REST socket itself is still unbounded.** This bounds how many workers
   a hung endpoint can accumulate, not how long one of them lives. A total
   response deadline — `stream=True` plus an elapsed check while reading — is
