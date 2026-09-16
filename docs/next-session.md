@@ -961,6 +961,26 @@ unnecessary source of behaviour change.
   the segfault is a suite-level soft spot that predates this PR's code and
   belongs with the WebEngine teardown warning, not with Azure.
 
+  **The named cause is now fixed** (`c759bdc`). The real `App()` that
+  `test_app.py` constructs was never torn down, and its startup refresh was a
+  bare `QTimer.singleShot(500, lambda: ...)` whose lambda kept the App alive:
+  500 ms later, inside whatever test was then processing events, a real cycle
+  dispatched real providers and started a real scrape. That stray page was the
+  `Release of profile requested but WebEnginePage still not deleted` warning,
+  and it was also the intermittent
+  `TypeError: 'NoneType' object is not callable` that pytest-qt pinned on a
+  long-running test in `test_app_logging.py`. The startup refresh is now a
+  parented single-shot `QTimer`, `App.shutdown()` stops it along with the
+  cadence timer, the heartbeat and every armed watchdog, and the smoke test
+  calls it in a `finally`.
+
+  What that closes and what it does not: the teardown warning and the
+  misattributed `TypeError` are gone, and the suite no longer leaves a live
+  Chromium page running under later tests. The run 67 segfault itself was
+  never reproduced, so this removes its most likely cause rather than proving
+  it was the cause. If a native-thread crash reappears with the stray page
+  gone, this entry is no longer the explanation and the hunt starts fresh.
+
 ### 8.4 Decisions taken in review, so they are not relitigated
 
 Three reviews went over this feature before it merged (see the
@@ -1063,3 +1083,224 @@ the calls that were made, and why:
   requests exception carries the request URL and with it the subscription id.
   The redaction in `error_dialog` is the second line of defence, not the
   first.
+
+---
+
+## 9. Delegating to OpenCode — evaluated, guarded, not adopted
+
+`docs/opencode-plugin-evaluation.md` is the full review of the two plugin
+families that connect Claude Code and OpenCode, read at the commits named in
+it. Two things from it are operational rather than advisory:
+
+- **`opencode-plugin-cc` rewrites OpenCode's global permissions on every server
+  start**, setting `bash`, `edit`, `webfetch` and `external_directory` to
+  `allow` in `~/.config/opencode/opencode.json`. Reverting it once is not
+  enough — the next delegation puts it back. `python tools/egress_guard.py
+  posture` is what notices, and it runs as part of every `preflight` and
+  `dispatch`.
+- **The subscription-bridge plugins are declined, not parked.** OpenCode's own
+  provider docs state that Anthropic prohibits using a Claude Pro/Max
+  subscription from OpenCode, and the plugins that do it work by impersonating
+  Claude Code down to the system prompt and billing-header signature. Nothing
+  about that improves with a later version.
+
+**What the guard is not.** `tools/egress_guard.py` is a choke point, not a
+sandbox or a DLP product. It sees the payload handed to it and refuses on
+credential shapes, denied paths, marked material and unapproved destinations.
+It cannot see what a delegated agent fetches on its own once `bash` and
+`webfetch` are allowed, which is why the evaluation puts a network allowlist
+under it rather than treating the scan as sufficient. Regex detection has false
+negatives by construction: a clean scan means nothing known-bad was found.
+
+**Nothing in the app changed.** The guard is developer tooling in `tools/`,
+stdlib-only so it runs without the app's dependencies, and no version bump goes
+with it.
+
+### What the security review of the guard found, and what is still open
+
+A review by execution of `tools/egress_guard.py` produced nine blocking
+findings. All nine are fixed on this branch, each with a driver run before and
+after: the destination check was a string prefix and a payload demonstrably
+left the machine to an off-box address while `posture` said `ok`; the
+unrecognised-credential catch-all defaulted to `warn`, and `warn` neither
+blocked, redacted nor printed; `\b` in the `secret-assignment` rule never fires
+after `_`, so `DATABASE_PASSWORD=` produced no finding; the path scanner was
+quadratic (22 s at 64 000 characters, and it did not finish at the tool's own
+400 000-byte cap) and the cap did not gate the scan; `--include-diff` executed
+the workspace's `diff.external`; `cmd_dispatch` had no test and three gutting
+mutations survived; `hook` failed open on every error path; the documented exit
+codes held on no fault path and the audit line was written after the POST.
+
+Four things are deliberately **not** fixed, and are limits of the design rather
+than defects to patch:
+
+- **Every posture input is settable by the thing being checked.**
+  `opencode_config_path()` builds its path from `$XDG_CONFIG_HOME`. Measured:
+  with that variable pointed elsewhere, a real drifted config
+  (`bash`+`webfetch`+`external_directory` = `allow`) is invisible and `posture`
+  reports ok. A missing config file and a config path that is a directory both
+  read as clean, and the object form `{"bash": {"*": "allow"}}` is not
+  recognised, because the check is an exact string test. Malformed JSON shapes
+  no longer crash out of `posture()` — they are faults now, which is what the
+  exit-code contract requires — but the gap itself is not staleness and not
+  parsing: it is that the check consults a path the delegated agent can move.
+  Closing it needs the config to be read from a location the agent cannot
+  redirect, which the guard cannot arrange on its own.
+
+- **The policy that governs the guard is a workspace file the delegated agent
+  can write.** Candidates are `--policy`, `$AIGAUGE_EGRESS_POLICY`, then
+  `<workspace>/.egress-policy.json`. Measured: a planted `.egress-policy.json`
+  with every detector `off`, `destinations.allow: ["*"]` and `audit.path`
+  `/dev/null` dispatches a GitHub token and a path to `~/.aws/credentials` with
+  exit 0. The control and its configuration share a trust boundary with the
+  thing being controlled. `dispatch` now prints and records `policy_source`, so
+  the substitution is at least visible after the fact, but **`--policy` or the
+  environment variable is the only supported source for anything unattended** —
+  a workspace file is a convenience for interactive use.
+
+- **`fnmatch` globs cross `/`.** `openrouter/*` matches `openrouter/a/b/c/d`.
+  Pin exact ids when the depth matters.
+
+- **Regex detection has false negatives by construction**, as this section
+  already says. The review confirmed it: every base64, URL-encoded, split-line
+  and zero-width variant of every credential in its corpus walks through. The
+  guard is a choke point for the plain forms, not a DLP product.
+
+Two smaller items were left as they are and are recorded here rather than
+fixed: an over-cap payload is hashed and counted in full in the audit line but
+only scanned up to the cap, and the line says so in its `refusals` field rather
+than in the hash itself; and `_scan_paths` still strips `a/` and `b/` diff
+prefixes from every path-shaped token, so a real top-level directory called `a`
+or `b` is matched by its suffix.
+
+### What the second review found, and what that round left open
+
+The second review by execution took the nine fixes apart again and found two of
+them had been made at the instance rather than at the class, plus six smaller
+findings. All of them are addressed on this branch — the scanner is linear in
+the size of the payload and in the number of findings it produces, on fillers
+that match nothing and on fillers that match almost everywhere, and a test fails
+the build on any unbounded quantifier in any pattern; `--include-diff` diffs commit trees, runs no workspace-planted
+command on twelve vectors, and no longer runs `git status`; a `block` can no
+longer be silenced by an overlapping `redact`; a redirect off the pinned host is
+refused rather than followed with the server password attached; `scan` refuses a
+payload it could not finish reading; the path scanner has no window and
+therefore no band; the hook refuses a direct POST to the agent's own server; and
+the two rules that fired on every mention of a credential need a credential.
+
+What that round leaves open, deliberately:
+
+- **A regex is not a shell parser.** The hook now refuses the `curl`/`wget`/
+  `http`/`python -c` family aimed at the agent's own endpoint, which was the
+  gap that mattered, because that endpoint is the guard's own dispatch path.
+  The forms that still slip are shell quote-splitting (`o''pencode`,
+  `opencod\e`, a line continuation inside the binary's name), an `alias`
+  defined earlier in the session, and a Cyrillic look-alike. Closing those
+  needs a shell parser, and a hook that tried to be one would be a larger
+  attack surface than the one it guards.
+
+- **A denied path followed immediately by sentence punctuation is not
+  recognised.** The scanner takes whole whitespace- or quote-delimited tokens
+  and requires every character to be a path character, which is what stops it
+  blocking on every mention of a store path in prose and documentation. The
+  cost is that `read /home/u/.aws/credentials,` is not matched. A trailing `.`
+  was already missed before this change. The same trade-off in the other
+  direction — stripping punctuation — puts the repository's own docstrings back
+  on the blocked list. (The third round narrowed this: a trailing bracket, a
+  `?query` and a `:line`/`#fragment` citation *are* now taken off the token, so
+  `(/home/u/.aws/credentials)` and `…/credentials:12` are matched. Sentence
+  punctuation still is not.)
+
+- **The deny list blocks this repository's own documentation of its own
+  store.** `SECURITY.md` names `%APPDATA%/ai-gauge/secrets.dat` in a table, so
+  `git diff | scan --stdin` over the two most recent diffs that touch it exits
+  2 on one `denied-path` finding each. That is the rule doing exactly what
+  `paths.deny` asks of it, and the answer for this repository is its own
+  `paths.deny` in a `--policy` file rather than a narrower default that would
+  stop denying the store. The repository's *source* no longer blocks: handing
+  `src/aigauge/secret_storage.py` to a delegate went from one blocking finding
+  and four redactions to none.
+
+- **`opaque-token: redact` keeps its false positives.** On this repository's
+  source it costs 13 placeholders on identifier runs such as
+  `transport_max_attempts=SCRAPE_TRANSPORT_ATTEMPTS`. An unnamed high-entropy
+  blob is the case where taking it out of the payload is most obviously right,
+  and a placeholder is not a block, so the default stays.
+
+- **`--include-diff` no longer sees uncommitted work.** It diffs `<base>...HEAD`
+  because a clean filter runs whenever git has to turn a worktree file into a
+  blob, and a filter driver can be called anything, so pinning the names cannot
+  be complete. Commit first, or pass the text with `--task`/`--stdin`. A path
+  buried in the middle of a single token longer than 4 096 characters is
+  likewise not matched; tokens that long are scanned in overlapping windows,
+  which catches the path at the end of one but not a path with another 4 KB of
+  path characters after it.
+
+- **The audit file's mode is POSIX-only**, as `SECURITY.md` says of the app's
+  own stores, and the guard's doc repeats. The directory chain is now `0700` at
+  every level on POSIX; on Windows the file inherits the parent ACL.
+
+### What the third review found, and what this branch leaves open
+
+The third review by execution closed all fifteen round-2 findings on their own
+terms and found one High plus three Lows and six nits. The High was the same
+class of defect for the third time, at a third site: round 1 bounded the path
+scanner, round 2 bounded every other pattern, and the loop that resolves
+*overlapping findings* — added by round 2's own fix — was still quadratic, this
+time in the number of findings rather than in the bytes. It checked each
+candidate span against a list of every claim already made, so 400 KB of
+seven-character email addresses separated by spaces — a contact list, not an
+attack — is 57 143 findings and took 58.0 s in `scan()`
+and 58.4 s in the hook, against the hook's own documented 10 s timeout, and a
+hook killed at its timeout blocks nothing. A CSV of addresses was 9.1 s and a
+400 KB `.env`-shaped block 7.9 s. The claims are now a byte per character of the
+payload instead of a list of spans, which is O(1) per claim, and `redact()`
+builds the redacted text in one pass instead of rebuilding the whole string once
+per finding. The same payloads are 0.44 s, 0.25 s and 0.22 s, and `redact()` on
+57 143 spans went from 13.5 s to 0.02 s. The reason the suite could not see any
+of it is recorded in the tests: eighteen of its nineteen linearity fillers
+produced zero findings and the nineteenth produced 1 482, so the byte axis was
+tested exhaustively and the finding-density axis not at all. Four fillers that
+are almost all findings, and one that fills both severity bands with overlapping
+blocks and redactions, are now in the same parametrised tests.
+
+Also taken in that round: an ambiguous or wrong `--base` is a fault rather than a
+silently empty diff (git's own "refname is ambiguous" warning was being thrown
+away, so `--base amb` diffed whichever ref git picked and reported it clean);
+the shipped `tools/egress-policy.example.json` carries the built-in deny list in
+full, because a policy file *replaces* `paths.deny` rather than adding to it and
+the example was quietly four globs weaker than the defaults; a denied path
+followed by `:12`, `#L4`, `?x=1` or a closing bracket is matched; `nc`/`socat`
+conversations with the agent's own port are refused; a quoted secret of six
+characters or more is redacted, where the floor used to be eight; `posture`
+prints the policy source the other commands already print; and the hook's
+literal-endpoint branch — the only thing that catches a POST to the pinned
+server on a path other than `/session` — finally has a test.
+
+What this round leaves open, deliberately:
+
+- **Two overlapping redactions still resolve to one of them, not to their
+  union.** An `api_key=` assignment whose value runs straight into an email
+  address is dispatched as `[redacted:secret-assignment]` followed by the tail
+  of that address: the credential-shaped part is removed and the domain
+  survives. Merging the spans would be
+  strictly better, but every way of doing it inside five lines changes which
+  rule is *reported* for an overlap — a longer `opaque-token` run would start
+  displacing the named rule beside it — and that is a worse report for a
+  cosmetic gain. Left for a round that can measure the report quality.
+
+- **The bypass regex is still not a shell parser**, and `deno run -A
+  opencode.ts` and a port held in a shell variable (`S=4096; curl …:$S/session`)
+  join the list above. The netcat pair was worth one more alternative because
+  `nc` was already in the client list; the rest are the same trade as before.
+
+- **A denied path inside a markdown link is not matched.** `[creds](/home/u/
+  .aws/credentials)` is one token whose middle is `](`, and neither character is
+  a path character, so the token is dropped before any glob sees it. Trimming
+  brackets off the *ends* of a token, which is what this round added, does not
+  reach it.
+
+- **An over-cap payload is still hashed in full and scanned only to the cap**,
+  and the `a/`/`b/` diff-prefix strip is still redundant given that `fnmatch`'s
+  `*` crosses `/`. Both were recorded in the round-2 list above and neither
+  moved.
