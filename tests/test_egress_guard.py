@@ -453,6 +453,14 @@ _ADVERSARIAL_FILLERS = {
     "assignment shaped": "password=",
     "keyring shaped": "keyring ai-gauge x ",
     "mixed alphabet": "aZ9._%+-@:/=~ \t\n",
+    # The cost axis the citation cuts introduced: every token is path-shaped and
+    # carries several `:`/`#`, so every one of them is cut to the limit and
+    # tested against the whole deny list at each cut. `/a:::: ` is 57 142 such
+    # tokens in 400 KB and was 4.5 s at the built-in twenty globs, 12.5 s at
+    # sixty. None of the fillers above reaches it: `a/` is path-shaped with no
+    # colon (one pass), and `mixed alphabet` was the closest at 1.2 s.
+    "path citations": "/a:::: ",
+    "path cuts": "/a/b:1:2:3 ",
 }
 
 # The fillers above are the *byte* axis, and every one of them produces at most
@@ -604,6 +612,55 @@ def test_redacting_every_finding_does_not_copy_the_payload_once_each():
     assert time.monotonic() - started < 5.0
     assert count > 10_000
     assert "@" not in out.replace("[redacted:email-address]", "")
+
+
+def _deny_list(extra: int) -> dict:
+    """The built-in deny globs plus `extra` of the operator's own.
+
+    `paths.deny` is an operator-editable list, the doc invites editing it, and
+    §9 tells this repository in particular to. Sixty globs is an ordinary
+    setting, not a pathological one.
+    """
+    return {"deny": list(eg._DEFAULT_DENY_GLOBS) + [f"**/custom{i}/**" for i in range(extra)]}
+
+
+def test_a_long_deny_list_does_not_take_the_scan_past_the_hooks_timeout():
+    """The citation cuts tested every glob once per cut, so a path-shaped token
+    carrying several colons cost four passes over the whole deny list. At the
+    built-in twenty globs 400 KB of `/a:::: ` was 4.5 s; at sixty it was 12.5 s,
+    past the hook's documented 10 s timeout, on a payload of plain text."""
+    import time
+
+    payload = _filled(_ADVERSARIAL_FILLERS["path citations"])
+    pol = policy(paths=_deny_list(40))
+    assert len(pol.deny_globs) == 60
+    started = time.monotonic()
+    eg.scan(payload, pol)
+    assert time.monotonic() - started < 5.0
+
+
+def test_the_length_of_the_deny_list_is_not_a_multiplier():
+    """Four times the globs must cost at most about four times, not sixteen -
+    and with one compiled alternation per list it costs about twice."""
+    import time
+
+    payload = _filled(_ADVERSARIAL_FILLERS["path citations"], 200_000)
+    elapsed = {}
+    for extra in (0, 60):
+        pol = policy(paths=_deny_list(extra))
+        eg.scan(payload[:2000], pol)  # compile the matcher outside the clock
+        started = time.monotonic()
+        eg.scan(payload, pol)
+        elapsed[len(pol.deny_globs)] = time.monotonic() - started
+    assert elapsed[80] <= 4 * max(elapsed[20], 0.005), elapsed
+
+
+def test_a_longer_deny_list_still_denies_what_it_names():
+    """The control for the two above: the alternation must not have lost a glob."""
+    pol = policy(paths=_deny_list(40))
+    assert any(f.rule == "denied-path" for f in eg.scan("read src/custom7/x.txt", pol))
+    assert any(f.rule == "denied-path" for f in eg.scan("read /home/u/.aws/credentials", pol))
+    assert not [f for f in eg.scan("read src/aigauge/app.py", pol) if f.rule == "denied-path"]
 
 
 def _quantifiers(pattern: str, verbose: bool = False):

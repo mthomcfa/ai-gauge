@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import base64
 import fnmatch
+import functools
 import hashlib
 import ipaddress
 import json
@@ -594,7 +595,35 @@ def _trim_brackets_and_query(text: str, start: int, end: int) -> tuple[int, int]
     return start, end
 
 
-def _denied_glob_match(path: str, globs: Iterable[str]) -> str | None:
+@functools.lru_cache(maxsize=8)
+def _deny_matcher(globs: tuple[str, ...]) -> re.Pattern[str] | None:
+    r"""The whole deny list as one compiled alternation, cached per list.
+
+    A glob at a time cost one `fnmatch` call per glob per candidate, and the
+    citation cuts multiply the candidates: four passes over twenty globs is
+    eighty calls for every path-shaped token that does not match, and 400 KB of
+    `/a:::: ` is 57 142 such tokens - 4.5 s at the built-in twenty globs and
+    12.5 s at the sixty a repository is invited to configure, past the hook's
+    documented 10 s timeout. One compiled alternation is one match per
+    candidate whatever the list's length, so the cost stops multiplying by it.
+
+    Both sides are lowered: fnmatch is case-sensitive on POSIX and insensitive
+    on Windows, so `C:\Users\m\.AWS\CREDENTIALS` was denied on one platform and
+    passed on the other. A deny list that depends on the case a path was typed
+    in is not a deny list. Each translated glob ends in `\Z`, so matching from
+    the start is a whole-string match.
+    """
+    parts: list[str] = []
+    for glob in globs:
+        pattern = glob.lower()
+        parts.append(fnmatch.translate(pattern))
+        # fnmatch has no ** semantics, so "**/x" also has to match a bare "x".
+        if pattern.startswith("**/"):
+            parts.append(fnmatch.translate(pattern[3:]))
+    return re.compile("|".join(parts)) if parts else None
+
+
+def _denied_glob_match(path: str, matcher: re.Pattern[str] | None) -> str | None:
     """The token, or the path a `:line`/`#fragment` citation follows.
 
     `file:line` is how grep, every compiler and every stack trace names a file,
@@ -604,11 +633,12 @@ def _denied_glob_match(path: str, globs: Iterable[str]) -> str | None:
     them, so this stays linear and sentence punctuation still does not count.
     Returns the candidate that matched, for the excerpt.
     """
+    if matcher is None:
+        return None
     candidate = path
     for _ in range(_PATH_CITATION_CUTS + 1):
-        for glob in globs:
-            if _glob_match(candidate, glob):
-                return candidate
+        if matcher.match(candidate.lower()):
+            return candidate
         cut = max(candidate.rfind(":"), candidate.rfind("#"))
         if cut <= 0:
             return None
@@ -621,6 +651,7 @@ def _scan_paths(text: str, policy: Policy) -> list[Finding]:
     action = policy.action_for("denied-path", BLOCK)
     if not globs or action == "off":
         return []
+    matcher = _deny_matcher(tuple(globs))
     found: list[Finding] = []
     seen: set[str] = set()
     for start, end in _path_like_spans(text):
@@ -629,26 +660,11 @@ def _scan_paths(text: str, policy: Policy) -> list[Finding]:
         normalised = raw.removeprefix("a/").removeprefix("b/")
         if normalised in seen:
             continue
-        matched = _denied_glob_match(normalised, globs)
+        matched = _denied_glob_match(normalised, matcher)
         if matched is not None:
             seen.add(normalised)
             found.append(Finding("denied-path", action, start, end, _path_excerpt(matched)))
     return found
-
-
-def _glob_match(path: str, glob: str) -> bool:
-    # Both sides lowered: fnmatch is case-sensitive on POSIX and insensitive on
-    # Windows, so `C:\Users\m\.AWS\CREDENTIALS` was denied on one platform and
-    # passed on the other. A deny list that depends on the case a path was typed
-    # in is not a deny list.
-    lowered = path.lower()
-    pattern = glob.lower()
-    if fnmatch.fnmatchcase(lowered, pattern):
-        return True
-    # fnmatch has no ** semantics, so "**/x" also has to match a bare "x".
-    if pattern.startswith("**/") and fnmatch.fnmatchcase(lowered, pattern[3:]):
-        return True
-    return False
 
 
 def _path_excerpt(path: str) -> str:
