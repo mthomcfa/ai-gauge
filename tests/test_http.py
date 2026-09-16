@@ -1000,6 +1000,29 @@ def test_a_timer_that_fires_after_the_call_ended_does_nothing():
     assert deadline._timer is None
 
 
+def test_a_re_arm_that_races_the_call_ending_never_starts(monkeypatch):
+    """`_fire` reads the connection's socket outside the lock, so a call that
+    ends in that window finds `cancel()` already done by the time the re-arm
+    is armed. The guard in `_arm_in` is what keeps that last timer from
+    starting - and a started one is a thread outliving its call, which is the
+    thing the `finally` exists to prevent."""
+    made = _patch_timer(monkeypatch)
+    deadline = _http._DeadlineShutdown(30.0)
+
+    class _ConnectionThatEndsTheCall:
+        @property
+        def sock(self):
+            deadline.cancel()
+            return None
+
+    deadline.record(_ConnectionThatEndsTheCall())
+    deadline._fire()
+
+    assert len(made) == 1, "the re-arm did not reach threading.Timer"
+    assert not made[0].started, "a timer was armed after the call had ended"
+    assert deadline._timer is None
+
+
 def test_the_re_arm_loop_is_ended_by_the_call_and_leaves_no_thread(monkeypatch):
     """Nothing counts the re-arms, so what stops them is `bounded_request`'s
     own `finally` - here on the failure path, with a socket that never

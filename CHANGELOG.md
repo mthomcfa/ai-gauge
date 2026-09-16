@@ -305,15 +305,15 @@ call that answers in under a second answers exactly as it did.
 
 ### Notes
 
-- The suite is **1 834 tests**, from 1 729. `tests/test_http.py` is new and
-  holds 70 of them; the Copilot file is at 24, OpenRouter's at 38, Azure's at
-  232, the config file at 138, and the egress guard's at 460. Sixty-five of
-  the hundred and five came from the two review rounds. Round 1's
+- The suite is **1 835 tests**, from 1 729. `tests/test_http.py` is new and
+  holds 71 of them; the Copilot file is at 24, OpenRouter's at 38, Azure's at
+  232, the config file at 138, and the egress guard's at 460. Sixty-six of
+  the hundred and six came from the two review rounds. Round 1's
   thirty-six: the out-of-band deadline (12), the urllib3 floor and the
   nested-coding refusal (5), Copilot's named transport failures (2), the
   redirect refusal (10), the five mutation survivors the code lane found (6)
-  and the symlinked-`config.json` note (1). Round 2's twenty-nine: the
-  timer's re-arm (3), the adapter hook driven from `requests` itself (4), the
+  and the symlinked-`config.json` note (1). Round 2's thirty: the timer's
+  re-arm (4), the adapter hook driven from `requests` itself (4), the
   un-watched pool (1), the comma refusal (9 with its parameters), the 304
   (3), Copilot's truncated reply (2) and four edges that survived the code
   lane's mutations (7). One existing test also had its derivation completed

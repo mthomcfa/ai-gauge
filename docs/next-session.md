@@ -4,7 +4,7 @@ State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#1
 610 tests passing, all five providers reading.
 
 > **Updated 2026-09-16** by the REST-deadline follow-up (`1.3.2+cfa.7`,
-> 1 834 tests), which closed the three residuals that release left in
+> 1 835 tests), which closed the three residuals that release left in
 > [§8.3](#83-known-soft-spots-in-what-was-built): the unbounded REST socket,
 > the non-atomic `Config.save()`, and what `SECURITY.md` did not say about
 > "Clear all browser data". It also gave the egress guard's glob-side case
