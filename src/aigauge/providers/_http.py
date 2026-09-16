@@ -26,6 +26,7 @@ new host, no new request, no new dependency - stdlib plus ``requests``.
 """
 from __future__ import annotations
 
+import logging
 import socket
 import threading
 import time
@@ -40,6 +41,12 @@ from requests.adapters import HTTPAdapter
 # `requests` exception `Response.iter_content` would have wrapped it in.
 from urllib3.exceptions import DecodeError, ProtocolError, ReadTimeoutError
 from urllib3.exceptions import SSLError as _Urllib3SSLError
+
+# One line, one fixed literal, and only from the timer thread: see
+# _DeadlineShutdown._note_missed_hook. The URL this module is handed is never
+# logged - an ARM URL carries the subscription id and a Copilot one carries
+# the GitHub username - and neither is any header, body or exception text.
+log = logging.getLogger("aigauge.providers.http")
 
 # How long one call may spend between "about to connect" and "body fully read".
 # The clock starts BEFORE requests.request(), so the connect and header-read
@@ -230,6 +237,8 @@ class _DeadlineShutdown:
         # bounds the re-arm loop below - the call's own `finally`, not a
         # count of attempts here.
         self._ended = False
+        # One warning per call, not one per re-arm (see _note_missed_hook).
+        self._noted_missed_hook = False
         # Read by bounded_request: a socket this timer cut must surface as
         # ResponseDeadlineExceeded rather than as whatever the broken read
         # raised, however the two clocks round. Written here under the lock
@@ -285,6 +294,7 @@ class _DeadlineShutdown:
             # to being bounded by nothing (measured: 40 s and 70 s against a
             # 4.0 s bound, ended only by the harness). So the timer tries
             # again shortly, and keeps trying until the call ends.
+            self._note_missed_hook()
             self._arm_in(REARM_SECONDS)
             return
         try:
@@ -293,6 +303,30 @@ class _DeadlineShutdown:
             # Already closed, never connected, or refused by the platform.
             # The read this was meant to unblock has ended on its own.
             pass
+
+    def _note_missed_hook(self) -> None:
+        """Say once that the deadline came due with no socket to shut down.
+
+        Two different things look like this from here. The ordinary one is a
+        call still in ``getaddrinfo`` or in the TCP connect, which the re-arm
+        above picks up the moment a socket exists. The other is the failure
+        this module cannot detect for itself: ``record()`` was never called at
+        all, because the single seam that calls it - an
+        ``HTTPAdapter.get_connection_with_tls_context`` override (a
+        ``requests`` 2.32 method; ``pyproject.toml`` pins only
+        ``requests>=2.32``) wrapping urllib3's private ``_get_conn`` - moved
+        under a dependency upgrade. That silently removes the whole bound:
+        measured by renaming the override, the suite stayed green at 1 805
+        while a TLS header drip went from 3.00 s to 14.03 s and stuck. So it
+        costs one line in the log instead of nothing. A fixed literal, like
+        every other line this package writes: no URL, no host, no header, no
+        exception text.
+        """
+        with self._lock:
+            if self._noted_missed_hook:
+                return
+            self._noted_missed_hook = True
+        log.warning("provider http deadline_hook_missed=True")
 
 
 class _ConnectionRecordingAdapter(HTTPAdapter):

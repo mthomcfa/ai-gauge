@@ -9,6 +9,7 @@ injected, the stream is a fake, and nothing here opens a socket.
 from __future__ import annotations
 
 import gzip
+import logging
 import socket
 import threading
 import tracemalloc
@@ -705,6 +706,54 @@ class _FakePool:
         return self._connection
 
 
+class _SendableRaw(_FakeRaw):
+    """A `_FakeRaw` shaped like the urllib3 response `requests` builds a
+    `Response` from, so a test can let `HTTPAdapter.send` run for real."""
+
+    reason = "OK"
+    version = 11
+    # `extract_cookies_to_jar` returns at once when this is falsy.
+    _original_response = None
+
+    def __init__(self, chunks, status: int = 200, headers=None):
+        super().__init__(chunks)
+        self.status = status
+        self.headers = headers or {"Content-Type": "application/json"}
+
+    def release_conn(self):
+        self.closed += 1
+
+
+class _SendablePool(_FakePool):
+    """`_FakePool` plus the one urllib3 method `HTTPAdapter.send` calls.
+
+    `urlopen` takes a connection out of the pool the way urllib3 does, which
+    is the call the deadline's hook is wrapped around.
+    """
+
+    def __init__(self, connection, raw):
+        super().__init__(connection)
+        self._raw = raw
+
+    def urlopen(self, **kwargs):  # noqa: ARG002
+        self._get_conn()
+        return self._raw
+
+
+def _patch_pool_manager(monkeypatch, pool) -> None:
+    """Fake the pool under `requests`, not the transport above it.
+
+    Everything else in this file injects at `Session.request`, which is above
+    the adapter; this is below it, so `requests` runs its own `Session.send`,
+    its own adapter and this module's override of it.
+    """
+    monkeypatch.setattr(
+        urllib3.poolmanager.PoolManager,
+        "connection_from_host",
+        lambda self, host, port=None, scheme="http", pool_kwargs=None: pool,
+    )
+
+
 def _patch_timer(monkeypatch, events: list | None = None) -> list:
     """Replace `threading.Timer` with a double that records and never fires."""
     made: list = []
@@ -938,13 +987,127 @@ def test_the_pool_hook_records_the_connection_once():
     connection = _FakeConnection(_FakeSocket())
     pool = _FakePool(connection)
 
+    records: list = []
+    deadline.record = lambda conn: records.append(conn)  # type: ignore[method-assign]
+
     _http._watch_pool(pool, deadline)
     _http._watch_pool(pool, deadline)
     assert pool._get_conn() is connection
 
     assert pool.calls == 1, "the pool was wrapped twice"
-    deadline._fire()
-    assert connection.sock.shutdowns == [socket.SHUT_RDWR]
+    # And wrapped once, not wrapped around its own wrapper: the count above
+    # is of the pool's own method, which a second wrapper would still reach.
+    assert records == [connection], "the hook was layered on itself"
+
+
+def test_a_pool_with_no_get_conn_is_handed_back_untouched():
+    """The hook is a private urllib3 attribute, so its absence is a version
+    this module does not know rather than something to patch onto: wrapping a
+    `None` would raise a TypeError inside `requests`' own send path, where no
+    `except requests.RequestException` branch would catch it."""
+
+    class _NotAPool:
+        pass
+
+    pool = _NotAPool()
+
+    assert _http._watch_pool(pool, _http._DeadlineShutdown(30.0)) is pool
+    assert not hasattr(pool, "_get_conn")
+
+
+def test_a_real_send_reaches_the_pool_hook(monkeypatch):
+    """The one bridge from `requests` to the recording hook, driven by
+    `requests`.
+
+    Everything the timer does depends on `record()` having been called, and
+    the only thing that calls it in production is `HTTPAdapter.send` ->
+    `get_connection_with_tls_context` -> `_watch_pool` -> `_get_conn`. Every
+    other transport test in this file injects at `Session.request`, which is
+    above the adapter, so that override was covered by nothing: renaming it
+    left the suite at 1 805 passed while a TLS header drip went from 3.00 s
+    back to 14.03 s and stuck. Here `requests` runs its own `Session.send`
+    and only the pool below it is a fake.
+    """
+    assert hasattr(
+        requests.adapters.HTTPAdapter, "get_connection_with_tls_context"
+    ), "requests moved the adapter seam this module hooks"
+
+    connection = _FakeConnection(_FakeSocket())
+    pool = _SendablePool(connection, _SendableRaw([b'{"a": ', b"1}"]))
+    _patch_pool_manager(monkeypatch, pool)
+    recorded: list = []
+    real_record = _http._DeadlineShutdown.record
+
+    def spy(self, conn):
+        recorded.append((self, conn))
+        real_record(self, conn)
+
+    monkeypatch.setattr(_http._DeadlineShutdown, "record", spy)
+
+    response = _http.bounded_request(
+        "GET",
+        "https://example.invalid/x",
+        timeout=15,
+        proxies={"http": None, "https": None},
+    )
+
+    assert response.json() == {"a": 1}
+    assert pool.calls == 1
+    assert [conn for _, conn in recorded] == [connection]
+    # The deadline the recording reached is the one the call armed, not a
+    # spare: `_fire` on any other would shut nothing down.
+    assert recorded[0][0]._connection is connection
+    assert connection.sock.shutdowns == [], "a healthy call was cut short"
+
+
+def test_a_real_send_lets_the_deadline_cut_the_socket_it_learned(monkeypatch):
+    """The other half of the same bridge: a read that only the shutdown ends.
+
+    The injected clock never advances, so nothing in band can raise. The only
+    way out is the timer firing on a socket it learned through `requests`' own
+    send path - which is the property the release rests on and which no test
+    drove before.
+    """
+    sock = _SignallingSocket()
+    connection = _FakeConnection(sock)
+
+    class _BlockingRaw(_SendableRaw):
+        def read1(self, amt=None, decode_content=None):  # noqa: ARG002
+            assert sock.cut.wait(10), "the deadline never reached the socket"
+            raise ProtocolError("Connection broken: IncompleteRead(0 bytes read)")
+
+    pool = _SendablePool(connection, _BlockingRaw([]))
+    _patch_pool_manager(monkeypatch, pool)
+
+    with pytest.raises(_http.ResponseDeadlineExceeded):
+        _http.bounded_request(
+            "GET",
+            "https://example.invalid/x",
+            timeout=15,
+            total_seconds=0.05,
+            monotonic=lambda: 1234.5,
+            proxies={"http": None, "https": None},
+        )
+
+    assert sock.shutdowns == [socket.SHUT_RDWR]
+
+
+def test_a_deadline_that_never_learned_a_connection_says_so_once(caplog):
+    """The failure mode the line above exists for is silent by construction:
+    `_fire` finds no connection and returns. One warning, from the timer
+    thread, with no URL in it - and one per call however often the re-arm
+    looks again, because the log is the only place a moved seam would show."""
+    deadline = _http._DeadlineShutdown(30.0)
+
+    with caplog.at_level(logging.WARNING, logger="aigauge"):
+        deadline._fire()
+        deadline._fire()
+        deadline.cancel()
+
+    assert caplog.text.count("deadline_hook_missed=True") == 1
+    # A fixed literal, so there is nothing in it to redact.
+    assert "://" not in caplog.text
+    assert "example.invalid" not in caplog.text
 
 
 def test_every_call_gets_its_own_session_on_the_deadlines_adapter(monkeypatch):
