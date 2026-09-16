@@ -599,6 +599,40 @@ def test_scan_stays_linear_in_the_number_of_findings():
     assert elapsed[400_000] <= 8 * max(elapsed[100_000], 0.005), elapsed
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "x.AKIAIOSFODNN7EXAMPLE@y.io",
+        "read /srv/ops@example.org/.env now",
+        "api_key=aaaaaaa1@example.org and ops@example.org",
+        "postgres://svc:hunter2@db.example.org:5432/app",
+        "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.aaaaaaaaaaaa.bbbbbbbbbbbb",
+        "read /srv/ops@example.org/.env and mail ops@example.org",
+    ],
+    ids=["key in a local part", "path holding an address", "assignment then address",
+         "connection string", "bearer jwt", "both bands"],
+)
+def test_scan_never_returns_overlapping_spans(text):
+    """`redact()` walks the findings once with a cursor that only moves forward,
+    which is only correct because `scan()` resolves every overlap first. That
+    invariant is what the one-pass rewrite depends on, so it is pinned here
+    rather than left to the redaction tests to notice second-hand."""
+    spans = sorted((f.start, f.end) for f in eg.scan(text, policy()))
+    for (_, end), (start, _) in zip(spans, spans[1:]):
+        assert end <= start, f"overlapping spans in {text!r}: {spans}"
+
+
+def test_a_finding_whose_interior_is_claimed_is_dropped():
+    """The claim map is tested across the whole span, not at its first
+    character. `x.AKIAIOSFODNN7EXAMPLE@y.io` is one blocking AWS key inside a
+    longer address: the key is claimed first, and the address that starts two
+    characters *earlier* has an unclaimed start and a claimed body. Testing the
+    start alone accepts it, and the two findings then overlap - which is exactly
+    what `redact()` may not be handed."""
+    findings = eg.scan("x.AKIAIOSFODNN7EXAMPLE@y.io", policy())
+    assert [f.rule for f in findings] == ["aws-access-key"]
+
+
 def test_redacting_every_finding_does_not_copy_the_payload_once_each():
     """`redact()` rebuilt the whole string once per finding, which is O(k*n) on
     top of the scan: 13.0 s for the 57 143 redactions on 400 KB of `a@b.co `,
