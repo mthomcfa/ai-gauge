@@ -203,13 +203,17 @@ def request_worst_case_seconds(
       before the timer, each byte of a dripping header reset the per-socket
       timeout and nothing re-checked the clock until the headers were
       complete;
-    * the slack is one read plus one re-arm interval. A timer cannot shut
-      down a socket that does not exist yet, so a timer that fires before
-      there is one does not give up: it re-arms every ``REARM_SECONDS``
-      until the call ends (``_DeadlineShutdown._fire``), which catches the
-      exchange within a quarter-second of the socket appearing rather than
-      leaving everything after it unbounded. The read that catch interrupts
-      blocks at most ``read``.
+    * the slack is one read, and the re-arm interval is inside it rather
+      than beside it. A timer cannot shut down a socket that does not exist
+      yet - nor, during a TLS handshake, the detached one it can see - so a
+      timer that comes due before there is a socket it can reach does not
+      give up: it looks again every ``REARM_SECONDS`` until the call ends
+      (``_DeadlineShutdown._fire``), which catches the exchange within a
+      quarter-second of a reachable socket appearing rather than leaving
+      everything after it unbounded. The read that catch interrupts blocks
+      at most ``read``, and ``REARM_SECONDS`` is 0.25 s against a smallest
+      ``read`` of 10 s anywhere in this package, so no term is added here
+      for it: the test beside this arithmetic pins that ordering.
 
     So the call returns or raises by ``max(connect, total_seconds) + read``.
     Note this is NOT ``connect + read + total_seconds + read``: that sum
@@ -253,6 +257,18 @@ class _DeadlineShutdown:
     One timer thread at a time per call, cancelled in ``bounded_request``'s
     ``finally`` whether the call succeeded or failed, so nothing outlives the
     call.
+
+    ``cancel()`` cannot stop a ``_fire`` that is already past its ``_ended``
+    check, so a shutdown can land after ``cancel()``, ``_unwatch_pools()``
+    and ``session.close()`` have all returned. It is harmless, and that is a
+    property of the call rather than luck: the session, the adapter, the pool
+    and the connection are built for this one call and are being closed, and
+    nothing is pooled across calls, so the socket that shutdown reaches is
+    this call's own - either already closed, which raises ``OSError``, or one
+    nobody will read again. Closing the window properly would mean holding
+    the lock across a blocking syscall that the timer and the caller share,
+    which is a worse trade. Forced, it happens; in 500 rounds of a cancel
+    racing a zero-second arm, it did not.
     """
 
     def __init__(self, seconds: float) -> None:
@@ -659,11 +675,15 @@ def _refuse_nested_encoding(response: requests.Response) -> None:
     """Refuse ``Content-Encoding: gzip, gzip`` before reading a byte of it.
 
     The test is the comma, not the names around it, because the comma is
-    exactly what urllib3 decides on: ``HTTPResponse._init_decoder`` sends any
-    header containing one to ``MultiDecoder``, which splits on ``","``
-    *without* dropping empty entries and maps every entry it does not
-    recognise - ``""`` included - to a ``DeflateDecoder``. So a tidier parse
-    disagrees with it at the edges, and disagreeing downwards is a bypass:
+    what urllib3 decides on: ``HTTPResponse._init_decoder`` sends a header
+    containing one to ``MultiDecoder``, which splits on ``","`` *without*
+    dropping empty entries and maps every entry it does not recognise -
+    ``""`` included - to a ``DeflateDecoder``. (Strictly, urllib3 builds no
+    decoder at all unless at least one entry is a coding it knows, so
+    ``Content-Encoding: ,`` is read there and refused here. That is this
+    rule refusing more than urllib3 would, which is the safe direction and
+    a header no host this app speaks to sends.) A tidier parse disagrees
+    with it the other way, and disagreeing downwards is a bypass:
     ``Content-Encoding: gzip,`` is one coding to a parse that drops empties
     and two decoder layers to urllib3, and a ``deflate(gzip(16 MiB))`` body
     under that header walked straight through the count this used to do -

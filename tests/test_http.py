@@ -359,18 +359,19 @@ def test_the_urllib3_floor_is_declared_as_a_dependency():
 
 @responses.activate
 @pytest.mark.parametrize(
-    "coding",
+    "coding, codings",
     [
-        pytest.param("gzip, gzip", id="two"),
-        pytest.param("gzip,gzip", id="tight"),
-        pytest.param("gzip,", id="trailing"),
-        pytest.param(", gzip", id="leading"),
-        pytest.param("identity, gzip", id="identity"),
-        pytest.param("GZIP, GZIP", id="upper"),
+        pytest.param("gzip, gzip", 2, id="two"),
+        pytest.param("gzip,gzip", 2, id="tight"),
+        pytest.param("gzip,", 2, id="trailing"),
+        pytest.param(", gzip", 2, id="leading"),
+        pytest.param("identity, gzip", 2, id="identity"),
+        pytest.param("GZIP, GZIP", 2, id="upper"),
+        pytest.param("gzip, gzip, gzip", 3, id="three"),
     ],
 )
 def test_a_body_under_more_than_one_coding_is_refused_before_it_is_read(
-    monkeypatch, coding
+    monkeypatch, coding, codings
 ):
     """`gzip, gzip` is 988 bytes on the wire and 1 070 MiB in a worker on a
     urllib3 the floor above now forbids. No host this app speaks to serves
@@ -406,7 +407,10 @@ def test_a_body_under_more_than_one_coding_is_refused_before_it_is_read(
 
     assert issubclass(_http.ResponseEncodingRefused, requests.RequestException)
     # The message reaches snapshot.error and the log: a count, never the
-    # endpoint's own header text.
+    # endpoint's own header text. The count is what a reader is told the
+    # endpoint did, so it is asserted rather than left to the shape of the
+    # sentence.
+    assert f"declared {codings} content encodings" in str(excinfo.value)
     assert "gzip" not in str(excinfo.value)
     assert "http" not in str(excinfo.value).lower()
 
@@ -1719,6 +1723,31 @@ def test_the_worst_case_is_derived_from_the_two_bounds():
     # A total below the connect timeout cannot make a call shorter than the
     # connect it has to wait out.
     assert _http.request_worst_case_seconds(15, total_seconds=1.0) == 30.0
+
+
+def test_the_re_arm_interval_is_covered_by_the_read_the_sum_already_allows():
+    """Why the sum has no `REARM_SECONDS` term.
+
+    A deadline that comes due before there is a socket the timer can reach
+    looks again every `REARM_SECONDS`, so the catch can be that much late -
+    but the term it would be added to is `+ read`, the one read the catch
+    interrupts, and every read timeout in this package is two orders of
+    magnitude larger. If a caller ever set one below the re-arm interval the
+    45 s / 40 s in `SECURITY.md`, the 130/135/495 s refresh budgets and the
+    watchdog derived from them would all be a quarter-second short, so the
+    ordering is pinned rather than assumed.
+    """
+    from aigauge.providers import _azure_auth
+    from aigauge.providers import azure, copilot, openrouter
+
+    timeouts = [
+        copilot.USERNAME_TIMEOUT,
+        copilot.USAGE_TIMEOUT,
+        openrouter.REQUEST_TIMEOUT,
+        azure.REQUEST_TIMEOUT,
+        _azure_auth.REQUEST_TIMEOUT,
+    ]
+    assert _http.REARM_SECONDS <= min(timeouts)
 
 
 @pytest.mark.parametrize(
