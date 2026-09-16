@@ -40,6 +40,7 @@ from .config import (
     BrowserAccount,
     ColorThresholds,
     Config,
+    is_usable_profile_id,
     account_display_name,
     app_data_dir,
     browser_accounts,
@@ -60,7 +61,6 @@ from .config import (
 )
 from .error_dialog import reveal_path
 from .logging_setup import log_path
-from .webview.profile import purge_profile
 from .providers.catalog import clear_scans
 from .providers.claude import CLAUDE_USAGE_URL
 from .providers.codex import CODEX_USAGE_URL
@@ -526,6 +526,13 @@ class SettingsDialog(QDialog):
     sign_in_clicked = pyqtSignal(str)  # provider name
     paste_cookie_clicked = pyqtSignal(str)  # provider name
     rescan_meters_clicked = pyqtSignal()
+    # Every profile id "Clear all browser data" is about, handed to the App
+    # to delete. The dialog cannot do it itself: `purge_profile` releases the
+    # cached `QWebEngineProfile` and rmtree's its directory, Qt requires a
+    # profile to outlive its pages, and only the App knows whether a scrape
+    # of that account is still holding one. See
+    # App._on_browser_data_clear_requested.
+    browser_data_clear_requested = pyqtSignal(list)
 
     def __init__(self, config: Config, parent=None):
         # Don't pass parent — avoids any cascading stylesheet issues.
@@ -544,6 +551,11 @@ class SettingsDialog(QDialog):
         self._removed_browser_account_ids: list[str] = []
         # Read by App._on_settings_finished after apply_to; see apply_to.
         self.removed_profile_ids: list[str] = []
+        # What "Clear all browser data" has already handed the App in this
+        # dialog session. The button and OK are two separate calls into the
+        # App, so a removed account's id went down both routes and reached
+        # `purge_profile` twice - see apply_to.
+        self._cleared_profile_ids: set[str] = set()
         self._browser_accounts = [
             account.model_copy(deep=True) for account in browser_accounts(config)
         ]
@@ -1289,22 +1301,63 @@ class SettingsDialog(QDialog):
             url = OPENCODE_GO_USAGE_URL
         _open_in_browser(url)
 
-    def _profile_ids_on_disk(self) -> list[str]:
+    def _profile_dirs_on_disk(self) -> tuple[list[str], list[str]]:
+        """Every name in `profiles/`, and the ones this sweep can act on.
+
+        Names on disk are read from the filesystem, so they are not bounded
+        by anything the app generates. `purge_profile` refuses any whose id
+        the rule rejects *and* any whose resolved path leaves the
+        `profiles/` root - that refusal is the containment guarantee and it
+        holds - but it refuses them one at a time, deep in the App, where
+        the user never hears about it. `is_usable_profile_id` asks the same
+        questions on the same resolved path, so the count the button reports
+        is the count that was really left alone: a symlink inside `profiles/`
+        pointing out of it has a legal *name*, and the name rule on its own
+        called it deleted. It also refuses every link, whatever it resolves
+        to - one pointing at another profile passes containment and deletes
+        the account it aliases, under a live scrape, because the deferral is
+        keyed on the link's own name.
+
+        Both lists come back, because the button's two halves want
+        different ones. The stored credential is a keyring entry, nothing
+        holds it open and it is the part that matters, so that pass takes
+        every name on disk; only the ids handed to the App for deletion are
+        filtered, because deletion is the half with a containment rule.
+        """
         try:
             profiles_root = app_data_dir() / "profiles"
             if not profiles_root.is_dir():
-                return []
-            return [child.name for child in profiles_root.iterdir() if child.is_dir()]
+                return [], []
+            names = [child.name for child in profiles_root.iterdir() if child.is_dir()]
         except OSError:
-            return []
+            return [], []
+        return names, [name for name in names if is_usable_profile_id(name)]
 
     def _clear_all_browser_data(self) -> None:
+        """Clear the stored cookies here; hand the profiles to the App.
+
+        The credential is a keyring entry, nothing holds it open, and it is
+        the part that matters - so it goes at the click, for every id. The
+        on-disk QtWebEngine profile is a different thing: `purge_profile`
+        calls `deleteLater()` on the cached `QWebEngineProfile` and then
+        rmtree's its directory, and Qt requires a profile to outlive its
+        pages. This dialog is modeless and a refresh cycle runs every five
+        minutes, so a live scrape while the button is clicked is ordinary,
+        and deleting a profile under a live `QuietWebEnginePage` is a
+        use-after-free - the most reachable route to the destroyed page that
+        used to strand the live-scrape guard for the life of the process.
+        Only the App knows whether a scrape of an account is still out, so
+        the ids go to it and it deletes each one as soon as that account is
+        free.
+        """
         answer = QMessageBox.question(
             self,
             "Clear all browser data",
             "Delete every account's saved cookie and embedded-browser profile?\n\n"
             "You will need to sign in again for each provider. This cannot be "
-            "undone.",
+            "undone.\n\n"
+            "A profile that is being refreshed right now is deleted as soon "
+            "as that refresh finishes, or at the next start.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -1313,19 +1366,51 @@ class SettingsDialog(QDialog):
         account_ids = {account.id for account in self._current_browser_accounts()}
         account_ids |= {account.id for account in self._config.browser_accounts}
         account_ids |= {"claude", "codex", "opencode_go"}
-        account_ids |= set(self._profile_ids_on_disk())
-        for account_id in sorted(account_ids):
+        # Ids on disk that are not accounts go the same way: they are exactly
+        # the leftovers this button exists to sweep up.
+        on_disk, usable = self._profile_dirs_on_disk()
+        unusable = len(on_disk) - len(usable)
+        # The keyring pass takes every name, including the ones the sweep
+        # will not touch: no reachable keyring entry can exist under such a
+        # name - the three writers are this sweep, the removal path and the
+        # cookie dialog, all of which hold ids that pass the rule - but this
+        # is the one button whose whole promise is "everything", and a
+        # keyring write has no containment question to answer.
+        account_ids |= set(usable)
+        for account_id in sorted(account_ids | set(on_disk)):
             try:
                 set_provider_cookie(account_id, None)
-                purge_profile(account_id)
             except Exception:  # noqa: BLE001 - clear as much as possible
-                log.exception("failed to clear browser data for %s", account_id)
-        QMessageBox.information(
-            self,
-            "Browser data cleared",
-            "Saved cookies and browser profiles were deleted. Sign in again to "
-            "resume monitoring.",
+                # The id can have come off the filesystem, so it is bounded
+                # here rather than trusted to be one the app generated.
+                log.exception("failed to clear the stored cookie for %.64r", account_id)
+        # Assigned, not accumulated: the button's set is every configured
+        # account, every fixed id and every usable name on disk, so a second
+        # click can only cover what the first did.
+        self._cleared_profile_ids = set(account_ids)
+        self.browser_data_clear_requested.emit(sorted(account_ids))
+        # A count only: the names are the ones the id rule rejected, which is
+        # exactly the text there is no reason to put in a log line.
+        log.info(
+            "browser data clear requested count=%s unusable_dirs=%s",
+            len(account_ids),
+            unusable,
         )
+        message = (
+            "Saved cookies were deleted and the browser profiles are being "
+            "removed; one that is being refreshed right now is removed as "
+            "soon as that refresh finishes, or at the next start if you quit "
+            "before then. Sign in again to resume monitoring."
+        )
+        if unusable:
+            # Not "not named like an account": the sweep also leaves alone a
+            # folder whose name is fine but whose resolved path is not inside
+            # `profiles/`, which is the one case a hostile tree constructs.
+            message += (
+                f"\n\n{unusable} folder(s) in the profiles directory could "
+                "not be matched to an account and were left alone."
+            )
+        QMessageBox.information(self, "Browser data cleared", message)
 
     def _rescan_meters(self) -> None:
         """Arm the meter scan that otherwise runs once a week.
@@ -1725,7 +1810,19 @@ class SettingsDialog(QDialog):
         # Qt requires a profile to outlive its pages, and a page that survives
         # its profile can flush rotated session cookies back into a directory
         # that was just removed. See App._run_profile_purges.
-        self.removed_profile_ids = list(self._removed_browser_account_ids)
+        #
+        # Minus whatever "Clear all browser data" already sent. That button
+        # asks for every account's profile, so a row removed in the same
+        # dialog session is always in its set - and the two are separate
+        # calls into the App, at the click and at OK, so the id reached
+        # `purge_profile` a second time for a directory that was already
+        # gone. The clear is the stronger request of the two: its startup
+        # drain skips nothing where a removal's skips a configured account.
+        self.removed_profile_ids = [
+            account_id
+            for account_id in self._removed_browser_account_ids
+            if account_id not in self._cleared_profile_ids
+        ]
         # Copy so the saved config never aliases this dialog's working state.
         config.copilot.colors = self._provider_colors["copilot"].model_copy(deep=True)
         config.openrouter.colors = self._provider_colors["openrouter"].model_copy(

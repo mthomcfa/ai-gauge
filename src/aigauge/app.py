@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -31,7 +32,7 @@ from .config import (
     qt_scale_factor_env,
 )
 from .cookie_dialog import CookieDialog
-from .error_dialog import ErrorDetailsDialog, _redact_azure_ids
+from .error_dialog import ErrorDetailsDialog, _ID_START, _redact_azure_ids
 from .history import HistoryStore
 from .logging_setup import setup_logging
 from .gauge import highest_indicator
@@ -45,6 +46,7 @@ from .providers.azure import AzureProvider
 from .providers.copilot import CopilotProvider
 from .providers.openrouter import OpenRouterProvider
 from .providers.opencode_go import OpenCodeGoProvider, usage_url as opencode_go_usage_url
+from .providers._scrape_runner import account_is_busy
 from .ratio import RatioStore, sessions_per_week
 from .ratio_dialog import RatioHistoryDialog
 from .settings_dialog import SettingsDialog
@@ -84,6 +86,9 @@ _HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000
 # deleted". Parented to the App, it dies with it and `shutdown()` can stop it.
 _STARTUP_REFRESH_DELAY_MS = 500
 _LOG_VALUE_LIMIT = 300
+# What a tile says when the user asks for a refresh the App cannot start yet.
+# Fixed text: nothing a provider chose reaches the tile through this.
+_PARKED_REFRESH_HINT = "Waiting for the previous refresh to finish."
 # How long a provider may hold a refresh before the App declares it lost.
 # Browser providers name their own bound (the scraper timeout times the
 # attempts it may make); a REST provider is a handful of HTTPS calls with
@@ -92,13 +97,25 @@ _REST_REFRESH_BUDGET_SECONDS = 60.0
 # Enough slack that a provider finishing right at its own bound reports
 # normally rather than racing the watchdog.
 _WATCHDOG_SLACK_SECONDS = 20.0
-# How long after the watchdog gave up a provider stays parked, as a multiple
-# of the budget that expired. Until then its worker is presumed still out
-# there - a browser scrape holding the one cached QWebEngineProfile for that
-# account - and re-dispatching would put a second one on it. Past it the
-# worker is assumed dead, because parking a provider forever is its own
-# failure mode.
+# How long after the watchdog gave up a BROWSER provider stays parked, as a
+# multiple of the budget that expired. Until then its worker is presumed
+# still out there - a browser scrape holding the one cached
+# QWebEngineProfile for that account - and re-dispatching would put a second
+# one on it. Past it the worker is assumed dead, because parking a provider
+# forever is its own failure mode, and the account-keyed live-scrape guard in
+# `providers/_scrape_runner.py` refuses the re-entrant scrape anyway.
 _ABANDONED_CEILING_FACTOR = 2.0
+# A REST provider has no such guard, and `requests`' `timeout` is per socket
+# operation rather than a total: a server that sends one byte just inside the
+# timeout holds a `QThreadPool` worker for as long as it likes. Releasing the
+# park on a clock therefore starts ANOTHER stuck worker every time it
+# expires, and the pool is global - measured against a byte-dripping server
+# over six fake hours, every slot ends up stuck (1 of 1, 2 of 2, 4 of 4, 8 of
+# 8) and all three REST tiles are dead for the life of the process. So a REST
+# park lasts until its worker reports back - any snapshot for that name, live
+# or late, un-parks it - with this as a backstop, because a park nothing can
+# lift is its own failure mode too.
+_REST_PARK_BACKSTOP_SECONDS = 3600.0
 
 
 def _pool_capacity() -> int:
@@ -140,16 +157,30 @@ def _refresh_budget_seconds(provider) -> float:
 # is the one field this release adds to `config.json`, it is drained before
 # anything else at startup, and neither its length nor its entries are
 # bounded: a poisoned file carrying two 200 000-character ids wrote 800 KB of
-# records, of which one line was 0.76x the whole 512 KiB rotation - the same
-# anti-forensic outcome the `raw_summary=` cap closes, on the one path that
-# runs before the app has done anything else.
+# records, of which one line was 0.25x the whole 512 KiB x 3 rotation - the
+# same anti-forensic outcome the `raw_summary=` cap closes, on the one path
+# that runs before the app has done anything else.
 _LOG_ID_LIMIT = 64
 _LOG_ID_SAMPLE = 3
 
 
 def _clip_for_log(value: object) -> str:
-    text = str(value)
-    return text if len(text) <= _LOG_ID_LIMIT else text[:_LOG_ID_LIMIT] + "..."
+    try:
+        text = str(value)
+    except Exception:  # noqa: BLE001 - a log line must never raise
+        # The same rule `_error_for_log` and the two key walks follow.
+        # Unreachable through the two callers, because `_coerce_pending_purges`
+        # keeps only `str` - but this is the helper that prints ids onto four
+        # records, and it was the one of the four that could still raise.
+        return "<unprintable id>"
+    if len(text) > _LOG_ID_LIMIT:
+        text = text[:_LOG_ID_LIMIT] + "..."
+    # Flattened for the reason `_error_for_log` flattens: the coercion bounds
+    # an id's type and its length, not its characters, so a 53-character id
+    # carrying two newlines read as three records in the file - a forged
+    # ERROR line naming a balance and a key, and a forged CRITICAL "signed
+    # out". Four records print ids this way and this PR added two of them.
+    return text.replace("\r", " ").replace("\n", " ")
 
 
 def _ids_for_log(ids: list[str]) -> str:
@@ -297,8 +328,82 @@ _LOG_KEY_LEN_LIMIT = 60
 # And a cap on the whole record, because the per-node caps multiply. Fifty
 # keys at each of three levels is 125 000 nodes, so a payload nested four
 # deep with a fan-out of 20 measured 2.2 MB and an api-capture-shaped one
-# 4.77 MB - 9x the entire 512 KiB x 3 rotation, from one ERROR scrape.
+# 4.77 MB - 3.03x the entire 512 KiB x 3 rotation, from one ERROR scrape.
 _LOG_SUMMARY_BUDGET = 4000
+# How much past the value limit the redaction pass is allowed to see. Long
+# enough for any single identifier it matches - a GUID is 36 characters, its
+# compact form 32 - so an identifier straddling the *value* limit is still
+# whole when the redaction runs.
+_LOG_REDACT_MARGIN = 200
+# The margin does not help the identifier straddling the margin's *own* cut,
+# and that one is the dangerous half: redaction shrinks what sits in front of
+# it (`/subscriptions/<36-char guid>` becomes 21 characters), so material that
+# sat past the value limit before the pass sits inside it after - including the
+# front half of the identifier the window cut in two. A subscription id
+# straddling the 500-character cut reached the log with 26 of its 36
+# characters, where redact-then-clip wrote `<guid>`.
+#
+# Only the record's *last* token can be one of these: every other token in the
+# window was seen whole by the redaction, and a cut identifier is a prefix of a
+# GUID or of its compact form, so at most 35 characters of hex and dashes
+# beginning where `_redact_azure_ids` allows one to begin. Matched after the
+# redaction, so a token that survived the cut intact is already `<guid>` and
+# nothing is dropped from it; built from the redaction's own `_ID_START`, so
+# the two cannot drift; bounded at 35, so a record that is one long hex run -
+# an md5, a request id - keeps its 300 characters.
+_CUT_ID_TAIL_RE = re.compile(_ID_START + r"[0-9A-Fa-f][0-9A-Fa-f-]{0,34}$")
+
+
+def _error_for_log(error: object) -> str:
+    """A snapshot's error string, bounded and on one line.
+
+    The tile, the tray tooltip and the error dialog render `snapshot.error`
+    in full and are a different question; this is the log record, which
+    shares a 512 KiB x 3 rotation with every other diagnostic. Most providers
+    build the string from a fixed literal, but Copilot's and OpenRouter's
+    transport failures carry `str(exc)` from `requests`, so neither its
+    length nor its line breaks are the app's to assume: a 2 MB error measured
+    1.58x the whole 512 KiB x 3 rotation in one record - 2 480 065
+    characters for `provider=copilot` - with 20 000 embedded newlines that
+    each read like a log line of their own.
+
+    Guarded end to end like the two helpers it is evaluated beside:
+    `UsageSnapshot` is a plain dataclass, so `error: str | None` is a hint
+    and not a check, and `error or ""` runs the object's `__bool__` and
+    `str()` runs its `__str__`. This was the one argument of that record
+    that could still raise out of `_on_snapshot`.
+    """
+    try:
+        # Clipped before the redaction, not after: `_redact_azure_ids` is
+        # four regex passes and it ran over the whole unbounded string on the
+        # GUI thread to produce 300 characters. The margin keeps an identifier
+        # straddling the value limit whole for the redaction; the tail drop
+        # keeps the one straddling the margin's own cut out of the record.
+        raw = str(error or "")
+        window = raw[: _LOG_VALUE_LIMIT + _LOG_REDACT_MARGIN]
+        text = _redact_azure_ids(window)
+        clipped = len(text) > _LOG_VALUE_LIMIT
+        if clipped:
+            text = text[:_LOG_VALUE_LIMIT]
+        if len(window) < len(raw):
+            text = _CUT_ID_TAIL_RE.sub("", text)
+        if clipped:
+            text += "..."
+        return text.replace("\r", " ").replace("\n", " ")
+    except Exception:  # noqa: BLE001 - a log line must never raise
+        return "<unprintable error>"
+
+
+def _key_text(raw_key) -> str:
+    """A dict key as a string, from a payload that chose the keys.
+
+    `str()` runs the key's own `__str__`, which can raise - and both of the
+    functions below reach a key before anything catches anything.
+    """
+    try:
+        return str(raw_key)
+    except Exception:  # noqa: BLE001 - a log line must never raise
+        return "<key>"
 
 
 def _summarize_for_log(value, *, depth: int = 0, budget: list[int] | None = None):
@@ -324,8 +429,30 @@ def _summarize_for_log(value, *, depth: int = 0, budget: list[int] | None = None
         )
         budget[0] -= len(text)
         return text
-    if isinstance(value, (int, float, bool)) or value is None:
+    if isinstance(value, bool) or value is None:
+        # bool before int: it is an int subclass, and `true` costs four
+        # characters however the branch below would have charged for it.
         budget[0] -= 8
+        return value
+    if isinstance(value, int):
+        # Its printed length is *estimated*, never measured: CPython 3.11+
+        # raises ValueError on `str()` of an int over 4 300 digits and
+        # `json.dumps` hits the same limit from the inside, so asking how
+        # long it is is itself the crash. log10(2) is ~0.301, so bits // 3
+        # never underestimates the digits it would take.
+        digits = value.bit_length() // 3 + 2
+        budget[0] -= max(8, digits)
+        if digits > _LOG_VALUE_LIMIT:
+            # And past the value limit it does not travel at all. A flat 8
+            # per number let fifty 4 200-digit JSON integers - which
+            # `json.loads` will not produce, but an extractor or a provider
+            # can - write a 210 KB record against a 512 KiB rotation.
+            return f"<int {digits} digits>"
+        return value
+    if isinstance(value, float):
+        # repr() of a float is bounded by the format, so a flat charge is
+        # honest: 24 covers the longest of them with room to spare.
+        budget[0] -= 24
         return value
     if isinstance(value, dict):
         # Lists were already bounded; dictionaries were not. A page-controlled
@@ -333,14 +460,14 @@ def _summarize_for_log(value, *, depth: int = 0, budget: list[int] | None = None
         # against a 512 KiB rotation, which discards the user's existing
         # diagnostics - the log is the one artifact that makes a provider
         # failure explainable, so losing it is the expensive part.
-        items = sorted(value.items(), key=lambda item: str(item[0]))
+        items = sorted(value.items(), key=lambda item: _key_text(item[0]))
         summarized = {}
         dropped = len(items) - _LOG_DICT_KEY_LIMIT
         for raw_key, item in items[:_LOG_DICT_KEY_LIMIT]:
             if budget[0] <= 0:
                 dropped = len(items) - len(summarized)
                 break
-            key = str(raw_key)[:_LOG_KEY_LEN_LIMIT]
+            key = _key_text(raw_key)[:_LOG_KEY_LEN_LIMIT]
             budget[0] -= len(key) + 4
             summarized[key] = _summarize_for_log(
                 item, depth=depth + 1, budget=budget
@@ -359,7 +486,15 @@ def _summarize_for_log(value, *, depth: int = 0, budget: list[int] | None = None
         if len(value) > len(summarized):
             summarized.append(f"... {len(value) - len(summarized)} more")
         return summarized
-    text = repr(value)
+    try:
+        text = repr(value)
+    except Exception:  # noqa: BLE001 - a diagnostic, not a reason to raise
+        text = f"<unrepresentable {type(value).__name__}>"
+    # Clipped and charged exactly like the string branch. It was charged
+    # after the fact and never clipped, so one 5 MB `bytes` value produced a
+    # record 3.18x the whole 512 KiB x 3 rotation - 5 000 012 characters.
+    if len(text) > _LOG_VALUE_LIMIT:
+        text = text[:_LOG_VALUE_LIMIT] + "..."
     budget[0] -= len(text)
     return text
 
@@ -374,20 +509,44 @@ def _raw_keys_for_log(raw: dict | None) -> str:
     keys is a megabyte-long record against a 512 KiB x 3 rotation, which
     discards the diagnostic history the line exists to build.
     """
-    if not raw:
-        return "[]"
-    keys = sorted(str(key) for key in raw)
-    shown = [key[:_LOG_KEY_LEN_LIMIT] for key in keys[:_LOG_DICT_KEY_LIMIT]]
-    if len(keys) > _LOG_DICT_KEY_LIMIT:
-        shown.append(f"... {len(keys) - _LOG_DICT_KEY_LIMIT} more")
-    return repr(shown)
-
-
-def _raw_summary(raw: dict) -> str:
+    # Guarded end to end, like `_raw_summary` beside it: this one is
+    # evaluated in the *same* `log.warning(...)` call, so anything it raises
+    # raises out of `_on_snapshot` before the other one is ever reached. The
+    # walk was guarded per key, but `bool(raw)` runs the payload's `__len__`
+    # and iterating it runs its `__iter__`, and a `dict` subclass can refuse
+    # either.
     try:
+        if not raw:
+            return "[]"
+        keys = sorted(_key_text(key) for key in raw)
+        shown = [key[:_LOG_KEY_LEN_LIMIT] for key in keys[:_LOG_DICT_KEY_LIMIT]]
+        if len(keys) > _LOG_DICT_KEY_LIMIT:
+            shown.append(f"... {len(keys) - _LOG_DICT_KEY_LIMIT} more")
+        return repr(shown)
+    except Exception:  # noqa: BLE001 - a log line must never raise
+        return "[]"
+
+
+def _raw_summary(raw: dict | None) -> str:
+    # `except Exception`, because a log line must never be able to raise:
+    # this one runs inside `_on_snapshot`, and an object whose `__repr__`
+    # raises, a key whose `__str__` raises or a `dict` subclass whose
+    # `items()` raises all produced something `except TypeError` did not
+    # catch. The fallback is a BOUNDED literal - `repr(raw)` was the
+    # unbounded thing this function exists to prevent, so having it as the
+    # escape hatch gave the whole payload back on the one path that had
+    # already gone wrong.
+    try:
+        # Inside the guard, because `bool(raw)` is itself a call into the
+        # payload: the empty test used to sit at the call site, where a
+        # `__len__` that raises took the whole log line with it.
+        if not raw:
+            return "{}"
         return json.dumps(_summarize_for_log(raw), sort_keys=True, default=str)
-    except TypeError:
-        return repr(raw)
+    except Exception:  # noqa: BLE001
+        # The class name is the payload's too, and nothing bounds a class
+        # name: a 1 MB one produced a 1 000 017-character "bounded" literal.
+        return f"<unsummarisable {type(raw).__name__[:_LOG_KEY_LEN_LIMIT]}>"
 
 
 def _preserve_error_metrics(
@@ -455,6 +614,10 @@ class App(QObject):
         self._active_until = datetime.now() + timedelta(minutes=_ACTIVE_MODE_MINUTES)
         self._current_refresh_manual = False
         self._pending_manual_refresh = False
+        # Did a *person* ask for the queued refresh? A settings save runs one
+        # too, and the parked-tile hint is an answer to a question - see
+        # `_note_refresh_parked`.
+        self._pending_manual_asked = False
         self._pending_manual_providers: list[str] = []
         self._watchdogs: dict[str, QTimer] = {}
         self._cycle_active = False
@@ -468,6 +631,13 @@ class App(QObject):
         # is matched against it, so an answer from a dispatch the App has
         # already given up on cannot be read as the current one.
         self._dispatch_epoch: dict[str, int] = {}
+        # provider -> whether the dispatch now outstanding was a browser
+        # scrape. Recorded here rather than asked of `_providers` when the
+        # watchdog fires, because a settings save that removes the account
+        # takes the provider object with it while its dispatch is still out:
+        # `_uses_browser` then answered False for a browser scrape and the
+        # watchdog parked it under the REST rule.
+        self._dispatch_browser: dict[str, bool] = {}
         # provider -> (the epoch the watchdog abandoned, when its worker may
         # be assumed dead). While an entry is live the provider is not
         # dispatched again by anything.
@@ -478,6 +648,10 @@ class App(QObject):
         # Accounts the user removed whose on-disk profile is waiting for a
         # live scrape to let go of it. See _run_profile_purges.
         self._pending_profile_purges: list[str] = []
+        # The same wait for "Clear all browser data", kept apart because the
+        # two drains differ - this one skips nothing. Persisted like the
+        # other. See _on_browser_data_clear_requested.
+        self._pending_data_clears: list[str] = []
         # The names this cycle is accounting for. A snapshot from outside it
         # repaints its tile without joining its progress or its verdict.
         self._cycle_names: set[str] = set()
@@ -489,7 +663,7 @@ class App(QObject):
 
         # Anything a previous run left owed, before a cookie is hydrated into
         # a profile and before a provider exists that could scrape it.
-        self._drain_pending_profile_purges()
+        self._drain_pending_purges()
 
         # Push any saved session cookies into the WebEngine profiles before any
         # scrape runs, so the headless page loads as signed-in.
@@ -700,7 +874,7 @@ class App(QObject):
         # A profile whose scrape was abandoned is only released when that
         # worker reports back or its ceiling passes; the heartbeat is what
         # notices the second of those.
-        if self._pending_profile_purges:
+        if self._pending_profile_purges or self._pending_data_clears:
             self._run_profile_purges()
 
     def _recover_dead_timer(self) -> None:
@@ -820,11 +994,27 @@ class App(QObject):
             for name, state in self._error_retry.items()
             if name in self._providers
         }
+        # A park outlives the provider it was about. Nothing else clears it
+        # for a name the user removed - `_dispatch_refusal` answers
+        # `not_configured` before it ever asks `_is_abandoned` - so the entry
+        # and the `_dispatch_times` / `_dispatch_epoch` rows `keep` holds open
+        # for it would live for the process. A name still in flight keeps its
+        # park: that dispatch is what it bounds.
+        for name in [
+            n
+            for n in self._abandoned
+            if n not in self._providers and n not in self._inflight
+        ]:
+            self._abandoned.pop(name, None)
         # Same pruning for the other per-provider maps, so a removed provider
         # leaves nothing behind. A name still in flight or still parked keeps
         # its entries: its dispatch is what they bound.
         keep = set(self._providers) | self._inflight | set(self._abandoned)
-        for mapping in (self._dispatch_times, self._dispatch_epoch):
+        for mapping in (
+            self._dispatch_times,
+            self._dispatch_epoch,
+            self._dispatch_browser,
+        ):
             for name in [n for n in mapping if n not in keep]:
                 mapping.pop(name, None)
         for name in [n for n in self._watchdogs if n not in keep]:
@@ -1043,13 +1233,23 @@ class App(QObject):
             for name in names
         }
 
-    def _begin_cycle(self, names: list[str], *, manual: bool, reason: str) -> None:
+    def _begin_cycle(
+        self,
+        names: list[str],
+        *,
+        manual: bool,
+        reason: str,
+        asked: bool | None = None,
+    ) -> None:
         """Start one refresh cycle over ``names``, in queue order.
 
         The single entry point for every cycle - manual, scheduled or a
         per-provider retry - so the log line that opens a cycle cannot
         disagree with what actually ran.
         """
+        # What the caller asked for, before anything is filtered out of it.
+        # This is what decides whether the cycle is *partial* - see below.
+        requested = len(names)
         # A provider the App has given up on but whose worker is still out
         # there is not dispatched again - by this cycle or any other. Filter
         # before the cycle's own totals are computed, so its progress and its
@@ -1063,6 +1263,14 @@ class App(QObject):
                 log.info(
                     "refresh provider skipped provider=%s reason=%s", name, refusal
                 )
+                if (manual if asked is None else asked) and refusal == "abandoned":
+                    # The user asked, and the answer is "not yet". A
+                    # scheduled cycle says nothing - nobody asked for it, and
+                    # neither did a settings save, which applies the new
+                    # settings and refreshes on its own: pressing OK while a
+                    # provider was parked wrote "Waiting for the previous
+                    # refresh to finish." onto that tile in answer to nothing.
+                    self._note_refresh_parked(name)
         names = wanted
         if not names:
             # Nothing runnable. A cycle over zero providers blinked
@@ -1091,7 +1299,19 @@ class App(QObject):
         self._cycle_started_at = time.monotonic()
         self._cycle_reason = reason
         self._cycle_names = set(names)
-        self._cycle_partial = len(names) < len(self._providers)
+        # "Partial" is a property of the *request*: a retry wake or a
+        # per-provider refresh polls a subset, and "nothing changed" there
+        # says nothing about whether the app is idle. It is not a property of
+        # what the park filter removed. Reading it off the filtered list made
+        # every cycle inside an hour-long REST park partial, which froze
+        # `_unchanged_cycles` and with it the idle backoff, so a hung
+        # endpoint pinned the app on the five-minute active cadence for as
+        # long as it stayed hung: measured over six fake hours, a healthy
+        # sibling of one wedged REST provider was dispatched 54 times where
+        # the same run without the wedged provider dispatched it 12 - a
+        # remote server multiplying this app's request rate against every
+        # other provider's host.
+        self._cycle_partial = requested < len(self._providers)
         self._cycle_active = True
         log.info(
             "refresh cycle start manual=%s reason=%s providers=%s",
@@ -1125,7 +1345,16 @@ class App(QObject):
             self._dispatching = False
         self._advance_cycle()
 
-    def refresh_now(self, manual: bool = True) -> None:
+    def refresh_now(self, manual: bool = True, *, asked: bool | None = None) -> None:
+        """Refresh every provider.
+
+        `asked` is "a person asked for this refresh", which is `manual`
+        everywhere except a settings save: that applies the new settings and
+        refreshes, without the user having asked for a refresh at all. The
+        only thing it decides is whether a provider refused as `abandoned`
+        writes the waiting hint onto its tile.
+        """
+        asked = manual if asked is None else asked
         if not self._providers:
             return
         if self._inflight or self._refresh_queue:
@@ -1136,6 +1365,7 @@ class App(QObject):
                 # stale, which is usually mid-cycle. Settings-save went the
                 # same way: apply, then a refresh_now that no-opped.
                 self._pending_manual_refresh = True
+                self._pending_manual_asked = self._pending_manual_asked or asked
                 log.info(
                     "refresh_now queued inflight=%s queue=%s",
                     ",".join(sorted(self._inflight)) or "-",
@@ -1154,6 +1384,7 @@ class App(QObject):
             _refresh_provider_order(self._providers),
             manual=manual,
             reason="manual" if manual else self._next_refresh_reason,
+            asked=asked,
         )
 
     def refresh_provider(self, provider: str) -> None:
@@ -1162,6 +1393,13 @@ class App(QObject):
         if self._inflight or self._refresh_queue:
             if provider not in self._pending_manual_providers:
                 self._pending_manual_providers.append(provider)
+            # A person asked, and `_run_pending_manual` may not run this
+            # request as itself: when a settings save has already queued a
+            # *full* refresh, its `full` branch wins and drops the
+            # per-provider one. The save carries `asked=False`, so without
+            # this the queued sign-in - `open_login` and `open_cookie_paste`
+            # both call here - answered a parked tile with silence.
+            self._pending_manual_asked = True
             log.info(
                 "refresh_provider queued provider=%s inflight=%s queue=%s",
                 provider,
@@ -1182,13 +1420,15 @@ class App(QObject):
 
     def _run_pending_manual(self) -> None:
         full = self._pending_manual_refresh
+        asked = self._pending_manual_asked
         wanted = list(self._pending_manual_providers)
         names = self._ordered(wanted)
         self._pending_manual_refresh = False
+        self._pending_manual_asked = False
         self._pending_manual_providers = []
         if full:
             log.info("refresh pending manual running scope=all")
-            self.refresh_now(manual=True)
+            self.refresh_now(manual=True, asked=asked)
         elif names:
             log.info("refresh pending manual running scope=%s", ",".join(names))
             self._begin_cycle(names, manual=True, reason="manual")
@@ -1198,6 +1438,23 @@ class App(QObject):
             # neither branch running and no line at all - indistinguishable
             # from the request never having been made.
             log.info("refresh pending manual dropped scope=%s", ",".join(wanted))
+
+    def _note_refresh_parked(self, name: str) -> None:
+        """Say on the tile that a refresh the user asked for is waiting.
+
+        A manual refresh refused as `abandoned` used to do nothing visible at
+        all: the button re-enabled, no tile moved, and the log line was the
+        only evidence. A REST park now lasts until its worker reports or an
+        hour passes, so that silence can be an hour long.
+
+        It is a hint and nothing more - no snapshot, no history, no ratio, no
+        cycle - and its text is a fixed literal, so no provider string
+        reaches the tile through it. The next paint of that tile clears it.
+        """
+        try:
+            self._widget.set_status_hint(name, _PARKED_REFRESH_HINT)
+        except Exception:  # noqa: BLE001 - a hint is not worth a crash
+            log.exception("widget.set_status_hint failed")
 
     def _uses_browser(self, name: str) -> bool:
         return bool(getattr(self._providers.get(name), "uses_browser", False))
@@ -1256,8 +1513,15 @@ class App(QObject):
         writing one cookie store, which is how a spurious sign-out happens,
         and N times the load on the provider from one desktop app.
 
-        The entry clears when the abandoned worker finally reports back, or
-        when twice its budget has passed and it can fairly be called dead.
+        The entry clears when the abandoned worker finally reports back -
+        which for a REST provider is the only thing that normally clears it,
+        because nothing bounds a `requests` call that keeps dripping bytes
+        and a second worker on the same endpoint just holds a second slot of
+        the global QThreadPool. A browser provider is let go at twice its
+        budget, where its worker really is over and the account-keyed
+        live-scrape guard would refuse a re-entrant scrape anyway; a REST one
+        at `_REST_PARK_BACKSTOP_SECONDS`, so that a park nothing can lift
+        does not become permanent either.
         """
         entry = self._abandoned.get(name)
         if entry is None:
@@ -1273,31 +1537,58 @@ class App(QObject):
             return False
         return True
 
-    def _drain_pending_profile_purges(self) -> None:
-        """Run what a previous run left owed.
+    def _drain_pending_purges(self) -> None:
+        """Run what a previous run left owed - both lists, before anything else.
 
-        The deferral list used to be in memory only: `App` has no
-        `aboutToQuit` hook that flushes it, and once the account is gone from
-        `config.json` nothing at the next start looked for its directory -
-        the only sweep of `profiles/` on disk is the manual Settings "Clear
-        all browser data". What survived was the removed account's Chromium
-        profile, which uses `ForcePersistentCookies`, i.e. the live session
-        cookie itself, with no recovery path at all. (The keyring secret is
-        cleared by the dialog at the moment of removal either way.)
+        Neither list used to be in memory only: nothing flushes them at
+        `aboutToQuit` - the App has that connection, but it only logs - and
+        once an account is gone from `config.json` nothing at the next start
+        looked for its directory, because the only sweep of `profiles/` on
+        disk is the manual Settings "Clear all browser data". What survived was a Chromium profile that uses
+        `ForcePersistentCookies`, i.e. the live session cookie itself, with
+        no recovery path at all. (The keyring secret is cleared by the dialog
+        at the moment of the removal or the click either way, which is why
+        nothing in the UI would ever mention such a profile again.)
+
+        The two drains differ in one thing and are kept apart for it: a
+        removal skips an id that is a configured account again, a clear-all
+        skips nothing.
         """
         pending = list(getattr(self._config, "pending_profile_purges", []) or [])
-        if not pending:
+        clears = list(getattr(self._config, "pending_data_clears", []) or [])
+        if not pending and not clears:
             return
-        # A count, and a bounded sample of the ids: the list is
-        # config-controlled and nothing bounds it, so echoing it whole let a
-        # poisoned `config.json` erase the log ring at every start.
-        log.info(
-            "profile purge owed from a previous run count=%s accounts=%s",
-            len(pending),
-            _ids_for_log(pending),
-        )
+        # A count, and a bounded sample of the ids: both lists are
+        # config-controlled and nothing bounds them, so echoing one whole let
+        # a poisoned `config.json` erase the log ring at every start.
+        if pending:
+            log.info(
+                "profile purge owed from a previous run count=%s accounts=%s",
+                len(pending),
+                _ids_for_log(pending),
+            )
+        if clears:
+            log.info(
+                "browser data clear owed from a previous run count=%s accounts=%s",
+                len(clears),
+                _ids_for_log(clears),
+            )
+        for account_id in clears:
+            # No configured-account skip here, on purpose: the user asked for
+            # these profiles to be deleted and every one of them belongs to
+            # an account they still have, so the skip below would drop the
+            # whole list at the next start.
+            if account_id not in self._pending_data_clears:
+                self._pending_data_clears.append(account_id)
         configured = {account.id for account in browser_accounts(self._config)}
         for account_id in pending:
+            if account_id in self._pending_data_clears:
+                # Already owed the stronger of the two - see
+                # `_run_profile_purges`, which drops the duplicate. Tested
+                # before `configured`, or a `reason=reconfigured` line would
+                # claim a profile was kept while the clear deletes it a
+                # moment later.
+                continue
             if account_id in configured:
                 # The list is persisted now, so an entry outlives the removal
                 # that wrote it. A restored backup, a synced config directory
@@ -1326,19 +1617,127 @@ class App(QObject):
                 self._pending_profile_purges.append(account_id)
         self._run_profile_purges()
 
-    def _persist_pending_profile_purges(self) -> None:
-        """Record what is still owed, so a quit cannot lose it."""
-        pending = list(self._pending_profile_purges)
-        if list(getattr(self._config, "pending_profile_purges", []) or []) == pending:
+    def _persist_pending_purges(self) -> None:
+        """Record what is still owed, so a quit cannot lose it.
+
+        Both lists through one helper and one `Config.save()`: they are owed
+        together, drained together, and the app writing the user's settings
+        file on its own is worth doing once rather than twice. The equality
+        test is what keeps the steady state - two empty lists - from writing
+        anything at all, which is most of the life of the app.
+        """
+        changed = False
+        for field, owed in (
+            ("pending_profile_purges", self._pending_profile_purges),
+            ("pending_data_clears", self._pending_data_clears),
+        ):
+            pending = list(owed)
+            if list(getattr(self._config, field, []) or []) == pending:
+                continue
+            setattr(self._config, field, pending)
+            changed = True
+        if not changed:
             return
-        self._config.pending_profile_purges = pending
         try:
             self._config.save()
         except Exception:  # noqa: BLE001 - cleanup must not crash the app
             log.exception("failed to record the pending profile purges")
 
+    def _on_browser_data_clear_requested(self, account_ids) -> None:
+        """Run the profile half of Settings' "Clear all browser data".
+
+        The dialog still clears the stored cookies at the click: that is a
+        keyring write, nothing holds it open, and it is the part that
+        matters. Deleting the on-disk QtWebEngine profile is the App's job
+        for the same reason a removed account's is - `purge_profile` calls
+        `deleteLater()` on the cached `QWebEngineProfile` and then rmtree's
+        its directory, and Qt requires a profile to outlive its pages. The
+        dialog is modeless and a cycle runs every five minutes, so a live
+        scrape during that click is ordinary rather than exotic, and doing
+        it synchronously from the dialog was the most reachable way to
+        produce a destroyed page under a live one.
+
+        These ids are kept apart from `pending_profile_purges` because they
+        are accounts the user still has. That list is persisted and its
+        drain skips a configured account by design
+        (`purge skipped ... reason=reconfigured`), which is right for a
+        removal that a restored backup has undone and wrong for this: a
+        deferred clear would be dropped at the next start. So this list is a
+        second persisted one, with a drain of its own that skips nothing -
+        and, for that reason, the one an id owed both ends up on.
+
+        It has to be persisted. The profile that is most likely to be
+        deferred is the one being scraped right now, the button's whole
+        promise is that the saved credential is gone, and the keyring copy
+        *is* gone at the click - so a quit inside the deferral window used to
+        leave the live provider session cookie on disk with nothing in the UI
+        ever mentioning it again. Clicking the button a second time was the
+        only thing that reached it.
+        """
+        for account_id in account_ids:
+            if not isinstance(account_id, str) or not account_id:
+                continue
+            if account_id not in self._pending_data_clears:
+                self._pending_data_clears.append(account_id)
+        log.info(
+            "browser data clear requested count=%s accounts=%s",
+            len(self._pending_data_clears),
+            _ids_for_log(self._pending_data_clears),
+        )
+        self._run_profile_purges()
+
+    def _purge_blocked_reason(self, account_id: str) -> str | None:
+        """Why this profile cannot be deleted yet, or None.
+
+        `_inflight` and `_abandoned` are what the App knows: a dispatch it
+        has not seen the end of. `account_is_busy` is what the *runner*
+        knows, and it is the only one of the three that can still answer yes
+        once the App has given up on a dispatch or never made one - it is
+        module state keyed by account, so it survives the `_build_providers`
+        every settings save runs. Neither purge path consulted it.
+        """
+        if account_id in self._inflight or self._is_abandoned(account_id):
+            return "refresh_in_flight"
+        if account_is_busy(account_id):
+            return "scrape_in_flight"
+        return None
+
+    def _purge_or_defer(
+        self,
+        account_ids: list[str],
+        *,
+        removal: bool,
+    ) -> list[str]:
+        """Purge what is free; return what is still waiting.
+
+        `removal` picks the log line only. Both lists are recorded and both
+        are drained at the next start; what differs is the drain's skip rule,
+        which is why they are two lists - and never both, which
+        `_run_profile_purges` makes true before either is worked.
+        """
+        waiting: list[str] = []
+        for account_id in account_ids:
+            blocked = self._purge_blocked_reason(account_id)
+            if blocked is not None:
+                log.info(
+                    (
+                        "profile purge deferred account=%s reason=%s"
+                        if removal
+                        else "browser data clear deferred account=%s reason=%s"
+                    ),
+                    _clip_for_log(account_id),
+                    blocked,
+                )
+                waiting.append(account_id)
+                continue
+            try:
+                purge_profile(account_id)
+            except Exception:  # noqa: BLE001 - cleanup must not crash the app
+                log.exception("failed to purge profile for %s", account_id)
+        return waiting
+
     def _run_profile_purges(self) -> None:
-        """Delete a removed account's profile, once nothing is still using it.
+        """Delete a profile the app is finished with, once nothing is using it.
 
         `purge_profile` calls `deleteLater()` on the cached
         `QWebEngineProfile` and then rmtree's its directory. A settings save
@@ -1349,24 +1748,42 @@ class App(QObject):
         cookies back into the directory that was just deleted, which puts a
         removed account's live credential back on disk.
 
+        Two lists, one test. `_pending_profile_purges` is the removals and
+        `_pending_data_clears` is "Clear all browser data"; both are
+        persisted, so a quit cannot lose either, and they stay apart because
+        their startup drains differ - see `_on_browser_data_clear_requested`.
+
+        Apart, and disjoint. An id can reach both - the dialog puts one on
+        each, a `config.json` restored from a backup can list it twice, and
+        the startup drain reads both - and a shared "already purged" set
+        inside this function closed only the case where it is free: a
+        *deferred* id is never purged, so nothing was ever noted for it and
+        both lists logged it at every heartbeat, on the one record that
+        explains where a profile went. The duplicate is dropped here
+        instead, before either list is worked, and the clear is the entry
+        that survives: both end in the same `purge_profile`, and the clear's
+        startup drain skips nothing where a removal's skips an account the
+        config has again.
+
         The keyring secret is cleared immediately by the dialog either way;
         this is only the on-disk profile, and deferring it costs nothing.
         """
-        waiting: list[str] = []
-        for account_id in self._pending_profile_purges:
-            if account_id in self._inflight or self._is_abandoned(account_id):
-                log.info(
-                    "profile purge deferred account=%s reason=refresh_in_flight",
-                    account_id,
-                )
-                waiting.append(account_id)
-                continue
-            try:
-                purge_profile(account_id)
-            except Exception:  # noqa: BLE001 - cleanup must not crash the app
-                log.exception("failed to purge profile for %s", account_id)
-        self._pending_profile_purges = waiting
-        self._persist_pending_profile_purges()
+        if self._pending_data_clears:
+            owed_a_clear = set(self._pending_data_clears)
+            self._pending_profile_purges = [
+                account_id
+                for account_id in self._pending_profile_purges
+                if account_id not in owed_a_clear
+            ]
+        self._pending_profile_purges = self._purge_or_defer(
+            self._pending_profile_purges, removal=True
+        )
+        self._pending_data_clears = self._purge_or_defer(
+            self._pending_data_clears, removal=False
+        )
+        # One write, after both lists have been worked: what is owed is what
+        # is left on them.
+        self._persist_pending_purges()
 
     def _pool_wait_slack(self, name: str) -> float:
         """How long this dispatch may sit in the thread pool before it starts.
@@ -1407,6 +1824,7 @@ class App(QObject):
         self._inflight.add(name)
         now = time.monotonic()
         self._dispatch_times[name] = now
+        self._dispatch_browser[name] = self._uses_browser(name)
         log.info(
             "refresh provider start provider=%s epoch=%s queued_s=%.1f",
             name,
@@ -1418,7 +1836,29 @@ class App(QObject):
         # The epoch travels with the answer, so a snapshot can be matched to
         # the dispatch it answers rather than to whatever is in flight for
         # that name when it lands.
-        def _emit(snap: UsageSnapshot, _epoch=epoch):
+        def _emit(snap: UsageSnapshot, _epoch=epoch, _name=name):
+            # And the *name* is the App's, not the payload's. Every gate
+            # downstream - `_on_snapshot`, the epoch check,
+            # `_on_late_snapshot`, `_inflight`, `_watchdogs`, the cycle's
+            # books, which tile is painted - keys on `snapshot.provider`, and
+            # epochs advance in lockstep across a cycle, so an answer
+            # mislabelled with a sibling account's id is accepted as that
+            # sibling's live answer: its in-flight entry cleared, its
+            # watchdog destroyed, its tile painted with another account's
+            # numbers. Unreachable today - `ScrapeRunner` sets
+            # `provider=self._account_id`, the browser builders take
+            # `account_id=` from the App and the three REST providers
+            # hardcode their literal - and the check belongs in the one place
+            # that knows what was dispatched rather than in each provider.
+            if getattr(snap, "provider", _name) != _name:
+                # The payload's own name is never printed: it is
+                # provider-controlled text, and not trusting it to name a
+                # tile is the entire point of this.
+                log.warning(
+                    "refresh provider answer relabelled provider=%s relabelled=True",
+                    _name,
+                )
+                snap = replace(snap, provider=_name)
             self._signals.snapshot_ready.emit((snap, _epoch))
 
         try:
@@ -1494,13 +1934,37 @@ class App(QObject):
         # name until that worker reports back or can be assumed dead, so no
         # cycle, retry wake, manual refresh or settings save starts a second
         # one alongside it.
-        assumed_dead_in = _ABANDONED_CEILING_FACTOR * budget
+        #
+        # How long "can be assumed dead" is depends on what is holding the
+        # worker. A browser scrape is bounded by the scraper's own QTimer and
+        # guarded by the account-keyed registry in `_scrape_runner`, so twice
+        # the budget is a fair assumption and the one case it lets through is
+        # refused there. A REST worker is a `requests` call whose timeout is
+        # per socket operation, with no provider-side guard at all: assuming
+        # it dead on a clock hands the same endpoint another worker, and they
+        # accumulate until the global QThreadPool has no free slot.
+        # What was dispatched, not what is configured now: a settings save
+        # that removes an account drops its provider object while the scrape
+        # is still out, and reading `uses_browser` off `_providers` then
+        # parked a *browser* account for an hour under `rest_backstop` - its
+        # on-disk profile, which holds the session cookie, waited 60 minutes
+        # for deletion rather than 10, re-adding the same account left its
+        # tile refused for the rest of the hour, and the log line named the
+        # wrong rule.
+        if self._dispatch_browser.get(name, self._uses_browser(name)):
+            assumed_dead_in = _ABANDONED_CEILING_FACTOR * budget
+            ceiling = "browser_2x"
+        else:
+            assumed_dead_in = _REST_PARK_BACKSTOP_SECONDS
+            ceiling = "rest_backstop"
         self._abandoned[name] = (epoch, time.monotonic() + assumed_dead_in)
         log.warning(
-            "refresh provider abandoned provider=%s epoch=%s eligible_again_in_s=%.0f",
+            "refresh provider abandoned provider=%s epoch=%s "
+            "eligible_again_in_s=%.0f ceiling=%s",
             name,
             epoch,
             assumed_dead_in,
+            ceiling,
         )
         self._signals.snapshot_ready.emit(
             (
@@ -1722,17 +2186,17 @@ class App(QObject):
             log.warning(
                 "snapshot error provider=%s error=%s raw_keys=%s raw_summary=%s",
                 snapshot.provider,
-                _redact_azure_ids(snapshot.error or ""),
+                _error_for_log(snapshot.error),
                 _raw_keys_for_log(snapshot.raw),
-                _raw_summary(snapshot.raw) if snapshot.raw else "{}",
+                _raw_summary(snapshot.raw),
             )
         elif snapshot.status == SnapshotStatus.AUTH_REQUIRED:
             log.info(
                 "snapshot auth_required provider=%s error=%s raw_keys=%s raw_summary=%s",
                 snapshot.provider,
-                _redact_azure_ids(snapshot.error or ""),
+                _error_for_log(snapshot.error),
                 _raw_keys_for_log(snapshot.raw),
-                _raw_summary(snapshot.raw) if snapshot.raw else "{}",
+                _raw_summary(snapshot.raw),
             )
         try:
             self._history.record_snapshot(snapshot)
@@ -2126,6 +2590,12 @@ class App(QObject):
         # The dialog has already cleared the scan timestamps; refresh so the
         # scan happens now rather than at the next scheduled cycle.
         dlg.rescan_meters_clicked.connect(lambda: self.refresh_now(manual=True))
+        # The dialog clears the stored cookies itself; the on-disk profiles
+        # are the App's, because only it knows whether a scrape of one is
+        # still holding the directory. See _on_browser_data_clear_requested.
+        dlg.browser_data_clear_requested.connect(
+            self._on_browser_data_clear_requested
+        )
         dlg.finished.connect(
             lambda result, dialog=dlg, old_quota=old_copilot_quota, old_budget=old_openrouter_budget: (
                 self._on_settings_finished(dialog, result, old_quota, old_budget)
@@ -2182,7 +2652,10 @@ class App(QObject):
             if old_openrouter_budget != new_openrouter_budget:
                 self._rerender_openrouter(new_openrouter_budget)
             self._restart_timer()
-            self.refresh_now(manual=True)
+            # Manual in every other respect - it re-arms the active window,
+            # and the user is looking at the app - but nobody asked for a
+            # refresh, so a parked provider says nothing on its tile.
+            self.refresh_now(manual=True, asked=False)
             if getattr(dlg, "start_at_login_error", False):
                 QMessageBox.warning(
                     self._widget,

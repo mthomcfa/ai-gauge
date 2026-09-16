@@ -1,3 +1,6 @@
+import sys
+
+import pytest
 from PyQt6.QtWidgets import QPushButton
 
 from aigauge import settings_dialog
@@ -485,3 +488,294 @@ def test_a_foundry_project_child_id_can_be_pinned(qtbot, monkeypatch):
     dialog.azure_foundry_ids.setPlainText(child)
     dialog.apply_to(config)
     assert config.azure.foundry_resource_ids == [child]
+
+
+def test_clear_all_browser_data_hands_the_profiles_to_the_app(qtbot, monkeypatch):
+    """The dialog clears the credentials and deletes no directory.
+
+    `purge_profile` releases the cached `QWebEngineProfile` and rmtree's its
+    directory; Qt requires a profile to outlive its pages, and this dialog is
+    modeless with a refresh cycle running every five minutes, so doing it
+    here is the most reachable way to destroy a profile under a live page.
+    The id set is the whole sweep - the accounts in the dialog, the accounts
+    in the config, the three fixed ids and every directory on disk - because
+    the leftovers are what the button is for.
+    """
+    from aigauge.config import BrowserAccount, app_data_dir
+
+    monkeypatch.setattr(
+        settings_dialog.QMessageBox,
+        "question",
+        lambda *a, **k: settings_dialog.QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(settings_dialog.QMessageBox, "information", lambda *a, **k: None)
+    cleared: list[str] = []
+    monkeypatch.setattr(
+        settings_dialog,
+        "set_provider_cookie",
+        lambda account_id, value: cleared.append(account_id),
+    )
+    orphan = app_data_dir() / "profiles" / "claude-deadbeef"
+    orphan.mkdir(parents=True)
+
+    config = Config()
+    config.browser_accounts.append(BrowserAccount(id="codex-12345678", kind="codex"))
+    dialog = SettingsDialog(config)
+    qtbot.addWidget(dialog)
+
+    with qtbot.waitSignal(dialog.browser_data_clear_requested) as signal:
+        _button(dialog, "clear_browser_data_btn").click()
+
+    ids = signal.args[0]
+    assert {"claude", "codex", "opencode_go"} <= set(ids), "a fixed id was missed"
+    assert "codex-12345678" in ids, "a configured account was missed"
+    assert "claude-deadbeef" in ids, "a profile on disk was missed"
+    # Every id whose profile is going is logged out of the credential store
+    # at the click: that is a keyring write, nothing holds it open, and it is
+    # the part that matters.
+    assert sorted(cleared) == sorted(ids)
+    assert orphan.is_dir(), "the dialog deleted a profile directory itself"
+
+
+def test_clear_all_browser_data_says_when_a_busy_profile_goes(qtbot, monkeypatch):
+    """What the user is told has to match what the app does.
+
+    The deletion of a profile that is mid-scrape is deferred, and both
+    deferral lists are recorded in `config.json`, so the honest answer is
+    "when that refresh finishes, or at the next start". While the clear list
+    was in memory only the completion box said the profiles were being
+    removed and a quit could silently leave one - with its live session
+    cookie - on disk.
+    """
+    monkeypatch.setattr(
+        settings_dialog.QMessageBox,
+        "question",
+        lambda *a, **k: settings_dialog.QMessageBox.StandardButton.Yes,
+    )
+    said: list[str] = []
+    monkeypatch.setattr(
+        settings_dialog.QMessageBox,
+        "information",
+        lambda parent, title, text, *a, **k: said.append(text),
+    )
+    monkeypatch.setattr(
+        settings_dialog, "set_provider_cookie", lambda account_id, value: None
+    )
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+
+    _button(dialog, "clear_browser_data_btn").click()
+
+    assert said, "the click said nothing at all"
+    assert "next start" in said[0], said[0]
+
+
+def test_clear_all_browser_data_says_what_it_left_behind(qtbot, monkeypatch):
+    """Names on disk are not bounded by anything the app generates.
+
+    `purge_profile` refuses any that the id rule rejects, which is the
+    containment guarantee and is exactly right - but it refuses them deep in
+    the App, one at a time, while the button promised to "delete every
+    account's saved cookie and embedded-browser profile". The count comes
+    back to the dialog, which says the folders were left alone; the names
+    themselves never reach the message or the log.
+
+    The filter is on the half that deletes directories, and only that half.
+    A stored cookie is a keyring entry with no containment question to
+    answer, and this is the one button whose whole promise is "everything",
+    so every name on disk is still cleared - which is what it did before the
+    filter existed.
+    """
+    from aigauge.config import app_data_dir
+
+    monkeypatch.setattr(
+        settings_dialog.QMessageBox,
+        "question",
+        lambda *a, **k: settings_dialog.QMessageBox.StandardButton.Yes,
+    )
+    said: list[str] = []
+    monkeypatch.setattr(
+        settings_dialog.QMessageBox,
+        "information",
+        lambda parent, title, text, *a, **k: said.append(text),
+    )
+    cleared: list[str] = []
+    monkeypatch.setattr(
+        settings_dialog,
+        "set_provider_cookie",
+        lambda account_id, value: cleared.append(account_id),
+    )
+    profiles = app_data_dir() / "profiles"
+    (profiles / "claude-deadbeef").mkdir(parents=True)
+    (profiles / "not an id").mkdir()
+    (profiles / "also.bad!").mkdir()
+
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    with qtbot.waitSignal(dialog.browser_data_clear_requested) as signal:
+        _button(dialog, "clear_browser_data_btn").click()
+
+    ids = signal.args[0]
+    assert "claude-deadbeef" in ids, "a usable leftover was not swept"
+    assert not [one for one in ids if " " in one or "!" in one], (
+        "an unusable directory name was handed to the purge path"
+    )
+    assert "2 folder(s)" in said[0], said[0]
+    assert "not an id" not in said[0], "the message named a directory on disk"
+    assert {"not an id", "also.bad!"} <= set(cleared), (
+        "the sweep's filter narrowed the keyring pass too"
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs symlink privilege")
+def test_clear_all_browser_data_does_not_delete_through_a_link(qtbot, monkeypatch):
+    """The one entry in `profiles/` that deletes something that is not it.
+
+    A link inside `profiles/` pointing at another profile resolves *inside*
+    the root, so it passed the containment half and was emitted - and
+    `purge_profile` then rmtree's the target. The App's live-scrape deferral
+    is keyed on the link's own name, so the account it aliases is deferred
+    and deleted in the same heartbeat, through the alias. A link to the root
+    itself is the other half: emitted, counted as removed, and refused by
+    `purge_profile` where nobody reads the reason.
+
+    Driven through the real button, because it is the count in the
+    completion box that was wrong in the "we deleted it" direction.
+    """
+    from aigauge.config import app_data_dir
+
+    monkeypatch.setattr(
+        settings_dialog.QMessageBox,
+        "question",
+        lambda *a, **k: settings_dialog.QMessageBox.StandardButton.Yes,
+    )
+    said: list[str] = []
+    monkeypatch.setattr(
+        settings_dialog.QMessageBox,
+        "information",
+        lambda parent, title, text, *a, **k: said.append(text),
+    )
+    cleared: list[str] = []
+    monkeypatch.setattr(
+        settings_dialog,
+        "set_provider_cookie",
+        lambda account_id, value: cleared.append(account_id),
+    )
+    profiles = app_data_dir() / "profiles"
+    (profiles / "claude-deadbeef").mkdir(parents=True)
+    try:
+        (profiles / "alias").symlink_to(profiles / "claude-deadbeef", True)
+        (profiles / "selfroot").symlink_to(profiles, True)
+    except (OSError, NotImplementedError):  # pragma: no cover - CI/Windows
+        pytest.skip("this filesystem does not allow symlinks")
+
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    with qtbot.waitSignal(dialog.browser_data_clear_requested) as signal:
+        _button(dialog, "clear_browser_data_btn").click()
+
+    ids = signal.args[0]
+    assert "claude-deadbeef" in ids, "a usable leftover was not swept"
+    assert "alias" not in ids, "the sweep emitted a link to another profile"
+    assert "selfroot" not in ids, "the sweep emitted a link to the root"
+    assert "2 folder(s)" in said[0], said[0]
+    # The keyring half is unfiltered on purpose: a stored cookie has no
+    # containment question to answer and this button promises everything.
+    assert {"alias", "selfroot"} <= set(cleared)
+
+
+def test_the_settings_dialog_no_longer_deletes_profiles_itself(
+    qtbot, monkeypatch
+):
+    """Both routes out of this dialog hand the directory to the App.
+
+    This was an `inspect.getsource` substring test. `purge_profile` releases
+    the cached `QWebEngineProfile` and rmtree's its directory; the dialog is
+    modeless and a refresh cycle runs every five minutes, so only the App -
+    which knows what is in flight - may run it. Driven here instead, through
+    both buttons that used to: the module-level function is watched, and
+    neither the removal nor the clear-all calls it.
+    """
+    import aigauge.webview.profile as profile_module
+    from aigauge.config import app_data_dir
+
+    called: list[str] = []
+    monkeypatch.setattr(profile_module, "purge_profile", called.append)
+    monkeypatch.setattr(settings_dialog, "set_start_at_login", lambda enabled: None)
+    monkeypatch.setattr(
+        settings_dialog.QMessageBox,
+        "question",
+        lambda *a, **k: settings_dialog.QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(
+        settings_dialog.QMessageBox, "information", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        settings_dialog, "set_provider_cookie", lambda account_id, value: None
+    )
+    config = Config()
+    dialog = SettingsDialog(config)
+    qtbot.addWidget(dialog)
+    dialog._add_browser_account("claude")  # noqa: SLF001
+    account_id = dialog._browser_accounts[-1].id  # noqa: SLF001
+    profile_dir = app_data_dir() / "profiles" / account_id
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    (profile_dir / "Cookies").write_bytes(b"SQLite format 3\x00")
+
+    _button(dialog, "clear_browser_data_btn").click()
+    dialog._remove_browser_account(account_id)  # noqa: SLF001
+    dialog.apply_to(config)
+
+    assert called == [], "the settings dialog is deleting QtWebEngine profiles again"
+    assert profile_dir.is_dir(), "the dialog deleted a profile the App may be using"
+    # The spy above is bound on the defining module, so it sees a call made
+    # through it or through a function-local import. The one shape it cannot
+    # see is a module-level `from .webview.profile import purge_profile`,
+    # which binds before any patch - so that name must simply not be here.
+    assert not hasattr(settings_dialog, "purge_profile"), (
+        "the settings dialog imported purge_profile again"
+    )
+
+
+def test_one_dialog_session_asks_the_app_for_a_profile_once(qtbot, monkeypatch):
+    """Clearing all browser data and removing an account are two calls.
+
+    The clear goes to the App at the button and the removal list at OK, so
+    an account removed in the same dialog session travelled both routes and
+    reached `purge_profile` twice - once for a directory that was already
+    gone. Nothing broke (it is idempotent and path-guarded), but the two
+    routes are also two deferral lists in the App, and a blocked id sat on
+    both and was logged by both at every heartbeat.
+
+    The clear-all set is the whole answer: the button asks for every
+    configured account, every fixed id and every usable name in `profiles/`,
+    so a row removed before or after the click is always inside it.
+    """
+    monkeypatch.setattr(settings_dialog, "set_start_at_login", lambda enabled: None)
+    monkeypatch.setattr(
+        settings_dialog.QMessageBox,
+        "question",
+        lambda *a, **k: settings_dialog.QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(
+        settings_dialog.QMessageBox, "information", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        settings_dialog, "set_provider_cookie", lambda account_id, value: None
+    )
+    config = Config()
+    dialog = SettingsDialog(config)
+    qtbot.addWidget(dialog)
+    dialog._add_browser_account("claude")  # noqa: SLF001
+    account_id = dialog._browser_accounts[-1].id  # noqa: SLF001
+
+    emitted: list[list[str]] = []
+    dialog.browser_data_clear_requested.connect(emitted.append)
+    _button(dialog, "clear_browser_data_btn").click()
+    dialog._remove_browser_account(account_id)  # noqa: SLF001
+    dialog.apply_to(config)
+
+    assert account_id in emitted[0], "the clear did not cover the account"
+    assert dialog.removed_profile_ids == [], (
+        "the App was asked to delete a profile it had just been asked to clear"
+    )

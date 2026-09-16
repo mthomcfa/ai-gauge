@@ -317,6 +317,56 @@ def test_update_snapshot_clears_refreshing_flag(qtbot):
     assert widget._tiles["codex"]._rows[0].bar.maximum() == 100  # noqa: SLF001
 
 
+def test_a_parked_refresh_hint_is_cleared_by_the_next_paint(qtbot):
+    """The hint is the whole of what a refused manual refresh does.
+
+    The snapshot the tile is showing, its rows and its burn rate are
+    untouched - nothing was measured - and the next answer that really
+    arrives rewrites the status label, which is what clears it.
+    """
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_ok_snapshot("codex"), "Codex")
+    tile = widget._tiles["codex"]  # noqa: SLF001
+    rows_before = len(tile._rows)  # noqa: SLF001
+    assert tile.status.text() == ""
+
+    hint = "Waiting for the previous refresh to finish."
+    widget.set_status_hint("codex", hint)
+
+    assert tile.status.toolTip() == hint
+    assert tile.status.text() == hint
+    assert tile._latest_snapshot is not None  # noqa: SLF001
+    assert len(tile._rows) == rows_before, "a refusal changed the metric rows"  # noqa: SLF001
+
+    widget.update_snapshot(_ok_snapshot("codex"), "Codex")
+
+    assert tile.status.toolTip() == ""
+    assert tile.status.text() == ""
+
+
+def test_a_parked_refresh_hint_keeps_an_error_tiles_own_label(qtbot):
+    """An ERROR tile's status label is the link to the error details, and an
+    AUTH_REQUIRED one says "not signed in" - the one thing on the tile the
+    user can act on. The hint goes to the tooltip there rather than over the
+    top of it."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(
+        UsageSnapshot(
+            provider="copilot", status=SnapshotStatus.ERROR, error="Refresh timed out."
+        ),
+        "Copilot",
+    )
+    tile = widget._tiles["copilot"]  # noqa: SLF001
+    label_before = tile.status.text()
+
+    widget.set_status_hint("copilot", "Waiting for the previous refresh to finish.")
+
+    assert tile.status.text() == label_before
+    assert tile.status.toolTip() == "Waiting for the previous refresh to finish."
+
+
 def test_auth_required_tile_uses_sign_in_button(qtbot):
     widget = UsageWidget(Config())
     qtbot.addWidget(widget)

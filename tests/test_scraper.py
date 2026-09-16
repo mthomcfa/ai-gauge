@@ -1,8 +1,18 @@
 import logging
+import time
 
 import pytest
 
 from aigauge.webview.scraper import HeadlessScraper
+
+# How far back a stand-in's clock is pushed to stand for "the lid was closed
+# mid-scrape". It is an offset from `time.monotonic()`, never an absolute
+# value: `_is_resume_artifact` compares `monotonic() - _started_at` against
+# three times the scrape budget, so a literal 0.0 measures the *host's
+# uptime*. A CI runner 74.9 s into its first boot put that below the 75 s
+# threshold and the classification never happened, while every long-lived
+# runner passed.
+_A_SUSPEND_AGO = 300_000.0
 
 
 def test_extractor_retry_limit_is_retryable_transport_error():
@@ -82,7 +92,9 @@ class _LoadFailStandIn:
         self._provider = "claude"
         self._attempt = 1
         self._render_terminated = False
-        self._started_at = 0.0
+        # What the real scraper does at construction, so elapsed is ~0 and
+        # nothing is a resume artifact unless a test asks for one.
+        self._started_at = time.monotonic()
         self._timeout_ms = 25000
         self._max_attempts = 1
         self._RETRYABLE_ERRORS = ()
@@ -256,7 +268,7 @@ def test_a_timeout_measured_across_a_suspend_is_named_as_one(caplog):
     import logging
 
     stand_in = _LoadFailStandIn()
-    stand_in._started_at = 0.0  # monotonic zero: elapsed is hours, not seconds
+    stand_in._started_at = time.monotonic() - _A_SUSPEND_AGO  # ~3.5 days
 
     with caplog.at_level(logging.WARNING, logger="aigauge.webview.scraper"):
         HeadlessScraper._finish(stand_in, None, "timeout")
@@ -267,8 +279,6 @@ def test_a_timeout_measured_across_a_suspend_is_named_as_one(caplog):
 
 
 def test_an_ordinary_timeout_is_not_called_a_resume_artifact():
-    import time
-
     stand_in = _LoadFailStandIn()
     # Timed out at its own budget, as a slow page does.
     stand_in._started_at = time.monotonic() - 26.0
@@ -283,7 +293,7 @@ def test_a_page_that_failed_to_load_is_never_a_resume_artifact():
     """Only a timeout can be measured across a suspend; every other failure
     is reported by Chromium at the moment it happens."""
     stand_in = _LoadFailStandIn()
-    stand_in._started_at = 0.0
+    stand_in._started_at = time.monotonic() - _A_SUSPEND_AGO
 
     HeadlessScraper._finish(stand_in, None, "page failed to load")
 
@@ -404,3 +414,136 @@ def test_a_successful_scrape_survives_a_page_that_cannot_be_read(caplog):
         HeadlessScraper._finish(stand_in, {"usage": 42}, "")
 
     assert stand_in.finished_with == ({"usage": 42}, "")
+
+
+def _stand_in_with_title(title: str):
+    stand_in = _LoadFailStandIn()
+
+    class _Page:
+        def url(self):
+            return "https://claude.ai/usage"
+
+        def title(self):
+            return title
+
+    stand_in._page = _Page()  # noqa: SLF001
+    return stand_in
+
+
+@pytest.mark.parametrize("error", ["", "timeout"])
+def test_a_page_cannot_write_a_megabyte_into_one_log_record(
+    monkeypatch, caplog, error
+):
+    """`document.title` and the extractor's key names are chosen by the page.
+
+    Neither was capped, and the healthy line is at INFO, so one scrape of a
+    hostile or merely broken page overwrote the rotating 512 KiB x 3 log -
+    the file the error dialog asks the user to attach. Measured on the tree
+    before this cap, with a 1 MB title and 10 000 keys of 1 000 characters:
+    11 079 134 characters for `scrape ok` and 1 000 367 for `scrape fail`,
+    21x and 1.9x the whole rotation.
+    """
+    monkeypatch.setattr(
+        "aigauge.webview.scraper.QTimer.singleShot", lambda ms, cb: None
+    )
+    stand_in = _stand_in_with_title("T" * 1_000_000)
+    result = {("K" * 1_000) + str(index): 1 for index in range(10_000)}
+
+    with caplog.at_level(logging.INFO, logger="aigauge.scraper"):
+        caplog.clear()
+        HeadlessScraper._finish(stand_in, result if not error else None, error)
+
+    assert stand_in.finished_with is not None, "the scrape never reported"
+    worst = max(len(record.getMessage()) for record in caplog.records)
+    assert worst < 10_000, f"one record was {worst} characters"
+    line = "\n".join(record.getMessage() for record in caplog.records)
+    assert "TTTT" in line, "the title was dropped instead of clipped"
+    if not error:
+        assert "more" in line, "the key list was truncated without saying so"
+
+
+def test_the_scrapers_key_walk_cannot_raise_and_its_class_name_is_bounded():
+    """`_result_keys_for_log` reaches the result's own keys.
+
+    `_clip(key, ...)` ran the key's `__bool__` and `__str__` unguarded, where
+    app.py deliberately routes the same walk through a guard - so one key
+    that refuses to be printed cost the whole `scrape ok` record, which
+    `_finish` then replaces with "the diagnostics could not be read". The
+    non-dict branch printed `type(result).__name__` whole, and a class name
+    is not bounded by anything: measured 1 000 000 characters, now 60.
+    """
+    from aigauge.webview.scraper import _result_keys_for_log
+
+    class _KeyStrRaises:
+        def __str__(self):
+            raise ValueError("this key refuses to be printed")
+
+        def __hash__(self):
+            return 11
+
+    # One key that refuses to print costs that key its name and nothing
+    # else: the outer guard added beside this one would otherwise mask a
+    # missing per-key guard by throwing the whole list away.
+    line = _result_keys_for_log({_KeyStrRaises(): 1, "usage": 2, "limit": 3})
+    assert "'usage'" in line and "'limit'" in line, line
+    assert "'<key>'" in line, line
+
+    huge = type("N" * 1_000_000, (), {})()
+    assert len(_result_keys_for_log(huge)) == 60
+
+
+def test_the_scrapers_key_walk_survives_a_result_that_refuses_to_be_walked(
+    caplog,
+):
+    """Guarded end to end, the way app.py's twin is.
+
+    `_key_text` covers a key that refuses to be printed; the `for key in
+    result` walk itself runs the payload's `__iter__`, and a `dict` subclass
+    can refuse that too - so the same refusal still escaped, `_finish`
+    caught it, and the whole `scrape ok` record of a scrape that had worked
+    was replaced by "the diagnostics could not be read". app.py's
+    `_raw_keys_for_log` answers `[]` for the identical payload.
+    """
+    from aigauge.webview.scraper import _result_keys_for_log
+
+    class _IterRaises(dict):
+        def __iter__(self):
+            raise RuntimeError("this result refuses to be iterated")
+
+    assert _result_keys_for_log(_IterRaises(a=1)) == "[]"
+
+    # And through the real `_finish`, which is where it cost the record.
+    stand_in = _stand_in_with_title("short")
+    with caplog.at_level(logging.INFO, logger="aigauge.scraper"):
+        caplog.clear()
+        HeadlessScraper._finish(stand_in, _IterRaises(a=1), "")
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(message.startswith("scrape ok") for message in messages), messages
+
+
+def test_the_scrapers_load_error_string_is_bounded(caplog):
+    """Chromium's `errorString` is a Qt string-table message - 49 characters
+    for an HTTP failure against a real QtWebEngine, not the server's reason
+    phrase - so this closes an assumption rather than a hole. It is still
+    the largest argument on `scrape fail` with no cap of its own: forced to
+    500 000 characters it produced a 500 353-character record, 0.95x the
+    whole rotation."""
+    stand_in = _stand_in_with_title("short")
+    stand_in._last_load_error_string = "E" * 500_000  # noqa: SLF001
+
+    with caplog.at_level(logging.INFO, logger="aigauge.scraper"):
+        caplog.clear()
+        HeadlessScraper._finish(stand_in, None, "page failed to load")
+
+    assert caplog.records, "the failure logged nothing at all"
+    worst = max(len(record.getMessage()) for record in caplog.records)
+    assert worst < 2_000, f"one record was {worst} characters"
+
+
+def test_the_scrapers_url_field_is_bounded_too():
+    """`_safe_url` is the other page-controlled field on those lines."""
+    from aigauge.webview.scraper import _safe_url
+
+    assert len(_safe_url("https://claude.ai/" + "p" * 100_000)) <= 300
+    assert len(_safe_url("not a url at all " + "q" * 100_000)) <= 300

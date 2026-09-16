@@ -67,8 +67,9 @@ def purge_profile(account_id: str) -> None:
     Releases the cached ``QWebEngineProfile`` (clearing its cookie store and
     HTTP cache first), then recursively removes the on-disk profile directory
     so a removed account leaves no live session, cache, or persisted cookies
-    behind. The directory delete is guarded: it only proceeds for a path that
-    resolves strictly inside the ``profiles/`` root.
+    behind. The directory delete is guarded: it never follows a link, and it
+    only proceeds for a path that resolves strictly inside the ``profiles/``
+    root.
     """
     profile = _profiles.pop(account_id, None)
     if profile is not None:
@@ -89,6 +90,14 @@ def purge_profile(account_id: str) -> None:
         # Clipped: the id comes from `config.json`, which bounds neither its
         # length nor the list's, and a refusal must not cost the log ring.
         log.warning("purge_profile: refusing unsafe account id %.64r", account_id)
+        return
+    if target.is_symlink():
+        # A link inside profiles/ resolves to some other directory - another
+        # account's live profile, the root, or somewhere outside - and every
+        # check below runs on the resolved path. The dialog's sweep already
+        # refuses links; this is the same refusal at the primitive, so an id
+        # that reaches here from config.json cannot delete through one either.
+        log.warning("purge_profile: refusing to delete through a link %.64r", account_id)
         return
     profiles_root = (app_data_dir() / "profiles").resolve()
     resolved = target.resolve()

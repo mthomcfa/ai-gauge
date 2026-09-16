@@ -6,6 +6,271 @@
 > earlier `0.6.4` entry predates that convention and **is not** upstream's
 > `v0.6.4`, which is different code.
 
+## 1.3.1+cfa.6 - 2026-09-15
+
+The residuals of the refresh-cadence release, and two coercions on
+`config.json`. A healthy provider's cadence does not change: over six fake
+hours beside a wedged REST provider it is dispatched 11 times where the same
+run with nothing wedged dispatches it 12, and over a day 29 against 30. What
+moves is the park on a hung REST worker, where profile deletion is decided
+and recorded, the name an answer is filed under, and what a log line is
+allowed to cost.
+
+### Changed
+
+- **A REST provider's park is released by its worker, not by a timer.** A
+  provider the watchdog gave up on was parked for twice the budget that
+  expired and then let go. For the browser providers that is right: the
+  account-keyed live-scrape guard refuses the re-entrant scrape anyway.
+  Copilot, OpenRouter and Azure have no such guard, and `requests`'
+  `timeout` is per socket operation rather than a total, so a server that
+  drips a byte just inside it holds a `QThreadPool` worker for as long as it
+  likes — and every park expiry started another one on the same endpoint.
+  Six fake hours against a wedged REST worker, with the app in its active
+  five-minute cadence — something on screen is moving, which is when the app
+  is busiest and the accumulation is worst: **50 dispatches under the old
+  rule, 6 under this one**, no two closer than 3 680 s. An *idle* app backs
+  off to an hourly cadence of its own, so the same six hours are 11 and 6
+  there, and over 24 hours 28 and 24: the bound matters most exactly when
+  the app is working hardest. Each of those 50 is a
+  slot of the *global* pool, which fills (1 of 1, 2 of 2, 4 of 4, 8 of 8),
+  after which all three REST tiles are dead for the life of the process. The
+  park now lasts until the worker reports back — any snapshot for that name,
+  live or late, already un-parks it — or one hour, whichever is first;
+  browser providers keep the 2x ceiling, measured unchanged at 26 and 28
+  dispatches over the same six hours. The `abandoned` log line says which
+  rule applied. A retry due that comes up during such a park still rides the
+  next ordinary cadence wake rather than buying one of its own: pinned over
+  eleven five-minute wakes inside one hour-long park.
+- **A manual refresh that is refused now says so on the tile.** Refused as
+  `abandoned`, both manual routes re-enabled and did nothing visible; with an
+  hour-long park that silence is long enough to read as a broken button. The
+  tile's status tooltip — and its status text, where that text is empty —
+  says "Waiting for the previous refresh to finish." An ERROR or
+  AUTH_REQUIRED tile keeps its own label, which is the one thing on it the
+  user can act on. Nothing else moves: no snapshot, no history, no ratio, no
+  cycle, and the next paint clears it. A scheduled cycle marks nothing.
+- **"Clear all browser data" hands the profiles to the app.** The dialog
+  cleared the cookie secret and then called `purge_profile` synchronously for
+  every configured account, every profile directory on disk and the three
+  fixed ids, consulting nothing. That is `deleteLater()` on the cached
+  `QWebEngineProfile` followed by `rmtree`, Qt requires a profile to outlive
+  its pages, and the dialog is modeless with a cycle running every five
+  minutes — so a live scrape during that click is ordinary, and this was the
+  most reachable route to the destroyed page that used to strand the
+  live-scrape guard for the life of the process. The stored cookies are still
+  cleared at the click, for every id. The profiles now go to the App, which
+  deletes each one as soon as that account is free, and the confirmation says
+  that a profile being refreshed right now is deleted when that refresh
+  finishes or at the next start.
+
+  These ids are kept on their own list, `config.pending_data_clears`, rather
+  than in `pending_profile_purges`: that list's drain skips an id that is
+  *also* a configured account, which is right for a removal a restored backup
+  has undone and would silently drop every deferred clear at the next start,
+  because a clear is *always* about an account the user still has. Both lists
+  are persisted and both are drained at the next start — before any cookie is
+  hydrated and before any provider exists — through one helper and one
+  `Config.save()`; only the skip rule differs. The clear list has to be
+  written down: the keyring copy of the credential is deleted at the click,
+  so a quit inside the deferral window used to leave the account's
+  `ForcePersistentCookies` profile — the live session cookie, which is what
+  the button exists to destroy — on disk with nothing in the app ever
+  mentioning it again. `docs/next-session.md` §8.3 records that this is the
+  second thing that makes the app write `config.json` unasked.
+
+### Fixed
+
+- **A parked provider no longer freezes the idle backoff.** `_begin_cycle`
+  filtered the parked names out and *then* decided whether the cycle was
+  partial, so every cycle inside an hour-long REST park counted as one —
+  and `_end_cycle` will not advance `_unchanged_cycles` for a partial cycle,
+  which is what `_adaptive_refresh_minutes` derives the idle interval from.
+  One hung endpoint therefore pinned the whole app on the five-minute active
+  cadence for as long as it stayed hung, multiplying the scrapes of *other*
+  providers' hosts: a healthy sibling went from 12 dispatches in six fake
+  hours to **54**, and with every tile's number moving every three hours —
+  the realistic case, because each move zeroes the counter — from 68 in a
+  day (2.83/h) to **154** (6.42/h). Partial is now decided from what the
+  cycle was *asked* for, which is what `_end_cycle`'s comment always said it
+  meant: a retry wake or a per-provider refresh. The numbers go back to 11,
+  29 and 67, against controls of 12, 30 and 68.
+- **A park uses the rule the dispatch went out under.** `_on_watchdog` asked
+  `_providers` whether the name is a browser provider, and a settings save
+  that removes an account drops its provider object while the scrape is
+  still out — so a *browser* account removed mid-scrape was parked for an
+  hour under `ceiling=rest_backstop`. Its on-disk profile, which holds the
+  session cookie, then waited 60 minutes for deletion instead of 10, the
+  same account re-added was refused for the rest of that hour, and the log
+  line named the wrong rule. The kind is recorded with the epoch at dispatch
+  and pruned with it.
+- **The rest of that log call cannot raise or bloat either.**
+  `_raw_keys_for_log` is evaluated in the same `log.warning` as
+  `_raw_summary` and guarded only per key, the call site's own
+  `if snapshot.raw` ran the payload's `__len__`, and both "bounded literal"
+  fallbacks embed a class name the payload chose (1 MB in, 1 000 017
+  characters out; now 77 in app.py and 60 in the scraper). `snapshot.error`
+  on that record is clipped to 300 characters with its newlines flattened: a
+  2 480 000-character error — 20 000 forged lines — made one record of
+  2 480 065 characters with `provider=copilot` and 2 480 069 with the
+  longest provider name, 1.58x the whole 512 KiB × 3 rotation, every one of
+  those 20 000 lines reading like a real one. (Every multiplier in this
+  entry is against the whole rotation, 512 KiB × 3 = 1 572 864 bytes. An
+  earlier draft divided by one 512 KiB file and read 3× worse: 4.73x here.)
+  The tile, the tray tooltip and the error dialog still get the string
+  whole. `scrape fail`'s `load_error_string` is clipped the same way;
+  measured against a real QtWebEngine it is a Qt string-table message
+  rather than the server's, so that one closes an assumption rather than a
+  hole. All three arguments are guarded, `snapshot.error` included:
+  `UsageSnapshot` is a plain dataclass, so `error or ""` runs the object's
+  `__bool__` and `str()` its `__str__`, and either raised straight out of
+  `_on_snapshot` — before the tile was painted — until the helper caught it
+  and answered `<unprintable error>`. The clip runs *before* the redaction rather than
+  after, so four regex passes see 500 characters rather than the whole
+  string (0.08 ms for a 1.2 MB error against 163 ms): the margin past the
+  300-character limit keeps an identifier straddling *that* limit whole for
+  the redaction, and a cut identifier left at the end of the 500-character
+  window is dropped after it, because redaction shrinks the text in front of
+  such a fragment and pulled 26 characters of a subscription id into the
+  record. Swept across every offset the window can cut an id at, no run of
+  eight hex-or-dash characters of it now reaches the log. The scraper's
+  `_result_keys_for_log` gets the same outer guard as app.py's twin, because
+  `for key in result` runs the payload's `__iter__` and a `dict` subclass
+  can refuse it.
+- **A short id with a newline in it cannot forge a log record.** The
+  coercion on both pending-purge lists bounds an id's type and its length,
+  not its characters, and four records print ids through `_clip_for_log`. A
+  53-character id from a hand-edited `config.json` carrying two newlines
+  read as three records in the file — a forged `ERROR … balance=0.00
+  key=sk-ant-x` among them. Both a carriage return and a newline, because a
+  bare `\r` makes a record overwrite the one before it. Flattened exactly as
+  `snapshot.error` is: 6 forged lines to 0 on the same poisoned config, and
+  the helper that does it is guarded end to end like the three beside it —
+  its `str()` was the last one on that record outside a `try`.
+- **Smaller ones.** A settings save no longer writes "Waiting for the
+  previous refresh to finish." onto a parked tile — it refreshes without the
+  user having asked, exactly like a scheduled cycle — while a sign-in queued
+  behind such a save still does, which it did not: the queued route recorded
+  the provider and not that a person had asked, and the save's own queued
+  refresh won. An id owed both a removal and a clear reaches `purge_profile`
+  once across the two calls one dialog session makes, and one `deferred` line
+  per drain rather than two while its scrape is still out. "Clear all browser
+  data" counts the `profiles/` directories `purge_profile` will refuse — by
+  the rule it refuses them with, the resolved path and not the name alone —
+  and says how many, without naming them. A **symlink** is never one it will
+  act on, whatever it resolves to: one pointing out of `profiles/` was
+  counted as removed where the purge refused it, and one pointing at another
+  profile *inside* it passed containment and deleted the account it aliased,
+  under a live scrape, because the deferral is keyed on the link's own name.
+  `purge_profile` itself refuses a link too, so an id that reaches it from
+  `config.json`'s two pending lists cannot delete through one either.
+  An entry resolving to the `profiles/` root is refused for the same reason —
+  `webview_profile_dir` permits it and `purge_profile` does not. Measured on
+  a hostile tree of eight entries: the predicate disagreed with the deletion
+  on five of them and now on none, the emitted set drops from six ids to
+  three, and the box's "left alone" count goes from 2 to the 5 that really
+  were. Its keyring pass still takes every name on disk: only the directory
+  sweep has a containment question to answer.
+- **Neither purge path asked whether a scrape was live.** Both now consult
+  `account_is_busy()` from `providers/_scrape_runner.py` as well as
+  `_inflight` and the abandoned-dispatch park. It is the only one of the
+  three that still answers yes once the App has stopped waiting for a
+  dispatch or never made one, because it is module state keyed by account and
+  survives the `_build_providers` a settings save runs.
+- **The App stamps the name it dispatched onto every answer.** `_dispatch`'s
+  `_emit` forwarded the provider's own `snapshot.provider`, and every gate
+  downstream keys on that name while epochs advance in lockstep across a
+  cycle — so an answer mislabelled with a *sibling account's* id was accepted
+  as that sibling's live answer: its in-flight entry cleared, its watchdog
+  destroyed, its tile painted with another account's numbers. Unreachable
+  today, and checked rather than assumed (`ScrapeRunner` sets
+  `provider=self._account_id`, the browser builders take `account_id=` from
+  the App, the three REST providers hardcode their literal), but it is one
+  line in the one place that knows what it dispatched: `_emit` compares the
+  payload's name with the dispatched one and re-stamps it with
+  `replace(snap, provider=_name)` when they differ. The warning it logs names
+  the dispatched provider and a fixed literal; the payload's own string is
+  never printed.
+- **The log summariser can no longer raise or print an unbounded value.** Its
+  shared character budget covered strings, key names and elided nodes; the
+  numeric branch charged a flat 8 whatever the magnitude and the `repr()`
+  fallback was charged after the fact and never clipped. Measured, and then
+  measured again after: a 5 MB `bytes` value **5 000 012 → 312** characters
+  (3.18x the whole rotation, to a fifth of a line), a 5 MB `bytearray`
+  5 000 023 → 312, a 50 000-element `set` 338 899 → 312, fifty 4 200-digit
+  integers **210 440 → 50**. An int's printed length is now estimated from
+  `bit_length()` and the number is never converted: CPython 3.11+ raises on
+  `str()` past 4 300 digits and `json.dumps` hits the same limit from the
+  inside, so asking how long it is was itself the crash — one 6 000-digit
+  integer raised `ValueError` straight out of `_on_snapshot`. So did an
+  object whose `__repr__` raises, a dict key whose `__str__` raises and a
+  `dict` subclass whose `items()` raises; `except TypeError` caught none of
+  them. `_raw_summary` now catches `Exception` — a log line must never be
+  able to raise — and its fallback is a bounded literal, where `repr(raw)`
+  handed back the whole payload on the one path that had already gone wrong.
+  The existing adversarial payloads are unmoved: the worst `raw_summary=`
+  argument is 4 803 characters and the whole `snapshot error …` record it
+  sits in is up to 4 998 — the record carries the provider's name, so it is
+  4 992 for `azure` and 4 998 for `opencode_go` (`_nested(20, 4)`, measured
+  on both trees; an earlier draft of this entry, and the message of commit
+  `21bd5be`, gave 4 283 and called it the record — the claim was right, the
+  number was not, and 4 803 is the argument rather than the line). None of it is reachable today; it bites the first time an
+  extractor or a provider returns something that is not plain JSON.
+- **The scraper's log lines clip the text the page chose.** `title=%r` at
+  four call sites and `result_keys=%s` at one had no length cap, and the
+  healthy `scrape ok` line is at INFO. Driving `_finish` with a 1 MB
+  `document.title` and an extractor result of 10 000 keys of 1 000
+  characters: **11 079 134 characters for `scrape ok` and 1 000 367 for
+  `scrape fail`** — 7.04x and 0.64x the whole rotation, from one scrape, into
+  the file the error dialog asks the user to attach. The same inputs now
+  produce 3 664 and 570 (3 814 until `_key_text(key)[:60]` stopped appending
+  the `"..."` marker to each of 50 over-long key names). Titles clip at 200; the key list takes the shape
+  `raw_keys=` already has, 50 names of 60 characters and the true count
+  beside them. `_safe_url` was checked and was already bounded at 300.
+  Nothing else in the scraper moves.
+- **Two coercions on a poisoned `config.json`.**
+  `pending_profile_purges` now keeps only strings of 1 to 64 characters and
+  at most 64 of them — `purge_profile` is still the defence that matters,
+  but a delete list read before anything else at startup should not be able
+  to carry 5 000 ids of 200 000 characters to it. And a `BrowserAccount` id
+  may no longer be `copilot`, `openrouter`, `opencode_go` or `azure`: those
+  are exactly the provider keys `_build_providers` creates that are not
+  browser accounts, and it keys one dict on both, so such an account owned
+  that provider's snapshot, tile and place in the queue. `claude` and `codex`
+  are not on the list — they are the two fixed browser accounts. A config
+  carrying one still loads: the migration drops that account, as it already
+  did for an unsafe path component, and now logs it with the id bounded to
+  64 characters.
+- **A park no longer outlives the provider it was about.** Nothing cleared
+  `_abandoned` for a name the user removed in Settings — `_dispatch_refusal`
+  answers `not_configured` before it ever asks — so the entry and the
+  per-dispatch rows held open for it lived for the process.
+
+### Notes
+
+- **1 216 → 1 277 tests.** Including six fake hours of a wedged REST worker
+  against a browser sibling, an hour-long park ridden out over eleven cadence
+  wakes, a mislabelled answer that must not touch its sibling's dispatch, and
+  the three payloads that used to raise out of `_on_snapshot`. **Thirty-six**
+  of them are this release's own review, over three rounds: the idle backoff
+  measured with a provider parked and without, a removed browser account's
+  park, the epoch guard on the un-park, a deferred clear carried across a
+  quit and the payloads that refuse to be iterated, measured or repr'd
+  (round 1); the snapshot-error record bounded where it is written, a
+  sign-in queued behind a settings save, and an id on both deferral lists
+  purged once (round 2); and a subscription id swept across every offset the
+  log's clip can cut it at, a link in `profiles/` that is never a profile,
+  and the two arms of `is_usable_profile_id` the filesystem decides
+  (round 3). Counted by collection: 1 216 at `origin/main`, 1 239 when the
+  release was tagged, 1 275 after the three review rounds, and 1 277 once
+  `main`'s suite-teardown fix (#26) was merged in and `purge_profile` learned
+  to refuse a link.
+- **The REST socket itself is still unbounded.** This bounds how many workers
+  a hung endpoint can accumulate, not how long one of them lives. A total
+  response deadline — `stream=True` plus an elapsed check while reading — is
+  the only thing that bounds the socket, and it is still the open item in
+  `docs/next-session.md` §8.3.
+
 ## 1.3.0+cfa.5 - 2026-09-15
 
 The refresh cycle. Four and a half days of a real desktop log — 137 cycles,

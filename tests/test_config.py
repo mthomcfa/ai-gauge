@@ -1,4 +1,6 @@
 import json
+import logging
+import sys
 
 import pytest
 from pydantic import ValidationError
@@ -15,6 +17,7 @@ from aigauge.config import (
     browser_accounts,
     config_path,
     display_name_for_account,
+    is_usable_profile_id,
     qt_scale_factor_env,
     webview_profile_dir,
 )
@@ -29,15 +32,180 @@ def test_browser_account_rejects_unsafe_ids(bad_id):
         BrowserAccount(id=bad_id, kind="claude")
 
 
-@pytest.mark.parametrize("good_id", ["claude", "codex", "opencode_go", "claude-ab12cd34"])
+@pytest.mark.parametrize("bad_id", ["copilot", "openrouter", "opencode_go", "azure"])
+def test_browser_account_rejects_another_providers_key(bad_id):
+    """`App._build_providers` keys one dict on both, so an account carrying
+    one of these ids owns that provider's entry in `_providers`, its
+    snapshot, its tile and its place in the refresh queue - one account's
+    numbers under another provider's name. `claude` and `codex` are not on
+    the list: they are the two fixed browser accounts, and those ids are
+    theirs."""
+    with pytest.raises(ValidationError):
+        BrowserAccount(id=bad_id, kind="claude")
+
+
+@pytest.mark.parametrize("good_id", ["claude", "codex", "claude-ab12cd34"])
 def test_browser_account_accepts_generated_ids(good_id):
     assert BrowserAccount(id=good_id, kind="claude").id == good_id
+
+
+def test_a_config_naming_a_provider_as_an_account_still_loads(caplog):
+    """`Config.load()` coerces rather than raises. One bad account must cost
+    the user that account, not their whole settings file - the id is dropped
+    in the migration, before validation can raise out of the blanket
+    except."""
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        json.dumps(
+            {
+                "active_refresh_interval_minutes": 7,
+                "browser_accounts": [
+                    {"id": "claude", "kind": "claude"},
+                    {"id": "copilot", "kind": "claude", "name": "Sneaky"},
+                    {"id": "x" * 500_000, "kind": "claude"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="aigauge.config"):
+        loaded = Config.load()
+
+    assert loaded.active_refresh_interval_minutes == 7, (
+        "the whole config was discarded"
+    )
+    assert [account.id for account in loaded.browser_accounts] == ["claude", "codex"]
+    dropped = [
+        record.getMessage()
+        for record in caplog.records
+        if "dropping browser account" in record.getMessage()
+    ]
+    assert len(dropped) == 2
+    assert max(len(message) for message in dropped) < 200, (
+        "a 500 000-character id reached the log"
+    )
 
 
 @pytest.mark.parametrize("bad_id", ["../../evil", "a/b", "..", "foo/bar"])
 def test_webview_profile_dir_rejects_traversal(bad_id):
     with pytest.raises(ValueError):
         webview_profile_dir(bad_id)
+
+
+def test_a_usable_profile_id_is_one_the_purge_will_actually_act_on():
+    """The sweep's filter and the deletion's refusal must be the same rule.
+
+    Settings' "Clear all browser data" tells the user how many folders in
+    `profiles/` it left alone. It counted names the id rule rejects - but
+    `purge_profile` refuses on two tests, the id rule *and* whether the
+    resolved path is still inside `profiles/`, and a symlink pointing out of
+    that directory has a perfectly legal name. So the one entry a hostile
+    tree would construct was counted as deleted while the purge refused it,
+    and the message was wrong in the "we deleted it" direction.
+    """
+    assert is_usable_profile_id("claude-deadbeef")
+    for bad in ("../../evil", "a/b", "..", "foo/bar", "not an id", "CON", ""):
+        assert not is_usable_profile_id(bad), bad
+        with pytest.raises(ValueError):
+            webview_profile_dir(bad)
+
+    # The containment half, where the filesystem allows it to be built.
+    profiles = app_data_dir() / "profiles"
+    profiles.mkdir(parents=True, exist_ok=True)
+    outside = app_data_dir() / "OUTSIDE"
+    outside.mkdir(exist_ok=True)
+    try:
+        (profiles / "escape").symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError):  # pragma: no cover - Windows/CI
+        pytest.skip("this filesystem does not allow symlinks")
+    assert not is_usable_profile_id("escape"), (
+        "a legal name resolving outside profiles/ counted as one to delete"
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs symlink privilege")
+def test_a_symlink_inside_the_profiles_directory_is_never_usable():
+    """The predicate has to answer about the entry, not about its target.
+
+    `webview_profile_dir` resolves, so a link inside `profiles/` that points
+    at *another* profile passes containment - and the sweep then hands that
+    id to `purge_profile`, which rmtree's the target. The live-scrape
+    deferral is keyed on the link's own name, so an account mid-scrape has
+    its `QWebEngineProfile` directory deleted under it through an alias the
+    deferral never sees. A link to the root itself is the complementary
+    case: `webview_profile_dir` permits it and `purge_profile` refuses it,
+    so the entry was counted as deleted and then left alone.
+
+    This app writes no links under `profiles/`, so refusing every one of
+    them costs nothing real and makes the count the button reports the count
+    that was really left behind.
+    """
+    profiles = app_data_dir() / "profiles"
+    profiles.mkdir(parents=True, exist_ok=True)
+    (profiles / "live_one").mkdir(exist_ok=True)
+    try:
+        (profiles / "alias").symlink_to(profiles / "live_one", True)
+        (profiles / "selfroot").symlink_to(profiles, True)
+        (profiles / "dangling").symlink_to(profiles / "nothere", True)
+        (profiles / "loop_a").symlink_to(profiles / "loop_b")
+        (profiles / "loop_b").symlink_to(profiles / "loop_a")
+    except (OSError, NotImplementedError):  # pragma: no cover - CI/Windows
+        pytest.skip("this filesystem does not allow symlinks")
+
+    assert is_usable_profile_id("live_one"), "a real profile directory"
+    for name, why in (
+        ("alias", "a link to another account's profile"),
+        ("selfroot", "a link to the profiles/ root, which the purge refuses"),
+        ("dangling", "a link to nothing"),
+        ("loop_a", "a symlink loop, where resolve() raises RuntimeError"),
+    ):
+        assert not is_usable_profile_id(name), why
+    assert (profiles / "live_one").is_dir(), "the predicate deleted something"
+
+
+def test_an_entry_resolving_to_the_profiles_root_is_not_one_to_delete(monkeypatch):
+    """The containment case `webview_profile_dir` and `purge_profile` differ on.
+
+    `webview_profile_dir` permits `resolved == root`; `purge_profile` refuses
+    it. A plain symlink is caught a line earlier, so this is the reachable
+    shape on Windows, where a directory *junction* to the `profiles/` root is
+    followed by `resolve()` and reported as a link by nothing - `is_symlink()`
+    answers False for one. Stood in for here by making that answer False.
+    """
+    from pathlib import Path
+
+    profiles = app_data_dir() / "profiles"
+    profiles.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(Path, "is_symlink", lambda self: False)
+    monkeypatch.setattr(
+        Path, "resolve", lambda self, strict=False: profiles.absolute()
+    )
+    assert not is_usable_profile_id("junction"), (
+        "an entry resolving to the profiles/ root was counted as one to delete"
+    )
+
+
+def test_is_usable_profile_id_answers_where_the_filesystem_refuses(monkeypatch):
+    """A public predicate returns a bool or it is not one.
+
+    `resolve()` touches the filesystem, and both arms of that are reachable
+    from a directory nothing in this app created: a name the OS refuses
+    raises `OSError`, and a symlink loop raises `RuntimeError`, which is not
+    an `OSError` at all. Today's only caller filters on `is_dir()` first,
+    which is False for a loop, so neither escapes the dialog - but the
+    branch is what makes that filter optional rather than load-bearing.
+    """
+    from pathlib import Path
+
+    for error in (OSError("refused"), RuntimeError("Symlink loop from ...")):
+
+        def _raise(self, *args, _error=error, **kwargs):
+            raise _error
+
+        monkeypatch.setattr(Path, "resolve", _raise)
+        assert is_usable_profile_id("claude-deadbeef") is False, error
+        monkeypatch.undo()
 
 
 @pytest.mark.parametrize(
@@ -671,6 +839,26 @@ def test_the_pending_purge_list_coerces_instead_of_carrying_junk():
     ).pending_profile_purges == ["claude-ab12cd34", "codex-99999999"]
 
 
+def test_the_clear_list_is_coerced_and_bounded_like_the_purge_list():
+    """The second deferral list is read at startup from the same file, and
+    reaches the same rmtree, so it carries the same bounds."""
+    from aigauge.config import _PENDING_PURGE_LIMIT, _PROFILE_ID_MAX_LEN
+
+    assert Config(pending_data_clears={"a": 1}).pending_data_clears == []
+    assert Config(pending_data_clears="claude").pending_data_clears == []
+    assert Config(
+        pending_data_clears=["claude", "", None, 3, b"codex", ["nested"], "codex"]
+    ).pending_data_clears == ["claude", "codex"]
+    assert Config(
+        pending_data_clears=["claude", "a" * (_PROFILE_ID_MAX_LEN + 1)]
+    ).pending_data_clears == ["claude"]
+    assert len(
+        Config(
+            pending_data_clears=[f"codex-{index:08d}" for index in range(5_000)]
+        ).pending_data_clears
+    ) == _PENDING_PURGE_LIMIT
+
+
 def test_the_pending_purge_list_survives_a_round_trip_through_the_file():
     config_path().parent.mkdir(parents=True, exist_ok=True)
     config_path().write_text(
@@ -679,3 +867,27 @@ def test_the_pending_purge_list_survives_a_round_trip_through_the_file():
     )
 
     assert Config.load().pending_profile_purges == ["claude-ab12cd34"]
+
+
+def test_the_pending_purge_list_is_bounded_in_length_and_in_entries():
+    """A delete list read at every start, from a file this module treats as
+    hostile everywhere else. `purge_profile` is still the defence that
+    matters - it refuses anything that does not resolve strictly inside
+    `profiles/` - but a poisoned file carrying 5 000 ids of 200 000
+    characters should not reach it, or the line that announces the drain, at
+    all. The length bound is `_PROFILE_ID_RE`'s own, so nothing the app can
+    generate is lost.
+    """
+    from aigauge.config import _PENDING_PURGE_LIMIT, _PROFILE_ID_MAX_LEN
+
+    long_id = "a" * (_PROFILE_ID_MAX_LEN + 1)
+    kept = Config(
+        pending_profile_purges=["claude-ab12cd34", long_id, "b" * _PROFILE_ID_MAX_LEN]
+    ).pending_profile_purges
+    assert kept == ["claude-ab12cd34", "b" * _PROFILE_ID_MAX_LEN]
+
+    many = Config(
+        pending_profile_purges=[f"codex-{index:08d}" for index in range(5_000)]
+    ).pending_profile_purges
+    assert len(many) == _PENDING_PURGE_LIMIT
+    assert many[0] == "codex-00000000", "the cap took the wrong end of the list"

@@ -79,7 +79,22 @@ def app_data_dir() -> Path:
 # Restrict them to the shape our own generators produce (slugs, hex suffixes,
 # and the fixed provider ids like ``opencode_go``) so a poisoned config.json
 # can never turn an id into a path-traversal payload.
-_PROFILE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_PROFILE_ID_MAX_LEN = 64
+_PROFILE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,%d}" % _PROFILE_ID_MAX_LEN)
+
+# The provider keys ``App._build_providers`` creates that are NOT browser
+# accounts. A ``BrowserAccount`` carrying one of these collides with it in
+# ``_providers``, ``_snapshots`` and the tile map - one account's numbers
+# under another provider's name, and a ``profiles/`` directory named after a
+# provider that has no profile. ``claude`` and ``codex`` are deliberately
+# absent: they are the two fixed browser accounts and those ids are theirs.
+_RESERVED_PROVIDER_IDS = frozenset({"copilot", "openrouter", "opencode_go", "azure"})
+
+# How many deferred purges a config file may carry. The app defers one per
+# removed account and drains the list at the next start, so a real one holds
+# a handful; the cap is what stops a poisoned file from walking 5 000 ids
+# through `purge_profile` and the log line that announces them.
+_PENDING_PURGE_LIMIT = 64
 
 # Windows treats these as device names regardless of any extension, so a
 # profiles/<id> path built from one would target the device, not a directory.
@@ -98,6 +113,11 @@ def _is_safe_profile_id(provider: str) -> bool:
     return provider.split(".", 1)[0].lower() not in _WIN_RESERVED_NAMES
 
 
+def _is_valid_account_id(account_id: str) -> bool:
+    """Safe as a path component *and* not the name of another provider."""
+    return _is_safe_profile_id(account_id) and account_id not in _RESERVED_PROVIDER_IDS
+
+
 def webview_profile_dir(provider: str) -> Path:
     """Path to a provider/account's QtWebEngine profile.
 
@@ -114,6 +134,46 @@ def webview_profile_dir(provider: str) -> Path:
     if resolved != root_resolved and not resolved.is_relative_to(root_resolved):
         raise ValueError(f"profile path escapes root: {provider!r}")
     return target
+
+
+def is_usable_profile_id(provider: str) -> bool:
+    """Whether the profile sweep can act on this `profiles/` entry.
+
+    The tests the deletion path applies, on the same resolved path: the id
+    rule, and containment inside the `profiles/` root. A name can pass the
+    first and fail the second - a symlink inside `profiles/` that points out
+    of it has a perfectly legal name - so anything that wants to know what
+    will actually be deleted has to ask for both, which is what
+    `webview_profile_dir` already answers. Public because the settings dialog
+    needs the same answer and was reaching for the name rule alone.
+
+    A link is never one of these, whatever it resolves to. `webview_profile_dir`
+    answers about the *target*, so a link inside `profiles/` pointing at
+    another profile passes containment and the sweep then deletes the account
+    it aliases - while the live-scrape deferral is keyed on the link's own
+    name and never sees it, which is the use-after-free that deferral exists
+    to prevent. This app writes no links here; refusing them costs nothing
+    and makes the predicate an answer about the entry rather than its target.
+    """
+    try:
+        target = webview_profile_dir(provider)
+        if target.is_symlink():
+            return False
+        # And the root itself, which `webview_profile_dir` permits and
+        # `purge_profile` refuses - the one containment case where the two
+        # disagreed, in the "we deleted it" direction.
+        if target.resolve() == (app_data_dir() / "profiles").resolve():
+            return False
+    except ValueError:
+        return False
+    except (OSError, RuntimeError):
+        # `resolve()` touches the filesystem: a name the OS itself refuses is
+        # one `purge_profile` will not act on either, and a symlink loop
+        # raises `RuntimeError` rather than `OSError` on CPython - which the
+        # only caller happens to filter out with `is_dir()`, but this is a
+        # public predicate and its contract is that it answers.
+        return False
+    return True
 
 
 def config_path() -> Path:
@@ -367,7 +427,10 @@ class BrowserAccount(BaseModel):
         # The id is used verbatim as a profiles/ path component and as a
         # keyring/secret name; keep it to the generated slug-<hex> / fixed-id
         # shape so it can never carry a path-traversal or separator payload.
-        if not _is_safe_profile_id(value):
+        # It must also not be the key of a provider that is not a browser
+        # account - see _RESERVED_PROVIDER_IDS - because `_build_providers`
+        # keys one dict on both.
+        if not _is_valid_account_id(value):
             raise ValueError(f"unsafe browser account id: {value!r}")
         return value
 
@@ -683,18 +746,39 @@ class Config(BaseModel):
     # refuses anything that does not resolve strictly inside
     # `app_data_dir()/profiles`.
     pending_profile_purges: list[str] = Field(default_factory=list)
+    # The same deferral for Settings' "Clear all browser data", kept on its
+    # own list because the two drains differ: this one has no
+    # configured-account skip. The user asked for these profiles to be gone,
+    # and "the account is still configured" is what every one of them is -
+    # skipping them is what the *removal* list does, for an entry a restored
+    # backup has undone. Persisted for the same reason as that list: what
+    # would otherwise survive a quit inside the deferral window is the live
+    # provider session cookie, which is the thing the button exists to
+    # destroy.
+    pending_data_clears: list[str] = Field(default_factory=list)
     # When each provider kind last asked its page for every meter it renders,
     # ISO-8601 per kind. Empty (or missing) means the next refresh re-scans -
     # which is also how the Settings "Re-scan meters now" button works.
     meter_catalog_last_scan: dict[str, str] = Field(default_factory=dict)
     window: WindowState = Field(default_factory=WindowState)
 
-    @field_validator("pending_profile_purges", mode="before")
+    @field_validator("pending_profile_purges", "pending_data_clears", mode="before")
     @classmethod
     def _coerce_pending_purges(cls, value: object) -> list[str]:
         if not isinstance(value, list):
             return []
-        return [item for item in value if isinstance(item, str) and item]
+        # Defence in depth, and a bound on the line the startup drain logs.
+        # Path safety stays downstream in `_is_safe_profile_id` /
+        # `purge_profile`, which is what actually refuses a traversal
+        # payload; this is what stops a poisoned file carrying 5 000 ids of
+        # 200 000 characters from reaching either. The length bound is
+        # `_PROFILE_ID_RE`'s own, so no id the app can generate is lost.
+        kept = [
+            item
+            for item in value
+            if isinstance(item, str) and 1 <= len(item) <= _PROFILE_ID_MAX_LEN
+        ]
+        return kept[:_PENDING_PURGE_LIMIT]
 
     @field_validator("meter_catalog_last_scan", mode="before")
     @classmethod
@@ -815,15 +899,24 @@ class Config(BaseModel):
             accounts = [
                 item for item in data["browser_accounts"] if isinstance(item, dict)
             ]
-            # Drop entries whose id can't be a safe profiles/ path component
-            # before validation runs. Otherwise one poisoned id would raise out
-            # of Config.load()'s blanket except and discard the entire config;
+            # Drop entries whose id can't be a safe profiles/ path component,
+            # or that would collide with a non-browser provider key, before
+            # validation runs. Otherwise one poisoned id would raise out of
+            # Config.load()'s blanket except and discard the entire config;
             # dropping just the bad account preserves everything else.
-            accounts = [
-                item
-                for item in accounts
-                if _is_safe_profile_id(str(item.get("id") or ""))
-            ]
+            kept = []
+            for item in accounts:
+                account_id = str(item.get("id") or "")
+                if _is_valid_account_id(account_id):
+                    kept.append(item)
+                    continue
+                # Bounded: the id is config-controlled, and if it failed the
+                # regex it was never bounded by it either.
+                log.warning(
+                    "config: dropping browser account with an unusable id (%s)",
+                    _safe_repr(account_id, limit=_PROFILE_ID_MAX_LEN),
+                )
+            accounts = kept
             ids = {str(item.get("id") or "") for item in accounts}
             if "claude" not in ids:
                 accounts.insert(
