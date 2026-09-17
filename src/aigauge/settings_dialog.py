@@ -373,8 +373,8 @@ def _page_height(page: QWidget, width: int) -> int:
     one, else its minimum hint, and the viewport's height if that is more.
     ``sizeHint()`` is the wrong number: a word-wrapped ``QLabel`` hints at
     80 average characters, not at the width it will get, so General's hint
-    of 498 is 12 px over the 486 it lays out at in a 592-px viewport. Never
-    less than the minimum hint, which is what the scroll bar is measured
+    of 498 is 12 px over the 486 it lays out at 582 px wide. Never less
+    than the minimum hint, which is what the scroll bar is measured
     against; never less than the plain hint without height-for-width, so a
     page with no wrapped label opens at its preference rather than squeezed.
     """
@@ -1431,14 +1431,19 @@ class SettingsDialog(QDialog):
 
         The old ``resize(620, 520)`` was a number, not a measurement. The
         landing page is General, so that is what the dialog is sized to: the
-        height General lays out at in the viewport it will get, plus the
-        chrome around it, both read off the live widgets - 12 + 10 margins,
-        10 spacing, a 34-px button row, a 27-px tab bar and 4 px of pane,
-        i.e. 97, plus ``_DIALOG_HEIGHT_SLACK``. General is 486 px at the
-        592-px viewport width (its ``sizeHint()`` says 498, see
-        ``_page_height``), so the dialog opens at 589. A binary search for
-        the smallest height at which General shows no scroll bar gives 580:
-        9 px generous, 3 of them the pane rounding and 6 the slack.
+        height General lays out at, plus the chrome around it, both read off
+        the live widgets - 12 + 10 margins, 10 spacing, a 34-px button row,
+        a 27-px tab bar and 4 px of pane, i.e. 97, plus
+        ``_DIALOG_HEIGHT_SLACK``. The width General is measured at is the
+        viewport's less a scroll bar, 582 px here, because that is the width
+        ``QScrollArea`` decides with: its first pass runs with the bar
+        reserved, and a page that needs the bar at that width keeps it. On
+        the macOS runner General's wrapped label takes one more line at 584
+        than at 594 (505 px against 493), which is exactly the case the
+        wider width mis-sizes. General is 486 px here (its ``sizeHint()``
+        says 498, see ``_page_height``), so the dialog opens at 589. A binary
+        search for the smallest height at which General shows no scroll bar
+        gives 580: 9 px generous, 3 of them the pane rounding and 6 the slack.
 
         Every layout is activated first, deepest up - see
         ``_activate_layouts`` for why the top-level ``activate()`` alone left
@@ -1472,18 +1477,21 @@ class SettingsDialog(QDialog):
         available = (self.screen() or QApplication.primaryScreen()).availableGeometry()
         ceiling = int(available.height() * _DIALOG_SCREEN_FRACTION)
         width = min(_DIALOG_DEFAULT_W, available.width())
+        general_scroll = next(
+            scroll for scroll in self._page_scrolls if scroll.widget() is general_page
+        )
+        bar_extent = general_scroll.verticalScrollBar().sizeHint().width()
         # The page is laid out no narrower than its own minimum: the scroll
         # area expands the viewport width to it and clips (horizontal bar off).
         page_width = max(
-            width - margins.left() - margins.right() - pane_extra_w,
+            width - margins.left() - margins.right() - pane_extra_w - bar_extent,
             general_page.minimumSizeHint().width(),
         )
         content = _page_height(general_page, page_width)
         height = _dialog_height(content, chrome, _DIALOG_MIN_H, ceiling)
-        self._general_scroll = next(
-            scroll for scroll in self._page_scrolls if scroll.widget() is general_page
-        )
+        self._general_scroll = general_scroll
         self._height_terms = {
+            "page_w": page_width,
             "content": content,
             "chrome": chrome - _DIALOG_HEIGHT_SLACK,
             "slack": _DIALOG_HEIGHT_SLACK,
@@ -1507,18 +1515,19 @@ class SettingsDialog(QDialog):
     def _fit_general_page_on_show(self) -> None:
         """Measure General again with the real viewport, before the first paint.
 
-        The pre-show estimate reads its chrome off size hints, and a style can
-        lay its tab pane out a few pixels away from what it hinted: on the
-        macOS runner the landing page still opened with 3 px of scroll range
-        after the estimate was made exact for Fusion. Here the tree has been
+        The pre-show estimate can only read hints - the chrome, the page's
+        width - and a platform's fonts and style can land a few pixels away
+        from them. This is the guarantee behind it: here the tree has been
         polished and shown, so once the dialog's layouts are activated every
-        geometry is the real one, synchronously - a visible widget gets its
-        resize event inside ``setGeometry``. The viewport's width may still
-        reserve a scroll bar at this point, which only errs the page taller.
-        A deficit grows the dialog by that much, under the same ceiling; a
-        resize inside ``showEvent`` lands before the first paint, so there is
-        nothing to see. When the estimate is right, as it is here, this is a
-        measurement and no resize.
+        geometry is the real one, synchronously (a visible widget gets its
+        resize event inside ``setGeometry``), and the viewport's width is the
+        one the scroll area decides with, bar reserved. A deficit grows the
+        dialog by that much, under the same ceiling; a resize inside
+        ``showEvent`` lands before the first paint, so there is nothing to
+        see. When the estimate is right, as it is here, this is a measurement
+        and no resize - and the measured-need test warns with both sets of
+        terms wherever it is not, which is how the macOS runner's extra
+        wrapped line was found.
         """
         scroll = self._general_scroll
         if scroll is None:

@@ -918,11 +918,15 @@ def test_the_default_height_is_the_measured_need_plus_the_slack(qtbot):
     qtbot.wait(0)
     general = tabs.widget(general_index)
     assert general.verticalScrollBar().maximum() == 0, dialog._height_terms
+    # The estimate measures at the width the scroll area decides with, bar
+    # reserved - never wider than the viewport showEvent found.
+    terms = dialog._height_terms
+    assert terms["page_w"] <= terms["viewport_w"], terms
 
-    # The show-time measurement may grow the dialog where a style lays its
-    # pane out away from its hints; more than this and the estimate itself
-    # is wrong, not the style. Any growth is reported so a platform that
-    # needs it shows up in the run's warnings with its terms.
+    # The show-time measurement may grow the dialog where a platform's fonts
+    # or style land away from their hints; more than this and the estimate
+    # itself is wrong. Any growth is reported so a platform that needs it
+    # shows up in the run's warnings with both sets of terms.
     grew = dialog.height() - estimate
     assert 0 <= grew <= 8, dialog._height_terms
     if grew:

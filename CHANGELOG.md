@@ -118,10 +118,14 @@ user sees.
   i.e. 97, plus 6 px of declared slack, because a style rounds its tab pane
   differently in a hint than in a layout (Fusion's laid-out pane is 1 px, so
   the number is 3 px generous here and could be 3 px short elsewhere). The
-  page's need is its height-for-width at the width the viewport will have
-  (592 px), never less than its minimum hint - not its `sizeHint`, which for a
+  page's need is its height-for-width at the width the scroll area decides
+  with - the viewport less a scroll bar, 582 px, since a `QScrollArea`'s first
+  pass runs with the bar reserved and a page that needs it at that width keeps
+  it - never less than its minimum hint, and not its `sizeHint`, which for a
   page with a word-wrapped label is the height at 80 average characters, not at
-  the width it gets: General is 486 px at 592 (minimum 483, `sizeHint` 498).
+  the width it gets: General is 486 px at 582 (minimum 483, `sizeHint` 498).
+  On the macOS runner the same label takes one more line at 584 than at 594
+  (505 px against 493), which is what measuring at the wider width missed.
   And it is read only after every layout under the dialog has been activated,
   deepest first. A widget's `updateGeometry()` reaches only its parent's
   top-level layout, a hidden widget drops the `LayoutRequest`, and the nested
@@ -135,10 +139,11 @@ user sees.
   slack of that search from both sides. Then `showEvent` measures once more,
   with the real viewport: the tree is polished and shown by then, so after the
   layouts are activated every geometry is the laid-out one, and a deficit
-  grows the dialog before its first paint. Offscreen this is a measurement
-  and no resize; the macOS runner, whose style lays its pane out 3 px away
-  from what it hinted, is what it exists for. The chrome is deliberately not
-  derived as `height() - viewport().height()` before `show()`: the viewport is
+  grows the dialog before its first paint. That is the guarantee behind the
+  estimate on a platform whose fonts or style land away from their hints;
+  offscreen it is a measurement and no resize, and the test that pins the
+  default warns with both sets of terms wherever it is not. The chrome is
+  deliberately not derived as `height() - viewport().height()` before `show()`: the viewport is
   still at its unlaid 640 x 480 then and the subtraction comes out **-60**,
   which yields a 428 px dialog in which General itself scrolls. Both ends are
   clamped to the screen's work area, the minimum included - at 200 % display
