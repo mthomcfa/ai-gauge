@@ -78,6 +78,14 @@ PROVIDER_ORDER = ("claude", "codex", "opencode_go", "copilot", "azure", "openrou
 # and a chip that wraps costs a whole row in the collapsed panel.
 COMPACT_DISPLAY_NAMES = {"azure": "Azure"}
 COLLAPSED_MIN_HEIGHT = WINDOW_COLLAPSED_HEIGHT
+
+# How long after the last move/resize event of a window-manager drag the
+# geometry is written back. ``startSystemMove``/``startSystemResize`` hand the
+# pointer to the WM, which on Windows, macOS and X11 means the release never
+# comes back to us - so the only sign a drag has ended is that the events stop.
+# One second is long enough that a drag is one write and short enough that a
+# crash or a kill loses nothing the user would notice.
+NATIVE_GESTURE_COMMIT_MS = 1000
 # How far in from an edge a press counts as a resize rather than a drag. Eight
 # logical pixels is what a native frameless window uses and what a pointer can
 # be expected to land on; a wider band starts eating clicks on the tile rows.
@@ -1451,6 +1459,9 @@ class UsageWidget(QWidget):
         # mousePressEvent.
         self._press_moved = False
         self._screen_signals_wired = False
+        # True between the moment the window manager took a move or resize
+        # over and the moment its events stop arriving - see _arm_geometry_commit.
+        self._native_gesture = False
         # The height to come back to when the chip strip is expanded again;
         # seeded from the restored geometry at the end of __init__, because a
         # widget that starts collapsed never passes through set_collapsed.
@@ -1640,6 +1651,13 @@ class UsageWidget(QWidget):
         self._tick.timeout.connect(self._refresh_header_labels)
         self._tick.start(1000)
         self._expanded_height = self.height()
+        # What the file already says, so a hide or a close that changed
+        # nothing does not rewrite it.
+        self._committed_geometry = self._geometry_state()
+        self._geometry_commit = QTimer(self)
+        self._geometry_commit.setSingleShot(True)
+        self._geometry_commit.setInterval(NATIVE_GESTURE_COMMIT_MS)
+        self._geometry_commit.timeout.connect(self._commit_after_native_gesture)
         self._apply_collapsed_state(save=False)
         self._track_hover()
 
@@ -2368,6 +2386,7 @@ class UsageWidget(QWidget):
         if edges:
             if handle is not None and handle.startSystemResize(edges):
                 self._resize_edges = Qt.Edge(0)
+                self._native_gesture = True
             else:
                 self._resize_edges = edges
                 self._resize_origin = event.globalPosition().toPoint()
@@ -2407,6 +2426,7 @@ class UsageWidget(QWidget):
             handle = self.windowHandle()
             if handle is not None and handle.startSystemMove():
                 self._drag_offset = None
+                self._native_gesture = True
                 event.accept()
                 return
         self._press_moved = True
@@ -2451,11 +2471,11 @@ class UsageWidget(QWidget):
         if was_resizing:
             self._clamp_to_visible_screen()
         self._do_refit_height()
-        self._config.window.x = self.x()
-        self._config.window.y = self.y()
-        self._config.window.collapsed = self._collapsed
-        self._remember_size()
-        self._config.save()
+        # A release that did arrive ends the gesture here; the debounce is for
+        # the ones that do not.
+        self._native_gesture = False
+        self._geometry_commit.stop()
+        self._commit_geometry()
         if not self._press_moved:
             # A click, not a drag: this is where an open Settings window comes
             # forward, once the press can no longer be one.
@@ -2482,19 +2502,73 @@ class UsageWidget(QWidget):
         self._config.window.width = self.width()
         self._config.window.height = self.height()
 
+    def _geometry_state(self) -> tuple[int | None, int | None, int, int, bool]:
+        window = self._config.window
+        return (window.x, window.y, window.width, window.height, window.collapsed)
+
+    def _commit_geometry(self) -> None:
+        """The one place the window's geometry reaches the file.
+
+        It used to be ``mouseReleaseEvent`` alone, and the code's own comment
+        says that release does not arrive: ``startSystemMove`` and
+        ``startSystemResize`` hand the pointer to the window manager, which is
+        the path taken on Windows, macOS and X11/Wayland, and only offscreen
+        falls back to the pure-Qt drag the suite can see. ``hideEvent`` wrote
+        the model and never saved it, ``closeEvent`` saved without writing
+        x/y, and ``App.shutdown()`` hides and quits - so on a real desktop the
+        size and the position were lost about as often as they were kept.
+
+        Everything that can end a gesture now comes here: the release, a hide,
+        a close, and a one-shot debounce for the drags that end in the WM. The
+        dirty check is what makes that safe to call freely - a hide/show cycle
+        that moved nothing writes nothing, and one drag is one atomic write,
+        not one per event.
+        """
+        self._remember_size()
+        window = self._config.window
+        window.x = self.x()
+        window.y = self.y()
+        window.collapsed = self._collapsed
+        state = self._geometry_state()
+        if state == self._committed_geometry:
+            return
+        self._committed_geometry = state
+        self._config.save()
+
+    def _arm_geometry_commit(self) -> None:
+        """Re-start the debounce, but only while the WM owns the gesture.
+
+        Every other resize - auto-fit, a collapse, the screen clamp - is the
+        app moving its own window and is saved (or deliberately not) by
+        whatever asked for it.
+        """
+        if self._native_gesture:
+            self._geometry_commit.start()
+
+    def _commit_after_native_gesture(self) -> None:
+        self._native_gesture = False
+        # The WM is bounded by the maximum size, not by the work area's
+        # origin, so a drag can still leave the window part-way off a screen.
+        self._clamp_to_visible_screen()
+        self._commit_geometry()
+
+    def moveEvent(self, event):  # noqa: N802
+        super().moveEvent(event)
+        self._arm_geometry_commit()
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        self._arm_geometry_commit()
+
     def hideEvent(self, event):  # noqa: N802
         # The X button hides rather than closes, so closeEvent is not where a
         # size reliably gets written back.
-        self._remember_size()
-        self._config.window.x = self.x()
-        self._config.window.y = self.y()
+        self._commit_geometry()
         super().hideEvent(event)
 
     def closeEvent(self, event):  # noqa: N802
         self._do_refit_height()
-        self._config.window.collapsed = self._collapsed
-        self._remember_size()
-        self._config.save()
+        self._commit_geometry()
         self.closed.emit()
         super().closeEvent(event)
 

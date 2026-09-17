@@ -50,10 +50,21 @@ user sees.
   auto-fitted only while the config still carries both first-run values, i.e.
   while the window has never been sized by hand. After that the saved size
   wins and the tile area takes the difference - re-fitting on the next refresh
-  is exactly what would undo the drag. Only a *resize* writes the size back, so
-  moving a fresh window does not quietly switch auto-fit off, and the write
-  happens on release, on hide (the ✕ button hides rather than closes) and on
-  close.
+  is exactly what would undo the drag.
+
+  **The geometry is written back from one seam, `_commit_geometry()`**, and
+  everything that can end a gesture reaches it: the mouse release, a hide (the
+  ✕ button hides rather than closes, and `App.shutdown()` hides and quits), a
+  close, and - for the drags that end in the window manager - a one-second
+  single-shot debounce armed by `moveEvent`/`resizeEvent` while
+  `startSystemMove`/`startSystemResize` owns the pointer. That last one is the
+  path every real desktop takes and the one offscreen cannot see: the WM keeps
+  the release, so before this the position and the size of a WM-ended drag
+  reached the file only if the user later closed the window. The seam writes
+  x, y, width, height and collapsed together and saves only when one of them
+  changed, so a drag is one atomic write however many events it took, a
+  hide/show cycle that moved nothing writes nothing, and the clamp onto a
+  visible screen is re-run when the debounce fires.
 
 - **An app icon.** Three stacked pill bars at 47 %, 72 % and 92 % on the app's
   own rounded dark panel - the compact chip row the widget already shows, which

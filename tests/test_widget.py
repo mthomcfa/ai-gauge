@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 
 import pytest
 from PyQt6.QtCore import QEvent, QPoint, QPointF, Qt
-from PyQt6.QtGui import QMouseEvent
+from PyQt6.QtGui import QMouseEvent, QResizeEvent
 from PyQt6.QtWidgets import QApplication
 
 from aigauge.config import (
@@ -17,6 +17,7 @@ from aigauge.models import SnapshotStatus, UsageMetric, UsageSnapshot
 from aigauge.ratio import RatioEstimate
 from aigauge.ui_style import SCROLLBAR_WIDTH
 from aigauge.widget import (
+    NATIVE_GESTURE_COMMIT_MS,
     UsageWidget,
     _format_ratio_inline,
     _MetricRow,
@@ -1367,6 +1368,100 @@ def test_moving_a_fresh_window_does_not_end_auto_fit(qtbot):
         WINDOW_DEFAULT_HEIGHT,
     )
     assert (config.window.x, config.window.y) == (widget.x(), widget.y())
+
+
+def test_the_geometry_survives_a_drag_the_window_manager_ended(qtbot):
+    """No press, no release - the path every real desktop takes.
+
+    ``startSystemMove``/``startSystemResize`` hand the pointer to the window
+    manager and the release comes back to it, not to us; offscreen they both
+    return False, which is why the suite only ever saw the pure-Qt fallback.
+    ``hideEvent`` wrote the model without saving it and ``App.shutdown()``
+    hides and quits, so the size and position were lost on every such drag.
+    """
+    config = Config()
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_ok_snapshot("claude"), "Claude")
+    with qtbot.waitExposed(widget):
+        widget.show()
+    widget._mark_user_sized()  # noqa: SLF001
+    geo = QApplication.primaryScreen().availableGeometry()
+    widget.setGeometry(
+        geo.left() + 30,
+        geo.top() + 40,
+        min(520, geo.width() - 60),
+        min(360, geo.height() - 80),
+    )
+    qtbot.wait(0)
+
+    widget.hide()
+
+    loaded = Config.load()
+    assert (loaded.window.x, loaded.window.y) == (widget.x(), widget.y())
+    assert (loaded.window.width, loaded.window.height) == (
+        widget.width(),
+        widget.height(),
+    )
+
+
+def test_a_window_manager_drag_is_written_once_when_its_events_stop(qtbot, monkeypatch):
+    """One atomic write per gesture, and none during it.
+
+    The only sign a WM-owned drag has ended is that its events stop, so the
+    save is a single-shot debounce armed by move and resize while the gesture
+    is live - not one write per event, which at 200 events a drag would be
+    200 fsyncs.
+    """
+    config = Config()
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+    widget._mark_user_sized()  # noqa: SLF001
+    assert widget._geometry_commit.isSingleShot()  # noqa: SLF001
+    assert widget._geometry_commit.interval() == NATIVE_GESTURE_COMMIT_MS  # noqa: SLF001
+    # The same timer, wound down so the test does not sit out a second.
+    widget._geometry_commit.setInterval(1)  # noqa: SLF001
+
+    saves: list[int] = []
+    monkeypatch.setattr(Config, "save", lambda self: saves.append(1))
+
+    widget._native_gesture = True  # startSystemResize returned True  # noqa: SLF001
+    before = widget.size()
+    for step in range(20):
+        widget.resize(360 + step, 240 + step)
+        widget.resizeEvent(QResizeEvent(widget.size(), before))
+    assert saves == [], "the drag itself wrote to the file"
+
+    qtbot.waitUntil(lambda: bool(saves), timeout=3000)
+    qtbot.wait(20)
+    assert saves == [1], "one gesture, more than one write"
+    assert (config.window.width, config.window.height) == (
+        widget.width(),
+        widget.height(),
+    )
+    assert widget._native_gesture is False  # noqa: SLF001
+
+
+def test_a_hide_that_changed_nothing_writes_nothing(qtbot, monkeypatch):
+    """The dirty check. Re-applying the always-on-top flag hides and shows the
+    window, and the App hides it on quit, so the commit seam is reached far
+    more often than the geometry changes."""
+    config = Config()
+    config.window.x, config.window.y = 60, 70
+    config.window.width, config.window.height = 420, 280
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+    with qtbot.waitExposed(widget):
+        widget.show()
+    qtbot.wait(0)
+
+    saves: list[int] = []
+    monkeypatch.setattr(Config, "save", lambda self: saves.append(1))
+    widget.hide()
+    widget.show()
+    widget.hide()
+
+    assert saves == []
 
 
 def test_a_click_raises_settings_but_a_drag_does_not(qtbot):
