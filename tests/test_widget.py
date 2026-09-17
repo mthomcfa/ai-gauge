@@ -1508,3 +1508,159 @@ def test_the_collapsed_strip_keeps_the_width_the_user_chose(qtbot):
 
     assert widget.width() == chosen_width
     assert widget.height() == 58
+
+
+# --- An error tile with no rows -------------------------------------------
+
+
+def _error_snapshot(provider, error, metrics=(), status=SnapshotStatus.ERROR):
+    return UsageSnapshot(
+        provider=provider,
+        status=status,
+        metrics=list(metrics),
+        error=error,
+        fetched_at=datetime(2026, 4, 27, 12, 0),
+    )
+
+
+def test_an_error_tile_with_no_rows_says_what_happened(qtbot):
+    """The reported symptom - "the title and nothing else".
+
+    The status line was there all along: 26 px of "error" in the far corner of
+    a 340 px header, on a tile 22 px tall. It is now a full-width line under
+    the header carrying the message itself, and the corner tag names the
+    failure mode.
+    """
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    message = "Cost Management is rate limiting this tenant; next attempt at 12:16."
+    widget.update_snapshot(
+        _error_snapshot("azure", message), "Microsoft · Azure"
+    )
+    with qtbot.waitExposed(widget):
+        widget.show()
+    widget._do_refit_height()  # noqa: SLF001
+    qtbot.wait(0)
+    tile = widget._tiles["azure"]  # noqa: SLF001
+
+    assert tile.detail.isVisible()
+    assert tile.detail.width() > tile.header.width()
+    assert tile.detail.toolTip().startswith(message)
+    assert message.startswith(tile.detail.text().rstrip("…")), (
+        "the line does not show the beginning of the message"
+    )
+    assert "rate limited" in tile.status.text()
+    assert tile.height() > tile.header.sizeHint().height() + tile.detail.height() - 1
+
+
+def test_the_error_line_is_the_clickable_details_affordance(qtbot):
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_error_snapshot("azure", "boom"), "Microsoft · Azure")
+    tile = widget._tiles["azure"]  # noqa: SLF001
+
+    with qtbot.waitSignal(widget.details_requested) as signal:
+        tile.detail.mousePressEvent(
+            QMouseEvent(
+                QEvent.Type.MouseButtonPress,
+                QPointF(QPoint(4, 4)),
+                QPointF(tile.detail.mapToGlobal(QPoint(4, 4))),
+                Qt.MouseButton.LeftButton,
+                Qt.MouseButton.LeftButton,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+    assert signal.args == ["azure"]
+
+
+def test_a_long_error_is_elided_not_clipped(qtbot):
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    message = "x" * 60
+    widget.update_snapshot(_error_snapshot("azure", message), "Microsoft · Azure")
+    with qtbot.waitExposed(widget):
+        widget.show()
+    qtbot.wait(0)
+    detail = widget._tiles["azure"].detail  # noqa: SLF001
+
+    drawn = detail.text()
+    assert drawn.endswith("…")
+    assert detail.fontMetrics().horizontalAdvance(drawn) <= detail.width()
+    assert detail.toolTip().startswith(message), "the full text is unreachable"
+
+
+def test_an_error_tile_that_still_has_rows_does_not_repeat_itself(qtbot):
+    """With numbers on the tile the corner tag reads "error · stale" beside
+    them and a second red line would be noise."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(
+        _error_snapshot(
+            "azure",
+            "boom",
+            metrics=[UsageMetric("Spend", 40.0, datetime(2026, 4, 28, 12, 0))],
+        ),
+        "Microsoft · Azure",
+    )
+    tile = widget._tiles["azure"]  # noqa: SLF001
+
+    assert tile.detail.isVisibleTo(tile) is False
+    assert "stale" in tile.status.text()
+
+
+def test_a_provider_with_no_sign_in_button_says_why_it_is_unauthenticated(qtbot):
+    """Azure, Copilot and OpenRouter have no Sign in button, so
+    "not signed in" in the corner was the whole message."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(
+        _error_snapshot(
+            "azure",
+            "The client secret has expired.",
+            status=SnapshotStatus.AUTH_REQUIRED,
+        ),
+        "Microsoft · Azure",
+    )
+    tile = widget._tiles["azure"]  # noqa: SLF001
+    assert tile.detail.isVisibleTo(tile)
+    assert tile.detail.toolTip() == "The client secret has expired."
+    assert tile.detail.cursor().shape() == Qt.CursorShape.ArrowCursor
+
+    widget.update_snapshot(
+        _error_snapshot(
+            "claude", "Session expired.", status=SnapshotStatus.AUTH_REQUIRED
+        ),
+        "Claude",
+    )
+    claude = widget._tiles["claude"]  # noqa: SLF001
+    assert claude.action_btn.isVisibleTo(claude)
+    assert claude.detail.isVisibleTo(claude) is False, (
+        "a tile with a Sign in button does not also need a sentence"
+    )
+
+
+def test_a_recovered_tile_drops_the_error_line(qtbot):
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_error_snapshot("azure", "boom"), "Microsoft · Azure")
+    tile = widget._tiles["azure"]  # noqa: SLF001
+    assert tile.detail.isVisibleTo(tile)
+
+    widget.update_snapshot(_ok_snapshot("azure"), "Microsoft · Azure")
+    assert tile.detail.isVisibleTo(tile) is False
+    assert tile.detail.text() == ""
+
+
+@pytest.mark.parametrize(
+    "error,expected",
+    [
+        ("Cost Management is rate limiting this tenant", "error · rate limited"),
+        ("the request was throttled", "error · rate limited"),
+        ("something else entirely", "error"),
+    ],
+    ids=["rate-limiting", "throttled", "unmatched"],
+)
+def test_a_rate_limit_is_named_in_the_corner_tag(error, expected):
+    from aigauge.widget import _short_error_reason
+
+    assert _short_error_reason(error) == expected

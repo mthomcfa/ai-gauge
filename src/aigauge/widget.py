@@ -356,7 +356,74 @@ def _short_error_reason(error: str | None) -> str:
         return "error · api"
     if "not signed in" in e or "auth" in e:
         return "error · signed out"
+    # Azure's 429 is the common one that matched nothing and showed a bare
+    # "error" - 26 px of text in the corner of a 340 px header.
+    if "rate limit" in e or "throttl" in e:
+        return "error · rate limited"
     return "error"
+
+
+class _DetailLine(QLabel):
+    """One elided, optionally clickable line of explanation under a header.
+
+    A plain-text label rather than the rich-text link the corner tag uses:
+    the text is an error message of arbitrary length and it has to be elided
+    to whatever width the window currently has, which a rich-text link cannot
+    be. Clicking is wired here instead, to the same handler the tag reaches.
+    """
+
+    clicked = pyqtSignal()
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._full_text = ""
+        self._clickable = False
+        self.setVisible(False)
+        self.setWordWrap(False)
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+
+    def set_line(self, text: str, *, clickable: bool, color: str) -> None:
+        self._full_text = text or ""
+        self._clickable = clickable and bool(self._full_text)
+        self.setStyleSheet(
+            f"color:{color}; font-size:10px;"
+            + (" text-decoration: underline;" if self._clickable else "")
+        )
+        self.setToolTip(
+            (self._full_text + "\n\nClick for details.")
+            if self._clickable
+            else self._full_text
+        )
+        self.setCursor(
+            Qt.CursorShape.PointingHandCursor
+            if self._clickable
+            else Qt.CursorShape.ArrowCursor
+        )
+        self.setVisible(bool(self._full_text))
+        self._elide()
+
+    def _elide(self) -> None:
+        if not self._full_text:
+            super().setText("")
+            return
+        super().setText(
+            self.fontMetrics().elidedText(
+                self._full_text, Qt.TextElideMode.ElideRight, max(0, self.width())
+            )
+        )
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        self._elide()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._clickable and event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        # Ignored on purpose: an unclickable line must keep propagating the
+        # press to the window, which is what drags the panel.
+        event.ignore()
 
 
 def _render_refresh_pixmap(color: str, size: int) -> QPixmap:
@@ -938,10 +1005,20 @@ class _ProviderTile(QFrame):
         self._ratio_recent: list[float] = []
         self._ratio_live: RatioEstimate | None = None
 
+        # One line under the header for a tile that has nothing else to show.
+        # A header and a 26-px "error" in the far corner is what the user
+        # reported as "the title and nothing else"; it was there, it was just
+        # not sayable from across the room.
+        self.detail = _DetailLine(self)
+        self.detail.clicked.connect(
+            lambda: self.details_requested.emit(self.provider)
+        )
+
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(6, 4, 6, 4)
         self._layout.setSpacing(2)
         self._layout.addLayout(header_row)
+        self._layout.addWidget(self.detail)
 
         # Refresh-in-progress dim. Animates between 1.0 and 0.55 so the user
         # sees a brief breath when refresh starts/completes instead of a snap.
@@ -1040,6 +1117,7 @@ class _ProviderTile(QFrame):
     def set_snapshot(self, snapshot: UsageSnapshot | None) -> None:
         self._latest_snapshot = snapshot
         if snapshot is None:
+            self._set_detail(None)
             self.status.setText("loading…")
             self.status.setStyleSheet(
                 "color: #6b7280; font-size: 10px; font-style: italic;"
@@ -1060,13 +1138,25 @@ class _ProviderTile(QFrame):
             )
             self.status.setToolTip(snapshot.error or "")
             self.status.setCursor(Qt.CursorShape.ArrowCursor)
-            self.action_btn.setVisible(
-                _provider_family(self.provider) in ("claude", "codex", "opencode_go")
+            can_sign_in = _provider_family(self.provider) in (
+                "claude",
+                "codex",
+                "opencode_go",
             )
+            self.action_btn.setVisible(can_sign_in)
             self.expand_btn.setVisible(False)
             self.ratio_label.setVisible(False)
             self._hide_compact_metrics()
             self._set_rows([])
+            # A provider with no Sign in button - Azure, Copilot, OpenRouter -
+            # otherwise leaves "not signed in" in the corner and no hint as to
+            # what is missing. The reason is not clickable: the details dialog
+            # opens only for an ERROR snapshot.
+            self._set_detail(
+                None if can_sign_in else snapshot.error,
+                clickable=False,
+                color="#f59e0b",
+            )
             return
 
         if snapshot.status == SnapshotStatus.ERROR:
@@ -1096,6 +1186,14 @@ class _ProviderTile(QFrame):
             )
             self.expand_btn.setVisible(has_breakdown or bool(compact_metrics))
             self._update_expand_btn_glyph()
+            # Only when there is nothing else on the tile. With rows present
+            # the corner tag reads "error · stale" beside numbers that explain
+            # themselves, and a second red line would be noise.
+            self._set_detail(
+                None if snapshot.metrics else (snapshot.error or "unknown error"),
+                clickable=True,
+                color="#ef4444",
+            )
             if compact_metrics and not self._expanded:
                 self._set_rows([])
                 self._set_compact_metrics(compact_metrics)
@@ -1121,6 +1219,7 @@ class _ProviderTile(QFrame):
             return
 
         # OK
+        self._set_detail(None)
         self.status.setText("")
         self.status.setStyleSheet(
             "color: #9ca3af; font-size: 10px; font-style: normal;"
@@ -1159,6 +1258,15 @@ class _ProviderTile(QFrame):
                 for m in visible
             ]
         )
+
+    def _set_detail(
+        self,
+        text: str | None,
+        *,
+        clickable: bool = False,
+        color: str = "#ef4444",
+    ) -> None:
+        self.detail.set_line(text or "", clickable=clickable, color=color)
 
     def set_ratio(
         self,
