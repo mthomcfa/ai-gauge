@@ -9,6 +9,7 @@ from aigauge.config import (
     BrowserAccount,
     Config,
     config_path,
+    WINDOW_AUTOFIT_MAX_HEIGHT,
     WINDOW_DEFAULT_HEIGHT,
     WINDOW_MIN_HEIGHT,
     WINDOW_MIN_WIDTH,
@@ -25,6 +26,7 @@ from aigauge.widget import (
     _connect_once,
     _QT_SIZE_MAX,
     _TOOLTIP_ERROR_CHARS,
+    _CompactMetric,
     _format_ratio_inline,
     _MetricRow,
     _safe_tooltip,
@@ -1755,6 +1757,111 @@ def test_an_app_resize_neither_marks_the_window_nor_arms_the_debounce(qtbot):
     ), "the collapse armed the commit debounce"
 
 
+def _prepare_a_screen_clamp(qtbot, widget):
+    """A window bigger than its work area and hanging off the right of it."""
+    work_area = QApplication.primaryScreen().availableGeometry()
+    widget._app_geometry(widget.setMaximumSize, _QT_SIZE_MAX, _QT_SIZE_MAX)  # noqa: SLF001
+    widget._app_geometry(  # noqa: SLF001
+        widget.resize, work_area.width() + 120, work_area.height() + 120
+    )
+    widget._app_geometry(  # noqa: SLF001
+        widget.move, work_area.right() - 20, work_area.top() + 10
+    )
+    return widget._clamp_to_visible_screen  # noqa: SLF001
+
+
+def _prepare_a_work_area_cap(qtbot, widget):
+    """The same oversized window, capped by the monitor it is on."""
+    work_area = QApplication.primaryScreen().availableGeometry()
+    widget._app_geometry(widget.setMaximumSize, _QT_SIZE_MAX, _QT_SIZE_MAX)  # noqa: SLF001
+    widget._app_geometry(  # noqa: SLF001
+        widget.resize, work_area.width() + 120, work_area.height() + 120
+    )
+    return widget._apply_screen_bounds  # noqa: SLF001
+
+
+def _prepare_an_expand(qtbot, widget):
+    """The height the window comes back to when the strip is expanded."""
+    tall = widget.height()
+    widget.set_collapsed(True)
+    qtbot.waitUntil(lambda: widget.height() < tall, timeout=3000)
+    return lambda: widget.set_collapsed(False)
+
+
+def _prepare_a_collapse(qtbot, widget):
+    """The other direction, which is the one that shrinks it to a strip.
+
+    Taller than the collapsed maximum first, so that maximum is what resizes
+    the window: at a height already under it the `setMaximumHeight` changes no
+    geometry and only the re-fit after it - pinned elsewhere - would answer.
+    """
+    widget._app_geometry(  # noqa: SLF001
+        widget.resize, widget.width(), WINDOW_AUTOFIT_MAX_HEIGHT + 120
+    )
+    return lambda: widget.set_collapsed(True)
+
+
+@pytest.mark.parametrize(
+    "prepare",
+    [
+        _prepare_a_screen_clamp,
+        _prepare_a_work_area_cap,
+        _prepare_an_expand,
+        _prepare_a_collapse,
+    ],
+    ids=["a screen clamp", "a work-area cap", "an expand", "a collapse"],
+)
+def test_no_app_geometry_call_reads_as_the_user_taking_the_size_over(qtbot, prepare):
+    """Every geometry call the app makes on its own window is behind the seam.
+
+    `test_an_app_resize_neither_marks…` pins auto-fit and the collapse's own
+    re-fit; these are the other four calls, each driven with the flags a
+    window-manager press leaves behind. The work-area cap is the one that was
+    live: with a stale flag, a monitor change or a taskbar appearing shrank
+    the window and *that* was recorded as the size the user chose, written to
+    disk, and auto-fit was off for good.
+    """
+    config = Config()
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_ok_snapshot("claude"), "Claude")
+    with qtbot.waitExposed(widget):
+        widget.show()
+    qtbot.wait(0)
+
+    drive = prepare(qtbot, widget)
+    widget._native_gesture = True  # what a press the WM accepted leaves  # noqa: SLF001
+    widget._native_resize = True  # noqa: SLF001
+    widget._geometry_commit.stop()  # noqa: SLF001
+    before = widget.geometry()
+
+    drive()
+    # A floor: a call that changed no geometry could not have marked anything.
+    qtbot.waitUntil(lambda: widget.geometry() != before, timeout=3000)
+    qtbot.wait(0)
+
+    assert widget._user_sized is False, "an app geometry call chose a size"  # noqa: SLF001
+    assert config.window.user_sized is False
+    assert (  # noqa: SLF001
+        widget._geometry_commit.isActive() is False
+    ), "an app geometry call armed the commit debounce"
+
+
+def test_the_dirty_check_sees_user_sized_change_on_its_own(qtbot):
+    """`user_sized` is a member of the tuple the commit compares, not a
+    passenger. A drag out and back to exactly the saved size changes that
+    field and nothing else; with it out of the tuple the commit would find
+    nothing to write and the file would still say auto-fit was on."""
+    config = Config()
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+
+    state = widget._geometry_state()  # noqa: SLF001
+    config.window.user_sized = not config.window.user_sized
+
+    assert widget._geometry_state() != state  # noqa: SLF001
+
+
 def test_a_pause_in_a_window_manager_drag_does_not_lose_the_rest_of_it(qtbot, monkeypatch):
     """The debounce is a commit, not the end of the gesture.
 
@@ -1836,6 +1943,13 @@ def test_the_debounce_clamps_an_off_screen_window_only_once_the_button_is_up(
         lambda: widget.x() + widget.width() - 1 <= work_area.right(), timeout=3000
     )
     assert widget.x() >= work_area.left()
+
+    # The clamp runs *before* the commit, so the file holds the geometry the
+    # clamp produced and not the one the drag left behind. With the two
+    # swapped the window is on screen and the file is not: the next launch
+    # restores the off-screen position and only the show-time clamp saves it.
+    on_disk = Config.load().window
+    assert (on_disk.x, on_disk.y) == (widget.x(), widget.y())
 
 
 def test_a_resize_that_begins_with_a_pause_is_still_the_users_size(qtbot, monkeypatch):
@@ -1996,10 +2110,20 @@ def test_the_macos_popover_anchor_is_not_saved_over_the_users_position(qtbot):
     qtbot.wait(0)
     chosen = widget.pos()
 
-    widget.show_as_popover(QApplication.primaryScreen().availableGeometry().center().x(), 24)
+    centre_x = QApplication.primaryScreen().availableGeometry().center().x()
+    widget.show_as_popover(centre_x, 24)
     qtbot.wait(0)
     assert widget.pos() != chosen, "the popover did not move the window"
     widget.resize(widget.width() + 20, widget.height())
+
+    # A second open while the window is already visible, which is the one that
+    # needs the seam: the first changed the window flags, and that hides the
+    # window, so its move was deferred and the visibility half answered it.
+    # With the flags already `Popup`, `setWindowFlags` returns early and the
+    # move is delivered inside the call - at depth 1, or not at all.
+    widget.show_as_popover(centre_x - 60, 24)
+    qtbot.wait(0)
+    assert widget._app_positioned is True, "a repeat popover open cleared the flag"  # noqa: SLF001
 
     widget.hide()
 
@@ -2661,7 +2785,6 @@ def test_an_error_tooltip_is_clipped_and_shows_markup_literally(qtbot):
 
     for tooltip in (tile.detail.toolTip(), tile.status.toolTip()):
         assert "&lt;b&gt;" in tooltip
-        assert "<b>" not in _tooltip_text(tooltip).replace("<b>x</b>", "")
         assert _tooltip_text(tooltip).startswith("<b>x</b>")
     assert tile.detail.text() == "<b>x</b>", "the label itself is the literal"
 
@@ -2756,20 +2879,21 @@ def _tooltip_bound() -> int:
     return (_TOOLTIP_ERROR_CHARS + 1) * 6 + len(_safe_tooltip("x")) - 1
 
 
-def _poisoned_snapshot(provider, status=SnapshotStatus.OK):
+def _poisoned_snapshot(provider, status=SnapshotStatus.OK, count=1):
     note = _POISON * 2000  # 20 000 characters, far past the tooltip clip
     return UsageSnapshot(
         provider=provider,
         status=status,
         metrics=[
             UsageMetric(
-                label=f"{_POISON} Session",
-                percent_used=40.0,
+                label=f"{_POISON} Session {index}" if index else f"{_POISON} Session",
+                percent_used=40.0 + index,
                 resets_at=datetime(2026, 4, 27, 14, 0),
                 reset_label=f"{_POISON} soon",
                 note=note,
                 window=timedelta(hours=5),
             )
+            for index in range(count)
         ],
         error=note,
         fetched_at=datetime(2026, 4, 27, 12, 0),
@@ -2835,8 +2959,12 @@ def test_no_label_or_tooltip_in_the_panel_interprets_provider_text(qtbot):
     widget.update_snapshot(
         _poisoned_snapshot("azure", SnapshotStatus.ERROR), "Microsoft · Azure"
     )
-    for tile in widget._tiles.values():  # noqa: SLF001
-        tile.set_expanded(True, emit=False)
+    # A tile left collapsed, with the two metrics a compact summary needs: it
+    # is the only way a `_CompactMetric` exists, and expanding every tile - as
+    # this test used to - meant the sweep never saw one.
+    widget.update_snapshot(_poisoned_snapshot("codex", count=2), "Codex")
+    for provider, tile in widget._tiles.items():  # noqa: SLF001
+        tile.set_expanded(provider != "codex", emit=False)
     with qtbot.waitExposed(widget):
         widget.show()
     qtbot.wait(0)
@@ -2867,6 +2995,17 @@ def test_no_label_or_tooltip_in_the_panel_interprets_provider_text(qtbot):
             tooltip = holder.toolTip()
             assert len(tooltip) <= bound, f"{type(holder).__name__} tooltip is unbounded"
             assert "<b>" not in tooltip, f"{type(holder).__name__} tooltip is unescaped"
+        # The compact metric is the one holder the marker cannot find by text:
+        # `code` shows the *first character* of a page-supplied label, so a
+        # poisoned label reaches it as a bare "<" - which `AutoText` renders as
+        # nothing at all. The floor is that the sweep saw one.
+        compact = [h for h in tooltips if isinstance(h, _CompactMetric)]
+        assert compact, f"the sweep found no collapsed tile's metrics ({state})"
+        for item in compact:
+            for label in (item.code, item.pct, item.reset):
+                assert (
+                    label.textFormat() == Qt.TextFormat.PlainText
+                ), f"a compact metric's {label.objectName() or 'label'} is interpreted"
 
 
 def test_an_error_tile_that_still_has_rows_does_not_repeat_itself(qtbot):

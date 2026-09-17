@@ -3417,6 +3417,41 @@ def test_the_throttled_message_is_composed_with_the_fetchs_clock(monkeypatch, co
 
 
 @responses.activate
+def test_the_429_handlers_stale_settings_note_is_composed_with_the_fetchs_clock(
+    monkeypatch, config
+):
+    """The 429 handler's *other* message site, and the one the spy could not
+    see: with an aggregate to serve it returns the cached figures with the
+    stale-settings note instead of the throttled error, so the two sites are
+    exclusive and the test beside this one only ever reached the error. A
+    settings change that has not been asked yet plus a tenant being rate
+    limited is exactly when this one composes a sentence naming a time.
+    """
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    _run(az.AzureProvider(config), monkeypatch)  # an aggregate worth serving
+    config.azure.reset_day = 15  # the question changed, so the gauge is stale
+    _run(az.AzureProvider(config), monkeypatch)  # marks it, fetches nothing
+    assert az.state_for(SUB).stale_settings is True
+    az.state_for(SUB).last_fetch_at -= az.MIN_FETCH_INTERVAL  # the window opens
+    _throttle("forecast")
+    ticks = _ticking_clock(monkeypatch)
+    clocks = _clock_spy(monkeypatch)
+
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+
+    note = snapshot.metrics[0].note or ""
+    assert "Settings changed" in note, "the 429 handler did not serve the cache"
+    assert "Next fetch at" in note
+    assert None not in clocks, "the stale-settings note read a wall clock of its own"
+    gate_now, *message_clocks = clocks
+    assert message_clocks, "the 429 handler's stale-settings note was not reached"
+    assert gate_now == ticks[0], "the gate was not the first to read the clock"
+    assert set(message_clocks) == {ticks[1]}, "not the clock the fetch decided with"
+    assert ticks[1] != ticks[0]
+
+
+@responses.activate
 def test_a_live_429_reports_the_hourly_floor(monkeypatch, config):
     """End to end through the provider, not just the helper."""
     monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
