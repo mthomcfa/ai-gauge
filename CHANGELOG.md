@@ -249,7 +249,10 @@ user sees.
   attempt at HH:MM.", in local time and with the same `%H:%M` as
   `_stale_settings_note` - the same promise about the same clock, on the same
   tile. A `Retry-After` longer than the hour is still what is named, because
-  `blocked_until` is then the later of the two.
+  `blocked_until` is then the later of the two, and `next_allowed_at` is
+  floored at the clock, so neither sentence can name a time that has already
+  gone by - `max(candidates)` on a state with no `last_fetch_at` and an
+  expired `blocked_until` said "next attempt at 14:09" at 17:09.
 
 - **An error tile with no rows says what happened.** Reproduced offscreen with
   an empty metric list and a 68-character error: the status line was there, as
@@ -260,7 +263,9 @@ user sees.
   names the failure: `_short_error_reason` matched timeout, load failure,
   layout change, no data, api and signed out and nothing else, so Azure's 429 -
   the most common error this app shows - fell through to a bare "error"; a rate
-  limit or a throttle now reads "error · rate limited", 92 px against 26. And a
+  limit, a throttle or a bare `429` now reads "error · rate limited", 92 px
+  against 26, and that branch is tested **before** the api one, because a
+  string saying both ("GitHub API rate limit exceeded") is a throttle first. And a
   tile with no rows at all gets the message itself on a full-width line under
   the header - 324 px, and the tile grows from 22 px to 36 - elided to the
   window's current width with the full text in the tooltip, and clickable to
