@@ -1664,3 +1664,88 @@ def test_a_rate_limit_is_named_in_the_corner_tag(error, expected):
     from aigauge.widget import _short_error_reason
 
     assert _short_error_reason(error) == expected
+
+
+# --- The note is reachable by hovering any part of a row --------------------
+
+
+def _azure_component_snapshot(note="CA$1,234.56"):
+    return UsageSnapshot(
+        provider="azure",
+        status=SnapshotStatus.OK,
+        metrics=[
+            UsageMetric(label="Spend", percent_used=42.0, note="CA$4,000.00"),
+            UsageMetric(
+                label="Azure App Service",
+                percent_used=13.0,
+                note=note,
+                tag="meter_breakdown",
+            ),
+        ],
+        fetched_at=datetime(2026, 4, 27, 12, 0),
+    )
+
+
+def _component_row(qtbot):
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_azure_component_snapshot(), "Microsoft · Azure")
+    tile = widget._tiles["azure"]  # noqa: SLF001
+    tile.set_expanded(True, emit=False)
+    with qtbot.waitExposed(widget):
+        widget.show()
+    widget._do_refit_height()  # noqa: SLF001
+    qtbot.wait(0)
+    assert [row.label.text() for row in tile._rows][-1] == "Azure App Service"  # noqa: SLF001
+    return widget, tile._rows[-1]  # noqa: SLF001
+
+
+def test_every_part_of_a_component_row_carries_the_amount(qtbot):
+    """A Windows desktop showed no tooltip on an Azure component row. The row
+    has always carried the note and Qt propagates an unanswered ToolTip event
+    up from a child, but that rests on every child answering with nothing -
+    so each of them now carries it outright."""
+    _widget, row = _component_row(qtbot)
+
+    assert row.toolTip() == "CA$1,234.56"
+    for name in ("label", "bar", "pct"):
+        assert getattr(row, name).toolTip() == "CA$1,234.56", name
+
+
+@pytest.mark.parametrize(
+    "target", ["row", "label", "bar", "pct"], ids=["row", "label", "bar", "pct"]
+)
+def test_a_tooltip_event_anywhere_on_the_row_shows_the_amount(qtbot, target):
+    from PyQt6.QtGui import QHelpEvent
+    from PyQt6.QtWidgets import QToolTip
+
+    _widget, row = _component_row(qtbot)
+    widget = row if target == "row" else getattr(row, target)
+
+    QToolTip.hideText()
+    point = QPoint(2, 2)
+    event = QHelpEvent(QEvent.Type.ToolTip, point, widget.mapToGlobal(point))
+    QApplication.sendEvent(widget, event)
+    qtbot.wait(0)
+
+    assert event.isAccepted()
+    assert QToolTip.text() == "CA$1,234.56"
+    QToolTip.hideText()
+
+
+def test_a_row_with_no_note_leaves_no_stale_tooltip_behind(qtbot):
+    """The children are written on every set_metric, so a row reused for a
+    metric that has no note must not keep the previous one's."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_azure_component_snapshot(), "Microsoft · Azure")
+    tile = widget._tiles["azure"]  # noqa: SLF001
+    tile.set_expanded(True, emit=False)
+    row = tile._rows[-1]  # noqa: SLF001
+    assert row.label.toolTip() == "CA$1,234.56"
+
+    row.set_metric("Azure App Service", 13.0, None, None, None, None)
+
+    assert row.toolTip() == ""
+    for name in ("label", "bar", "pct"):
+        assert getattr(row, name).toolTip() == "", name

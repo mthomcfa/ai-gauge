@@ -816,6 +816,20 @@ class _MetricRow(QWidget):
             self.bar.setToolTip((tooltip + "\n\n" if tooltip else "") + pace_line)
         else:
             self.bar.setToolTip(note or "")
+        # The note again on the two children that had none of their own. Qt
+        # propagates an unanswered ToolTip event up to the parent, so the row's
+        # own tooltip should be enough - and measured offscreen it is, from the
+        # label, the bar, the percentage, the inner QProgressBar and the pace
+        # overlay alike. A Windows desktop nevertheless showed no tooltip at all
+        # on an Azure component row, and nothing on the hover path could be made
+        # to hide one here: window opacity, a resize, the one-second label tick,
+        # the collapsed-summary rebuild, a refresh dim, raise_(), re-applying
+        # the always-on-top flag and re-delivering the snapshot all leave an
+        # open tooltip standing. So rather than guess at the cause, this removes
+        # the assumption the propagation rests on - that every child under the
+        # pointer answers a ToolTip event with nothing.
+        for child in (self.label, self.pct):
+            child.setToolTip(note or "")
 
     def refresh_pace(self) -> None:
         self.bar.set_pace(_time_elapsed_percent(self._resets_at, self._window))
