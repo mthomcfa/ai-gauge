@@ -74,6 +74,11 @@ def _band_colors() -> tuple[QColor, QColor, QColor]:
     if _BAND_CACHE is None:
         if str(REPO_ROOT / "src") not in sys.path:
             sys.path.insert(0, str(REPO_ROOT / "src"))
+        # This import is the only thing this script does to the source tree,
+        # and without it the script leaves `src/aigauge/__pycache__/` and
+        # `src/aigauge/platforms/__pycache__/` behind - five .pyc files in a
+        # checkout, from a tool whose job is to write four assets.
+        sys.dont_write_bytecode = True
         from aigauge.config import ColorThresholds
 
         bands = ColorThresholds()

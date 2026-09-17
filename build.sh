@@ -57,13 +57,10 @@ PYINSTALLER_ARGS=(
 # a bundle, and the bundle still has a face.
 if [ "$(uname -s)" = "Darwin" ]; then
     PYINSTALLER_ARGS+=(--icon assets/icon/ai-gauge.icns)
-else
-    PYINSTALLER_ARGS+=(--icon assets/icon/ai-gauge-256.png)
-fi
-
-if [ "$(uname -s)" = "Darwin" ]; then
     # Reverse-DNS bundle id; keeps Info.plist + LaunchServices happy.
     PYINSTALLER_ARGS+=(--osx-bundle-identifier org.aigauge.ai-gauge)
+else
+    PYINSTALLER_ARGS+=(--icon assets/icon/ai-gauge-256.png)
 fi
 
 if [ "$ONEFILE" -eq 1 ]; then
