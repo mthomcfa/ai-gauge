@@ -129,8 +129,9 @@ user sees.
   page whose own minimum is wider than the viewport is laid out at that
   minimum and clipped, horizontal scrolling being off, so it is measured
   there - and the dialog's width, 620 by default, grows to the widest page's
-  minimum plus the same chrome, which is how the Windows runner's fonts
-  (General 612 px wide against 454 offscreen) get a dialog that clips nothing.
+  minimum plus the same chrome, up to the work area - which is how the Windows
+  runner's fonts, a third wider than Linux's (General 612 px against 454), get
+  a dialog as wide as its pages need rather than one that clips them.
   And it is read only after every layout under the dialog has been activated,
   deepest first. A widget's `updateGeometry()` reaches only its parent's
   top-level layout, a hidden widget drops the `LayoutRequest`, and the nested

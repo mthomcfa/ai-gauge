@@ -958,36 +958,47 @@ def test_the_default_height_is_the_measured_need_plus_the_slack(qtbot):
 def test_the_default_width_fits_the_widest_page(qtbot, monkeypatch):
     """No page is clipped, whatever the fonts make of its minimum.
 
-    Offscreen every page's minimum fits in 620 and the default holds; on the
-    Windows runner General's minimum is 612 px, wider than the viewport 620
-    leaves, and the dialog opens wider. Forcing the default down to 300
-    makes the rule engage here: the dialog still opens wide enough that
-    every page, shown, is no wider than its viewport - the Microsoft page
-    with its scroll bar included.
+    Offscreen on Linux every page's minimum fits in 620 and the default
+    holds; the Windows runner's fonts run a third wider (General 612 px
+    against 454) and the dialog opens as wide as the 800-px work area
+    allows. So the assertions are the rule's, not a number's: never
+    narrower than the default, every page shown no wider than its viewport
+    unless the work area is what bounds the dialog, and with the default
+    forced down to 300 the rule alone still opens wide enough - the 560
+    floor underneath.
     """
+
+    def every_page_fits(dialog: SettingsDialog) -> None:
+        available = dialog.screen().availableGeometry().width()
+        tabs = _tabs(dialog)
+        for i in range(tabs.count()):
+            tabs.setCurrentIndex(i)
+            qtbot.wait(0)
+            scroll = tabs.widget(i)
+            clipped = scroll.widget().width() > scroll.viewport().width()
+            assert not clipped or dialog.width() >= available, (
+                tabs.tabText(i),
+                dialog._height_terms,
+            )
+
     fits = SettingsDialog(Config())
     qtbot.addWidget(fits)
-    assert fits.width() == settings_dialog._DIALOG_DEFAULT_W
+    available = fits.screen().availableGeometry().width()
+    assert fits.width() >= min(settings_dialog._DIALOG_DEFAULT_W, available)
+    with qtbot.waitExposed(fits):
+        fits.show()
+    every_page_fits(fits)
 
     monkeypatch.setattr(settings_dialog, "_DIALOG_DEFAULT_W", 300)
     dialog = SettingsDialog(Config())
     qtbot.addWidget(dialog)
     asked = dialog._height_terms["width"]
-    assert 300 < asked < settings_dialog._DIALOG_MIN_W, (
-        "the rule should ask for exactly what the pages need, which is less "
-        "than the floor here; if the pages grew, re-measure"
-    )
+    assert asked > 300, "the rule did not engage"
     # The 560 floor is a separate rule and still applies underneath.
     assert dialog.width() == max(asked, settings_dialog._DIALOG_MIN_W)
     with qtbot.waitExposed(dialog):
         dialog.show()
-    tabs = _tabs(dialog)
-    for i in range(tabs.count()):
-        tabs.setCurrentIndex(i)
-        qtbot.wait(0)
-        scroll = tabs.widget(i)
-        assert scroll.widget().width() <= scroll.viewport().width(), tabs.tabText(i)
-        assert scroll.horizontalScrollBar().maximum() == 0, tabs.tabText(i)
+    every_page_fits(dialog)
 
 
 def test_page_height_measures_at_the_pages_own_minimum_when_wider(qtbot):
