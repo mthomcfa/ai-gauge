@@ -919,7 +919,9 @@ def test_the_default_height_is_the_measured_need_plus_the_slack(qtbot):
     general = tabs.widget(general_index)
     assert general.verticalScrollBar().maximum() == 0, dialog._height_terms
     # The estimate measures at the width the scroll area decides with, bar
-    # reserved - never wider than the viewport showEvent found.
+    # reserved - never wider than the viewport showEvent found. (A page whose
+    # own minimum is wider is measured at that minimum inside _page_height,
+    # as the area lays it out; the estimate's width stays the viewport's.)
     terms = dialog._height_terms
     assert terms["page_w"] <= terms["viewport_w"], terms
 
@@ -951,6 +953,69 @@ def test_the_default_height_is_the_measured_need_plus_the_slack(qtbot):
     assert 0 <= estimate + grew - smallest <= (
         settings_dialog._DIALOG_HEIGHT_SLACK + pane_rounding
     ), (estimate, grew, smallest, dialog._height_terms)
+
+
+def test_the_default_width_fits_the_widest_page(qtbot, monkeypatch):
+    """No page is clipped, whatever the fonts make of its minimum.
+
+    Offscreen every page's minimum fits in 620 and the default holds; on the
+    Windows runner General's minimum is 612 px, wider than the viewport 620
+    leaves, and the dialog opens wider. Forcing the default down to 300
+    makes the rule engage here: the dialog still opens wide enough that
+    every page, shown, is no wider than its viewport - the Microsoft page
+    with its scroll bar included.
+    """
+    fits = SettingsDialog(Config())
+    qtbot.addWidget(fits)
+    assert fits.width() == settings_dialog._DIALOG_DEFAULT_W
+
+    monkeypatch.setattr(settings_dialog, "_DIALOG_DEFAULT_W", 300)
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    asked = dialog._height_terms["width"]
+    assert 300 < asked < settings_dialog._DIALOG_MIN_W, (
+        "the rule should ask for exactly what the pages need, which is less "
+        "than the floor here; if the pages grew, re-measure"
+    )
+    # The 560 floor is a separate rule and still applies underneath.
+    assert dialog.width() == max(asked, settings_dialog._DIALOG_MIN_W)
+    with qtbot.waitExposed(dialog):
+        dialog.show()
+    tabs = _tabs(dialog)
+    for i in range(tabs.count()):
+        tabs.setCurrentIndex(i)
+        qtbot.wait(0)
+        scroll = tabs.widget(i)
+        assert scroll.widget().width() <= scroll.viewport().width(), tabs.tabText(i)
+        assert scroll.horizontalScrollBar().maximum() == 0, tabs.tabText(i)
+
+
+def test_page_height_measures_at_the_pages_own_minimum_when_wider(qtbot):
+    """The Windows case, reproduced: a page whose minimum is wider than the
+    viewport is laid out at that minimum, so that is where its height is
+    read - never at a narrower width that would wrap its labels more."""
+    from PyQt6.QtWidgets import QLabel, QVBoxLayout, QWidget
+
+    page = QWidget()
+    qtbot.addWidget(page)
+    layout = QVBoxLayout(page)
+    wide = QLabel("a row that sets the page's minimum width")
+    wide.setMinimumWidth(500)
+    layout.addWidget(wide)
+    label = QLabel("word " * 60)
+    label.setWordWrap(True)
+    layout.addWidget(label)
+    layout.activate()
+
+    minimum_w = page.minimumSizeHint().width()
+    assert minimum_w >= 500
+    at_minimum = page.heightForWidth(minimum_w)
+    assert page.heightForWidth(300) > at_minimum, (
+        "the label should wrap more at 300 than at the minimum, or this "
+        "proves nothing"
+    )
+    assert settings_dialog._page_height(page, 300) == at_minimum
+    assert settings_dialog._page_height(page, minimum_w + 200) <= at_minimum
 
 
 def test_a_short_estimate_is_corrected_before_the_first_paint(qtbot, monkeypatch):

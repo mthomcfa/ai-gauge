@@ -125,7 +125,12 @@ user sees.
   page with a word-wrapped label is the height at 80 average characters, not at
   the width it gets: General is 486 px at 582 (minimum 483, `sizeHint` 498).
   On the macOS runner the same label takes one more line at 584 than at 594
-  (505 px against 493), which is what measuring at the wider width missed.
+  (505 px against 493), which is what measuring at the wider width missed. A
+  page whose own minimum is wider than the viewport is laid out at that
+  minimum and clipped, horizontal scrolling being off, so it is measured
+  there - and the dialog's width, 620 by default, grows to the widest page's
+  minimum plus the same chrome, which is how the Windows runner's fonts
+  (General 612 px wide against 454 offscreen) get a dialog that clips nothing.
   And it is read only after every layout under the dialog has been activated,
   deepest first. A widget's `updateGeometry()` reaches only its parent's
   top-level layout, a hidden widget drops the `LayoutRequest`, and the nested

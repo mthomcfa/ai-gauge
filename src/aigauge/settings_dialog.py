@@ -309,9 +309,11 @@ def _build_stylesheet() -> str:
     )
 
 
-# The dialog's own geometry. Width is unchanged: the widest page minimum is
-# 500 px (Claude with accounts) and horizontal scrolling is off, so 560 is
-# still the right floor. Height is no longer a guess - see _dialog_height.
+# The dialog's own geometry. 620 wide by default, or as much wider as the
+# widest page's minimum needs: horizontal scrolling is off, so a page wider
+# than the viewport is clipped, and on the Windows runner's fonts General's
+# minimum is 612 px against 454 offscreen on Linux. 560 stays the floor a
+# user may shrink to. Height is no longer a guess - see _dialog_height.
 _DIALOG_DEFAULT_W = 620
 _DIALOG_MIN_W = 560
 _DIALOG_MIN_H = 420
@@ -378,7 +380,11 @@ def _page_height(page: QWidget, width: int) -> int:
     against; never less than the plain hint without height-for-width, so a
     page with no wrapped label opens at its preference rather than squeezed.
     """
-    minimum = page.minimumSizeHint().height()
+    minimum_size = page.minimumSizeHint()
+    # The area lays the page out no narrower than its own minimum (and clips
+    # it, the horizontal bar being off), so measure at the larger width.
+    width = max(width, minimum_size.width())
+    minimum = minimum_size.height()
     if page.hasHeightForWidth():
         return max(minimum, page.heightForWidth(width))
     return max(minimum, page.sizeHint().height())
@@ -1445,6 +1451,12 @@ class SettingsDialog(QDialog):
         search for the smallest height at which General shows no scroll bar
         gives 580: 9 px generous, 3 of them the pane rounding and 6 the slack.
 
+        The width is 620 unless the widest page's minimum plus the same
+        horizontal chrome (margins, pane, a scroll bar) needs more, so no
+        page is clipped on a platform whose fonts run wide - the Windows
+        runner lays General out 612 px wide, 18 px more than the viewport
+        620 leaves it. Both are bounded by the screen's work area.
+
         Every layout is activated first, deepest up - see
         ``_activate_layouts`` for why the top-level ``activate()`` alone left
         a nested row 10 px stale, and General scrolling by 6-7 px on the
@@ -1476,21 +1488,23 @@ class SettingsDialog(QDialog):
         )
         available = (self.screen() or QApplication.primaryScreen()).availableGeometry()
         ceiling = int(available.height() * _DIALOG_SCREEN_FRACTION)
-        width = min(_DIALOG_DEFAULT_W, available.width())
         general_scroll = next(
             scroll for scroll in self._page_scrolls if scroll.widget() is general_page
         )
         bar_extent = general_scroll.verticalScrollBar().sizeHint().width()
-        # The page is laid out no narrower than its own minimum: the scroll
-        # area expands the viewport width to it and clips (horizontal bar off).
-        page_width = max(
-            width - margins.left() - margins.right() - pane_extra_w - bar_extent,
-            general_page.minimumSizeHint().width(),
+        horizontal_chrome = margins.left() + margins.right() + pane_extra_w + bar_extent
+        pages_min_w = max(
+            scroll.widget().minimumSizeHint().width() for scroll in self._page_scrolls
         )
+        width = min(
+            max(_DIALOG_DEFAULT_W, pages_min_w + horizontal_chrome), available.width()
+        )
+        page_width = width - horizontal_chrome
         content = _page_height(general_page, page_width)
         height = _dialog_height(content, chrome, _DIALOG_MIN_H, ceiling)
         self._general_scroll = general_scroll
         self._height_terms = {
+            "width": width,
             "page_w": page_width,
             "content": content,
             "chrome": chrome - _DIALOG_HEIGHT_SLACK,
