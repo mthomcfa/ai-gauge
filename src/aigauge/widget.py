@@ -100,6 +100,23 @@ def _autofit_height(value: int) -> int:
     return max(WINDOW_MIN_HEIGHT, min(value, WINDOW_AUTOFIT_MAX_HEIGHT))
 
 
+def _connect_once(signal, slot) -> None:
+    """Connect, unless this exact connection is already there.
+
+    PyQt raises ``TypeError`` rather than answering False when a
+    ``UniqueConnection`` already exists, and "it is already connected" is the
+    answer every caller here wants: Qt announcing a screen twice would
+    otherwise wire it twice, and one work-area change would then clamp the
+    window three times. A set of screens already seen would do the same job
+    and keep a ``QScreen`` alive past the widget, which is the defect the
+    bound methods were introduced to fix.
+    """
+    try:
+        signal.connect(slot, Qt.ConnectionType.UniqueConnection)
+    except TypeError:
+        pass
+
+
 def _edges_for_point(point: QPoint, width: int, height: int) -> Qt.Edge:
     """Which window edges a point is on, as Qt.Edge flags (0 for none).
 
@@ -2391,15 +2408,17 @@ class UsageWidget(QWidget):
         if handle is None or self._screen_signals_wired:
             return
         self._screen_signals_wired = True
-        handle.screenChanged.connect(self._on_screen_changed)
+        _connect_once(handle.screenChanged, self._on_screen_changed)
         for screen in QApplication.screens():
             self._wire_screen(screen)
         app = QApplication.instance()
         if app is not None:
-            app.screenAdded.connect(self._on_screen_added)
+            _connect_once(app.screenAdded, self._on_screen_added)
 
     def _wire_screen(self, screen) -> None:
-        screen.availableGeometryChanged.connect(self._on_available_geometry_changed)
+        _connect_once(
+            screen.availableGeometryChanged, self._on_available_geometry_changed
+        )
 
     def _on_screen_added(self, screen) -> None:
         self._wire_screen(screen)

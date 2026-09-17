@@ -2036,6 +2036,28 @@ def test_a_screen_plugged_in_later_is_wired_too(qtbot, monkeypatch):
     assert wired == [screen]
 
 
+def test_wiring_a_screen_twice_leaves_one_connection(qtbot, monkeypatch):
+    """`_on_screen_added` wires unconditionally, so a screen Qt announced
+    twice got two connections on top of the one the first show made, and a
+    single `availableGeometryChanged` then clamped the window three times.
+    Qt does not re-announce a live QScreen, so this is closed by construction
+    rather than because it was reachable."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    with qtbot.waitExposed(widget):
+        widget.show()
+    screen = QApplication.primaryScreen()
+    clamps: list[int] = []
+    monkeypatch.setattr(widget, "_apply_screen_bounds", lambda: clamps.append(1))
+
+    widget._on_screen_added(screen)  # noqa: SLF001
+    widget._on_screen_added(screen)  # noqa: SLF001
+    clamps.clear()  # the two adds clamp on purpose; the connection is the point
+    screen.availableGeometryChanged.emit(screen.availableGeometry())
+
+    assert clamps == [1], "one work-area change, more than one clamp"
+
+
 def test_a_click_raises_settings_but_a_drag_does_not(qtbot):
     """The drag defect: activated_requested used to fire on every press, and
     the App answers it by activating the Settings window - which takes the
