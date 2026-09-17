@@ -21,7 +21,7 @@ Compact monitor for **Claude.ai**, **ChatGPT Codex**, **Microsoft** (Azure spend
 
 > **Requires Python 3.11+.** Secrets live in the OS-native credential store (Windows Credential Manager / DPAPI, macOS Keychain, Linux Secret Service). Auto-start uses the platform's standard mechanism (Windows Task Scheduler / LaunchAgent / `~/.config/autostart`).
 
-Current version: **1.3.2+cfa.7** — a fork version, see [Versioning](#versioning). Release notes in [CHANGELOG.md](CHANGELOG.md).
+Current version: **1.4.0+cfa.8** — a fork version, see [Versioning](#versioning). Release notes in [CHANGELOG.md](CHANGELOG.md).
 
 AI Gauge is an independent open-source project and unofficial local desktop
 utility. It is not affiliated with Anthropic, OpenAI, GitHub, Microsoft,
@@ -46,6 +46,8 @@ notice.
   <img src="docs/screenshots/mac-popover.png" alt="AI Gauge macOS popover panel with Claude, Codex, and Copilot tiles" width="320" />
 </p>
 
+The window in these shots is at its first-run 340 px width. Since 1.4.0+cfa.8 it is resizable by its edges and remembers whatever size you give it, so yours may be wider.
+
 <details>
 <summary>Settings dialog</summary>
 
@@ -65,7 +67,7 @@ Binaries are published on **[this fork's Releases page](https://github.com/mthom
 | macOS   | `ai-gauge-<file-version>-macos.tar.gz`      | **Apple Silicon only.** Extract, drag `ai-gauge.app` to Applications |
 | Linux   | `ai-gauge-<file-version>-linux.tar.gz`      | extract, run `./ai-gauge/ai-gauge`           |
 
-`<file-version>` is the version with `+` replaced by `-`, so `1.3.2+cfa.7` ships as `ai-gauge-1.3.2-cfa.7-windows.zip`. Print it with `python tools/check_versions.py`.
+`<file-version>` is the version with `+` replaced by `-`, so `1.4.0+cfa.8` ships as `ai-gauge-1.4.0-cfa.8-windows.zip`. Print it with `python tools/check_versions.py`.
 
 **Intel Macs are not covered by the prebuilt archive.** PyInstaller builds for the host architecture and this fork's CI runs on Apple Silicon, so the `.app` is arm64-only. Intel users should [run from source](#run-from-source); the menu-bar UI works identically.
 
@@ -329,6 +331,8 @@ If the embedded-browser sign-in doesn't work for you (e.g. your account requires
 - **macOS:** the menu-bar item shows tinted status dots for enabled provider/account tiles. Click it to open the panel as a popover; click outside to dismiss. Right-click for the same Refresh / Settings / Quit menu.
 - **Linux without a system tray** (stock GNOME): the floating widget stays visible and serves the same Show / Refresh / Settings / Quit menu via right-click on the widget.
 - **Collapse / expand:** click the **−** button in the widget header to shrink to the compact pill view. Enabled provider/account chips wrap onto additional rows when needed, with named secondary Claude/Codex accounts using just the account name to save space.
+- **Resize it:** drag any edge or corner. The window remembers the size you gave it, in both dimensions, and keeps it across restarts; it will not grow past the work area of the monitor it is on, and a window restored onto a smaller screen is shrunk to fit and moved back on-screen. The floor is 260 x 80. Until you resize it for the first time the window still fits itself to its content, as it always did; once you have, your size wins and the tile area scrolls.
+- **Scroll bars** appear on the tile area only when something is hidden — vertically when there are more tiles than fit, horizontally when a row is wider than the window (an Azure row carrying a spend and an allowance is the one that gets there). A wheel notch moves three lines.
 - **Hide unused providers:** uncheck Claude / Codex / Copilot / Microsoft Azure / OpenRouter in Settings to remove their group from the widget — useful if you only use one or two of them.
 - Auto-refresh is adaptive: manual refresh or changed usage enters the active
   cadence, then unchanged results back off toward the configured max interval.
@@ -433,6 +437,8 @@ For most users the [pre-built downloads](#download) are easier — this section 
 
 Tagged commits matching `v*` trigger [the release workflow](.github/workflows/release.yml), but only a tag of the form `vX.Y.Z+cfa.N` is accepted — any other `v*` tag is rejected in the first job. Accepted tags build all three platforms in CI and upload them as a draft GitHub Release for the maintainer to publish.
 
+The app icon is committed under `assets/icon/` — `ai-gauge.ico` for Windows, `ai-gauge.icns` for macOS and `ai-gauge-256.png` for Linux — and the build scripts pass the right one to PyInstaller. It is generated, not hand-drawn: `QT_QPA_PLATFORM=offscreen python tools/make_icon.py` redraws all three plus the runtime copy at `src/aigauge/assets/ai-gauge-256.png` that ships inside the package and becomes the window icon. A test regenerates them and compares bytes, so an edit to the drawing that nobody re-ran the script for fails the suite.
+
 Bundles are ~150-200 MB because the Chromium runtime ships inside. User data still lives outside the bundle, under the per-OS app-data directory.
 
 For a single-file binary (slower first launch), pass `-OneFile` (PowerShell) or `--onefile` (bash). On macOS the `.app` bundle is recommended over the single-file form.
@@ -483,7 +489,7 @@ That also means **upstream cannot support this build**, and bugs here may not ex
 Fork releases use a [PEP 440](https://peps.python.org/pep-0440/) local version segment:
 
 ```
-1.3.2+cfa.7
+1.4.0+cfa.8
 └─┬─┘ └─┬─┘
   │     └── fork build counter — identifies this as a fork build
   └──────── this fork's own release counter, NOT an upstream release number

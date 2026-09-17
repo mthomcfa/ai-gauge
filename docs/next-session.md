@@ -3,6 +3,20 @@
 State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#16,
 610 tests passing, all five providers reading.
 
+> **Updated 2026-09-17** by the UI release (`1.4.0+cfa.8`, 1 928 tests): the
+> panel is resizable and remembers its size, every Settings tab scrolls, the
+> app has an icon, and three things the user's own desktop turned up were
+> fixed. **It closes nothing in [§4](#4-known-defects-deliberately-not-fixed)
+> or [§8.3](#83-known-soft-spots-in-what-was-built)** - checked, and none of
+> the six items had an entry there. That is not a gap in the tracker: every
+> one of them came from using the app on a real desktop rather than from a
+> review of what was built, which is a source this file has no section for.
+> The one place it touches is a name: `WINDOW_MAX_HEIGHT` is now
+> `WINDOW_AUTOFIT_MAX_HEIGHT`, and
+> [`docs/ui-scale-widget-only-plan.md`](ui-scale-widget-only-plan.md) - a
+> proposal that has not been started - still cites the old one. It also adds
+> [§10](#10-upstream-contribution--after-the-next-batch).
+>
 > **Updated 2026-09-16** by the REST-deadline follow-up (`1.3.2+cfa.7`,
 > 1 859 tests), which closed the three residuals that release left in
 > [§8.3](#83-known-soft-spots-in-what-was-built): the unbounded REST socket,
@@ -1508,3 +1522,53 @@ What this round leaves open, deliberately:
   and the `a/`/`b/` diff-prefix strip is still redundant given that `fnmatch`'s
   `*` crosses `/`. Both were recorded in the round-2 list above and neither
   moved.
+
+
+---
+
+## 10. Upstream contribution — after the next batch
+
+> **A plan, not a task.** Nothing below is started and nothing is due. It is
+> written down so the shape of it does not have to be reconstructed later.
+
+The maintainer intends to offer the generic half of this fork back to
+[upstream](https://github.com/jpajak/ai-gauge) as clean pull requests. **Not
+before October 2026**, and not before the next batch of work lands here: a PR
+opened against a tree that is still moving is a PR that gets rebased more than
+it gets reviewed.
+
+**The shape is a fork of the current build with everything proprietary
+stripped**, not a series of cherry-picks off this branch. The things that come
+out:
+
+- every CFA Societies Canada / `cfacanada.org` reference,
+- the `+cfa.N` version framing and `tools/check_versions.py`'s enforcement of
+  it (upstream has its own scheme and this one would fail their build),
+- `AI Gauge-datasheet.md`,
+- this file and `docs/opencode-plugin-evaluation.md`,
+- the audit provenance: `SECURITY-AUDIT.md`, `audit-artifacts/`, the
+  `[tool.ai-gauge-audit]` block in `pyproject.toml`, and the "Relationship to
+  upstream" section of the README,
+- the screenshots, which are of real accounts with real numbers,
+- the issue templates, which ask for this fork's version string,
+- tenant and organisation strings in the tests.
+
+**The candidates, in the order they are worth offering:**
+
+1. **The transport bound** (`providers/_http.py`). The largest and the most
+   generally useful: a REST call that returns or raises within a declared
+   budget rather than within a per-socket timeout. Self-contained, and the
+   1.3.2+cfa.7 changelog entry is most of its PR description already.
+2. **The atomic config save** (`atomic_write.py` plus `Config.save`). Small,
+   obviously correct, and fixes a real way to lose every setting.
+3. **The scheduler work**: the per-provider error retry, the dispatch epoch and
+   watchdog, and the adaptive cadence. Bigger and more opinionated; worth
+   splitting.
+4. **The meter catalog** (`providers/catalog.py` and the weekly self-scan).
+   The largest behavioural addition and the one most likely to want discussion
+   about whether upstream wants that shape at all.
+5. **The Azure provider.** Whole and new; it depends on 1 and probably on 4.
+
+What does *not* travel: anything that only makes sense against this fork's
+threat model or its release process. The egress guard is the obvious case —
+it is a development-time tool for this tree's agents, not a feature of the app.

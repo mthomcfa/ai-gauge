@@ -6,6 +6,250 @@
 > earlier `0.6.4` entry predates that convention and **is not** upstream's
 > `v0.6.4`, which is different code.
 
+## 1.4.0+cfa.8 - 2026-09-17
+
+A release about the window rather than about the numbers in it. The panel had
+been 340 px wide and 420 px tall at most since 1.0, the Settings dialog opened
+at a hardcoded size that one tab did not fit in, and the app had no icon at
+all. Minor rather than patch: a resizable window and an icon are things the
+user sees.
+
+### Added
+
+- **The floating panel resizes, in both dimensions, and remembers it.** Drag
+  any edge or corner. An 8 px band on each edge and corner hit-tests to
+  `Qt.Edges` - pure arithmetic on a rectangle, so the eight zones are testable
+  where there is no window manager to observe - and a press in the band calls
+  `QWindow.startSystemResize()`, which is what gets snapping, a live outline
+  and a multi-DPI desktop right on Windows, macOS and X11/Wayland alike. Where
+  it returns False the geometry is computed from the drag delta instead,
+  clamped to the window's own bounds, with the left and top edges moving the
+  origin as well as the size. Offscreen it returns False, which is what makes
+  the fallback the tested path.
+
+  The floor is **260 x 80**. 260 rather than the 239 the measurement gives: the
+  last header control to lose a pixel as the window narrows is the "just now"
+  age label, at 239 - the four header buttons are `setFixedSize` and never
+  squeeze - and 260 is the first round number above it that also leaves a
+  metric row's bar 64 px instead of 44. The ceiling is the **work area of the
+  monitor the window is on**, re-applied on show, on `screenChanged` and on
+  `availableGeometryChanged`, because that answer is per-monitor and changes
+  when a taskbar does. The existing off-screen clamp moved a window that came
+  back on a smaller display; it now shrinks one too.
+
+  `WindowState.width` and `.height` are real for the first time. The migration
+  that replaced the saved width with the constant 340 on every load and capped
+  the height at 420 is gone; both are bounded by the model to
+  `[minimum, 4096]` - a sanity bound, since the loader cannot know which
+  monitor the window will open on - and the widget clamps to the real screen at
+  show time. A 1.3.x config (340 x 420) loads unchanged.
+
+  **Auto-fit did not go away; it became conditional, and the docstring says
+  which rule applies when.** Collapsed is always auto-fitted: a chip strip has
+  one right height and the user cannot drag it into two rows. Expanded is
+  auto-fitted only while the config still carries both first-run values, i.e.
+  while the window has never been sized by hand. After that the saved size
+  wins and the tile area takes the difference - re-fitting on the next refresh
+  is exactly what would undo the drag. Only a *resize* writes the size back, so
+  moving a fresh window does not quietly switch auto-fit off, and the write
+  happens on release, on hide (the ✕ button hides rather than closes) and on
+  close.
+
+- **An app icon.** Three stacked pill bars at 47 %, 72 % and 92 % on the app's
+  own rounded dark panel - the compact chip row the widget already shows, which
+  is what survives 16 px where a dial's needle becomes a smudge. The band
+  colours are read from `ColorThresholds`, so the icon and the tiles cannot
+  disagree about what green means, and every measurement in the drawing is a
+  fraction of the icon's own size, so the 16 px entry is the 1024 px entry
+  scaled rather than a second drawing.
+
+  `tools/make_icon.py` draws it with QPainter and writes both containers
+  itself - stdlib plus PyQt6, no Pillow and no icon toolchain, because a
+  dependency added to draw one picture is a dependency in the shipped binary's
+  supply chain for the life of the project. **ICO**: 14 335 bytes, a 6-byte
+  header, one 16-byte directory entry per size and a PNG blob each, at
+  16/24/32/48/64/128/256 - with 256 written as 0 in the one-byte width field,
+  because that is what the format does with it. **ICNS**: 80 486 bytes, 11
+  chunks - `icp4`/`icp5`/`icp6` at 16/32/64, `ic07`-`ic10` at
+  128/256/512/1024, and the four @2x types `ic11`-`ic14` at 32/64/256/512,
+  since the container has no scale field and a Retina entry is simply a
+  different OSType holding a bigger PNG. Both parse back in the tests.
+
+  The generated files are committed beside the script and a test regenerates
+  all of them into a temp directory and compares **bytes**, not a pixel
+  tolerance: Qt's encoder and its antialiasing are deterministic for a fixed
+  input and offscreen takes the display out of it. `build.ps1` passes the
+  `.ico`, `build.sh` the `.icns` on macOS and the PNG elsewhere, and a runtime
+  copy at `src/aigauge/assets/ai-gauge-256.png` travels inside the package the
+  way the meter catalog does, so one package-relative lookup answers in a
+  source checkout, in a wheel and in a frozen bundle alike.
+  `QApplication.setWindowIcon` at startup gives it to every top-level window
+  at once. It does not undo the Dock trade-off `build.sh` documents:
+  `LSUIElement` is what hides the Dock icon for the menu-bar build, and a
+  bundle icon is what Finder draws on the `.app`, which a menu-bar agent still
+  has. The tray keeps its status dot and its menu-bar pixmap - that icon
+  carries the worst band's colour and an app icon cannot.
+
+### Changed
+
+- **Every Settings tab scrolls, and the dialog opens at the height its landing
+  page needs.** The Microsoft tab wants 1 765 px. The pane gave it 454 at the
+  hardcoded 620 x 520 and there was no scroll bar anywhere, so the bottom of
+  the Copilot block was unreachable. The over-tall-window symptom other
+  platforms show is the same defect from the other side: the only thing holding
+  the dialog down was `setMinimumSize(560, 420)`. Remove that one line and the
+  layout's own floor takes over - measured, `minimumSize()` becomes 519 x 1112
+  and a `resize(620, 300)` clamps to 620 x 1112 - because the Microsoft page's
+  `minimumSizeHint` is 1 015 px on its own, and every Azure row added pushes
+  both hints up.
+
+  Every tab is now added through one helper that wraps its page in a
+  `QScrollArea`, and there is no longer a code path that adds a bare page, so a
+  future tab gets the behaviour without anyone remembering to. A scroll area's
+  size hint is its widget's bounded to 36 x 24 font heights (504 x 336 here),
+  which is what breaks the link between a page's content and the window's
+  floor: the dialog's `minimumSizeHint` goes **519 x 1112 → 271 x 155** and the
+  tab widget's **495 x 1046 → 127 x 89**.
+
+  The default size is a measurement rather than a number. General is the
+  landing page, so the dialog opens at General's `sizeHint` plus the chrome
+  around it, read off the live widgets - 12 + 10 margins, 10 spacing, a 34 px
+  button row, a 27 px tab bar and 4 px of pane, i.e. 97. General hints 488 px
+  before `show()` (it reflows its word-wrapped hints to 498 after), so the
+  dialog opens **620 x 585** against the hardcoded 520. A binary search for the
+  smallest height at which General shows no scroll bar gives 580 - the binding
+  constraint is the page's 483 px minimum, not its 498 px preference - so 585
+  carries 5 px of slack and errs generous. The chrome is deliberately not
+  derived as `height() - viewport().height()` before `show()`: the viewport is
+  still at its unlaid 640 x 480 then and the subtraction comes out **-60**,
+  which yields a 428 px dialog in which General itself scrolls. Both ends are
+  clamped to the screen's work area, the minimum included - at 200 % display
+  scale every logical hint is unchanged while `availableGeometry()` shrinks
+  800 → 400, so an un-shrinkable 560 x 420 minimum is a dialog whose OK button
+  cannot be reached. Nothing persists the dialog's size, which was already true
+  and is now pinned by a test.
+
+- **One scroll-bar stylesheet, and it is visible.** The widget's tile area drew
+  a 6 px handle on a track the same colour as the panel - a floating sliver
+  with no trough - and the dialog drew whatever Qt's default style felt like.
+  Both now come from `ui_style`: 10 px, a track one step up the grey ramp from
+  whichever panel it is on, a `#4b5563` handle with 2 px margins that lightens
+  to `#6b7280` on hover and `#9ca3af` when pressed, no arrow buttons, a 24 px
+  minimum handle. Rendered and sampled at 12 tiles: handle `#4b5563`, track
+  `#1f2937`, panel `#111827` beside it, and `#111827` in that column on a
+  window whose content fits. In the dialog: viewport `#1f2937`, track
+  `#374151`, handle `#4b5563`, and nothing painted for a tab that fits. A
+  `QScrollArea`'s viewport has `autoFillBackground()` True and a Window
+  background role, and neither `setAutoFillBackground(False)` nor a rule on
+  `QScrollArea` itself reaches it - measured `#efefef` through the dark dialog
+  in both cases; only the descendant rule does, which is the same idiom
+  `widget.py` already used and the same trap this changelog records once
+  before.
+
+  The widget's tile area now shows a **horizontal** bar as well, and it is not
+  theoretical: a plain metric row's minimum width is 196 px, but an Azure row
+  carrying a spend and an allowance in its reset column measures 304, so at the
+  260 px window minimum that content really is wider than the viewport. A wheel
+  notch is three lines of text (42 px at this font) against Qt's default 20,
+  and a page step is the viewport.
+
+### Fixed
+
+- **A press on the panel no longer raises Settings, so dragging works.** The
+  user reported that the panel could not be dragged once the Azure tile's rows
+  appeared. The hypothesis that a child accepts the press once the tile area
+  scrolls is **disproved**: sending a press to the deepest child under each
+  point and asking whether it consumed it, nothing in the panel accepts one
+  except the four header buttons and a tile's chevron, with two rows and with a
+  540 px tile stack that scrolls alike. What is real is the other one. Every
+  press emitted `activated_requested`, and the App answers that by calling
+  `show()`, `raise_()` and `activateWindow()` on the Settings dialog -
+  activating another top-level window while a button is down takes the focus,
+  and with it the implicit mouse grab, away from the panel, so the drag dies on
+  the first move. That emit now happens on a **release that did not move the
+  window**, which is a click. The move itself is handed to the window manager
+  through `startSystemMove()`, which removes the whole class - started on the
+  first movement past `startDragDistance()` rather than on the press, because
+  the WM takes the pointer when it starts and the release never arrives, so
+  starting it on the press would have traded the drag defect for a click that
+  no longer raises Settings.
+
+- **The Azure tile says when it will actually try again.** On a 429 it read the
+  server's `Retry-After` and said "retrying in N min", and then did no such
+  thing: what governs the next attempt is `next_allowed_at`, the later of the
+  hourly floor from `last_fetch_at` and `blocked_until`. Measured on the user's
+  desktop, a 52 s `Retry-After` at 11:16:48 was followed by every refresh until
+  12:16 being served from the cached error in 0.0 s, under a message promising
+  one minute. It now reads "Cost Management is rate limiting this tenant; next
+  attempt at HH:MM.", in local time and with the same `%H:%M` as
+  `_stale_settings_note` - the same promise about the same clock, on the same
+  tile. A `Retry-After` longer than the hour is still what is named, because
+  `blocked_until` is then the later of the two.
+
+- **An error tile with no rows says what happened.** Reproduced offscreen with
+  an empty metric list and a 68-character error: the status line was there, as
+  26 px of the word "error" in the far right corner of a 340 px header, on a
+  tile 22 px tall, with the message reachable only by hovering it. So the
+  report - "the title and nothing else" - is accurate about what the tile
+  communicates and wrong only about the mechanism. Two changes. The corner tag
+  names the failure: `_short_error_reason` matched timeout, load failure,
+  layout change, no data, api and signed out and nothing else, so Azure's 429 -
+  the most common error this app shows - fell through to a bare "error"; a rate
+  limit or a throttle now reads "error · rate limited", 92 px against 26. And a
+  tile with no rows at all gets the message itself on a full-width line under
+  the header - 324 px, and the tile grows from 22 px to 36 - elided to the
+  window's current width with the full text in the tooltip, and clickable to
+  the same details dialog. Only when there is nothing else on the tile: with
+  rows present the tag reads "error · stale" beside numbers that explain
+  themselves. The same line covers `AUTH_REQUIRED` for the three providers with
+  no Sign in button, where "not signed in" in the corner was the whole message.
+
+- **An Azure component row's amount is on every part of the row.** A Windows 11
+  desktop showed no tooltip when hovering an "Azure App Service" row, although
+  the row carries the metric's note. It could not be reproduced: a ToolTip help
+  event sent to the row, its label, its bar, its percentage, the inner
+  `QProgressBar` and the pace overlay each produced the amount, and nothing on
+  the hover path could be made to hide an open tooltip - window opacity at 1.0
+  and 0.8, the enterEvent path, a resize, `_do_refit_height`, the one-second
+  header tick, the collapsed-summary rebuild, a refresh dim, `raise_()`,
+  re-applying the always-on-top flag and re-delivering the snapshot all leave
+  it standing. The offscreen plugin has no real window activation or native
+  stacking order, so that is evidence the cause is not in the app's own event
+  flow rather than proof about Windows. Rather than guess, the fix removes the
+  assumption the propagation rests on - that every child under the pointer
+  answers a ToolTip event with nothing - by writing the note onto the row's
+  label and percentage as well, on every `set_metric`, so a row reused for a
+  metric with no note cannot keep the previous one's.
+
+### Notes
+
+- The suite is **1 928 tests**, from 1 859. `tests/test_icon.py` is new and
+  holds 12. `tests/test_widget.py` goes 57 → 92,
+  `tests/test_settings_dialog.py` 33 → 44, `tests/test_config.py` 138 → 145
+  and `tests/test_azure.py` 232 → 236.
+
+- **Two tests had to change**, both because they pinned the behaviour this
+  release replaces. `test_widget_uses_fixed_width_despite_extreme_saved_size`
+  asserted that a 5 000 px saved width became 340; the answer is now "fit it to
+  the monitor", and the replacement asserts that. `test_refit_restores_fixed_width_after_dpi_resize_glitch`
+  asserted that the re-fit restores 340 after a DPI glitch; that is now
+  precisely the thing that would undo a drag, and the replacement asserts the
+  re-fit leaves a chosen width alone. Both replacements name what they
+  replace.
+
+- **`WINDOW_MAX_HEIGHT` is now `WINDOW_AUTOFIT_MAX_HEIGHT`.** The value is
+  unchanged at 420 and so is its job - the ceiling on a height the *app* picks,
+  so a fresh install with six providers does not open most of a screen tall -
+  but it is no longer a ceiling on the window, and a constant whose name says
+  otherwise is how the next change gets it wrong. `WINDOW_MIN_WIDTH` (260),
+  `WINDOW_DEFAULT_HEIGHT` (220) and `WINDOW_MAX_DIMENSION` (4096) are new.
+  `docs/ui-scale-widget-only-plan.md` still names the old constant; it is a
+  proposal that has not been started and was left alone.
+
+- Measured offscreen throughout: one 800 x 800 screen, a 14 px font, and
+  `QWindow.startSystemResize()` / `startSystemMove()` both returning False,
+  which is exactly the platform the pure-Qt fallback exists for.
+
 ## 1.3.2+cfa.7 - 2026-09-16
 
 The residuals of the hardening follow-up: the socket itself, the write that
