@@ -1520,12 +1520,20 @@ class SettingsDialog(QDialog):
         content = _page_height(general_page, page_width)
         height = _dialog_height(content, chrome, _DIALOG_MIN_H, ceiling)
         self._general_scroll = general_scroll
+        # `asked_w`/`asked_h` are what the derivation produced; `width` and
+        # `height` are what the window ended up with, read back after the
+        # resize. The two differ wherever the minimum or the screen bounds the
+        # answer, and the terms are for a bug report and a failing test's
+        # message - so the number a reader compares against the window on
+        # their desk has to be the window's.
         self._height_terms = {
+            "asked_w": width,
             "width": width,
             "page_w": page_width,
             "content": content,
             "chrome": chrome - _DIALOG_HEIGHT_SLACK,
             "slack": _DIALOG_HEIGHT_SLACK,
+            "asked_h": height,
             "height": height,
         }
         # Clamped against the screen as well: at 200% display scale the work
@@ -1545,6 +1553,7 @@ class SettingsDialog(QDialog):
             min(_DIALOG_MIN_H, ceiling),
         )
         self.resize(width, height)
+        self._height_terms.update(width=self.width(), height=self.height())
 
     def showEvent(self, event) -> None:  # noqa: N802 - Qt override
         super().showEvent(event)
@@ -1576,8 +1585,14 @@ class SettingsDialog(QDialog):
         viewport = scroll.viewport()
         need = _page_height(scroll.widget(), viewport.width())
         deficit = need - viewport.height()
+        # `viewport_w_at_show` and not `viewport_w`: this is the transient
+        # width read inside showEvent, with the vertical bar reserved by the
+        # scroll area's first pass. It is deliberately the narrower number -
+        # it is what `page_w` is meant to be compared against - and the
+        # settled viewport of a page that turns out not to need the bar is
+        # 10 px wider.
         self._height_terms.update(
-            viewport_w=viewport.width(),
+            viewport_w_at_show=viewport.width(),
             viewport_h=viewport.height(),
             need=need,
             grew=max(0, deficit),
@@ -1587,6 +1602,7 @@ class SettingsDialog(QDialog):
         available = (self.screen() or QApplication.primaryScreen()).availableGeometry()
         ceiling = int(available.height() * _DIALOG_SCREEN_FRACTION)
         self.resize(self.width(), min(self.height() + deficit, ceiling))
+        self._height_terms.update(height=self.height())
 
     def _edit_provider_colors(self, provider: str, label: str) -> None:
         dialog = GaugeColorsDialog(label, self._provider_colors[provider], parent=self)

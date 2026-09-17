@@ -930,7 +930,7 @@ def test_the_default_height_is_the_measured_need_plus_the_slack(qtbot):
     # own minimum is wider is measured at that minimum inside _page_height,
     # as the area lays it out; the estimate's width stays the viewport's.)
     terms = dialog._height_terms
-    assert terms["page_w"] <= terms["viewport_w"], terms
+    assert terms["page_w"] <= terms["viewport_w_at_show"], terms
 
     # The show-time measurement may grow the dialog where a platform's fonts
     # or style land away from their hints; more than this and the estimate
@@ -1002,10 +1002,12 @@ def test_the_default_width_fits_the_widest_page(qtbot, monkeypatch):
     monkeypatch.setattr(settings_dialog, "_DIALOG_DEFAULT_W", 300)
     dialog = SettingsDialog(Config())
     qtbot.addWidget(dialog)
-    asked = dialog._height_terms["width"]
+    asked = dialog._height_terms["asked_w"]
     assert asked > 300, "the rule did not engage"
     # The 560 floor is a separate rule and still applies underneath.
     assert dialog.width() == max(asked, settings_dialog._DIALOG_MIN_W)
+    # And `width` is what the window got, not what the derivation asked for.
+    assert dialog._height_terms["width"] == dialog.width()
     with qtbot.waitExposed(dialog):
         dialog.show()
     every_page_fits(dialog)
