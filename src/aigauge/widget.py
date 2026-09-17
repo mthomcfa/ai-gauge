@@ -86,6 +86,15 @@ COLLAPSED_MIN_HEIGHT = WINDOW_COLLAPSED_HEIGHT
 # One second is long enough that a drag is one write and short enough that a
 # crash or a kill loses nothing the user would notice.
 NATIVE_GESTURE_COMMIT_MS = 1000
+# How many times in a row the debounce may fire with a mouse button still
+# down, and no move or resize event in between, before the gesture flags are
+# cleared anyway. A pause inside a live drag is silence with the button held,
+# so the fire cannot end the gesture - but Qt's button state is the window
+# manager's, and a release it never saw would otherwise keep a one-second
+# timer re-arming for the life of the window. Sixty is a minute of "held with
+# nothing happening", far longer than any hesitation and far shorter than a
+# session. Any real geometry event resets the count.
+NATIVE_GESTURE_MAX_IDLE_FIRES = 60
 # How far in from an edge a press counts as a resize rather than a drag. Eight
 # logical pixels is what a native frameless window uses and what a pointer can
 # be expected to land on; a wider band starts eating clicks on the tile rows.
@@ -1591,6 +1600,9 @@ class UsageWidget(QWidget):
         # Narrower: the WM is running a *resize*, so the next resizeEvent is
         # the user changing the size and not the app fitting itself.
         self._native_resize = False
+        # How many times the debounce has fired with a button still down and
+        # nothing happening in between - see NATIVE_GESTURE_MAX_IDLE_FIRES.
+        self._native_gesture_idle_fires = 0
         # The window is where the *app* put it, not where the user left it:
         # the macOS popover anchors itself under the menu-bar item on every
         # open. Committing that x/y would save the app's choice over the
@@ -2563,6 +2575,7 @@ class UsageWidget(QWidget):
                 # were left armed for the life of the window and the next
                 # auto-fit growth was read as the user taking the size over.
                 # Starting the debounce here is what ends such a gesture.
+                self._native_gesture_idle_fires = 0
                 self._geometry_commit.start()
             else:
                 self._resize_edges = edges
@@ -2666,6 +2679,7 @@ class UsageWidget(QWidget):
         # the ones that do not.
         self._native_gesture = False
         self._native_resize = False
+        self._native_gesture_idle_fires = 0
         self._geometry_commit.stop()
         self._commit_geometry()
         if not self._press_moved:
@@ -2780,6 +2794,8 @@ class UsageWidget(QWidget):
         itself is saved, or deliberately not, by whoever asked.
         """
         if self._is_user_geometry():
+            # Something happened, so the fires that follow are not idle ones.
+            self._native_gesture_idle_fires = 0
             self._geometry_commit.start()
 
     def _commit_after_native_gesture(self) -> None:
@@ -2791,6 +2807,16 @@ class UsageWidget(QWidget):
         resumed drag commits again, and the geometry the user let go at is the
         one that survives.
 
+        The button state is what tells the two apart, and it decides the flags
+        as well as the clamp. Clearing them on the fire alone made a drag that
+        *begins* with a hesitation - hand on the edge, deciding - arrive at
+        its first ``resizeEvent`` with ``_native_resize`` already False: the
+        size was never marked as the user's, never written, and auto-fit took
+        it straight back. So while a button is down this commits, re-arms and
+        keeps the flags, up to ``NATIVE_GESTURE_MAX_IDLE_FIRES`` fires with
+        nothing happening in between - after which a button state the window
+        manager never took back cannot keep the timer alive any longer.
+
         The clamp is the part that cannot be guessed at. It moves and resizes
         the window, and doing that while the window manager still owns the
         pointer is the app fighting a live drag - measured, a 240 px jump out
@@ -2798,8 +2824,16 @@ class UsageWidget(QWidget):
         state is stale the clamp is skipped, which is the safe direction,
         because the next show or screen change clamps anyway.
         """
+        if QGuiApplication.mouseButtons() != Qt.MouseButton.NoButton:
+            self._native_gesture_idle_fires += 1
+            if self._native_gesture_idle_fires < NATIVE_GESTURE_MAX_IDLE_FIRES:
+                # A pause inside a live gesture, not its end.
+                self._commit_geometry()
+                self._geometry_commit.start()
+                return
         self._native_gesture = False
         self._native_resize = False
+        self._native_gesture_idle_fires = 0
         if QGuiApplication.mouseButtons() == Qt.MouseButton.NoButton:
             # The WM is bounded by the maximum size, not by the work area's
             # origin, so a drag can still leave the window part-way off a

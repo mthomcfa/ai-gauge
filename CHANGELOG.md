@@ -76,8 +76,9 @@ user sees.
   event at all - so the flags the press set stayed set for the life of the
   window and the next auto-fit growth was written back as the size the user
   chose. The press now starts the same one-second debounce, which is what ends
-  such a gesture; offscreen `startSystemResize` returns False, so the test for
-  it patches the `QWindow` to return True the way every real desktop does.
+  such a gesture once the button is up; offscreen `startSystemResize` returns
+  False, so the test for it patches the `QWindow` to return True the way every
+  real desktop does.
 
   **The geometry is written back from one seam, `_commit_geometry()`**, and
   everything that can end a gesture reaches it: the mouse release, a hide (the
@@ -104,6 +105,18 @@ user sees.
   drag, measured at a 240 px jump out from under it. It runs only when Qt
   reports no button down, and if that state is stale it is skipped - the next
   show or screen change clamps anyway, which is the safe direction.
+
+  That same button state decides the two gesture flags, because **a pause
+  before the first event is a pause too**: grab an edge, hesitate while you
+  decide, then drag, and clearing the flags on the fire meant the first size
+  the window manager delivered arrived with the native-resize flag already
+  False - so the drag was never marked as yours, never written, and the next
+  auto-fit took it back. While a button is down the fire commits, re-arms and
+  keeps the flags; a release clears them and stops the timer. A button state
+  the window manager never took back is bounded rather than trusted:
+  `NATIVE_GESTURE_MAX_IDLE_FIRES` (60, about a minute of "held with nothing
+  happening") consecutive fires with no event in between clear the flags
+  anyway, and any real move or resize resets the count.
 
   The collapse toggle goes through the same seam. It was the one write path
   outside the dirty check - an unconditional `save()` that left the seam's

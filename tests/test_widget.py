@@ -19,6 +19,7 @@ from aigauge.ratio import RatioEstimate
 from aigauge.ui_style import SCROLLBAR_WIDTH, wheel_step
 from aigauge.widget import (
     NATIVE_GESTURE_COMMIT_MS,
+    NATIVE_GESTURE_MAX_IDLE_FIRES,
     RESIZE_BAND,
     UsageWidget,
     _QT_SIZE_MAX,
@@ -1821,7 +1822,9 @@ def test_the_debounce_clamps_an_off_screen_window_only_once_the_button_is_up(
         QGuiApplication, "mouseButtons", staticmethod(lambda: Qt.MouseButton.LeftButton)
     )
     widget.move(hanging_off)
-    qtbot.waitUntil(lambda: not widget._geometry_commit.isActive(), timeout=3000)  # noqa: SLF001
+    # The fire itself, not the timer going quiet: with a button down the
+    # debounce commits and re-arms, because the gesture is still live.
+    qtbot.waitUntil(lambda: widget._native_gesture_idle_fires >= 1, timeout=3000)  # noqa: SLF001
     assert widget.pos() == hanging_off, "the app moved the window under a live drag"
 
     monkeypatch.setattr(
@@ -1832,6 +1835,148 @@ def test_the_debounce_clamps_an_off_screen_window_only_once_the_button_is_up(
         lambda: widget.x() + widget.width() - 1 <= work_area.right(), timeout=3000
     )
     assert widget.x() >= work_area.left()
+
+
+def test_a_resize_that_begins_with_a_pause_is_still_the_users_size(qtbot, monkeypatch):
+    """Grab an edge, hesitate, then drag.
+
+    The debounce fires on silence, and a hand resting on an edge while the
+    user decides makes exactly the silence a finished gesture makes. Clearing
+    the two flags on that fire meant the first size the window manager
+    delivered afterwards arrived with `_native_resize` already False: nothing
+    marked it as the user's, `_remember_size` returned early, and the next
+    auto-fit took the dragged size straight back. Qt holds the window
+    manager's button state, and a button still down says the gesture is live.
+    """
+    config = Config()
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_ok_snapshot("claude"), "Claude")
+    with qtbot.waitExposed(widget):
+        widget.show()
+    qtbot.wait(0)
+    handle = widget.windowHandle()
+    # What startSystemResize returns on Windows, macOS and X11; offscreen it
+    # returns False, which is why only the pure-Qt fallback was ever covered.
+    monkeypatch.setattr(handle, "startSystemResize", lambda _edges: True)
+    # The same debounce, wound down so the test does not sit out a second.
+    widget._geometry_commit.setInterval(1)  # noqa: SLF001
+    buttons = [Qt.MouseButton.LeftButton]  # the WM has the pointer
+    monkeypatch.setattr(
+        QGuiApplication, "mouseButtons", staticmethod(lambda: buttons[0])
+    )
+
+    _press(widget, QPoint(2, widget.height() // 2))
+    assert widget._native_resize is True, "the native branch was not taken"  # noqa: SLF001
+
+    # The hesitation: nothing happens for longer than the debounce, so the
+    # timer fires into the middle of the gesture.
+    qtbot.waitUntil(lambda: widget._native_gesture_idle_fires >= 1, timeout=3000)  # noqa: SLF001
+    assert widget._native_resize is True, "a pause ended the gesture"  # noqa: SLF001
+    assert widget._native_gesture is True  # noqa: SLF001
+    assert (  # noqa: SLF001
+        widget._geometry_commit.isActive() is True
+    ), "the debounce did not re-arm inside a live gesture"
+
+    # And now the drag the user was deciding on.
+    widget.resize(widget.width() + 90, widget.height() + 70)
+    dragged = widget.size()
+    assert widget._user_sized is True, "the dragged size was not the user's"  # noqa: SLF001
+    assert (  # noqa: SLF001
+        widget._native_gesture_idle_fires == 0
+    ), "an event did not reset the idle-fire count"
+
+    buttons[0] = Qt.MouseButton.NoButton  # the user lets go; the WM keeps the release
+    qtbot.waitUntil(lambda: not widget._native_resize, timeout=3000)  # noqa: SLF001
+    on_disk = Config.load().window
+    assert (on_disk.width, on_disk.height) == (dragged.width(), dragged.height())
+    assert on_disk.user_sized is True, "the file does not say the user sized it"
+
+
+def test_a_motionless_native_click_still_clears_the_flags(qtbot, monkeypatch):
+    """The other direction of the same button rule.
+
+    A press in the band that the window manager accepts, and a release it
+    keeps to itself: no event ever comes back. The button is up by the time
+    the debounce fires, so that fire *is* the end of the gesture - the flags
+    clear, the timer stops, and the next auto-fit growth is the app's own
+    size again rather than one the user is recorded as having chosen.
+    """
+    config = Config()
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_ok_snapshot("claude"), "Claude")
+    with qtbot.waitExposed(widget):
+        widget.show()
+    qtbot.wait(0)
+    handle = widget.windowHandle()
+    monkeypatch.setattr(handle, "startSystemResize", lambda _edges: True)
+    widget._geometry_commit.setInterval(1)  # noqa: SLF001
+    # Stated rather than relied on: no button is down by the time the timer
+    # fires, because the user has already let go.
+    monkeypatch.setattr(
+        QGuiApplication, "mouseButtons", staticmethod(lambda: Qt.MouseButton.NoButton)
+    )
+    fitted = widget.height()
+
+    _press(widget, QPoint(2, widget.height() // 2))
+    assert widget._native_resize is True, "the native branch was not taken"  # noqa: SLF001
+
+    qtbot.waitUntil(lambda: not widget._native_resize, timeout=3000)  # noqa: SLF001
+    assert widget._native_gesture is False  # noqa: SLF001
+    assert widget._geometry_commit.isActive() is False  # noqa: SLF001
+    assert widget._user_sized is False  # noqa: SLF001
+
+    widget.update_snapshot(_ok_snapshot("codex"), "Codex")
+    qtbot.waitUntil(lambda: widget.height() > fitted, timeout=3000)
+    assert widget._user_sized is False, "an auto-fit growth was read as the user's"  # noqa: SLF001
+    assert Config.load().window.user_sized is False
+
+
+def test_a_stale_button_state_cannot_keep_the_debounce_alive(qtbot, monkeypatch):
+    """`mouseButtons()` is the window manager's state, not ours.
+
+    A release the WM never reported would otherwise leave a one-second timer
+    re-arming itself, and the gesture flags set, for the life of the window -
+    which is the defect the timeout was added to close, one step along. The
+    bound is a count of fires with *nothing happening* in between, so a real
+    gesture, which produces events, resets it and never reaches it.
+    """
+    config = Config()
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_ok_snapshot("claude"), "Claude")
+    with qtbot.waitExposed(widget):
+        widget.show()
+    qtbot.wait(0)
+    handle = widget.windowHandle()
+    monkeypatch.setattr(handle, "startSystemResize", lambda _edges: True)
+    # A bound at 1 would give back the defect above; an unbounded one is what
+    # this test is about. The claim is that there is a bound, and that a
+    # minute or so of "held with nothing happening" is inside it.
+    assert 2 <= NATIVE_GESTURE_MAX_IDLE_FIRES <= 600
+    widget._geometry_commit.setInterval(1)  # noqa: SLF001
+    monkeypatch.setattr(
+        QGuiApplication, "mouseButtons", staticmethod(lambda: Qt.MouseButton.LeftButton)
+    )
+    fitted = widget.height()
+
+    _press(widget, QPoint(2, widget.height() // 2))
+    assert widget._native_resize is True, "the native branch was not taken"  # noqa: SLF001
+
+    # Nothing happens at all from here: no move, no resize, no release.
+    qtbot.waitUntil(lambda: not widget._native_resize, timeout=5000)  # noqa: SLF001
+    assert widget._native_gesture is False  # noqa: SLF001
+    assert (  # noqa: SLF001
+        widget._geometry_commit.isActive() is False
+    ), "a stale button state kept the debounce alive"
+
+    widget.update_snapshot(_ok_snapshot("codex"), "Codex")
+    qtbot.waitUntil(lambda: widget.height() > fitted, timeout=3000)
+    assert widget._user_sized is False, "an auto-fit growth was read as the user's"  # noqa: SLF001
+    assert (  # noqa: SLF001
+        widget._geometry_commit.isActive() is False
+    ), "an app resize armed the commit debounce"
 
 
 def test_the_macos_popover_anchor_is_not_saved_over_the_users_position(qtbot):
