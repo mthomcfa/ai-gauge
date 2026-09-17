@@ -340,8 +340,14 @@ def _dialog_height(content: int, chrome: int, floor: int, ceiling: int) -> int:
     otherwise untestable offscreen: the floor only engages on a tiny page and
     the ceiling only on a screen shorter than the content, and an offscreen
     run has one fixed 800x800 screen.
+
+    The ceiling wins when the two disagree. Written the other way round the
+    floor did, and at 200% display scale - where the logical work area is
+    400 px - the dialog was sized 420 px tall, i.e. taller than the whole
+    desktop, before any paint. The ``showEvent`` re-fit happened to pull it
+    back, which is the correction doing the estimate's job.
     """
-    return max(floor, min(content + chrome, ceiling))
+    return min(max(floor, content + chrome), ceiling)
 
 
 def _activate_layouts(root: QWidget) -> None:
@@ -1524,7 +1530,11 @@ class SettingsDialog(QDialog):
         }
         # Clamped against the screen as well: at 200% display scale the work
         # area is 400 px high and an un-shrinkable 560x420 minimum is a dialog
-        # whose OK button cannot be reached.
+        # whose OK button cannot be reached. The *height* floor is clamped to
+        # the same ceiling `_dialog_height` uses, not to the raw work area, or
+        # the 420 minimum would out-rank a 360 ceiling and the documented
+        # "never more than 90% of the work area" would be the one number the
+        # code does not enforce.
         #
         # The *width* floor is the same widest-page rule as the default, so a
         # user cannot drag the dialog narrower than its pages need wherever the
@@ -1532,7 +1542,7 @@ class SettingsDialog(QDialog):
         # the pages' horizontal bars take the rest.
         self.setMinimumSize(
             min(max(_DIALOG_MIN_W, pages_min_w + horizontal_chrome), available.width()),
-            min(_DIALOG_MIN_H, available.height()),
+            min(_DIALOG_MIN_H, ceiling),
         )
         self.resize(width, height)
 

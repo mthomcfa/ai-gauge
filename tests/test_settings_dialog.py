@@ -885,7 +885,7 @@ def test_the_default_size_tracks_the_general_page(qtbot):
     [
         (486, 103, 420, 720, 589),
         (40, 97, 420, 720, 420),
-        (1765, 97, 420, 360, 420),
+        (1765, 97, 420, 360, 360),
         (1765, 97, 100, 360, 360),
     ],
     ids=["tall", "short", "capped", "squeezed"],
@@ -893,7 +893,12 @@ def test_the_default_size_tracks_the_general_page(qtbot):
 def test_the_height_clamp_has_a_floor_and_a_ceiling(
     content, chrome, floor, ceiling, expected
 ):
-    """The two ends are unreachable offscreen: one 800x800 screen, one font."""
+    """The two ends are unreachable offscreen: one 800x800 screen, one font.
+
+    `capped` is the disagreement: a 420 floor against a 360 ceiling is a
+    400-px work area at 200% display scale, and the ceiling has to win or the
+    dialog is sized taller than the desktop before it is ever painted.
+    """
     assert settings_dialog._dialog_height(content, chrome, floor, ceiling) == expected
 
 
@@ -1004,6 +1009,32 @@ def test_the_default_width_fits_the_widest_page(qtbot, monkeypatch):
     with qtbot.waitExposed(dialog):
         dialog.show()
     every_page_fits(dialog)
+
+
+def test_the_screen_fraction_is_the_effective_ceiling(qtbot, monkeypatch):
+    """Including the minimum size, which used to out-rank it.
+
+    At 200% display scale the logical work area is 400 px high, the ceiling is
+    360, and `setMinimumSize(..., min(420, 400))` floored the dialog at 400 -
+    so the documented 90% was the one number the code did not enforce, and the
+    pre-show size was 20 px taller than the whole desktop. The fraction is
+    forced down here rather than the screen faked: offscreen has one 800x800
+    screen, and a ceiling under the 420 floor is the only thing that matters.
+    """
+    monkeypatch.setattr(settings_dialog, "_DIALOG_SCREEN_FRACTION", 0.4)
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    available = dialog.screen().availableGeometry()
+    ceiling = int(available.height() * 0.4)
+    assert ceiling < settings_dialog._DIALOG_MIN_H, "the case did not engage"
+
+    assert dialog.minimumHeight() == ceiling
+    assert dialog.height() <= ceiling, dialog._height_terms
+
+    with qtbot.waitExposed(dialog):
+        dialog.show()
+    qtbot.wait(0)
+    assert dialog.height() <= ceiling, dialog._height_terms
 
 
 def test_no_page_is_clipped_at_the_dialog_floor(qtbot, monkeypatch):

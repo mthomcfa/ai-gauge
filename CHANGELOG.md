@@ -185,7 +185,13 @@ user sees.
   clamped to the screen's work area, the minimum included - at 200 % display
   scale every logical hint is unchanged while `availableGeometry()` shrinks
   800 → 400, so an un-shrinkable 560 x 420 minimum is a dialog whose OK button
-  cannot be reached. Nothing persists the dialog's size, which was already true
+  cannot be reached. **The ceiling out-ranks the floor**, in the clamp and in
+  the minimum alike: `max(floor, min(content, ceiling))` let a 420 floor beat a
+  360 ceiling, and the minimum was clamped to the raw work area rather than to
+  the ceiling, so at 200 % the dialog was sized 400 x 420 - 20 px taller than
+  the whole desktop - before any paint, and the `showEvent` re-fit was doing
+  the estimate's job. Measured again at `QT_SCALE_FACTOR=2`: 400 x 360 before
+  the show and 400 x 360 after it. Nothing persists the dialog's size, which was already true
   and is now pinned by a test.
 
 - **One scroll-bar stylesheet, and it is visible.** The widget's tile area drew
