@@ -1,12 +1,21 @@
 from datetime import datetime, timedelta
 
 import pytest
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QEvent, QPoint, QPointF, Qt
+from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtWidgets import QApplication
 
-from aigauge.config import BrowserAccount, Config
+from aigauge.config import (
+    BrowserAccount,
+    Config,
+    WINDOW_DEFAULT_HEIGHT,
+    WINDOW_MIN_HEIGHT,
+    WINDOW_MIN_WIDTH,
+    WINDOW_WIDTH,
+)
 from aigauge.models import SnapshotStatus, UsageMetric, UsageSnapshot
 from aigauge.ratio import RatioEstimate
+from aigauge.ui_style import SCROLLBAR_WIDTH
 from aigauge.widget import (
     UsageWidget,
     _format_ratio_inline,
@@ -639,7 +648,14 @@ def test_a_scheduled_cycle_marks_its_tiles_without_blanking_them(qtbot):
     assert tile._opacity_anim.endValue() > 0.55  # noqa: SLF001
 
 
-def test_widget_uses_fixed_width_despite_extreme_saved_size(qtbot):
+def test_an_extreme_saved_size_is_shrunk_to_the_screen(qtbot):
+    """Replaces test_widget_uses_fixed_width_despite_extreme_saved_size.
+
+    The width was pinned to 340 from 1.0 to 1.3.2; from 1.4.0+cfa.8 it is the
+    user's, so the answer to a 5000-px saved width is no longer "ignore it"
+    but "fit it to the monitor". WindowState bounds it to 4096 on load and the
+    widget shrinks it to the work area at construction.
+    """
     config = Config()
     config.window.width = 5000
     config.window.height = 2
@@ -647,18 +663,28 @@ def test_widget_uses_fixed_width_despite_extreme_saved_size(qtbot):
     widget = UsageWidget(config)
     qtbot.addWidget(widget)
 
-    assert widget.width() == 340
-    assert widget.height() >= 80
+    geo = (widget.screen() or QApplication.primaryScreen()).availableGeometry()
+    assert widget.width() <= geo.width()
+    assert widget.height() <= geo.height()
+    assert widget.width() >= WINDOW_MIN_WIDTH
+    assert widget.height() >= WINDOW_MIN_HEIGHT
+    assert widget.x() >= geo.left() and widget.y() >= geo.top()
 
 
-def test_refit_restores_fixed_width_after_dpi_resize_glitch(qtbot):
+def test_refit_leaves_a_user_chosen_width_alone(qtbot):
+    """Replaces test_refit_restores_fixed_width_after_dpi_resize_glitch.
+
+    Re-fitting used to restore the fixed width on every tile change, which is
+    precisely what would undo a drag now. It only ever touches the height, and
+    only while the window is still the app's to size.
+    """
     widget = UsageWidget(Config())
     qtbot.addWidget(widget)
-    widget.resize(5000, 120)
+    widget.resize(480, 120)
 
     widget._do_refit_height()  # noqa: SLF001
 
-    assert widget.width() == 340
+    assert widget.width() == 480
 
 
 def test_collapsed_mode_shows_session_summary(qtbot):
@@ -1152,3 +1178,333 @@ def test_metric_row_keeps_the_narrow_countdown_column_for_a_countdown(qtbot):
     qtbot.addWidget(row)
     row.set_metric("Weekly", 20.0, datetime.now() + timedelta(days=2), "idle")
     assert row.reset.width() == 58
+
+
+# --- Resizing ---------------------------------------------------------------
+#
+# Offscreen geometry is a single 800x800 screen with a 14 px font, and
+# QWindow.startSystemResize()/startSystemMove() both return False there, which
+# is exactly the platform the pure-Qt fallback exists for. Every resize below
+# therefore goes through the fallback path.
+
+
+def _press(widget, point, button=Qt.MouseButton.LeftButton):
+    widget.mousePressEvent(
+        QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            QPointF(point),
+            QPointF(widget.mapToGlobal(point)),
+            button,
+            button,
+            Qt.KeyboardModifier.NoModifier,
+        )
+    )
+
+
+def _move_to(widget, global_point):
+    widget.mouseMoveEvent(
+        QMouseEvent(
+            QEvent.Type.MouseMove,
+            QPointF(widget.mapFromGlobal(global_point)),
+            QPointF(global_point),
+            Qt.MouseButton.NoButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+    )
+
+
+def _release(widget, point):
+    widget.mouseReleaseEvent(
+        QMouseEvent(
+            QEvent.Type.MouseButtonRelease,
+            QPointF(point),
+            QPointF(widget.mapToGlobal(point)),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+    )
+
+
+def _drag_corner(widget, dx, dy):
+    """Drag the bottom-right corner by (dx, dy) through the fallback path."""
+    grab = QPoint(widget.width() - 2, widget.height() - 2)
+    _press(widget, grab)
+    _move_to(widget, widget.mapToGlobal(grab) + QPoint(dx, dy))
+    _release(widget, QPoint(widget.width() - 2, widget.height() - 2))
+
+
+@pytest.mark.parametrize(
+    "point,expected",
+    [
+        ((3, 150), Qt.Edge.LeftEdge),
+        ((337, 150), Qt.Edge.RightEdge),
+        ((170, 3), Qt.Edge.TopEdge),
+        ((170, 297), Qt.Edge.BottomEdge),
+        ((2, 2), Qt.Edge.LeftEdge | Qt.Edge.TopEdge),
+        ((338, 2), Qt.Edge.RightEdge | Qt.Edge.TopEdge),
+        ((2, 298), Qt.Edge.LeftEdge | Qt.Edge.BottomEdge),
+        ((338, 298), Qt.Edge.RightEdge | Qt.Edge.BottomEdge),
+        ((170, 150), Qt.Edge(0)),
+    ],
+    ids=["left", "right", "top", "bottom", "tl", "tr", "bl", "br", "middle"],
+)
+def test_edge_hit_testing_names_all_eight_zones(point, expected):
+    from aigauge.widget import _edges_for_point
+
+    assert _edges_for_point(QPoint(*point), 340, 300) == expected
+
+
+def test_a_resize_is_saved_to_config_on_release(qtbot):
+    config = Config()
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_ok_snapshot("claude"), "Claude")
+    widget.move(50, 50)
+    before = widget.size()
+
+    _drag_corner(widget, 120, 60)
+
+    assert widget.width() == before.width() + 120
+    assert widget.height() == before.height() + 60
+    assert config.window.width == widget.width()
+    assert config.window.height == widget.height()
+
+
+def test_the_saved_size_is_restored_on_the_next_construction(qtbot):
+    config = Config()
+    config.window.width = 512
+    config.window.height = 333
+
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_ok_snapshot("claude"), "Claude")
+    qtbot.wait(0)
+
+    assert (widget.width(), widget.height()) == (512, 333), (
+        "auto-fit overrode a size the user had chosen"
+    )
+
+
+def test_a_saved_size_larger_than_the_screen_is_shrunk_and_moved_on(qtbot):
+    config = Config()
+    geo = QApplication.primaryScreen().availableGeometry()
+    config.window.width = geo.width() + 500
+    config.window.height = geo.height() + 500
+    config.window.x = geo.right() - 10
+    config.window.y = geo.bottom() - 10
+
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+    with qtbot.waitExposed(widget):
+        widget.show()
+
+    assert widget.width() <= geo.width()
+    assert widget.height() <= geo.height()
+    assert widget.x() >= geo.left()
+    assert widget.y() >= geo.top()
+    assert widget.x() + widget.width() <= geo.right() + 1
+    assert widget.y() + widget.height() <= geo.bottom() + 1
+
+
+def test_the_minimum_width_and_height_hold_against_a_drag(qtbot):
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_ok_snapshot("claude"), "Claude")
+    widget.move(50, 50)
+
+    _drag_corner(widget, -4000, -4000)
+
+    assert widget.width() == WINDOW_MIN_WIDTH
+    assert widget.height() == WINDOW_MIN_HEIGHT
+
+
+def test_auto_fit_runs_on_a_fresh_config_and_stops_after_a_resize(qtbot):
+    """The whole point of the conditional: re-fitting after a drag would undo
+    it on the next refresh."""
+    config = Config()
+    assert (config.window.width, config.window.height) == (
+        WINDOW_WIDTH,
+        WINDOW_DEFAULT_HEIGHT,
+    )
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+
+    widget.update_snapshot(_ok_snapshot("claude"), "Claude")
+    widget._do_refit_height()  # noqa: SLF001
+    fitted = widget.height()
+    widget.update_snapshot(_ok_snapshot("codex"), "Codex")
+    widget._do_refit_height()  # noqa: SLF001
+    assert widget.height() > fitted, "auto-fit did not grow with a second tile"
+
+    widget.move(50, 50)
+    _drag_corner(widget, 0, 90)
+    chosen = widget.height()
+
+    widget.update_snapshot(_ok_snapshot("copilot"), "Copilot")
+    widget._do_refit_height()  # noqa: SLF001
+    assert widget.height() == chosen, "a refresh resized a window the user had sized"
+
+
+def test_moving_a_fresh_window_does_not_end_auto_fit(qtbot):
+    """Only a resize writes a size back; a move must leave the first-run
+    values in place or the first drag would silently pin the height."""
+    config = Config()
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_ok_snapshot("claude"), "Claude")
+    widget.move(50, 50)
+
+    middle = QPoint(widget.width() // 2, widget.height() // 2)
+    _press(widget, middle)
+    _move_to(widget, widget.mapToGlobal(middle) + QPoint(60, 40))
+    _release(widget, middle)
+
+    assert widget._user_sized is False  # noqa: SLF001
+    assert (config.window.width, config.window.height) == (
+        WINDOW_WIDTH,
+        WINDOW_DEFAULT_HEIGHT,
+    )
+    assert (config.window.x, config.window.y) == (widget.x(), widget.y())
+
+
+def test_a_click_raises_settings_but_a_drag_does_not(qtbot):
+    """The drag defect: activated_requested used to fire on every press, and
+    the App answers it by activating the Settings window - which takes the
+    focus, and with it the implicit mouse grab, away mid-drag."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_ok_snapshot("claude"), "Claude")
+    widget.move(50, 50)
+    raised: list[int] = []
+    widget.activated_requested.connect(lambda: raised.append(1))
+
+    middle = QPoint(widget.width() // 2, widget.height() // 2)
+    _press(widget, middle)
+    _move_to(widget, widget.mapToGlobal(middle) + QPoint(80, 0))
+    _release(widget, middle)
+    assert raised == [], "a drag raised Settings"
+
+    _press(widget, middle)
+    _release(widget, middle)
+    assert raised == [1], "a click did not raise Settings"
+
+
+def test_the_vertical_bar_appears_with_twelve_tiles_and_not_with_one(qtbot):
+    one = UsageWidget(Config())
+    qtbot.addWidget(one)
+    one.update_snapshot(_ok_snapshot("claude"), "Claude")
+    with qtbot.waitExposed(one):
+        one.show()
+    one._do_refit_height()  # noqa: SLF001
+    qtbot.wait(0)
+    assert one._tile_scroll.verticalScrollBar().maximum() == 0  # noqa: SLF001
+
+    many = UsageWidget(Config())
+    qtbot.addWidget(many)
+    for i in range(12):
+        many.update_snapshot(_ok_snapshot(f"claude-{i}"), f"Claude {i}")
+    with qtbot.waitExposed(many):
+        many.show()
+    many._do_refit_height()  # noqa: SLF001
+    qtbot.wait(0)
+    assert many._tile_scroll.verticalScrollBar().maximum() > 0  # noqa: SLF001
+
+
+def test_the_horizontal_bar_appears_only_when_a_row_is_wider_than_the_window(qtbot):
+    """A plain metric row's minimum is 196 px, well inside the 260 px window
+    minimum, so ordinary content never needs one. An Azure row that carries a
+    spend and an allowance in its reset column does: measured 304 px."""
+    plain = UsageWidget(Config())
+    qtbot.addWidget(plain)
+    plain.update_snapshot(_ok_snapshot("claude"), "Claude")
+    with qtbot.waitExposed(plain):
+        plain.show()
+    plain._mark_user_sized()  # noqa: SLF001
+    plain.resize(WINDOW_MIN_WIDTH, 300)
+    qtbot.wait(0)
+    assert plain._tile_scroll.horizontalScrollBar().maximum() == 0  # noqa: SLF001
+
+    wide = UsageWidget(Config())
+    qtbot.addWidget(wide)
+    fetched = datetime(2026, 4, 27, 12, 0)
+    wide.update_snapshot(
+        UsageSnapshot(
+            provider="azure",
+            status=SnapshotStatus.OK,
+            metrics=[
+                UsageMetric(
+                    "Spend",
+                    40.0,
+                    fetched + timedelta(days=5),
+                    reset_label="$1,234,567.89 of $9,999,999.00",
+                )
+            ],
+            fetched_at=fetched,
+        ),
+        "Microsoft · Azure",
+    )
+    with qtbot.waitExposed(wide):
+        wide.show()
+    wide._mark_user_sized()  # noqa: SLF001
+    wide.resize(WINDOW_MIN_WIDTH, 300)
+    qtbot.wait(0)
+    assert wide._tile_container.minimumSizeHint().width() > WINDOW_MIN_WIDTH  # noqa: SLF001
+    assert wide._tile_scroll.horizontalScrollBar().maximum() > 0  # noqa: SLF001
+
+
+def test_the_scroll_bar_is_painted_in_the_shared_colours(qtbot):
+    """A 6 px handle on a track the colour of the panel read as a floating
+    sliver. Measured here: a 10 px bar, a #1f2937 track against the #111827
+    panel, a #4b5563 handle - and nothing at all when the content fits."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    for i in range(12):
+        widget.update_snapshot(_ok_snapshot(f"claude-{i}"), f"Claude {i}")
+    with qtbot.waitExposed(widget):
+        widget.show()
+    widget._do_refit_height()  # noqa: SLF001
+    qtbot.wait(0)
+
+    bar = widget._tile_scroll.verticalScrollBar()  # noqa: SLF001
+    assert bar.maximum() > 0
+    assert bar.width() == SCROLLBAR_WIDTH
+    # Three lines of text per notch, and a page is the viewport.
+    assert bar.singleStep() == 3 * widget.fontMetrics().height()
+    assert bar.pageStep() == widget._tile_scroll.viewport().height()  # noqa: SLF001
+
+    image = widget.grab().toImage()
+    top_left = bar.mapTo(widget, bar.rect().topLeft())
+    column = top_left.x() + bar.width() // 2
+    assert image.pixelColor(column, top_left.y() + 12).name() == "#4b5563"
+    assert (
+        image.pixelColor(column, top_left.y() + bar.height() - 4).name() == "#1f2937"
+    ), "the track is not distinguishable from the panel"
+    assert image.pixelColor(top_left.x() - 6, top_left.y() + 12).name() == "#111827"
+
+    fitted = UsageWidget(Config())
+    qtbot.addWidget(fitted)
+    fitted.update_snapshot(_ok_snapshot("claude"), "Claude")
+    with qtbot.waitExposed(fitted):
+        fitted.show()
+    fitted._do_refit_height()  # noqa: SLF001
+    qtbot.wait(0)
+    fitted_image = fitted.grab().toImage()
+    assert fitted_image.pixelColor(column, 60).name() == "#111827", (
+        "a bar was painted for content that fits"
+    )
+
+
+def test_the_collapsed_strip_keeps_the_width_the_user_chose(qtbot):
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_ok_snapshot("claude"), "Claude")
+    widget.move(50, 50)
+    _drag_corner(widget, 140, 0)
+    chosen_width = widget.width()
+
+    widget.set_collapsed(True)
+
+    assert widget.width() == chosen_width
+    assert widget.height() == 58

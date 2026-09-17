@@ -44,9 +44,11 @@ from . import __version__
 from .config import (
     ColorThresholds,
     Config,
+    WINDOW_AUTOFIT_MAX_HEIGHT,
     WINDOW_COLLAPSED_HEIGHT,
-    WINDOW_MAX_HEIGHT,
+    WINDOW_DEFAULT_HEIGHT,
     WINDOW_MIN_HEIGHT,
+    WINDOW_MIN_WIDTH,
     WINDOW_WIDTH,
     browser_account,
     display_name_for_account,
@@ -59,6 +61,7 @@ from .ratio import (
     MIN_WEEKLY_DELTA,
     RatioEstimate,
 )
+from .ui_style import SCROLLBAR_STYLESHEET
 
 ROW_BAR_HEIGHT = 8
 # How wide the right-hand column may grow for a reset_label that is a phrase
@@ -75,10 +78,54 @@ PROVIDER_ORDER = ("claude", "codex", "opencode_go", "copilot", "azure", "openrou
 # and a chip that wraps costs a whole row in the collapsed panel.
 COMPACT_DISPLAY_NAMES = {"azure": "Azure"}
 COLLAPSED_MIN_HEIGHT = WINDOW_COLLAPSED_HEIGHT
+# How far in from an edge a press counts as a resize rather than a drag. Eight
+# logical pixels is what a native frameless window uses and what a pointer can
+# be expected to land on; a wider band starts eating clicks on the tile rows.
+RESIZE_BAND = 8
+# Qt's own "no maximum", which is what a maximum has to be reset to after a
+# smaller monitor has imposed one.
+_QT_SIZE_MAX = 16777215
 
 
-def _clamp_height(value: int) -> int:
-    return max(WINDOW_MIN_HEIGHT, min(value, WINDOW_MAX_HEIGHT))
+def _autofit_height(value: int) -> int:
+    """Bound a height the app chose for itself, not one the user chose."""
+    return max(WINDOW_MIN_HEIGHT, min(value, WINDOW_AUTOFIT_MAX_HEIGHT))
+
+
+def _edges_for_point(point: QPoint, width: int, height: int) -> Qt.Edge:
+    """Which window edges a point is on, as Qt.Edge flags (0 for none).
+
+    Pure arithmetic on a rectangle so the eight zones can be tested without a
+    window manager: offscreen there is no native resize to observe.
+    """
+    edges = Qt.Edge(0)
+    if not (0 <= point.x() < width and 0 <= point.y() < height):
+        return edges
+    if point.x() < RESIZE_BAND:
+        edges |= Qt.Edge.LeftEdge
+    elif point.x() >= width - RESIZE_BAND:
+        edges |= Qt.Edge.RightEdge
+    if point.y() < RESIZE_BAND:
+        edges |= Qt.Edge.TopEdge
+    elif point.y() >= height - RESIZE_BAND:
+        edges |= Qt.Edge.BottomEdge
+    return edges
+
+
+_EDGE_CURSORS = {
+    Qt.Edge.LeftEdge: Qt.CursorShape.SizeHorCursor,
+    Qt.Edge.RightEdge: Qt.CursorShape.SizeHorCursor,
+    Qt.Edge.TopEdge: Qt.CursorShape.SizeVerCursor,
+    Qt.Edge.BottomEdge: Qt.CursorShape.SizeVerCursor,
+    Qt.Edge.LeftEdge | Qt.Edge.TopEdge: Qt.CursorShape.SizeFDiagCursor,
+    Qt.Edge.RightEdge | Qt.Edge.BottomEdge: Qt.CursorShape.SizeFDiagCursor,
+    Qt.Edge.RightEdge | Qt.Edge.TopEdge: Qt.CursorShape.SizeBDiagCursor,
+    Qt.Edge.LeftEdge | Qt.Edge.BottomEdge: Qt.CursorShape.SizeBDiagCursor,
+}
+
+
+def _cursor_for_edges(edges: Qt.Edge) -> Qt.CursorShape:
+    return _EDGE_CURSORS.get(edges, Qt.CursorShape.ArrowCursor)
 
 
 def _provider_family(provider: str) -> str:
@@ -1270,7 +1317,28 @@ class UsageWidget(QWidget):
         self._config = config
         self._mouse_inside = False
         self._drag_offset: QPoint | None = None
-        self.setFixedWidth(WINDOW_WIDTH)
+        # Set while the pure-Qt fallback is driving a resize: the edges being
+        # dragged, the press position in global coordinates and the geometry
+        # the press started from. Empty edges mean no fallback resize is live.
+        self._resize_edges = Qt.Edge(0)
+        self._resize_origin: QPoint | None = None
+        self._press_global: QPoint | None = None
+        self._resize_geometry = self.geometry()
+        # Did this press move the window at all? A press that did not is a
+        # click, and only a click raises an open Settings window - see
+        # mousePressEvent.
+        self._press_moved = False
+        self._screen_signals_wired = False
+        # Has the user ever given this window a size of their own? A config
+        # still carrying both first-run values has not, and that is what keeps
+        # auto-fit switched on. Nothing writes the size back until this is
+        # True, so moving a fresh window does not silently end auto-fit.
+        self._user_sized = (
+            config.window.width != WINDOW_WIDTH
+            or config.window.height != WINDOW_DEFAULT_HEIGHT
+        )
+        self.setMinimumSize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
+        self.setMouseTracking(True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         # Background is drawn in paintEvent; no widget-level stylesheet — that
         # would cascade into child dialogs (Settings) and break their layout.
@@ -1394,8 +1462,13 @@ class UsageWidget(QWidget):
         self._tile_scroll = QScrollArea(self)
         self._tile_scroll.setWidgetResizable(True)
         self._tile_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        # Both axes, as needed. The window's width is the user's now, and an
+        # Azure row whose reset column carries a spend and an allowance has a
+        # minimum width of its own (378 px measured, against a 260 px window
+        # minimum) - so content can be wider than the viewport as well as
+        # taller, and a bar that only exists on one axis hides the other half.
         self._tile_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
         self._tile_scroll.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAsNeeded
@@ -1403,11 +1476,16 @@ class UsageWidget(QWidget):
         self._tile_scroll.setStyleSheet(
             "QScrollArea { background:#111827; border:none; }"
             "QScrollArea > QWidget > QWidget { background:#111827; }"
-            "QScrollBar:vertical { background:#111827; width:6px; margin:0; }"
-            "QScrollBar::handle:vertical { background:#4b5563; border-radius:3px; }"
-            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }"
+            + SCROLLBAR_STYLESHEET
         )
         self._tile_scroll.viewport().setStyleSheet("background:#111827;")
+        # Three lines of text per wheel notch. Qt's default single step is 20
+        # px, which is under two rows on a tile and reads as a bar that barely
+        # moves. The page step is the viewport height, which QScrollArea keeps
+        # in step with its own geometry - asserted rather than set.
+        wheel_step = 3 * self.fontMetrics().height()
+        self._tile_scroll.verticalScrollBar().setSingleStep(wheel_step)
+        self._tile_scroll.horizontalScrollBar().setSingleStep(wheel_step)
         self._tile_scroll.setWidget(self._tile_container)
 
         outer = QVBoxLayout(self)
@@ -1415,20 +1493,19 @@ class UsageWidget(QWidget):
         outer.setSpacing(0)
         outer.addWidget(self._collapsed_widget)
         outer.addWidget(self._header_widget)
-        outer.addWidget(self._tile_scroll)
-        outer.setAlignment(Qt.AlignmentFlag.AlignTop)
+        # Stretch factor 1 and no AlignTop: the tile area is what takes the
+        # slack in a window the user has made taller than its content. With
+        # AlignTop every child got its size hint and the extra height was an
+        # empty strip below the last tile.
+        outer.addWidget(self._tile_scroll, 1)
 
-        # Height is layout-driven (refit on tile/snapshot changes); width is
-        # intentionally fixed because the frameless widget has no resize handle.
-        self.resize(
-            QSize(
-                WINDOW_WIDTH,
-                _clamp_height(config.window.height),
-            )
-        )
+        # The saved size, bounded by WindowState; the monitor's work area is
+        # applied on top of it at show time, because only then is it known
+        # which monitor that is.
+        self.resize(QSize(config.window.width, config.window.height))
         if config.window.x is not None and config.window.y is not None:
             self.move(QPoint(config.window.x, config.window.y))
-            self._clamp_to_visible_screen()
+        self._clamp_to_visible_screen()
 
         # Drag-by-anywhere
 
@@ -1437,6 +1514,7 @@ class UsageWidget(QWidget):
         self._tick.timeout.connect(self._refresh_header_labels)
         self._tick.start(1000)
         self._apply_collapsed_state(save=False)
+        self._track_hover()
 
     def _mini_button(self, glyph: str, tooltip: str) -> QPushButton:
         btn = QPushButton(glyph)
@@ -1578,13 +1656,43 @@ class UsageWidget(QWidget):
         QTimer.singleShot(0, self._do_refit_height)
 
     def _do_refit_height(self) -> None:
+        """Fit the window to its content - but only while that is still the rule.
+
+        Two rules, and which one applies when:
+
+        * **Collapsed** is always auto-fitted. It is a chip strip with one
+          right answer for its height, and the user cannot drag a chip row
+          into being two rows tall. Its width is whatever the window already
+          has, so collapsing and expanding does not throw a size away.
+        * **Expanded** is auto-fitted only while the user has never sized the
+          window - a config still carrying the first-run 340x220. Once they
+          have dragged an edge, the saved size wins and the tile area takes
+          the difference: scroll bars if the content is bigger, empty panel if
+          it is smaller. Re-fitting after that would undo the drag on the next
+          refresh, which is the whole reason auto-fit had to become
+          conditional rather than being deleted.
+
+        The auto-fit ceiling stays 420 px. A fresh install with six providers
+        would otherwise open a window most of a screen tall.
+        """
         if self._collapsed:
             target_height = max(
                 COLLAPSED_MIN_HEIGHT,
-                min(WINDOW_MAX_HEIGHT, self._collapsed_widget.sizeHint().height()),
+                min(
+                    WINDOW_AUTOFIT_MAX_HEIGHT,
+                    self._collapsed_widget.sizeHint().height(),
+                ),
             )
-            if self.height() != target_height or self.width() != WINDOW_WIDTH:
-                self.resize(WINDOW_WIDTH, target_height)
+            if self.height() != target_height:
+                self.resize(self.width(), target_height)
+            return
+        self._track_hover()
+        if self._user_sized:
+            # Hand the tile area back to the layout: a fixed height left over
+            # from an earlier auto-fit would pin it at the content's size and
+            # leave the rest of the window blank.
+            self._tile_scroll.setMinimumHeight(0)
+            self._tile_scroll.setMaximumHeight(_QT_SIZE_MAX)
             return
         self._tile_layout.invalidate()
         self._tile_container.updateGeometry()
@@ -1593,12 +1701,11 @@ class UsageWidget(QWidget):
         self.layout().invalidate()
         header_height = self._header_widget.sizeHint().height()
         tile_height = self._tile_container.sizeHint().height()
-        max_tile_height = max(40, WINDOW_MAX_HEIGHT - header_height)
+        max_tile_height = max(40, WINDOW_AUTOFIT_MAX_HEIGHT - header_height)
         self._tile_scroll.setFixedHeight(min(tile_height, max_tile_height))
-        target_height = _clamp_height(header_height + self._tile_scroll.height())
-        target_width = WINDOW_WIDTH
-        if target_height != self.height() or target_width != self.width():
-            self.resize(target_width, target_height)
+        target_height = _autofit_height(header_height + self._tile_scroll.height())
+        if target_height != self.height():
+            self.resize(self.width(), target_height)
 
 
     def set_refreshing(self, refreshing: bool, *, total: int | None = None) -> None:
@@ -1720,7 +1827,10 @@ class UsageWidget(QWidget):
         self._collapsed_label.setText("")
         self._collapsed_label.hide()
         providers = sorted(self._tiles, key=self._tile_sort_key)
-        available_width = WINDOW_WIDTH - 16
+        # The chips wrap into whatever width the window has, not a
+        # constant: the collapsed strip follows the size the user chose
+        # rather than snapping back to 340 and losing it.
+        available_width = max(WINDOW_MIN_WIDTH, self.width()) - 16
         row_widget: QWidget | None = None
         row_layout: QHBoxLayout | None = None
         row_width = 0
@@ -1828,9 +1938,8 @@ class UsageWidget(QWidget):
             return
         self._collapsed = collapsed
         self._config.window.collapsed = collapsed
-        self._config.window.width = WINDOW_WIDTH
         if not collapsed:
-            self._config.window.height = _clamp_height(self.height())
+            self._remember_size()
         self._config.save()
         self._apply_collapsed_state(save=False)
 
@@ -1841,14 +1950,15 @@ class UsageWidget(QWidget):
         self._tile_container.setVisible(not self._collapsed)
         self._refresh_collapsed_summary()
         if self._collapsed:
-            self.setFixedWidth(WINDOW_WIDTH)
+            # A chip strip is one row tall and says so; only its width is the
+            # user's. The vertical maximum is released again on expand.
             self.setMinimumHeight(COLLAPSED_MIN_HEIGHT)
-            self.setMaximumHeight(WINDOW_MAX_HEIGHT)
+            self.setMaximumHeight(WINDOW_AUTOFIT_MAX_HEIGHT)
             self._do_refit_height()
         else:
-            self.setFixedWidth(WINDOW_WIDTH)
             self.setMinimumHeight(WINDOW_MIN_HEIGHT)
-            self.setMaximumHeight(WINDOW_MAX_HEIGHT)
+            self.setMaximumHeight(_QT_SIZE_MAX)
+            self._apply_screen_bounds()
             self._refit_height()
         if save:
             self._config.window.collapsed = self._collapsed
@@ -1925,15 +2035,19 @@ class UsageWidget(QWidget):
         widget never appears. Unplugging the monitor it was parked on does the
         same. Clamp into the available geometry so it always comes back.
         """
-        pos = self.pos()
-        screen = (
-            QApplication.screenAt(pos)
-            or self.screen()
-            or QApplication.primaryScreen()
-        )
+        screen = self._current_screen()
         if screen is None:
             return
         geo = screen.availableGeometry()
+        # Size first: a window restored onto a smaller monitor has to be made
+        # to fit before there is any position that fits. Since the size is the
+        # user's now, this is the only thing that stops a 3000-px-tall panel
+        # saved on a 4K display from opening taller than a laptop screen.
+        width = min(self.width(), geo.width())
+        height = min(self.height(), geo.height())
+        if width != self.width() or height != self.height():
+            self.resize(width, height)
+        pos = self.pos()
         # geo.right()/bottom() are inclusive, so the last fully-visible top-left
         # is right - width + 1 (clamped below left/top for tiny screens).
         max_x = max(geo.left(), geo.right() - self.width() + 1)
@@ -1943,10 +2057,56 @@ class UsageWidget(QWidget):
         if x != pos.x() or y != pos.y():
             self.move(x, y)
 
+    def _current_screen(self):
+        return (
+            QApplication.screenAt(self.pos())
+            or self.screen()
+            or QApplication.primaryScreen()
+        )
+
+    def _apply_screen_bounds(self) -> None:
+        """Cap the window at the work area of the monitor it is on.
+
+        ``availableGeometry`` rather than ``geometry``: the maximum the user
+        should be able to drag to is the screen minus its taskbar or dock, and
+        that is per-monitor. Re-applied whenever the answer can change - on
+        show, when the window moves to another screen, and when a screen's own
+        work area changes (a taskbar appearing, a resolution change).
+        """
+        if self._collapsed:
+            return
+        screen = self._current_screen()
+        if screen is None:
+            return
+        geo = screen.availableGeometry()
+        self.setMaximumSize(
+            max(WINDOW_MIN_WIDTH, geo.width()), max(WINDOW_MIN_HEIGHT, geo.height())
+        )
+        self._clamp_to_visible_screen()
+
+    def _wire_screen_signals(self) -> None:
+        """Follow the window onto whichever monitor it lands on.
+
+        The QWindow only exists once the widget has been created, so this runs
+        from showEvent rather than __init__, and only once.
+        """
+        handle = self.windowHandle()
+        if handle is None or self._screen_signals_wired:
+            return
+        self._screen_signals_wired = True
+        handle.screenChanged.connect(lambda _screen: self._apply_screen_bounds())
+        for screen in QApplication.screens():
+            screen.availableGeometryChanged.connect(
+                lambda _geo: self._apply_screen_bounds()
+            )
+
     def showEvent(self, event):  # noqa: N802
         # A DPI/scale or monitor change can happen while the widget is hidden;
-        # re-clamp on every show so it can never come back off-screen.
+        # re-clamp on every show so it can never come back off-screen, and
+        # re-cap it in case the monitor it is on is not the one it was saved on.
         super().showEvent(event)
+        self._wire_screen_signals()
+        self._apply_screen_bounds()
         self._clamp_to_visible_screen()
         self._apply_window_opacity()
 
@@ -1991,44 +2151,206 @@ class UsageWidget(QWidget):
         self.raise_()
         self.activateWindow()
 
-    # ----- drag-to-move -----
+    # ----- drag to move, drag an edge to resize -----
+
+    def edges_at(self, point: QPoint) -> Qt.Edge:
+        """Which window edges ``point`` (widget coordinates) is on."""
+        return _edges_for_point(point, self.width(), self.height())
+
+    def _track_hover(self) -> None:
+        """Let the resize cursor appear over the children, not just the gaps.
+
+        The layout has no margins, so tiles, labels and the scroll area cover
+        the frame right up to the edge, and a widget without mouse tracking
+        reports nothing until a button is down. Tracking plus one event filter
+        over the subtree is what puts the double-arrow under the pointer.
+
+        The filter only ever *reads* - it returns False for everything - so it
+        cannot take a click off a button or a link. The press itself needs no
+        help: measured, nothing in the panel accepts a left press except the
+        four header buttons and a tile's chevron, so it already propagates to
+        this widget's own handler from anywhere else.
+
+        Re-run after tiles change, because rows are created and destroyed as
+        snapshots arrive; a dynamic property keeps a child from collecting the
+        filter more than once.
+        """
+        for child in [self, *self.findChildren(QWidget)]:
+            child.setMouseTracking(True)
+            if not child.property("_ag_hover_filter"):
+                child.setProperty("_ag_hover_filter", True)
+                child.installEventFilter(self)
+
+    def eventFilter(self, obj, event):  # noqa: N802
+        if (
+            event.type() == QEvent.Type.MouseMove
+            and not event.buttons()
+            and isinstance(obj, QWidget)
+            and obj is not self
+            and self.isAncestorOf(obj)
+        ):
+            self._update_resize_cursor(
+                obj.mapTo(self, event.position().toPoint())
+            )
+        return False
+
+    def _update_resize_cursor(self, point: QPoint) -> None:
+        self.setCursor(_cursor_for_edges(self.edges_at(point)))
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.activated_requested.emit()
-            self._drag_offset = (
-                event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-            )
-            self._apply_window_opacity()
+        """An edge starts a resize; anywhere else arms a move.
+
+        ``startSystemResize`` hands the drag to the window manager, which is
+        what gets snapping, a live outline and correct behaviour on a
+        multi-DPI desktop on Windows, macOS and X11/Wayland alike. It returns
+        False where the platform has no such thing - offscreen is one,
+        conveniently, which is what makes the fallback testable - and then the
+        geometry is computed here from the drag delta. The move is armed but
+        not started (see mouseMoveEvent).
+
+        Raising an open Settings window is deliberately **not** done here any
+        more. It used to be: every press emitted ``activated_requested``,
+        which shows, raises and activates the Settings dialog, and activating
+        another top-level window while a button is down takes the focus - and
+        with it the implicit mouse grab - away from the panel, so the drag
+        ended on the first move. It now happens on a release that did not
+        move the window, which is a click.
+        """
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        point = event.position().toPoint()
+        self._press_moved = False
+        edges = self.edges_at(point)
+        handle = self.windowHandle()
+        if edges:
+            if handle is not None and handle.startSystemResize(edges):
+                self._resize_edges = Qt.Edge(0)
+            else:
+                self._resize_edges = edges
+                self._resize_origin = event.globalPosition().toPoint()
+                self._resize_geometry = self.geometry()
+            self._press_moved = True  # a resize is never also a click
+            self._mark_user_sized()
             event.accept()
+            return
+        self._press_global = event.globalPosition().toPoint()
+        self._drag_offset = self._press_global - self.frameGeometry().topLeft()
+        self._apply_window_opacity()
+        event.accept()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        if (
-            self._drag_offset is not None
-            and event.buttons() & Qt.MouseButton.LeftButton
-        ):
-            self.move(event.globalPosition().toPoint() - self._drag_offset)
+        if not (event.buttons() & Qt.MouseButton.LeftButton):
+            self._update_resize_cursor(event.position().toPoint())
+            return
+        if self._resize_edges and self._resize_origin is not None:
+            self._resize_from_delta(event.globalPosition().toPoint())
             event.accept()
+            return
+        if self._drag_offset is None:
+            return
+        global_point = event.globalPosition().toPoint()
+        if not self._press_moved:
+            travel = global_point - (self._press_global or global_point)
+            if (
+                abs(travel.x()) + abs(travel.y())
+                < QApplication.startDragDistance()
+            ):
+                return
+            # Only now is this a drag rather than a click, which is why the
+            # system move is not started on the press: the window manager
+            # takes the pointer when it starts, so the release never arrives
+            # and a plain click on the panel would stop raising Settings.
+            self._press_moved = True
+            handle = self.windowHandle()
+            if handle is not None and handle.startSystemMove():
+                self._drag_offset = None
+                event.accept()
+                return
+        self._press_moved = True
+        self.move(global_point - self._drag_offset)
+        event.accept()
+
+    def _resize_from_delta(self, global_point: QPoint) -> None:
+        """The pure-Qt fallback: new geometry from the pointer's travel.
+
+        Clamped to the same minimum and maximum the window carries, and the
+        left/top edges move the origin as well as the size - dragging the left
+        edge right must not walk the window's right edge across the screen.
+        """
+        origin = self._resize_origin
+        assert origin is not None
+        start = self._resize_geometry
+        dx = global_point.x() - origin.x()
+        dy = global_point.y() - origin.y()
+        minimum, maximum = self.minimumSize(), self.maximumSize()
+        left, top = start.left(), start.top()
+        width, height = start.width(), start.height()
+        if self._resize_edges & Qt.Edge.LeftEdge:
+            width = max(minimum.width(), min(maximum.width(), start.width() - dx))
+            left = start.right() - width + 1
+        elif self._resize_edges & Qt.Edge.RightEdge:
+            width = max(minimum.width(), min(maximum.width(), start.width() + dx))
+        if self._resize_edges & Qt.Edge.TopEdge:
+            height = max(minimum.height(), min(maximum.height(), start.height() - dy))
+            top = start.bottom() - height + 1
+        elif self._resize_edges & Qt.Edge.BottomEdge:
+            height = max(minimum.height(), min(maximum.height(), start.height() + dy))
+        self.setGeometry(left, top, width, height)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        was_resizing = bool(self._resize_edges)
+        self._resize_edges = Qt.Edge(0)
+        self._resize_origin = None
         self._drag_offset = None
+        self._press_global = None
         self._apply_window_opacity()
+        self._update_resize_cursor(event.position().toPoint())
+        if was_resizing:
+            self._clamp_to_visible_screen()
         self._do_refit_height()
-        # Persist position
         self._config.window.x = self.x()
         self._config.window.y = self.y()
-        self._config.window.width = WINDOW_WIDTH
         self._config.window.collapsed = self._collapsed
-        if not self._collapsed:
-            self._config.window.height = _clamp_height(self.height())
+        self._remember_size()
         self._config.save()
+        if not self._press_moved:
+            # A click, not a drag: this is where an open Settings window comes
+            # forward, once the press can no longer be one.
+            self.activated_requested.emit()
+        self._press_moved = False
+
+    def _mark_user_sized(self) -> None:
+        """The user has taken the window's size over from the app."""
+        if self._user_sized:
+            return
+        self._user_sized = True
+        # Whatever auto-fit pinned the tile area at is no longer the rule.
+        self._tile_scroll.setMinimumHeight(0)
+        self._tile_scroll.setMaximumHeight(_QT_SIZE_MAX)
+
+    def _remember_size(self) -> None:
+        """Write the current size back, but only once it is the user's.
+
+        A window still at its first-run size is left recorded as such, so
+        moving it - or closing it - does not quietly switch auto-fit off.
+        """
+        if not self._user_sized or self._collapsed:
+            return
+        self._config.window.width = self.width()
+        self._config.window.height = self.height()
+
+    def hideEvent(self, event):  # noqa: N802
+        # The X button hides rather than closes, so closeEvent is not where a
+        # size reliably gets written back.
+        self._remember_size()
+        self._config.window.x = self.x()
+        self._config.window.y = self.y()
+        super().hideEvent(event)
 
     def closeEvent(self, event):  # noqa: N802
         self._do_refit_height()
-        self._config.window.width = WINDOW_WIDTH
         self._config.window.collapsed = self._collapsed
-        if not self._collapsed:
-            self._config.window.height = _clamp_height(self.height())
+        self._remember_size()
         self._config.save()
         self.closed.emit()
         super().closeEvent(event)

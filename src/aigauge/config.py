@@ -32,9 +32,25 @@ KEYRING_GITHUB_PAT = "github-pat"
 KEYRING_OPENROUTER_KEY = "openrouter-key"
 KEYRING_OPENROUTER_MGMT_KEY = "openrouter-mgmt-key"
 KEYRING_AZURE_CLIENT_SECRET = "azure-client-secret"
+# The window the user can now drag by its edges. WINDOW_WIDTH and
+# WINDOW_DEFAULT_HEIGHT are the *first-run* size, not a constraint: a config
+# still carrying both is what "the user has never sized this window" means, and
+# it is what turns auto-fit on (see UsageWidget._do_refit_height).
 WINDOW_WIDTH = 340
+WINDOW_DEFAULT_HEIGHT = 220
+# 260, not 239. 239 is the hard floor - measured, the last header control to
+# survive is the "just now" age label, which loses its first pixel at 239 - and
+# 260 is the first round number above it that also leaves a metric row's bar
+# 64 px rather than 44. The four header buttons are setFixedSize and never
+# squeeze; a metric row's own minimum is 196.
+WINDOW_MIN_WIDTH = 260
 WINDOW_MIN_HEIGHT = 80
-WINDOW_MAX_HEIGHT = 420
+# The ceiling on *auto-fit*, not on the window. A window the user has sized is
+# bounded by the work area of the monitor it is on, which only the widget can
+# know; the loader sees no screen at all, so it bounds a saved size by this
+# instead and leaves the rest to the clamp at show time.
+WINDOW_AUTOFIT_MAX_HEIGHT = 420
+WINDOW_MAX_DIMENSION = 4096
 WINDOW_COLLAPSED_HEIGHT = 58
 
 # Per-provider session cookie names (HttpOnly cookies you can't read via JS).
@@ -182,10 +198,23 @@ def config_path() -> Path:
 
 
 class WindowState(BaseModel):
+    """Where and how big the floating panel is, as last left by the user.
+
+    ``width`` and ``height`` became real in 1.4.0+cfa.8. Before it the panel
+    was 340 px wide with a height re-fitted to its content, so the saved width
+    was overwritten with the constant on every load and the height capped at
+    420. Both are now whatever the user dragged the window to.
+
+    Bounded, never trusted: these reach ``QWidget.resize`` and a config file is
+    hand-editable. The bound here is a sanity bound rather than the real one -
+    the loader cannot know which monitor the window will open on, so it caps at
+    4096 and the widget clamps to that screen's work area at show time.
+    """
+
     x: int | None = None
     y: int | None = None
     width: int = WINDOW_WIDTH
-    height: int = 220
+    height: int = WINDOW_DEFAULT_HEIGHT
     collapsed: bool = False
     always_on_top: bool = True
     opacity: float = 0.8
@@ -196,11 +225,22 @@ class WindowState(BaseModel):
     # qt_scale_factor_env().
     ui_scale: float = 1.0
 
-    @field_validator("height", "opacity", "ui_scale", mode="before")
+    @field_validator("width", "height", "opacity", "ui_scale", mode="before")
     @classmethod
     def _coerce_bounds(cls, value: object, info) -> float | int:
         spec = {
-            "height": (220, float(WINDOW_MIN_HEIGHT), float(WINDOW_MAX_HEIGHT), True),
+            "width": (
+                WINDOW_WIDTH,
+                float(WINDOW_MIN_WIDTH),
+                float(WINDOW_MAX_DIMENSION),
+                True,
+            ),
+            "height": (
+                WINDOW_DEFAULT_HEIGHT,
+                float(WINDOW_MIN_HEIGHT),
+                float(WINDOW_MAX_DIMENSION),
+                True,
+            ),
             "opacity": (0.8, 0.3, 1.0, False),
             "ui_scale": (1.0, 0.75, 4.0, False),
         }[info.field_name]
@@ -939,14 +979,12 @@ class Config(BaseModel):
                     }
                 )
             data["browser_accounts"] = accounts
-        window = data.get("window")
-        if isinstance(window, dict):
-            width = window.get("width")
-            height = window.get("height")
-            if isinstance(width, int):
-                window["width"] = WINDOW_WIDTH
-            if isinstance(height, int):
-                window["height"] = max(WINDOW_MIN_HEIGHT, min(height, WINDOW_MAX_HEIGHT))
+        # The window block used to be rewritten here: the saved width was
+        # replaced with the constant 340 on every load and the height capped at
+        # 420, because neither was the user's to choose. Both are now, and
+        # WindowState's own validator bounds them - so a 1.3.x config
+        # (width 340, height 420) loads unchanged, and a hostile one is
+        # coerced rather than migrated.
         copilot = data.get("copilot")
         if isinstance(copilot, dict) and copilot.get("monthly_quota") == 300:
             copilot["monthly_quota"] = 1500
