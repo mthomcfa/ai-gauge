@@ -22,6 +22,7 @@ from aigauge.widget import (
     NATIVE_GESTURE_MAX_IDLE_FIRES,
     RESIZE_BAND,
     UsageWidget,
+    _connect_once,
     _QT_SIZE_MAX,
     _TOOLTIP_ERROR_CHARS,
     _format_ratio_inline,
@@ -2276,6 +2277,24 @@ def test_wiring_a_screen_twice_leaves_one_connection(qtbot, monkeypatch):
     screen.availableGeometryChanged.emit(screen.availableGeometry())
 
     assert clamps == [1], "one work-area change, more than one clamp"
+
+
+def test_connect_once_still_refuses_a_slot_that_is_not_one(qtbot):
+    """PyQt raises `TypeError` for a duplicate `UniqueConnection` *and* for a
+    slot it cannot connect at all, and the helper swallowed both: the next
+    `_connect_once(signal, self._typo)` would have wired nothing and said
+    nothing, and the defect would have surfaced as "the window stopped
+    re-clamping when I moved it to the other monitor"."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    screen = QApplication.primaryScreen()
+
+    with pytest.raises(TypeError):
+        _connect_once(screen.availableGeometryChanged, object())
+
+    # And the duplicate it *is* for is still swallowed, twice over.
+    _connect_once(screen.availableGeometryChanged, widget._apply_screen_bounds)  # noqa: SLF001
+    _connect_once(screen.availableGeometryChanged, widget._apply_screen_bounds)  # noqa: SLF001
 
 
 def test_a_click_raises_settings_but_a_drag_does_not(qtbot):

@@ -119,11 +119,17 @@ def _connect_once(signal, slot) -> None:
     window three times. A set of screens already seen would do the same job
     and keep a ``QScreen`` alive past the widget, which is the defect the
     bound methods were introduced to fix.
+
+    PyQt raises the same ``TypeError`` for a slot it cannot connect at all,
+    and swallowing that one would wire nothing and say nothing - the failure
+    would surface later as "the window stopped re-clamping on a monitor
+    change". A slot that is not callable is not a duplicate, so it is raised.
     """
     try:
         signal.connect(slot, Qt.ConnectionType.UniqueConnection)
     except TypeError:
-        pass
+        if not callable(slot):
+            raise
 
 
 def _edges_for_point(point: QPoint, width: int, height: int) -> Qt.Edge:
