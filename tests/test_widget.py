@@ -2019,6 +2019,56 @@ def test_the_macos_popover_anchor_is_not_saved_over_the_users_position(qtbot):
     assert (on_disk.x, on_disk.y) == (moved.x(), moved.y()), "a user move was ignored"
 
 
+def test_a_show_that_is_not_a_popover_hands_the_position_back(qtbot):
+    """`_app_positioned` is about the anchor, not about this window for ever.
+
+    Nothing but `show_as_popover` sets it and nothing but a user move cleared
+    it, so a build that stops being a menu-bar popover - the setting changed,
+    or a platform where the panel is a normal window - carried the flag for
+    the rest of the session: `window.x`/`y` stayed frozen at whatever was last
+    written, however often the window was shown, until the user dragged it.
+    The popover sets the `Popup` window type in the same breath as the flag,
+    so a show without it is the window being itself again.
+    """
+    config = Config()
+    config.window.x, config.window.y = 120, 140
+    config.window.width, config.window.height = 400, 260
+    config.window.user_sized = True
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+    with qtbot.waitExposed(widget):
+        widget.show()
+    qtbot.wait(0)
+    chosen = widget.pos()
+
+    widget.show_as_popover(
+        QApplication.primaryScreen().availableGeometry().center().x(), 24
+    )
+    qtbot.wait(0)
+    assert widget._app_positioned is True  # noqa: SLF001
+    anchored = widget.pos()
+    assert anchored != chosen, "the popover did not move the window"
+    # Something for the dirty check to write, so the file is the assertion
+    # rather than the model: the size is committed, the anchor is not.
+    widget.resize(widget.width() + 20, widget.height())
+    widget.hide()
+    on_disk = Config.load().window
+    assert (on_disk.x, on_disk.y) == (chosen.x(), chosen.y()), "the anchor was saved"
+
+    # The window stops being a popover: back to the flags the constructor
+    # gives it, and shown the way `_toggle_widget` shows it off macOS.
+    widget.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool)
+    with qtbot.waitExposed(widget):
+        widget.show()
+    qtbot.wait(0)
+    assert widget._app_positioned is False, "a normal show left the flag set"
+
+    widget.hide()
+    on_disk = Config.load().window
+    assert (on_disk.x, on_disk.y) == (widget.x(), widget.y())
+    assert (on_disk.x, on_disk.y) != (chosen.x(), chosen.y()), "the position is frozen"
+
+
 def test_a_collapse_is_one_write_and_the_hide_after_it_none(qtbot, monkeypatch):
     """`set_collapsed` saved unconditionally and left the commit seam's record
     of the file untouched, so it was the one write path outside the dirty

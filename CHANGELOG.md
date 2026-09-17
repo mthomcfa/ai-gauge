@@ -127,7 +127,10 @@ user sees.
   item on every open, and with the dismissal's hide now reaching the seam,
   that x/y would have replaced the position the user dragged to. The size and
   the collapsed state are still written; the first move the user makes hands
-  the position back.
+  the position back, and so does the first show that is not a popover open -
+  the flag is cleared whenever the window is shown without the `Popup` window
+  type `show_as_popover` sets, so a build that stops being a menu-bar popover
+  does not carry a frozen x/y for the rest of the session.
 
 - **An app icon.** Three stacked pill bars at 47 %, 72 % and 92 % on the app's
   own rounded dark panel - the compact chip row the widget already shows, which

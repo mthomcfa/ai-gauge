@@ -2447,6 +2447,14 @@ class UsageWidget(QWidget):
         # re-clamp on every show so it can never come back off-screen, and
         # re-cap it in case the monitor it is on is not the one it was saved on.
         super().showEvent(event)
+        if (self.windowFlags() & Qt.WindowType.WindowType_Mask) != Qt.WindowType.Popup:
+            # `show_as_popover` is the only thing that sets `_app_positioned`,
+            # and it sets the `Popup` window type in the same breath. A show
+            # that is not a popover open is the window being itself again, so
+            # where it comes back is the user's position to keep - without
+            # this, one popover open froze `window.x`/`y` until the user moved
+            # the window by hand.
+            self._app_positioned = False
         self._wire_screen_signals()
         self._apply_screen_bounds()
         self._clamp_to_visible_screen()
