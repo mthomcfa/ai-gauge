@@ -384,6 +384,7 @@ class _DetailLine(QLabel):
         super().__init__(parent)
         self._full_text = ""
         self._clickable = False
+        self._press_at: QPoint | None = None
         self.setVisible(False)
         self.setWordWrap(False)
         self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
@@ -423,13 +424,39 @@ class _DetailLine(QLabel):
         self._elide()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        """Remember where the press landed; the click is decided on release.
+
+        Emitting ``clicked`` here opened a top-level dialog with the mouse
+        still down - the very failure this release removed from the panel:
+        activating another window while a button is down takes the focus, and
+        with it the implicit mouse grab. This line is 324 px wide on a 340 px
+        panel, so on an error tile with no rows it was most of the window.
+        """
         if self._clickable and event.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit()
+            self._press_at = event.position().toPoint()
             event.accept()
             return
+        self._press_at = None
         # Ignored on purpose: an unclickable line must keep propagating the
         # press to the window, which is what drags the panel.
         event.ignore()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        press_at, self._press_at = self._press_at, None
+        if (
+            press_at is None
+            or not self._clickable
+            or event.button() != Qt.MouseButton.LeftButton
+        ):
+            event.ignore()
+            return
+        travel = event.position().toPoint() - press_at
+        # The same test the panel applies to its own press: a pointer that
+        # stayed put is a click, and anything further is a drag the user meant
+        # for the window.
+        if abs(travel.x()) + abs(travel.y()) < QApplication.startDragDistance():
+            self.clicked.emit()
+        event.accept()
 
 
 def _render_refresh_pixmap(color: str, size: int) -> QPixmap:

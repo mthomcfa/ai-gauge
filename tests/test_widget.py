@@ -1821,17 +1821,35 @@ def test_the_error_line_is_the_clickable_details_affordance(qtbot):
     tile = widget._tiles["azure"]  # noqa: SLF001
 
     with qtbot.waitSignal(widget.details_requested) as signal:
-        tile.detail.mousePressEvent(
-            QMouseEvent(
-                QEvent.Type.MouseButtonPress,
-                QPointF(QPoint(4, 4)),
-                QPointF(tile.detail.mapToGlobal(QPoint(4, 4))),
-                Qt.MouseButton.LeftButton,
-                Qt.MouseButton.LeftButton,
-                Qt.KeyboardModifier.NoModifier,
-            )
-        )
+        _press(tile.detail, QPoint(4, 4))
+        _release(tile.detail, QPoint(4, 4))
     assert signal.args == ["azure"]
+
+
+def test_the_error_line_raises_details_on_a_click_not_a_press(qtbot):
+    """The line used to emit on the press, so the details dialog came up with
+    the mouse still down - which is exactly the focus-and-grab steal this
+    release removed from the panel, re-introduced over most of the width of
+    every error tile that has no rows."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_error_snapshot("azure", "boom"), "Microsoft · Azure")
+    detail = widget._tiles["azure"].detail  # noqa: SLF001
+    seen: list[str] = []
+    widget.details_requested.connect(seen.append)
+
+    start = QPoint(4, 4)
+    _press(detail, start)
+    assert seen == [], "the dialog opened while the button was still down"
+
+    far = QPoint(start.x() + QApplication.startDragDistance() + 40, start.y())
+    _move_to(detail, detail.mapToGlobal(far))
+    _release(detail, far)
+    assert seen == [], "a drag across the line opened the dialog"
+
+    _press(detail, start)
+    _release(detail, start)
+    assert seen == ["azure"], "a click did not open the dialog"
 
 
 def test_a_long_error_is_elided_not_clipped(qtbot):

@@ -252,7 +252,11 @@ user sees.
   tile with no rows at all gets the message itself on a full-width line under
   the header - 324 px, and the tile grows from 22 px to 36 - elided to the
   window's current width with the full text in the tooltip, and clickable to
-  the same details dialog. Only when there is nothing else on the tile: with
+  the same details dialog - on the **release**, and only if the pointer stayed
+  within `startDragDistance()`, which is the same rule the panel applies to
+  its own press. Emitting on the press would have put a new top-level window
+  under a button that is still down, i.e. the defect below, over 324 px of a
+  340 px panel. Only when there is nothing else on the tile: with
   rows present the tag reads "error · stale" beside numbers that explain
   themselves. The same line covers `AUTH_REQUIRED` for the three providers with
   no Sign in button, where "not signed in" in the corner was the whole message.
