@@ -1497,17 +1497,89 @@ def test_the_scroll_bar_is_painted_in_the_shared_colours(qtbot):
 
 
 def test_the_collapsed_strip_keeps_the_width_the_user_chose(qtbot):
-    widget = UsageWidget(Config())
+    """And gives the height back on the way out.
+
+    ``set_collapsed`` used to record the size after ``_collapsed`` had flipped
+    to False and before the expanded geometry was back, so one click on the
+    chevron and one back wrote the 58 px strip's height over the size the user
+    had dragged to - in the config, i.e. on disk, i.e. for every later launch.
+    """
+    config = Config()
+    widget = UsageWidget(config)
     qtbot.addWidget(widget)
     widget.update_snapshot(_ok_snapshot("claude"), "Claude")
     widget.move(50, 50)
-    _drag_corner(widget, 140, 0)
-    chosen_width = widget.width()
+    _drag_corner(widget, 140, 60)
+    chosen = widget.size()
 
     widget.set_collapsed(True)
+    qtbot.wait(0)
 
-    assert widget.width() == chosen_width
-    assert widget.height() == 58
+    assert widget.width() == chosen.width()
+    assert widget.height() < chosen.height(), "the strip is not a strip"
+    # The guard in _remember_size: a collapsed window's height is the app's
+    # answer, not the user's, so it is never what gets written back.
+    assert (config.window.width, config.window.height) == (
+        chosen.width(),
+        chosen.height(),
+    ), "the collapsed height reached the config"
+
+    # And a click on the strip, which runs the same save path on release:
+    # the guard in _remember_size is the only thing between the strip's own
+    # height and the file.
+    strip_middle = QPoint(widget.width() // 2, widget.height() // 2)
+    _press(widget, strip_middle)
+    _release(widget, strip_middle)
+    assert (config.window.width, config.window.height) == (
+        chosen.width(),
+        chosen.height(),
+    ), "a click on the collapsed strip wrote its height back"
+
+    widget.set_collapsed(False)
+    qtbot.wait(0)
+
+    assert widget.size() == chosen, "expanding did not give the height back"
+    assert (config.window.width, config.window.height) == (
+        chosen.width(),
+        chosen.height(),
+    )
+
+
+def test_a_collapse_and_an_expand_survive_a_relaunch(qtbot):
+    """The same round trip, through the file and a second construction.
+
+    Twelve tiles, because that is the case where the strip wraps to three
+    rows and the height it would have written back (106) is far enough from
+    the user's to be unmistakable.
+    """
+    config = Config()
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+    for i in range(12):
+        widget.update_snapshot(_ok_snapshot(f"claude-{i}"), f"Claude {i}")
+    widget.move(50, 50)
+    _drag_corner(widget, 140, 60)
+    chosen = widget.size()
+
+    widget.set_collapsed(True)
+    qtbot.wait(0)
+    widget.set_collapsed(False)
+    qtbot.wait(0)
+    assert widget.size() == chosen
+
+    reloaded = Config.load()
+    assert (reloaded.window.width, reloaded.window.height) == (
+        chosen.width(),
+        chosen.height(),
+    ), "the next launch would open at the strip's height"
+
+    relaunched = UsageWidget(reloaded)
+    qtbot.addWidget(relaunched)
+    for i in range(12):
+        relaunched.update_snapshot(_ok_snapshot(f"claude-{i}"), f"Claude {i}")
+    qtbot.wait(0)
+    qtbot.wait(0)
+    assert relaunched.size() == chosen
 
 
 # --- An error tile with no rows -------------------------------------------

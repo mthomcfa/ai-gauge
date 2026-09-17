@@ -1451,6 +1451,10 @@ class UsageWidget(QWidget):
         # mousePressEvent.
         self._press_moved = False
         self._screen_signals_wired = False
+        # The height to come back to when the chip strip is expanded again;
+        # seeded from the restored geometry at the end of __init__, because a
+        # widget that starts collapsed never passes through set_collapsed.
+        self._expanded_height = 0
         # Has the user ever given this window a size of their own? A config
         # still carrying both first-run values has not, and that is what keeps
         # auto-fit switched on. Nothing writes the size back until this is
@@ -1635,6 +1639,7 @@ class UsageWidget(QWidget):
         self._tick = QTimer(self)
         self._tick.timeout.connect(self._refresh_header_labels)
         self._tick.start(1000)
+        self._expanded_height = self.height()
         self._apply_collapsed_state(save=False)
         self._track_hover()
 
@@ -2058,14 +2063,23 @@ class UsageWidget(QWidget):
     def set_collapsed(self, collapsed: bool) -> None:
         if self._collapsed == collapsed:
             return
+        if collapsed:
+            # While the window still has the expanded height: the strip is
+            # about to overwrite it, and this is what expanding restores.
+            self._expanded_height = self.height()
         self._collapsed = collapsed
         self._config.window.collapsed = collapsed
+        # Order matters. _remember_size() used to run here, with _collapsed
+        # already False and the window still 58 px tall, so a collapse and an
+        # expand wrote the strip's height over the size the user had dragged
+        # to - on disk, so it survived a relaunch. The size is recorded only
+        # once the expanded geometry is back.
+        self._apply_collapsed_state(save=False, restore_height=not collapsed)
         if not collapsed:
             self._remember_size()
         self._config.save()
-        self._apply_collapsed_state(save=False)
 
-    def _apply_collapsed_state(self, *, save: bool) -> None:
+    def _apply_collapsed_state(self, *, save: bool, restore_height: bool = False) -> None:
         self._collapsed_widget.setVisible(self._collapsed)
         self._header_widget.setVisible(not self._collapsed)
         self._tile_scroll.setVisible(not self._collapsed)
@@ -2080,6 +2094,13 @@ class UsageWidget(QWidget):
         else:
             self.setMinimumHeight(WINDOW_MIN_HEIGHT)
             self.setMaximumHeight(_QT_SIZE_MAX)
+            # Back to the height the window had before it became a strip -
+            # after the maximum is released, because the collapsed one is 420.
+            # Only on the way out of a collapse: every other caller is
+            # re-applying a state the window is already in. Auto-fit overrides
+            # it a tick later on a window the user has never sized.
+            if restore_height and self._expanded_height:
+                self.resize(self.width(), self._expanded_height)
             self._apply_screen_bounds()
             self._refit_height()
         if save:
