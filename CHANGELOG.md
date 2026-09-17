@@ -404,13 +404,33 @@ user sees.
 
 ### Notes
 
-- The suite is **2 008 tests**, from 1 859. `tests/test_icon.py` is new and
-  holds 15. `tests/test_widget.py` goes 57 → 144,
+- The suite is **2 024 tests**, from 1 859. `tests/test_icon.py` is new and
+  holds 15. `tests/test_widget.py` goes 57 → 154,
   `tests/test_settings_dialog.py` 33 → 54, `tests/test_config.py` 138 → 154,
-  `tests/test_azure.py` 232 → 241 and `tests/test_meter_catalog.py` 147 → 148.
-  Counted at the head of the branch, not at the first draft of it: the figures
-  this entry carried before were the ones from before the CI fixes and the two
-  review rounds below.
+  `tests/test_azure.py` 232 → 242, `tests/test_meter_catalog.py` 147 → 148 and
+  `tests/test_models.py` 2 → 7. Counted at the head of the branch, not at the
+  first draft of it: the figures this entry carried before were the ones from
+  before the CI fixes and the three review rounds below.
+
+- **A third review round fixed one regression, two small defects and closed
+  six test gaps.** The regression is the second round's own: the native press
+  starts the one-second debounce, and the fire cleared the gesture flags
+  whatever the pointer was doing - so a drag that *began* with a hesitation,
+  hand on the edge while the user decides, reached its first size change with
+  the flags already clear, was never marked as the user's, never written, and
+  was taken back by the next auto-fit. The button state decides the flags now,
+  as it already decided the clamp, bounded by `NATIVE_GESTURE_MAX_IDLE_FIRES`
+  so that a release the window manager never reported cannot keep the timer
+  re-arming for the life of the window. Then: `_app_positioned` was never
+  cleared when the window stopped being a popover, which froze `window.x`/`y`
+  for the rest of the session; opencode.ai's two page-derived notes had no
+  bound at all, and the bound now lives at `models.bounded_note` for every
+  reader of a provider's text; and `_connect_once` swallowed a connection that
+  genuinely failed as if it were a duplicate. The six gaps were eleven
+  mutations the suite walked through: the debounce's clamp-before-commit
+  order, a repeat popover open while visible, five more `_app_geometry` sites,
+  a compact metric's labels, `user_sized`'s membership of the dirty tuple, and
+  the 429 handler's stale-settings clock.
 
 - **A second review round changed nine more behaviours and closed six more
   test gaps.** The headline one is the same finding as round 1's motionless
