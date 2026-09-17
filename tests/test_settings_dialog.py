@@ -1165,12 +1165,11 @@ def test_activate_layouts_refreshes_a_nested_layouts_stale_hint(qtbot):
     layout keeps its cache, and a second top-level ``activate()`` returns
     early on its raised flag.
 
-    Two widgets deep, not one. With the row directly under the group box,
-    ``findChildren`` lists one widget with a layout and the pass has nothing
-    to order: dropping ``reversed`` changed nothing and the test still passed.
-    With an inner widget between them, the ancestor-first order activates the
-    group box against the inner widget's *stale* hint and never returns to it,
-    so only the deepest-first pass reaches the page.
+    Two widgets deep, not one, so the tree has something to order at all -
+    but this test is about the *outcome*, and measured, the outcome is the
+    same either way round: Qt's hint caches invalidate upward on their own, so
+    the page's hint comes back fresh whichever order the layouts are
+    activated in. The order itself is pinned directly, in the test below.
     """
     from PyQt6.QtWidgets import (
         QComboBox,
@@ -1207,6 +1206,47 @@ def test_activate_layouts_refreshes_a_nested_layouts_stale_hint(qtbot):
 
     settings_dialog._activate_layouts(page)
     assert page.sizeHint().height() >= before + 40
+
+
+def test_activate_layouts_visits_descendants_before_their_ancestors(qtbot):
+    """The pass's documented contract, asserted as an order.
+
+    Not through an outcome: measured on a three-deep tree, dropping
+    ``reversed`` leaves every size hint exactly where the deepest-first pass
+    does, because a layout's ``invalidate()`` already walks up to the
+    top-level one. What the order buys is the geometry each ``activate()``
+    assigns - a parent laid out against a stale child hint stays laid out that
+    way, since nothing comes back to it - so the promise is worth keeping and
+    worth pinning, and an outcome assertion cannot tell the two apart.
+    """
+    from PyQt6.QtWidgets import QComboBox, QGroupBox, QVBoxLayout, QWidget
+
+    visited: list[str] = []
+
+    class _Recording(QVBoxLayout):
+        def __init__(self, name, parent=None):
+            super().__init__(parent)
+            self._name = name
+
+        def activate(self):  # noqa: N802 - Qt override
+            visited.append(self._name)
+            return super().activate()
+
+    page = QWidget()
+    qtbot.addWidget(page)
+    outer = _Recording("page", page)
+    group = QGroupBox("Group")
+    group_layout = _Recording("group", group)
+    inner = QWidget()
+    inner_layout = _Recording("inner", inner)
+    inner_layout.addWidget(QComboBox())
+    group_layout.addWidget(inner)
+    outer.addWidget(group)
+
+    settings_dialog._activate_layouts(page)
+
+    assert {"inner", "group", "page"} <= set(visited), visited
+    assert visited.index("inner") < visited.index("group") < visited.index("page")
 
 
 def test_the_dialog_does_not_remember_its_size(qtbot):

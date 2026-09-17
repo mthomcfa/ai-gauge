@@ -367,6 +367,13 @@ def _activate_layouts(root: QWidget) -> None:
     the layout above, so one pass reaches the top with every cache fresh.
     ``findChildren`` lists ancestors before descendants; reversed, the
     descendants come first.
+
+    What the order buys, measured: on a three-deep tree every size hint comes
+    back the same either way round, because a layout's ``invalidate()``
+    already walks up to the top-level one. It is the *geometry* each
+    ``activate()`` assigns that differs - a parent laid out against a stale
+    child hint stays laid out that way, since nothing comes back to it - so
+    the order is pinned as an order rather than through an outcome.
     """
     for widget in reversed(root.findChildren(QWidget)):
         layout = widget.layout()
