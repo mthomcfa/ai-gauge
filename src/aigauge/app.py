@@ -11,6 +11,8 @@ import sys
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta
+from importlib import resources
+from pathlib import Path
 
 from PyQt6.QtCore import QObject, QLockFile, QPoint, Qt, QTimer
 from PyQt6.QtGui import QAction, QColor, QCursor, QIcon, QPainter, QPixmap
@@ -189,6 +191,50 @@ def _ids_for_log(ids: list[str]) -> str:
     if len(ids) > _LOG_ID_SAMPLE:
         sample = f"{sample},+{len(ids) - _LOG_ID_SAMPLE} more"
     return sample
+
+
+# The app icon travels inside the package, next to the code, exactly as the
+# meter catalog does - so one lookup answers in a source checkout, in a wheel
+# and in a frozen bundle, and build.ps1/build.sh only have to place it there.
+ASSET_DIR_NAME = "assets"
+APP_ICON_NAME = "ai-gauge-256.png"
+
+
+def app_icon_path() -> Path:
+    """Filesystem path of the packaged app icon.
+
+    ``importlib.resources`` first so a zipped or frozen install resolves the
+    same way the wheel does; ``__file__`` is the fallback for loaders that hand
+    back no traversable resource. Copied from ``providers.catalog.bundled_path``
+    because it is the same problem and that one is already proven.
+    """
+    try:
+        return Path(
+            str(resources.files(__package__).joinpath(ASSET_DIR_NAME, APP_ICON_NAME))
+        )
+    except (ModuleNotFoundError, TypeError, ValueError, OSError):
+        return Path(__file__).resolve().parent / ASSET_DIR_NAME / APP_ICON_NAME
+
+
+def apply_app_icon() -> bool:
+    """Give every top-level window the app icon. True if one was found.
+
+    Set on the QApplication rather than per window, so the Settings dialog,
+    the error details dialog, the ratio history and the sign-in window all
+    inherit it without each remembering to.
+
+    This is not what puts an icon in the macOS Dock - ``LSUIElement`` in
+    ``build.sh`` is, and it is deliberately true so the menu-bar build has no
+    Dock icon. A window icon does not undo that; it is what Finder, the
+    Windows taskbar and the Linux window list read.
+    """
+    path = app_icon_path()
+    icon = QIcon(str(path))
+    if icon.isNull():
+        log.warning("app icon missing or unreadable at the packaged path")
+        return False
+    QApplication.setWindowIcon(icon)
+    return True
 
 
 def _make_dot_tray_icon(color: str | None = None) -> QIcon:
@@ -598,6 +644,7 @@ class App(QObject):
         )
         self._started_at = datetime.now()
         self._instance_lock: QLockFile | None = None
+        apply_app_icon()
         self._config = Config.load()
         self._snapshots: dict[str, UsageSnapshot] = {}
         self._history = HistoryStore()

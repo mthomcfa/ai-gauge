@@ -79,7 +79,10 @@ build-backend = "hatchling.build"
 packages = ["src/aigauge"]
 # The meter catalog is data, not code, and the app cannot read a usage page
 # without it. Named explicitly so a future exclude rule cannot drop it silently.
-artifacts = ["src/aigauge/providers/meter_catalog/*.json"]
+artifacts = [
+    "src/aigauge/providers/meter_catalog/*.json",
+    "src/aigauge/assets/*.png",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

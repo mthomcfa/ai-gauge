@@ -48,6 +48,12 @@ $args = @(
     # Without it every Claude/Codex meter is unreadable in a frozen build.
     # Windows uses ';' as the --add-data separator.
     "--add-data", "src\aigauge\providers\meter_catalog\*.json;aigauge\providers\meter_catalog",
+    # The app icon, by the same rule: data next to the code, placed where the
+    # package-relative lookup in app.py finds it in the frozen tree.
+    "--add-data", "src\aigauge\assets\ai-gauge-256.png;aigauge\assets",
+    # The .exe's own icon, which is a different thing from the window icon:
+    # this is what Explorer and the taskbar shortcut show.
+    "--icon", "assets\icon\ai-gauge.ico",
     "--collect-all", "PyQt6.QtWebEngineWidgets",
     "--collect-all", "PyQt6.QtWebEngineCore",
     "pyinstaller_entry.py"

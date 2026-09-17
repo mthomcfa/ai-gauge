@@ -43,10 +43,23 @@ PYINSTALLER_ARGS=(
     # The meter catalog is data next to the code, so --paths does not carry it.
     # Without it every Claude/Codex meter is unreadable in a frozen build.
     --add-data "src/aigauge/providers/meter_catalog/*.json:aigauge/providers/meter_catalog"
+    # The app icon, by the same rule: data next to the code, placed where the
+    # package-relative lookup in app.py finds it in the frozen tree.
+    --add-data "src/aigauge/assets/ai-gauge-256.png:aigauge/assets"
     --collect-all PyQt6.QtWebEngineWidgets
     --collect-all PyQt6.QtWebEngineCore
     pyinstaller_entry.py
 )
+
+# The bundle's own icon. PyInstaller takes .icns on macOS and a PNG elsewhere;
+# on macOS this is what Finder draws on the .app, which is a different thing
+# from the Dock icon LSUIElement suppresses below - a menu-bar agent still has
+# a bundle, and the bundle still has a face.
+if [ "$(uname -s)" = "Darwin" ]; then
+    PYINSTALLER_ARGS+=(--icon assets/icon/ai-gauge.icns)
+else
+    PYINSTALLER_ARGS+=(--icon assets/icon/ai-gauge-256.png)
+fi
 
 if [ "$(uname -s)" = "Darwin" ]; then
     # Reverse-DNS bundle id; keeps Info.plist + LaunchServices happy.
