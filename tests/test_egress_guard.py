@@ -590,9 +590,18 @@ def test_scan_stays_linear_in_the_number_of_findings():
     elapsed = {}
     for size in (100_000, 400_000):
         payload = _filled(filler, size)
-        started = time.monotonic()
-        findings = eg.scan(payload, policy())
-        elapsed[size] = time.monotonic() - started
+        # Best of three. The ratio below is about the algorithm, not about the
+        # runner's scheduler, and a shared CI host can stall one sample by
+        # more than the whole 100 KB scan takes: one macOS runner measured
+        # 0.07 s against 0.62 s, a ratio of 8.6, with every other job on the
+        # same commit inside 4. The minimum of three is the sample least
+        # touched by anything other than the scan.
+        samples = []
+        for _ in range(3):
+            started = time.monotonic()
+            findings = eg.scan(payload, policy())
+            samples.append(time.monotonic() - started)
+        elapsed[size] = min(samples)
         assert len(findings) > size // 20, (size, len(findings))
     # Four times the input is four times the work when the loop is linear and
     # sixteen when it is quadratic. Eight is comfortably between them.
