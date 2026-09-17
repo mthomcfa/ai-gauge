@@ -1,6 +1,7 @@
 import sys
 
 import pytest
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QPushButton
 
 from aigauge import settings_dialog
@@ -778,4 +779,201 @@ def test_one_dialog_session_asks_the_app_for_a_profile_once(qtbot, monkeypatch):
     assert account_id in emitted[0], "the clear did not cover the account"
     assert dialog.removed_profile_ids == [], (
         "the App was asked to delete a profile it had just been asked to clear"
+    )
+
+
+# --- Size and scrolling ----------------------------------------------------
+
+
+def _tabs(dialog: SettingsDialog):
+    from PyQt6.QtWidgets import QTabWidget
+
+    tabs = dialog.findChild(QTabWidget)
+    assert tabs is not None
+    return tabs
+
+
+def _tab_index(dialog: SettingsDialog, title: str) -> int:
+    tabs = _tabs(dialog)
+    for i in range(tabs.count()):
+        if tabs.tabText(i) == title:
+            return i
+    raise AssertionError(f"no {title} tab")
+
+
+def test_the_microsoft_tab_no_longer_sets_the_dialog_floor(qtbot):
+    """Wrapping the pages is what did it, not a page that got smaller.
+
+    Before: the dialog's minimumSizeHint() was 519x1112, of which the
+    Microsoft page's own 1015-px minimum was nearly all. Measured after:
+    271x155.
+    """
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+
+    assert dialog.minimumSizeHint().height() < 300
+
+    microsoft = _tabs(dialog).widget(_tab_index(dialog, "Microsoft"))
+    assert microsoft.widget().sizeHint().height() > 1000, (
+        "the page shrank instead of the scroll area absorbing it"
+    )
+
+
+def test_every_tab_page_scrolls(qtbot):
+    """The guard for any tab added later: addTab with a bare page fails here."""
+    from PyQt6.QtWidgets import QScrollArea
+
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    tabs = _tabs(dialog)
+
+    assert tabs.count() == 6
+    for i in range(tabs.count()):
+        page = tabs.widget(i)
+        assert isinstance(page, QScrollArea), tabs.tabText(i)
+        assert page.widgetResizable()
+        assert (
+            page.horizontalScrollBarPolicy()
+            == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        assert (
+            page.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+
+
+def test_microsoft_scrolls_at_the_default_size_and_general_does_not(qtbot):
+    """maximum(), not isVisible(): macOS overlay bars are zero-width at rest,
+    and a tab that has never been current has not been laid out."""
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    with qtbot.waitExposed(dialog):
+        dialog.show()
+    tabs = _tabs(dialog)
+
+    ranges = {}
+    for i in range(tabs.count()):
+        tabs.setCurrentIndex(i)
+        qtbot.wait(0)
+        ranges[tabs.tabText(i)] = tabs.widget(i).verticalScrollBar().maximum()
+
+    assert ranges["Microsoft"] > 0, ranges
+    assert ranges["General"] == 0, ranges
+
+
+def test_the_default_size_tracks_the_general_page(qtbot):
+    """The landing page fits; the tallest page does not drag the window up."""
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    with qtbot.waitExposed(dialog):
+        dialog.show()
+    tabs = _tabs(dialog)
+
+    general_index = _tab_index(dialog, "General")
+    tabs.setCurrentIndex(general_index)
+    qtbot.wait(0)
+    assert tabs.widget(general_index).verticalScrollBar().maximum() == 0
+
+    microsoft = tabs.widget(_tab_index(dialog, "Microsoft"))
+    assert dialog.height() < microsoft.widget().sizeHint().height() / 2
+
+
+@pytest.mark.parametrize(
+    "content,chrome,floor,ceiling,expected",
+    [
+        (498, 97, 420, 720, 595),
+        (40, 97, 420, 720, 420),
+        (1765, 97, 420, 360, 420),
+        (1765, 97, 100, 360, 360),
+    ],
+    ids=["tall", "short", "capped", "squeezed"],
+)
+def test_the_height_clamp_has_a_floor_and_a_ceiling(
+    content, chrome, floor, ceiling, expected
+):
+    """The two ends are unreachable offscreen: one 800x800 screen, one font."""
+    assert settings_dialog._dialog_height(content, chrome, floor, ceiling) == expected
+
+
+def test_the_dialog_does_not_remember_its_size(qtbot):
+    """No settings-window field exists and none is to be added: the dialog is
+    sized from its content every time it opens."""
+    config = Config()
+    first = SettingsDialog(config)
+    qtbot.addWidget(first)
+    original_height = first.height()
+
+    before = set(Config().model_dump())
+    first.resize(900, 900)
+    first.apply_to(config)
+    assert set(config.model_dump()) == before
+    assert "settings" not in str(config.model_dump().get("window", {}))
+
+    second = SettingsDialog(config)
+    qtbot.addWidget(second)
+    assert second.height() == original_height
+
+
+def test_every_named_field_survives_the_wrapping(qtbot):
+    """findChild is recursive, so it sees through a scroll area - but a widget
+    left behind by a re-parent would not be inside one."""
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    scrolls = dialog._page_scrolls  # noqa: SLF001
+    assert len(scrolls) == 6
+
+    named = [
+        "claude_signin_btn",
+        "codex_paste_cookie_btn",
+        "opencode_go_signin_btn",
+        "azure_colors_btn",
+        "rescan_meters_btn",
+    ]
+    for name in named:
+        widget = _button(dialog, name)
+        assert any(
+            scroll.widget().isAncestorOf(widget) for scroll in scrolls
+        ), f"{name} is not inside any tab page"
+
+    for field in ("azure_subscription", "opencode_go_url", "gh_quota"):
+        widget = getattr(dialog, field)
+        assert any(
+            scroll.widget().isAncestorOf(widget) for scroll in scrolls
+        ), f"{field} is not inside any tab page"
+
+
+def test_a_wrapped_page_does_not_paint_qts_light_background(qtbot):
+    """The trap the widget's tile scroll area already fell into once.
+
+    A QScrollArea's viewport has autoFillBackground() True and a Window
+    background role, so without the descendant rule it paints #efefef through
+    the dark dialog. Measured here: #1f2937 viewport, a #374151 track and a
+    #4b5563 handle on the one tab that overflows, and nothing painted in that
+    column on a tab that fits.
+    """
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    with qtbot.waitExposed(dialog):
+        dialog.show()
+    tabs = _tabs(dialog)
+    tabs.setCurrentIndex(_tab_index(dialog, "Microsoft"))
+    qtbot.wait(0)
+
+    image = dialog.grab().toImage()
+    assert image.pixelColor(30, 200).name() == "#1f2937"
+
+    scroll = tabs.currentWidget()
+    bar = scroll.verticalScrollBar()
+    assert bar.maximum() > 0
+    top_left = bar.mapTo(dialog, bar.rect().topLeft())
+    column = top_left.x() + bar.width() // 2
+    assert image.pixelColor(column, top_left.y() + 12).name() == "#4b5563"
+    assert (
+        image.pixelColor(column, top_left.y() + bar.height() - 6).name() == "#374151"
+    ), "the track is not visible behind the handle"
+
+    tabs.setCurrentIndex(_tab_index(dialog, "General"))
+    qtbot.wait(0)
+    fitted = dialog.grab().toImage()
+    assert fitted.pixelColor(column, 200).name() == "#1f2937", (
+        "a bar was painted for a page with nothing hidden"
     )
