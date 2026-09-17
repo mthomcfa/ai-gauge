@@ -1169,7 +1169,10 @@ def test_a_short_estimate_is_corrected_before_the_first_paint(qtbot, monkeypatch
     qtbot.wait(0)
 
     assert dialog.height() > short, dialog._height_terms
+    # Nothing capped this one, so the two terms agree: what the measurement
+    # asked for and what the window got.
     assert dialog._height_terms["grew"] == dialog.height() - short
+    assert dialog._height_terms["deficit"] == dialog._height_terms["grew"]
     assert general.verticalScrollBar().maximum() == 0, dialog._height_terms
     assert dialog._fitted_on_show
 
@@ -1180,6 +1183,28 @@ def test_a_short_estimate_is_corrected_before_the_first_paint(qtbot, monkeypatch
     with qtbot.waitExposed(dialog):
         dialog.show()
     assert dialog.height() == grown
+
+
+def test_the_show_time_terms_say_what_was_asked_for_and_what_was_got(
+    qtbot, monkeypatch
+):
+    """`grew` was the deficit, i.e. the measurement's question, not the
+    window's answer. They differ whenever the resize is capped: at 200 %
+    display scale the terms read `grew: 242` while the dialog went 360 to 360,
+    because the screen ceiling held it. A maximum height stands in for that
+    ceiling here, since an offscreen run has one 800 x 800 screen."""
+    monkeypatch.setattr(settings_dialog, "_DIALOG_HEIGHT_SLACK", -40)
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    short = dialog.height()
+    dialog.setMaximumHeight(short)
+    with qtbot.waitExposed(dialog):
+        dialog.show()
+    qtbot.wait(0)
+
+    assert dialog.height() == short, "the cap did not hold"
+    assert dialog._height_terms["deficit"] > 0, "the measurement found nothing"
+    assert dialog._height_terms["grew"] == 0, "a capped resize reported growth"
 
 
 def test_activate_layouts_refreshes_a_nested_layouts_stale_hint(qtbot):

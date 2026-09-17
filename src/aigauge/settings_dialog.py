@@ -675,8 +675,10 @@ class SettingsDialog(QDialog):
         self._fitted_on_show = False
         # The terms behind the default height, for a test's failure message
         # and a bug report: "content", "chrome", "slack", "height" from the
-        # pre-show estimate; "viewport_w", "viewport_h", "need", "grew" from
-        # the second measurement in showEvent.
+        # pre-show estimate; "viewport_w_at_show", "viewport_h", "need",
+        # "deficit" and "grew" from the second measurement in showEvent -
+        # "deficit" is what that measurement asked for and "grew" is what the
+        # window got, which differ whenever the ceiling caps the resize.
         self._height_terms: dict[str, int] = {}
         self._config = config
         self._browser_account_rows: list[_BrowserAccountRow] = []
@@ -1602,18 +1604,24 @@ class SettingsDialog(QDialog):
         # it is what `page_w` is meant to be compared against - and the
         # settled viewport of a page that turns out not to need the bar is
         # 10 px wider.
+        before = self.height()
+        # Two terms, not one. `grew` used to be the deficit - what the
+        # measurement asked for - and the two part company whenever the
+        # ceiling caps the resize: at 200 % display scale the terms read
+        # `grew: 242` while the dialog went 360 to 360.
         self._height_terms.update(
             viewport_w_at_show=viewport.width(),
             viewport_h=viewport.height(),
             need=need,
-            grew=max(0, deficit),
+            deficit=max(0, deficit),
+            grew=0,
         )
         if deficit <= 0:
             return
         available = (self.screen() or QApplication.primaryScreen()).availableGeometry()
         ceiling = int(available.height() * _DIALOG_SCREEN_FRACTION)
         self.resize(self.width(), min(self.height() + deficit, ceiling))
-        self._height_terms.update(height=self.height())
+        self._height_terms.update(height=self.height(), grew=self.height() - before)
 
     def _edit_provider_colors(self, provider: str, label: str) -> None:
         dialog = GaugeColorsDialog(label, self._provider_colors[provider], parent=self)
