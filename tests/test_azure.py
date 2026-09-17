@@ -3309,6 +3309,66 @@ def test_the_next_attempt_is_never_a_time_already_past(last_fetch_ago, blocked_a
     assert az._stale_settings_note(state, now).endswith(f"Next fetch at {now:%H:%M}.")
 
 
+def _clock_spy(monkeypatch):
+    """Every `now` any caller hands `next_allowed_at` during one refresh.
+
+    The threading is the claim: `next_allowed_at`'s docstring says the clock
+    is passed rather than read so a caller with its own keeps it, and the gate
+    did while the three message sites did not - so a sentence could name a
+    minute the gate had not compared against. Collecting the argument is what
+    distinguishes "passed" from "read again inside".
+    """
+    clocks: list = []
+    real = az.next_allowed_at
+
+    def spy(state, now=None):
+        clocks.append(now)
+        return real(state, now)
+
+    monkeypatch.setattr(az, "next_allowed_at", spy)
+    return clocks
+
+
+@responses.activate
+def test_the_stale_settings_note_is_composed_with_the_gates_clock(monkeypatch, config):
+    """`serve_cache` is inside the same call that captured `now` and compared
+    the gate against it."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    _run(az.AzureProvider(config), monkeypatch)
+    config.azure.reset_day = 15  # the cached answer no longer fits the question
+    clocks = _clock_spy(monkeypatch)
+
+    second = _run(az.AzureProvider(config), monkeypatch)
+
+    assert "Next fetch at" in (second.metrics[0].note or "")
+    assert clocks, "next_allowed_at was not reached"
+    assert None not in clocks, "a message site read the wall clock of its own"
+    assert len(set(clocks)) == 1, "two clocks inside one refresh"
+
+
+@responses.activate
+def test_the_throttled_message_is_composed_with_the_fetchs_clock(monkeypatch, config):
+    """The 429 handler's two sites, in the middle of a fetch that captured its
+    own `now` before it started asking."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    _throttle("forecast")
+    clocks = _clock_spy(monkeypatch)
+
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+
+    assert (snapshot.error or "").startswith(
+        "Cost Management is rate limiting this tenant; next attempt at "
+    )
+    assert clocks, "next_allowed_at was not reached"
+    assert None not in clocks, "the throttled message read the wall clock of its own"
+    # Two, and only two: the gate's `now`, captured in `refresh`, and the
+    # fetch's own, captured before it started asking. Both message sites in
+    # the 429 handler are inside the second.
+    assert len(set(clocks)) == 2
+
+
 @responses.activate
 def test_a_live_429_reports_the_hourly_floor(monkeypatch, config):
     """End to end through the provider, not just the helper."""

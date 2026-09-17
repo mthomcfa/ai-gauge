@@ -2670,10 +2670,25 @@ def test_a_recovered_tile_drops_the_error_line(qtbot):
         ("GitHub API rate limit exceeded", "error · rate limited"),
         # And said neither word: a bare status line.
         ("429 Too Many Requests", "error · rate limited"),
+        ("HTTP 429", "error · rate limited"),
+        # A whole word, not a substring: a request id is a hex string, and
+        # "Request-Id 8429f" read "error · rate limited".
+        ("Request-Id 8429f failed", "error"),
+        ("account 429x not found", "error"),
         ("GitHub API returned 500", "error · api"),
         ("something else entirely", "error"),
     ],
-    ids=["rate-limiting", "throttled", "github-rate-limit", "429", "api", "unmatched"],
+    ids=[
+        "rate-limiting",
+        "throttled",
+        "github-rate-limit",
+        "429",
+        "http-429",
+        "request-id",
+        "account-id",
+        "api",
+        "unmatched",
+    ],
 )
 def test_a_rate_limit_is_named_in_the_corner_tag(error, expected):
     from aigauge.widget import _short_error_reason

@@ -363,8 +363,10 @@ def _short_error_reason(error: str | None) -> str:
     # Before the api branch, not after it. A throttle is the more specific
     # reading of a string that says both, and the ones that say both are the
     # common ones: "GitHub API rate limit exceeded" came out "error · api".
-    # "429" because a bare status line says neither of the words.
-    if "rate limit" in e or "throttl" in e or "429" in e:
+    # "429" because a bare status line says neither of the words - as a whole
+    # word, since a request id is a hex string and "Request-Id 8429f" read
+    # "error · rate limited".
+    if "rate limit" in e or "throttl" in e or re.search(r"\b429\b", e):
         return "error · rate limited"
     if "github" in e or "api" in e:
         return "error · api"

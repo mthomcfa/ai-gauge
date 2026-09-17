@@ -295,7 +295,8 @@ user sees.
   one minute. It now reads "Cost Management is rate limiting this tenant; next
   attempt at HH:MM.", in local time and with the same `%H:%M` as
   `_stale_settings_note` - the same promise about the same clock, on the same
-  tile. A `Retry-After` longer than the hour is still what is named, because
+  tile, and `now` is threaded to every caller rather than read again inside
+  each, so a sentence cannot name a minute the gate did not compare against. A `Retry-After` longer than the hour is still what is named, because
   `blocked_until` is then the later of the two, and `next_allowed_at` is
   floored at the clock, so neither sentence can name a time that has already
   gone by - `max(candidates)` on a state with no `last_fetch_at` and an
@@ -310,7 +311,9 @@ user sees.
   names the failure: `_short_error_reason` matched timeout, load failure,
   layout change, no data, api and signed out and nothing else, so Azure's 429 -
   the most common error this app shows - fell through to a bare "error"; a rate
-  limit, a throttle or a bare `429` now reads "error · rate limited", 92 px
+  limit, a throttle or a bare `429` as a whole word - a request id is a hex
+  string, and `Request-Id 8429f` read as a throttle - now reads
+  "error · rate limited", 92 px
   against 26, and that branch is tested **before** the api one, because a
   string saying both ("GitHub API rate limit exceeded") is a throttle first. And a
   tile with no rows at all gets the message itself on a full-width line under

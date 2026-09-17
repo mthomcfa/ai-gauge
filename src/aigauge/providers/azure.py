@@ -2094,7 +2094,12 @@ class AzureProvider(Provider):
                     azure_cfg,
                     fetched_at=state.fetched_at,
                     stale_note=(
-                        _stale_settings_note(state)
+                        # The clock this call decided with, not a second
+                        # reading of the wall clock: the gate compared against
+                        # `now`, so a sentence naming the next fetch has to be
+                        # derived from the same one or it can name a minute
+                        # the gate never used.
+                        _stale_settings_note(state, now)
                         if state.stale_settings
                         else None
                     ),
@@ -2388,13 +2393,13 @@ class AzureProvider(Provider):
                     azure_cfg,
                     fetched_at=state.fetched_at,
                     stale_note=(
-                        _stale_settings_note(state)
+                        _stale_settings_note(state, now)
                         if state.stale_settings
                         else None
                     ),
                 )
             return self._remember_error(
-                state, _error(_throttled_message(state)), backoff=False
+                state, _error(_throttled_message(state, now)), backoff=False
             )
         except AzurePermissionError as exc:
             if getattr(exc, "status", 0) == 401:
