@@ -8,7 +8,7 @@ from typing import Any, Callable
 from PyQt6.QtCore import QObject
 
 from ..config import Config, validate_opencode_usage_url
-from ..models import SnapshotStatus, UsageMetric, UsageSnapshot
+from ..models import SnapshotStatus, UsageMetric, UsageSnapshot, bounded_note
 from ._common import is_security_verification_page
 from ._scrape_runner import ScrapeRunner, account_is_busy
 from .base import Provider
@@ -203,7 +203,13 @@ def _build_snapshot(payload: dict[str, Any]) -> UsageSnapshot:
         if key not in _EXPECTED_ROWS or key in seen:
             continue
         seen.add(key)
-        reset_text = str(row.get("reset_text") or "").strip() or None
+        # Page text, and one element's whole `innerText` at that - or, in the
+        # body-text fallback, a regex group over the whole page. A page with a
+        # block after "Resets" hands us the block, so it is bounded as it
+        # arrives, the way the meter catalog bounds its own: once, before it
+        # is parsed for a time and before it is carried for the life of the
+        # tile.
+        reset_text = bounded_note(str(row.get("reset_text") or "").strip() or None)
         metrics.append(
             UsageMetric(
                 label=label,

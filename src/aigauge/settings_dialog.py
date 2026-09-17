@@ -13,6 +13,7 @@ from PyQt6.QtGui import (
     QPolygonF,
 )
 from PyQt6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QColorDialog,
     QComboBox,
@@ -20,6 +21,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QDoubleSpinBox,
     QFormLayout,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -28,6 +30,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSlider,
     QSpinBox,
@@ -66,6 +69,7 @@ from .providers.claude import CLAUDE_USAGE_URL
 from .providers.codex import CODEX_USAGE_URL
 from .providers.opencode_go import OPENCODE_GO_USAGE_URL, usage_url as opencode_go_usage_url
 from .startup import set_start_at_login
+from .ui_style import DIALOG_SCROLLBAR_STYLESHEET, apply_wheel_step
 
 log = logging.getLogger("aigauge.settings_dialog")
 
@@ -115,6 +119,20 @@ QTabWidget::pane {
     border: 1px solid #374151;
     border-radius: 6px;
     top: -1px;
+}
+/* A QScrollArea's viewport has autoFillBackground() True and a Window
+   background role, so a wrapped page paints Qt's default light grey (#efefef
+   measured) straight through the dark dialog. Neither
+   viewport().setAutoFillBackground(False) nor a rule on QScrollArea alone
+   changes that - only the descendant rule reaches the viewport, which is the
+   same idiom widget.py's tile scroll area already uses and the same trap
+   recorded against it in the 0.9.x changelog. */
+QScrollArea {
+    border: none;
+    background: transparent;
+}
+QScrollArea > QWidget > QWidget {
+    background: transparent;
 }
 QTabBar::tab {
     background: #111827;
@@ -277,10 +295,115 @@ def _chevron_png_path(direction: str) -> str:
 
 
 def _build_stylesheet() -> str:
-    """Inject the cached chevron paths into the static dark stylesheet."""
-    return _DARK_STYLESHEET.replace(
-        "__DOWN_ARROW__", _chevron_png_path("down")
-    ).replace("__UP_ARROW__", _chevron_png_path("up"))
+    """Inject the cached chevron paths into the static dark stylesheet.
+
+    The scroll-bar rules are appended from ``ui_style`` rather than written
+    here so the dialog's bars and the floating widget's are the same object at
+    two surface colours.
+    """
+    return (
+        _DARK_STYLESHEET.replace("__DOWN_ARROW__", _chevron_png_path("down")).replace(
+            "__UP_ARROW__", _chevron_png_path("up")
+        )
+        + DIALOG_SCROLLBAR_STYLESHEET
+    )
+
+
+# The dialog's own geometry. 620 wide by default, or as much wider as the
+# widest page's minimum needs: on the Windows runner's fonts General's minimum
+# is 612 px against 454 offscreen on Linux. 560 is the *smallest* floor a user
+# may shrink to; the real floor is that same widest-page rule, so a user cannot
+# drag the dialog to a width at which a page is clipped. Both are bounded by
+# the work area - on a screen narrower than a page the floor gives way and the
+# page's horizontal scroll bar takes over. Height is no longer a guess - see
+# _dialog_height.
+_DIALOG_DEFAULT_W = 620
+_DIALOG_MIN_W = 560
+_DIALOG_MIN_H = 420
+# Never taller than this much of the screen's work area. At 200% display
+# scale the logical screen is 400 px high here, and both the old hardcoded
+# 520 and the derived 589 are taller than the whole desktop.
+_DIALOG_SCREEN_FRACTION = 0.9
+# Added to the measured height. The chrome is read off size hints, and a
+# style rounds its tab-pane frame differently in a hint than in a layout:
+# Fusion's hint carries 4 px of pane where its laid-out pane uses 1, so the
+# measurement is 3 px generous here and could be as much short under another
+# style. Slack this small is invisible; a scroll bar on the landing page is
+# not.
+_DIALOG_HEIGHT_SLACK = 6
+
+
+def _dialog_height(content: int, chrome: int, floor: int, ceiling: int) -> int:
+    """Height for a dialog showing ``content`` px of page plus ``chrome``.
+
+    Pulled out as a function of four numbers because the two ends of it are
+    otherwise untestable offscreen: the floor only engages on a tiny page and
+    the ceiling only on a screen shorter than the content, and an offscreen
+    run has one fixed 800x800 screen.
+
+    The ceiling wins when the two disagree. Written the other way round the
+    floor did, and at 200% display scale - where the logical work area is
+    400 px - the dialog was sized 420 px tall, i.e. taller than the whole
+    desktop, before any paint. The ``showEvent`` re-fit happened to pull it
+    back, which is the correction doing the estimate's job.
+    """
+    return min(max(floor, content + chrome), ceiling)
+
+
+def _activate_layouts(root: QWidget) -> None:
+    """Bring every layout under ``root`` up to date, deepest first.
+
+    A widget's ``updateGeometry()`` invalidates its parent's *top-level*
+    layout and posts a ``LayoutRequest`` to that parent - and a hidden
+    widget drops the request. So before ``show()`` a nested layout can go on
+    serving the hint it cached before its widgets were styled: the UI-scale
+    row's ``QHBoxLayout`` said 22 px for a combo box that was already 32,
+    and General under-read by 10 px. ``QLayout::activate()`` does recompute
+    recursively, but only while its own flag is down, and the dialog's was
+    not: the request had stopped at the group box.
+
+    Deepest first, then: a layout whose flag is down recomputes, and the
+    ``updateGeometry()`` at the end of its ``activate()`` lowers the flag on
+    the layout above, so one pass reaches the top with every cache fresh.
+    ``findChildren`` lists ancestors before descendants; reversed, the
+    descendants come first.
+
+    What the order buys, measured: on a three-deep tree every size hint comes
+    back the same either way round, because a layout's ``invalidate()``
+    already walks up to the top-level one. It is the *geometry* each
+    ``activate()`` assigns that differs - a parent laid out against a stale
+    child hint stays laid out that way, since nothing comes back to it - so
+    the order is pinned as an order rather than through an outcome.
+    """
+    for widget in reversed(root.findChildren(QWidget)):
+        layout = widget.layout()
+        if layout is not None:
+            layout.activate()
+    layout = root.layout()
+    if layout is not None:
+        layout.activate()
+
+
+def _page_height(page: QWidget, width: int) -> int:
+    """The height a widget-resizable ``QScrollArea`` will lay ``page`` out at.
+
+    ``QScrollArea`` gives the page its height-for-width when its layout has
+    one, else its minimum hint, and the viewport's height if that is more.
+    ``sizeHint()`` is the wrong number: a word-wrapped ``QLabel`` hints at
+    80 average characters, not at the width it will get, so General's hint
+    of 498 is 12 px over the 486 it lays out at 582 px wide. Never less
+    than the minimum hint, which is what the scroll bar is measured
+    against; never less than the plain hint without height-for-width, so a
+    page with no wrapped label opens at its preference rather than squeezed.
+    """
+    minimum_size = page.minimumSizeHint()
+    # The area lays the page out no narrower than its own minimum (and clips
+    # it, the horizontal bar being off), so measure at the larger width.
+    width = max(width, minimum_size.width())
+    minimum = minimum_size.height()
+    if page.hasHeightForWidth():
+        return max(minimum, page.heightForWidth(width))
+    return max(minimum, page.sizeHint().height())
 
 
 def _hint_label(text: str) -> QLabel:
@@ -543,9 +666,20 @@ class SettingsDialog(QDialog):
         # this existing Settings window back to the foreground.
         self.setWindowTitle("AI Gauge — Settings")
         self.setModal(False)
-        self.resize(620, 520)
-        self.setMinimumSize(560, 420)
         self.setStyleSheet(_build_stylesheet())
+        # Filled by _add_tab; the size derivation at the end of __init__ and
+        # the tests both need handles on the tab widget and its scroll areas.
+        self._tabs: QTabWidget | None = None
+        self._page_scrolls: list[QScrollArea] = []
+        self._general_scroll: QScrollArea | None = None
+        self._fitted_on_show = False
+        # The terms behind the default height, for a test's failure message
+        # and a bug report: "content", "chrome", "slack", "height" from the
+        # pre-show estimate; "viewport_w_at_show", "viewport_h", "need",
+        # "deficit" and "grew" from the second measurement in showEvent -
+        # "deficit" is what that measurement asked for and "grew" is what the
+        # window got, which differ whenever the ceiling caps the resize.
+        self._height_terms: dict[str, int] = {}
         self._config = config
         self._browser_account_rows: list[_BrowserAccountRow] = []
         self._removed_browser_account_ids: list[str] = []
@@ -1245,12 +1379,13 @@ class SettingsDialog(QDialog):
         opencode_go_tab_layout.addStretch(1)
 
         tabs = QTabWidget()
-        tabs.addTab(general_tab, "General")
-        tabs.addTab(claude_tab, "Claude")
-        tabs.addTab(codex_tab, "Codex")
-        tabs.addTab(opencode_go_tab, "OpenCode")
-        tabs.addTab(microsoft_tab, "Microsoft")
-        tabs.addTab(openrouter_tab, "OpenRouter")
+        self._tabs = tabs
+        self._add_tab(tabs, general_tab, "General")
+        self._add_tab(tabs, claude_tab, "Claude")
+        self._add_tab(tabs, codex_tab, "Codex")
+        self._add_tab(tabs, opencode_go_tab, "OpenCode")
+        self._add_tab(tabs, microsoft_tab, "Microsoft")
+        self._add_tab(tabs, openrouter_tab, "OpenRouter")
         tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         # ----- Buttons -----
@@ -1276,6 +1411,217 @@ class SettingsDialog(QDialog):
         layout.setSpacing(10)
         layout.addWidget(tabs, 1)
         layout.addLayout(button_row)
+
+        self._size_to_general_page(layout, general_tab, button_row)
+
+    def _add_tab(self, tabs: QTabWidget, page: QWidget, title: str) -> QScrollArea:
+        """Put every tab behind a scroll area, this one and any future one.
+
+        The Microsoft page wants 1765 px and the pane gave it 454, with no
+        scroll bar anywhere: the bottom of the Copilot block was simply
+        unreachable. The page's 1015-px *minimum* was worse - remove the
+        dialog's own ``setMinimumSize`` and the layout's floor became
+        519x1112, i.e. one line away from a dialog taller than most screens,
+        and every Azure row added pushed it further.
+
+        Wrapping is what breaks the link. A ``QScrollArea``'s size hint is its
+        widget's bounded to 36x24 font heights (504x336 here), so no page can
+        drive the tab widget's height again. Measured on the whole dialog:
+        ``minimumSizeHint()`` 519x1112 -> 271x165, the tab widget's
+        495x1046 -> 127x99.
+
+        ``NoFocus``: the area would otherwise take a tab stop of its own (stop
+        #3 in the Microsoft chain). Removing it costs nothing measurable -
+        tabbing into a widget below the fold still scrolls to it through
+        ``QScrollArea::focusNextPrevChild`` (measured, 0 -> 633), and so does
+        the wheel.
+        """
+        scroll = QScrollArea()
+        scroll.setObjectName(f"{title.lower()}_scroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        # Both axes as-needed. Horizontal used to be AlwaysOff, which does not
+        # make a page fit - it hides the bar and leaves the page clipped, with
+        # the range sitting there unreachable: measured, a dialog dragged to
+        # its 560 floor clipped Claude by 46 px with hmax=46 and no bar. The
+        # width rule now keeps that from happening where the screen allows it,
+        # and where it does not - a work area narrower than a page - this is
+        # what shows the rest. The widget's tile area got the same treatment
+        # in this release, for the same reason.
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # Three lines of text per wheel notch, the same definition the panel's
+        # tile area uses. These pages kept Qt's default 20 px, so one notch
+        # moved two different distances in the same app.
+        apply_wheel_step(scroll)
+        scroll.setWidget(page)
+        tabs.addTab(scroll, title)
+        self._page_scrolls.append(scroll)
+        return scroll
+
+    def _size_to_general_page(
+        self, layout: QVBoxLayout, general_page: QWidget, button_row: QHBoxLayout
+    ) -> None:
+        """Open at the height the landing page needs, and little taller.
+
+        The old ``resize(620, 520)`` was a number, not a measurement. The
+        landing page is General, so that is what the dialog is sized to: the
+        height General lays out at, plus the chrome around it, both read off
+        the live widgets - 12 + 10 margins, 10 spacing, a 34-px button row,
+        a 27-px tab bar and 4 px of pane, i.e. 97, plus
+        ``_DIALOG_HEIGHT_SLACK``. The width General is measured at is the
+        viewport's less a scroll bar, 582 px here, because that is the width
+        ``QScrollArea`` decides with: its first pass runs with the bar
+        reserved, and a page that needs the bar at that width keeps it. On
+        the macOS runner General's wrapped label takes one more line at 584
+        than at 594 (505 px against 493), which is exactly the case the
+        wider width mis-sizes. General is 486 px here (its ``sizeHint()``
+        says 498, see ``_page_height``), so the dialog opens at 589. A binary
+        search for the smallest height at which General shows no scroll bar
+        gives 580: 9 px generous, 3 of them the pane rounding and 6 the slack.
+
+        The width is 620 unless the widest page's minimum plus the same
+        horizontal chrome (margins, pane, a scroll bar) needs more, so no
+        page is clipped on a platform whose fonts run wide - the Windows
+        runner lays General out 612 px wide, 18 px more than the viewport
+        620 leaves it. Both are bounded by the screen's work area.
+
+        Every layout is activated first, deepest up - see
+        ``_activate_layouts`` for why the top-level ``activate()`` alone left
+        a nested row 10 px stale, and General scrolling by 6-7 px on the
+        macOS and Windows runners. Do **not** derive the chrome as
+        ``height() - viewport().height()`` before ``show()`` - the viewport is
+        still at its unlaid 640x480 and the subtraction comes out -60, which
+        yields a 428-px dialog in which General itself scrolls.
+
+        Nothing persists this. ``Config`` has no settings-window field and
+        ``apply_to`` writes none, so every open is this calculation again.
+        """
+        _activate_layouts(self)
+        margins = layout.contentsMargins()
+        tabs = self._tabs
+        assert tabs is not None  # set by the caller before this runs
+        tab_bar_height = tabs.tabBar().sizeHint().height()
+        pages_hint_h = max(scroll.sizeHint().height() for scroll in self._page_scrolls)
+        pages_hint_w = max(scroll.sizeHint().width() for scroll in self._page_scrolls)
+        pane_extra_h = max(0, tabs.sizeHint().height() - tab_bar_height - pages_hint_h)
+        pane_extra_w = max(0, tabs.sizeHint().width() - pages_hint_w)
+        chrome = (
+            margins.top()
+            + margins.bottom()
+            + layout.spacing()
+            + button_row.sizeHint().height()
+            + tab_bar_height
+            + pane_extra_h
+            + _DIALOG_HEIGHT_SLACK
+        )
+        available = (self.screen() or QApplication.primaryScreen()).availableGeometry()
+        ceiling = int(available.height() * _DIALOG_SCREEN_FRACTION)
+        general_scroll = next(
+            scroll for scroll in self._page_scrolls if scroll.widget() is general_page
+        )
+        bar_extent = general_scroll.verticalScrollBar().sizeHint().width()
+        horizontal_chrome = margins.left() + margins.right() + pane_extra_w + bar_extent
+        pages_min_w = max(
+            scroll.widget().minimumSizeHint().width() for scroll in self._page_scrolls
+        )
+        width = min(
+            max(_DIALOG_DEFAULT_W, pages_min_w + horizontal_chrome), available.width()
+        )
+        page_width = width - horizontal_chrome
+        content = _page_height(general_page, page_width)
+        height = _dialog_height(content, chrome, _DIALOG_MIN_H, ceiling)
+        self._general_scroll = general_scroll
+        # `asked_w`/`asked_h` are what the derivation produced; `width` and
+        # `height` are what the window ended up with, read back after the
+        # resize. The two differ wherever the minimum or the screen bounds the
+        # answer, and the terms are for a bug report and a failing test's
+        # message - so the number a reader compares against the window on
+        # their desk has to be the window's.
+        self._height_terms = {
+            "asked_w": width,
+            "width": width,
+            "page_w": page_width,
+            "content": content,
+            "chrome": chrome - _DIALOG_HEIGHT_SLACK,
+            "slack": _DIALOG_HEIGHT_SLACK,
+            "asked_h": height,
+            "height": height,
+        }
+        # Clamped against the screen as well: at 200% display scale the work
+        # area is 400 px high and an un-shrinkable 560x420 minimum is a dialog
+        # whose OK button cannot be reached. The *height* floor is clamped to
+        # the same ceiling `_dialog_height` uses, not to the raw work area, or
+        # the 420 minimum would out-rank a 360 ceiling and the documented
+        # "never more than 90% of the work area" would be the one number the
+        # code does not enforce.
+        #
+        # The *width* floor is the same widest-page rule as the default, so a
+        # user cannot drag the dialog narrower than its pages need wherever the
+        # screen allows it; on a screen that does not, the work area wins and
+        # the pages' horizontal bars take the rest.
+        self.setMinimumSize(
+            min(max(_DIALOG_MIN_W, pages_min_w + horizontal_chrome), available.width()),
+            min(_DIALOG_MIN_H, ceiling),
+        )
+        self.resize(width, height)
+        self._height_terms.update(width=self.width(), height=self.height())
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().showEvent(event)
+        if not self._fitted_on_show:
+            self._fitted_on_show = True
+            self._fit_general_page_on_show()
+
+    def _fit_general_page_on_show(self) -> None:
+        """Measure General again with the real viewport, before the first paint.
+
+        The pre-show estimate can only read hints - the chrome, the page's
+        width - and a platform's fonts and style can land a few pixels away
+        from them. This is the guarantee behind it: here the tree has been
+        polished and shown, so once the dialog's layouts are activated every
+        geometry is the real one, synchronously (a visible widget gets its
+        resize event inside ``setGeometry``), and the viewport's width is the
+        one the scroll area decides with, bar reserved. A deficit grows the
+        dialog by that much, under the same ceiling; a resize inside
+        ``showEvent`` lands before the first paint, so there is nothing to
+        see. When the estimate is right, as it is here, this is a measurement
+        and no resize - and the measured-need test warns with both sets of
+        terms wherever it is not, which is how the macOS runner's extra
+        wrapped line was found.
+        """
+        scroll = self._general_scroll
+        if scroll is None:
+            return
+        _activate_layouts(self)
+        viewport = scroll.viewport()
+        need = _page_height(scroll.widget(), viewport.width())
+        deficit = need - viewport.height()
+        # `viewport_w_at_show` and not `viewport_w`: this is the transient
+        # width read inside showEvent, with the vertical bar reserved by the
+        # scroll area's first pass. It is deliberately the narrower number -
+        # it is what `page_w` is meant to be compared against - and the
+        # settled viewport of a page that turns out not to need the bar is
+        # 10 px wider.
+        before = self.height()
+        # Two terms, not one. `grew` used to be the deficit - what the
+        # measurement asked for - and the two part company whenever the
+        # ceiling caps the resize: at 200 % display scale the terms read
+        # `grew: 242` while the dialog went 360 to 360.
+        self._height_terms.update(
+            viewport_w_at_show=viewport.width(),
+            viewport_h=viewport.height(),
+            need=need,
+            deficit=max(0, deficit),
+            grew=0,
+        )
+        if deficit <= 0:
+            return
+        available = (self.screen() or QApplication.primaryScreen()).availableGeometry()
+        ceiling = int(available.height() * _DIALOG_SCREEN_FRACTION)
+        self.resize(self.width(), min(self.height() + deficit, ceiling))
+        self._height_terms.update(height=self.height(), grew=self.height() - before)
 
     def _edit_provider_colors(self, provider: str, label: str) -> None:
         dialog = GaugeColorsDialog(label, self._provider_colors[provider], parent=self)

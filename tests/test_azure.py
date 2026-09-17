@@ -3236,3 +3236,233 @@ def test_an_entra_token_deadline_does_not_read_as_a_rejected_registration(
     assert "ResponseDeadlineExceeded" in (snapshot.error or "")
     assert TENANT not in (snapshot.error or "")
     assert az.state_for(SUB).last_error is not None
+
+
+# --- The throttled message names the attempt that will happen ---------------
+
+
+@pytest.mark.parametrize(
+    "retry_after_s,expected_source",
+    [(52, "floor"), (6 * 3600, "retry_after")],
+    ids=["shorter-than-the-floor", "longer-than-the-floor"],
+)
+def test_the_throttled_message_names_the_real_next_attempt(
+    retry_after_s, expected_source
+):
+    """A Retry-After is the server's answer to the server's question. What
+    governs this tile is next_allowed_at: the later of the hourly floor from
+    the last fetch and blocked_until. Measured on the user's desktop, a 52 s
+    Retry-After at 11:16:48 was followed by an hour of refreshes served from
+    the cached error in 0.0 s, under a message promising one minute.
+
+    The clock is simulated, so it is passed in: the answer is floored at
+    ``now`` and a fixed date in the past would otherwise be floored away.
+    """
+    now = datetime(2026, 4, 27, 11, 16, 48)
+    state = az._State()
+    state.last_fetch_at = now
+    state.blocked_until = now + timedelta(seconds=retry_after_s)
+
+    message = az._throttled_message(state, now)
+
+    floor = now + az.MIN_FETCH_INTERVAL
+    expected = floor if expected_source == "floor" else state.blocked_until
+    assert message == (
+        "Cost Management is rate limiting this tenant; "
+        f"next attempt at {expected:%H:%M}."
+    )
+    assert "retrying in" not in message
+
+
+def test_the_throttled_message_without_a_clock_says_no_time():
+    """next_allowed_at answers None when nothing has been fetched and nothing
+    is blocked; a message must not invent an hour to fill the sentence."""
+    assert az._throttled_message(az._State()) == (
+        "Cost Management is rate limiting this tenant."
+    )
+
+
+@pytest.mark.parametrize(
+    "last_fetch_ago,blocked_ago",
+    [(None, 3), (5, 3), (None, 0)],
+    ids=["no-fetch", "old-fetch", "just-expired"],
+)
+def test_the_next_attempt_is_never_a_time_already_past(last_fetch_ago, blocked_ago):
+    """`max(candidates)` could answer behind the clock: a state with no
+    `last_fetch_at` and an expired `blocked_until` produced "next attempt at
+    14:09" at 17:09. Unreachable from the 429 handler, which sets
+    `blocked_until` to `now + retry_after` immediately before asking - floored
+    so the next caller does not inherit it."""
+    now = datetime(2026, 4, 27, 17, 9, 0)
+    state = az._State()
+    if last_fetch_ago is not None:
+        state.last_fetch_at = now - timedelta(hours=last_fetch_ago)
+    state.blocked_until = now - timedelta(hours=blocked_ago)
+
+    when = az.next_allowed_at(state, now)
+
+    assert when is not None
+    assert when >= now
+    assert az._throttled_message(state, now) == (
+        f"Cost Management is rate limiting this tenant; next attempt at {now:%H:%M}."
+    )
+    assert az._stale_settings_note(state, now).endswith(f"Next fetch at {now:%H:%M}.")
+
+
+def _clock_spy(monkeypatch):
+    """Every `now` any caller hands `next_allowed_at` during one refresh.
+
+    The threading is the claim: `next_allowed_at`'s docstring says the clock
+    is passed rather than read so a caller with its own keeps it, and the gate
+    did while the three message sites did not - so a sentence could name a
+    minute the gate had not compared against. Collecting the argument is what
+    distinguishes "passed" from "read again inside".
+    """
+    clocks: list = []
+    real = az.next_allowed_at
+
+    def spy(state, now=None):
+        clocks.append(now)
+        return real(state, now)
+
+    monkeypatch.setattr(az, "next_allowed_at", spy)
+    return clocks
+
+
+def _ticking_clock(monkeypatch):
+    """Give the provider a `datetime.now()` that is strictly increasing.
+
+    "The gate and the fetch captured different clocks" has to be true by
+    construction, not by how finely the platform measures time: Windows
+    advances the real clock in 1-16 ms ticks, so two reads a few hundred
+    microseconds apart came back identical to the microsecond and a test
+    asserting they differ was asserting the timer's resolution. A counter
+    settles it, and it settles the other direction too - on a coarse clock,
+    "these calls share one `now`" passes for a caller that read its own.
+
+    One second per read, starting from the real clock so the state a previous
+    fetch left behind is not suddenly in the future (which the refresh reads
+    as a clock that jumped and corrects for). Aware reads are left real:
+    `datetime.now(timezone.utc)` dates Cost Management's query window, it is
+    not the `now` under test, and faking it would move the period.
+
+    Returns the list of instants handed out, in order.
+    """
+    ticks: list = []
+    epoch = datetime.now()
+
+    class _Ticking(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is not None:
+                return datetime.now(tz)
+            moment = epoch + timedelta(seconds=len(ticks))
+            ticks.append(moment)
+            return moment
+
+    monkeypatch.setattr(az, "datetime", _Ticking)
+    return ticks
+
+
+@responses.activate
+def test_the_stale_settings_note_is_composed_with_the_gates_clock(monkeypatch, config):
+    """`serve_cache` is inside the same call that captured `now` and compared
+    the gate against it."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    _run(az.AzureProvider(config), monkeypatch)
+    config.azure.reset_day = 15  # the cached answer no longer fits the question
+    ticks = _ticking_clock(monkeypatch)
+    clocks = _clock_spy(monkeypatch)
+
+    second = _run(az.AzureProvider(config), monkeypatch)
+
+    assert "Next fetch at" in (second.metrics[0].note or "")
+    assert clocks, "next_allowed_at was not reached"
+    assert None not in clocks, "a message site read the wall clock of its own"
+    # `serve_cache` runs inside the call that captured `now` for the gate, so
+    # every reading here is that one instant - and a reading of its own would
+    # be a later tick, whatever the platform's timer resolution.
+    assert set(clocks) == {ticks[0]}, "two clocks inside one refresh"
+
+
+@responses.activate
+def test_the_throttled_message_is_composed_with_the_fetchs_clock(monkeypatch, config):
+    """The 429 handler's two sites, in the middle of a fetch that captured its
+    own `now` before it started asking."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    _throttle("forecast")
+    ticks = _ticking_clock(monkeypatch)
+    clocks = _clock_spy(monkeypatch)
+
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+
+    assert (snapshot.error or "").startswith(
+        "Cost Management is rate limiting this tenant; next attempt at "
+    )
+    assert clocks, "next_allowed_at was not reached"
+    assert None not in clocks, "the throttled message read the wall clock of its own"
+    # The gate and the fetch are two calls that capture two clocks, and the
+    # 429 handler is inside the second: every message site there used the
+    # fetch's `now`. Strictly later than the gate's because the clock ticks
+    # per read, not because the two happened to land on different microseconds
+    # - on Windows the real clock advances in 1-16 ms steps and they did not.
+    gate_now, *message_clocks = clocks
+    assert message_clocks, "the 429 handler's message sites were not reached"
+    gate_read, fetch_read = ticks[0], ticks[1]
+    assert gate_now == gate_read, "the gate was not the first to read the clock"
+    assert set(message_clocks) == {fetch_read}, "not the clock the fetch decided with"
+    assert fetch_read != gate_read
+
+
+@responses.activate
+def test_the_429_handlers_stale_settings_note_is_composed_with_the_fetchs_clock(
+    monkeypatch, config
+):
+    """The 429 handler's *other* message site, and the one the spy could not
+    see: with an aggregate to serve it returns the cached figures with the
+    stale-settings note instead of the throttled error, so the two sites are
+    exclusive and the test beside this one only ever reached the error. A
+    settings change that has not been asked yet plus a tenant being rate
+    limited is exactly when this one composes a sentence naming a time.
+    """
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    _run(az.AzureProvider(config), monkeypatch)  # an aggregate worth serving
+    config.azure.reset_day = 15  # the question changed, so the gauge is stale
+    _run(az.AzureProvider(config), monkeypatch)  # marks it, fetches nothing
+    assert az.state_for(SUB).stale_settings is True
+    az.state_for(SUB).last_fetch_at -= az.MIN_FETCH_INTERVAL  # the window opens
+    _throttle("forecast")
+    ticks = _ticking_clock(monkeypatch)
+    clocks = _clock_spy(monkeypatch)
+
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+
+    note = snapshot.metrics[0].note or ""
+    assert "Settings changed" in note, "the 429 handler did not serve the cache"
+    assert "Next fetch at" in note
+    assert None not in clocks, "the stale-settings note read a wall clock of its own"
+    gate_now, *message_clocks = clocks
+    assert message_clocks, "the 429 handler's stale-settings note was not reached"
+    assert gate_now == ticks[0], "the gate was not the first to read the clock"
+    assert set(message_clocks) == {ticks[1]}, "not the clock the fetch decided with"
+    assert ticks[1] != ticks[0]
+
+
+@responses.activate
+def test_a_live_429_reports_the_hourly_floor(monkeypatch, config):
+    """End to end through the provider, not just the helper."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    _throttle("forecast")
+
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+
+    state = az.state_for(SUB)
+    assert snapshot.status == SnapshotStatus.ERROR
+    assert (snapshot.error or "").startswith(
+        "Cost Management is rate limiting this tenant; next attempt at "
+    )
+    assert f"{az.next_allowed_at(state):%H:%M}." in (snapshot.error or "")

@@ -1,12 +1,16 @@
 import sys
+import warnings
 
 import pytest
+from PyQt6.QtCore import QRect, Qt
+from PyQt6.QtGui import QScreen
 from PyQt6.QtWidgets import QPushButton
 
 from aigauge import settings_dialog
 from aigauge.config import Config
 from aigauge.providers.catalog import record_scan, scan_due
 from aigauge.settings_dialog import SettingsDialog
+from aigauge.ui_style import wheel_step
 
 
 def _button(dialog: SettingsDialog, name: str) -> QPushButton:
@@ -778,4 +782,657 @@ def test_one_dialog_session_asks_the_app_for_a_profile_once(qtbot, monkeypatch):
     assert account_id in emitted[0], "the clear did not cover the account"
     assert dialog.removed_profile_ids == [], (
         "the App was asked to delete a profile it had just been asked to clear"
+    )
+
+
+# --- Size and scrolling ----------------------------------------------------
+
+
+def _tabs(dialog: SettingsDialog):
+    from PyQt6.QtWidgets import QTabWidget
+
+    tabs = dialog.findChild(QTabWidget)
+    assert tabs is not None
+    return tabs
+
+
+def _tab_index(dialog: SettingsDialog, title: str) -> int:
+    tabs = _tabs(dialog)
+    for i in range(tabs.count()):
+        if tabs.tabText(i) == title:
+            return i
+    raise AssertionError(f"no {title} tab")
+
+
+def _settled(qtbot, scroll) -> None:
+    """Wait for a scroll area to finish re-laying its page.
+
+    A tab switch or a resize can bring the vertical bar in, and that narrows
+    the viewport by the bar's extent (774 -> 764 on the Windows runner) and
+    posts a ``LayoutRequest``. Until that is delivered the page is still at
+    its old width *and* the horizontal range has not been recomputed, so a
+    reading taken there says "wider than its viewport, with no bar" about a
+    scroll area that is simply mid-layout. One ``qtbot.wait(0)`` is one
+    event-loop turn too few. Offscreen on Linux the pages fit the viewport,
+    the bar never flips, and the window never opens - which is why this only
+    ever failed on Windows.
+    """
+    try:
+        qtbot.waitUntil(
+            lambda: scroll.widget().width() <= scroll.viewport().width()
+            or scroll.horizontalScrollBar().maximum() > 0,
+            timeout=2000,
+        )
+    except TimeoutError:
+        # Genuinely clipped with no bar: let the caller's assertion say which
+        # page it was and by how much.
+        pass
+
+
+def _vertical_settled(qtbot, scroll) -> None:
+    """The vertical twin of `_settled`, for a reading of `maximum()`.
+
+    A tab switch posts a ``LayoutRequest`` and, until it is delivered, the
+    page inside the area is still at the size it had - so ``maximum()`` can
+    read 0 for a page that does not fit, or a range for one that does. One
+    ``qtbot.wait(0)`` is one turn too few; offscreen on Linux it happens to be
+    enough, which is exactly how the same reading on the other axis reached a
+    Windows runner before anyone saw it.
+    """
+    try:
+        qtbot.waitUntil(
+            lambda: scroll.widget().height() <= scroll.viewport().height()
+            or scroll.verticalScrollBar().maximum() > 0,
+            timeout=2000,
+        )
+    except TimeoutError:
+        # Let the caller's own assertion name the page and the number.
+        pass
+
+
+def test_the_microsoft_tab_no_longer_sets_the_dialog_floor(qtbot):
+    """Wrapping the pages is what did it, not a page that got smaller.
+
+    Before: the dialog's minimumSizeHint() was 519x1112, of which the
+    Microsoft page's own 1015-px minimum was nearly all. Measured after:
+    271x155.
+    """
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+
+    assert dialog.minimumSizeHint().height() < 300
+
+    microsoft = _tabs(dialog).widget(_tab_index(dialog, "Microsoft"))
+    assert microsoft.widget().sizeHint().height() > 1000, (
+        "the page shrank instead of the scroll area absorbing it"
+    )
+
+
+def test_every_tab_page_scrolls(qtbot):
+    """The guard for any tab added later: addTab with a bare page fails here."""
+    from PyQt6.QtWidgets import QScrollArea
+
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    tabs = _tabs(dialog)
+
+    assert tabs.count() == 6
+    for i in range(tabs.count()):
+        page = tabs.widget(i)
+        assert isinstance(page, QScrollArea), tabs.tabText(i)
+        assert page.widgetResizable()
+        # Both axes as-needed. AlwaysOff on the horizontal did not make a
+        # page fit - it hid the bar and left the page clipped with the range
+        # unreachable.
+        assert (
+            page.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        assert (
+            page.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        # One wheel notch moves the same distance here as on the panel's tile
+        # area: these pages kept Qt's default 20 px while the widget used 42.
+        step = wheel_step(page)
+        assert step > 20, "the shared step is Qt's own default"
+        assert page.verticalScrollBar().singleStep() == step
+        assert page.horizontalScrollBar().singleStep() == step
+
+
+def test_microsoft_scrolls_at_the_default_size_and_general_does_not(qtbot):
+    """maximum(), not isVisible(): macOS overlay bars are zero-width at rest,
+    and a tab that has never been current has not been laid out."""
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    with qtbot.waitExposed(dialog):
+        dialog.show()
+    tabs = _tabs(dialog)
+
+    ranges = {}
+    for i in range(tabs.count()):
+        tabs.setCurrentIndex(i)
+        _vertical_settled(qtbot, tabs.widget(i))
+        ranges[tabs.tabText(i)] = tabs.widget(i).verticalScrollBar().maximum()
+
+    assert ranges["Microsoft"] > 0, ranges
+    assert ranges["General"] == 0, ranges
+
+
+def test_the_dialog_and_its_floor_stay_inside_a_narrow_work_area(qtbot, monkeypatch):
+    """Both the size and the floor the user may drag to are the widest page's
+    rule bounded by the work area. On a screen narrower than a page the work
+    area has to win and the page's own horizontal bar takes the rest -
+    otherwise the dialog opens wider than the desktop with an OK button that
+    cannot be reached. An offscreen run has one 800 x 800 screen, so the work
+    area is forced and the page rule is forced past it."""
+    work_area = QRect(0, 0, 420, 700)
+    monkeypatch.setattr(QScreen, "availableGeometry", lambda self: work_area)
+    # The widest-page rule, forced wider than that screen. Both the default
+    # and the floor take it, and both are bounded by the same `min`.
+    monkeypatch.setattr(settings_dialog, "_DIALOG_DEFAULT_W", 2000)
+    monkeypatch.setattr(settings_dialog, "_DIALOG_MIN_W", 2000)
+
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+
+    assert dialog.width() <= work_area.width(), dialog._height_terms
+    assert dialog.minimumWidth() <= work_area.width(), dialog.minimumSize()
+    with qtbot.waitExposed(dialog):
+        dialog.show()
+    qtbot.wait(0)
+    assert dialog.width() <= work_area.width(), dialog._height_terms
+    # And the dialog can still be dragged down to that floor, which is the
+    # point of bounding it: a minimum wider than the screen is unshrinkable.
+    dialog.resize(work_area.width(), dialog.height())
+    qtbot.wait(0)
+    assert dialog.width() <= work_area.width()
+
+
+def test_the_default_size_tracks_the_general_page(qtbot):
+    """The landing page fits; the tallest page does not drag the window up."""
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    with qtbot.waitExposed(dialog):
+        dialog.show()
+    tabs = _tabs(dialog)
+
+    general_index = _tab_index(dialog, "General")
+    tabs.setCurrentIndex(general_index)
+    _vertical_settled(qtbot, tabs.widget(general_index))
+    assert tabs.widget(general_index).verticalScrollBar().maximum() == 0
+
+    microsoft = tabs.widget(_tab_index(dialog, "Microsoft"))
+    assert dialog.height() < microsoft.widget().sizeHint().height() / 2
+
+
+@pytest.mark.parametrize(
+    "content,chrome,floor,ceiling,expected",
+    [
+        (486, 103, 420, 720, 589),
+        (40, 97, 420, 720, 420),
+        (1765, 97, 420, 360, 360),
+        (1765, 97, 100, 360, 360),
+    ],
+    ids=["tall", "short", "capped", "squeezed"],
+)
+def test_the_height_clamp_has_a_floor_and_a_ceiling(
+    content, chrome, floor, ceiling, expected
+):
+    """The two ends are unreachable offscreen: one 800x800 screen, one font.
+
+    `capped` is the disagreement: a 420 floor against a 360 ceiling is a
+    400-px work area at 200% display scale, and the ceiling has to win or the
+    dialog is sized taller than the desktop before it is ever painted.
+    """
+    assert settings_dialog._dialog_height(content, chrome, floor, ceiling) == expected
+
+
+def test_the_default_height_is_the_measured_need_plus_the_slack(qtbot):
+    """The regression that reached CI, pinned from both sides.
+
+    The first cut read General's ``sizeHint()`` after one top-level
+    ``activate()``; a nested row was still serving a hint cached before its
+    combo box was styled, General under-read by 10 px, and the landing page
+    opened with 7 px of scroll range on Windows and 6 on macOS (offscreen
+    Linux passed by 5 px of font luck). Now: no range, and the default is
+    within the declared slack plus the style's pane rounding of the smallest
+    height that shows none - so a stale hint fails here whichever way it
+    errs.
+    """
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    estimate = dialog.height()
+    with qtbot.waitExposed(dialog):
+        dialog.show()
+    tabs = _tabs(dialog)
+    general_index = _tab_index(dialog, "General")
+    tabs.setCurrentIndex(general_index)
+    qtbot.wait(0)
+    general = tabs.widget(general_index)
+    assert general.verticalScrollBar().maximum() == 0, dialog._height_terms
+    # The estimate measures at the width the scroll area decides with, bar
+    # reserved - never wider than the viewport showEvent found. (A page whose
+    # own minimum is wider is measured at that minimum inside _page_height,
+    # as the area lays it out; the estimate's width stays the viewport's.)
+    terms = dialog._height_terms
+    assert terms["page_w"] <= terms["viewport_w_at_show"], terms
+
+    # The show-time measurement may grow the dialog where a platform's fonts
+    # or style land away from their hints; more than this and the estimate
+    # itself is wrong. Any growth is reported so a platform that needs it
+    # shows up in the run's warnings with both sets of terms.
+    grew = dialog.height() - estimate
+    assert 0 <= grew <= 8, dialog._height_terms
+    if grew:
+        warnings.warn(
+            f"the pre-show height estimate was {grew} px short here: "
+            f"{dialog._height_terms}",
+            stacklevel=1,
+        )
+
+    low, high = dialog.minimumHeight(), dialog.height()
+    while low < high:
+        mid = (low + high) // 2
+        dialog.resize(dialog.width(), mid)
+        qtbot.wait(0)
+        if general.verticalScrollBar().maximum() == 0:
+            high = mid
+        else:
+            low = mid + 1
+    smallest = low
+    assert smallest > dialog.minimumHeight(), "the search never engaged"
+    pane_rounding = 4
+    assert 0 <= estimate + grew - smallest <= (
+        settings_dialog._DIALOG_HEIGHT_SLACK + pane_rounding
+    ), (estimate, grew, smallest, dialog._height_terms)
+
+
+def test_the_default_width_fits_the_widest_page(qtbot, monkeypatch):
+    """No page is clipped, whatever the fonts make of its minimum.
+
+    Offscreen on Linux every page's minimum fits in 620 and the default
+    holds; the Windows runner's fonts run a third wider (General 612 px
+    against 454) and the dialog opens as wide as the 800-px work area
+    allows. So the assertions are the rule's, not a number's: never
+    narrower than the default, every page shown no wider than its viewport
+    unless the work area is what bounds the dialog, and with the default
+    forced down to 300 the rule alone still opens wide enough - the 560
+    floor underneath.
+    """
+
+    def every_page_fits(dialog: SettingsDialog) -> None:
+        tabs = _tabs(dialog)
+        for i in range(tabs.count()):
+            tabs.setCurrentIndex(i)
+            qtbot.wait(0)
+            scroll = tabs.widget(i)
+            _settled(qtbot, scroll)
+            clipped = scroll.widget().width() > scroll.viewport().width()
+            # No exemption for the work-area bound any more: where the screen
+            # is what stops the dialog from being wide enough, the page's own
+            # horizontal bar has to carry the rest. Clipped with no bar is the
+            # one answer that is never allowed.
+            assert not clipped or scroll.horizontalScrollBar().maximum() > 0, (
+                tabs.tabText(i),
+                dialog._height_terms,
+            )
+
+    fits = SettingsDialog(Config())
+    qtbot.addWidget(fits)
+    available = fits.screen().availableGeometry().width()
+    assert fits.width() >= min(settings_dialog._DIALOG_DEFAULT_W, available)
+    with qtbot.waitExposed(fits):
+        fits.show()
+    every_page_fits(fits)
+
+    monkeypatch.setattr(settings_dialog, "_DIALOG_DEFAULT_W", 300)
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    asked = dialog._height_terms["asked_w"]
+    assert asked > 300, "the rule did not engage"
+    # The 560 floor is a separate rule and still applies underneath.
+    assert dialog.width() == max(asked, settings_dialog._DIALOG_MIN_W)
+    # And `width` is what the window got, not what the derivation asked for.
+    assert dialog._height_terms["width"] == dialog.width()
+    with qtbot.waitExposed(dialog):
+        dialog.show()
+    every_page_fits(dialog)
+
+
+def test_the_screen_fraction_is_the_effective_ceiling(qtbot, monkeypatch):
+    """Including the minimum size, which used to out-rank it.
+
+    At 200% display scale the logical work area is 400 px high, the ceiling is
+    360, and `setMinimumSize(..., min(420, 400))` floored the dialog at 400 -
+    so the documented 90% was the one number the code did not enforce, and the
+    pre-show size was 20 px taller than the whole desktop. The fraction is
+    forced down here rather than the screen faked: offscreen has one 800x800
+    screen, and a ceiling under the 420 floor is the only thing that matters.
+    """
+    monkeypatch.setattr(settings_dialog, "_DIALOG_SCREEN_FRACTION", 0.4)
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    available = dialog.screen().availableGeometry()
+    ceiling = int(available.height() * 0.4)
+    assert ceiling < settings_dialog._DIALOG_MIN_H, "the case did not engage"
+
+    assert dialog.minimumHeight() == ceiling
+    assert dialog.height() <= ceiling, dialog._height_terms
+
+    with qtbot.waitExposed(dialog):
+        dialog.show()
+    qtbot.wait(0)
+    assert dialog.height() <= ceiling, dialog._height_terms
+
+
+def test_no_page_is_clipped_at_the_dialog_floor(qtbot, monkeypatch):
+    """The floor a user can drag to is the same widest-page rule as the
+    default, so the 560 constant can no longer put a page 50-80 px off the
+    right-hand edge - which is what it did on the Windows fonts, where
+    General's minimum is 612: measured at 480, Claude clipped by 46 px with
+    the range sitting there and the bar policy hiding it.
+
+    The constant is forced below the rule in the second half, because
+    offscreen on Linux every page's minimum already fits inside 560 and the
+    rule would otherwise never engage here.
+    """
+
+    def nothing_is_clipped_at_the_floor(dialog: SettingsDialog) -> None:
+        available = dialog.screen().availableGeometry().width()
+        tabs = _tabs(dialog)
+        dialog.resize(dialog.minimumWidth(), dialog.height())
+        qtbot.wait(0)
+        for i in range(tabs.count()):
+            tabs.setCurrentIndex(i)
+            qtbot.wait(0)
+            scroll = tabs.widget(i)
+            _settled(qtbot, scroll)
+            bar = scroll.horizontalScrollBar()
+            if dialog.minimumWidth() < available:
+                assert bar.maximum() == 0, (tabs.tabText(i), scroll.widget().width())
+            else:
+                # A work area narrower than the pages need: the floor gave way
+                # to the screen, and the bar is what makes the rest reachable.
+                assert (
+                    scroll.widget().width() <= scroll.viewport().width()
+                    or bar.maximum() > 0
+                ), tabs.tabText(i)
+
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    with qtbot.waitExposed(dialog):
+        dialog.show()
+    nothing_is_clipped_at_the_floor(dialog)
+
+    monkeypatch.setattr(settings_dialog, "_DIALOG_MIN_W", 300)
+    narrow = SettingsDialog(Config())
+    qtbot.addWidget(narrow)
+    available = narrow.screen().availableGeometry().width()
+    assert narrow.minimumWidth() > min(300, available), (
+        "the floor ignored the widest page"
+    )
+    with qtbot.waitExposed(narrow):
+        narrow.show()
+    nothing_is_clipped_at_the_floor(narrow)
+
+
+def test_page_height_measures_at_the_pages_own_minimum_when_wider(qtbot):
+    """The Windows case, reproduced: a page whose minimum is wider than the
+    viewport is laid out at that minimum, so that is where its height is
+    read - never at a narrower width that would wrap its labels more."""
+    from PyQt6.QtWidgets import QLabel, QVBoxLayout, QWidget
+
+    page = QWidget()
+    qtbot.addWidget(page)
+    layout = QVBoxLayout(page)
+    wide = QLabel("a row that sets the page's minimum width")
+    wide.setMinimumWidth(500)
+    layout.addWidget(wide)
+    label = QLabel("word " * 60)
+    label.setWordWrap(True)
+    layout.addWidget(label)
+    layout.activate()
+
+    minimum_w = page.minimumSizeHint().width()
+    assert minimum_w >= 500
+    at_minimum = page.heightForWidth(minimum_w)
+    assert page.heightForWidth(300) > at_minimum, (
+        "the label should wrap more at 300 than at the minimum, or this "
+        "proves nothing"
+    )
+    assert settings_dialog._page_height(page, 300) == at_minimum
+    assert settings_dialog._page_height(page, minimum_w + 200) <= at_minimum
+
+
+def test_a_short_estimate_is_corrected_before_the_first_paint(qtbot, monkeypatch):
+    """The show-time measurement, forced to engage.
+
+    Offscreen the estimate is exact and ``showEvent`` measures without
+    resizing, so the correction is exercised by making the estimate wrong on
+    purpose: 40 px of negative slack opens the dialog short, and the first
+    ``showEvent`` grows it back to a height at which General shows no bar.
+    """
+    monkeypatch.setattr(settings_dialog, "_DIALOG_HEIGHT_SLACK", -40)
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    short = dialog.height()
+    with qtbot.waitExposed(dialog):
+        dialog.show()
+    general = _tabs(dialog).widget(_tab_index(dialog, "General"))
+    qtbot.wait(0)
+
+    assert dialog.height() > short, dialog._height_terms
+    # Nothing capped this one, so the two terms agree: what the measurement
+    # asked for and what the window got.
+    assert dialog._height_terms["grew"] == dialog.height() - short
+    assert dialog._height_terms["deficit"] == dialog._height_terms["grew"]
+    assert general.verticalScrollBar().maximum() == 0, dialog._height_terms
+    assert dialog._fitted_on_show
+
+    # Once only: a later show (the dialog is modal and re-created each time,
+    # but a hide/show cycle must not keep growing it).
+    grown = dialog.height()
+    dialog.hide()
+    with qtbot.waitExposed(dialog):
+        dialog.show()
+    assert dialog.height() == grown
+
+
+def test_the_show_time_terms_say_what_was_asked_for_and_what_was_got(
+    qtbot, monkeypatch
+):
+    """`grew` was the deficit, i.e. the measurement's question, not the
+    window's answer. They differ whenever the resize is capped: at 200 %
+    display scale the terms read `grew: 242` while the dialog went 360 to 360,
+    because the screen ceiling held it. A maximum height stands in for that
+    ceiling here, since an offscreen run has one 800 x 800 screen."""
+    monkeypatch.setattr(settings_dialog, "_DIALOG_HEIGHT_SLACK", -40)
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    short = dialog.height()
+    dialog.setMaximumHeight(short)
+    with qtbot.waitExposed(dialog):
+        dialog.show()
+    qtbot.wait(0)
+
+    assert dialog.height() == short, "the cap did not hold"
+    assert dialog._height_terms["deficit"] > 0, "the measurement found nothing"
+    assert dialog._height_terms["grew"] == 0, "a capped resize reported growth"
+
+
+def test_activate_layouts_refreshes_a_nested_layouts_stale_hint(qtbot):
+    """The mechanism on its own, with no dialog in the way.
+
+    A combo box in a row layout inside an inner widget inside a group box's
+    grid: after the page's top-level ``activate()`` has cached everything,
+    growing the combo box invalidates the inner widget's layout and posts it a
+    ``LayoutRequest`` that a hidden widget never handles - the page's own
+    layout keeps its cache, and a second top-level ``activate()`` returns
+    early on its raised flag.
+
+    Two widgets deep, not one, so the tree has something to order at all -
+    but this test is about the *outcome*, and measured, the outcome is the
+    same either way round: Qt's hint caches invalidate upward on their own, so
+    the page's hint comes back fresh whichever order the layouts are
+    activated in. The order itself is pinned directly, in the test below.
+    """
+    from PyQt6.QtWidgets import (
+        QComboBox,
+        QGridLayout,
+        QGroupBox,
+        QHBoxLayout,
+        QVBoxLayout,
+        QWidget,
+    )
+
+    page = QWidget()
+    qtbot.addWidget(page)
+    outer = QVBoxLayout(page)
+    group = QGroupBox("Group")
+    grid = QGridLayout(group)
+    inner = QWidget()
+    inner_layout = QVBoxLayout(inner)
+    row = QHBoxLayout()
+    combo = QComboBox()
+    combo.addItem("one")
+    row.addWidget(combo)
+    inner_layout.addLayout(row)
+    grid.addWidget(inner, 0, 0)
+    outer.addWidget(group)
+    outer.activate()
+    before = page.sizeHint().height()
+
+    combo.setMinimumHeight(combo.sizeHint().height() + 40)
+    outer.activate()
+    assert page.sizeHint().height() == before, (
+        "the top-level activate() alone now refreshes the nested row, so the "
+        "deepest-first pass is no longer load-bearing - reconsider it"
+    )
+
+    settings_dialog._activate_layouts(page)
+    assert page.sizeHint().height() >= before + 40
+
+
+def test_activate_layouts_visits_descendants_before_their_ancestors(qtbot):
+    """The pass's documented contract, asserted as an order.
+
+    Not through an outcome: measured on a three-deep tree, dropping
+    ``reversed`` leaves every size hint exactly where the deepest-first pass
+    does, because a layout's ``invalidate()`` already walks up to the
+    top-level one. What the order buys is the geometry each ``activate()``
+    assigns - a parent laid out against a stale child hint stays laid out that
+    way, since nothing comes back to it - so the promise is worth keeping and
+    worth pinning, and an outcome assertion cannot tell the two apart.
+    """
+    from PyQt6.QtWidgets import QComboBox, QGroupBox, QVBoxLayout, QWidget
+
+    visited: list[str] = []
+
+    class _Recording(QVBoxLayout):
+        def __init__(self, name, parent=None):
+            super().__init__(parent)
+            self._name = name
+
+        def activate(self):  # noqa: N802 - Qt override
+            visited.append(self._name)
+            return super().activate()
+
+    page = QWidget()
+    qtbot.addWidget(page)
+    outer = _Recording("page", page)
+    group = QGroupBox("Group")
+    group_layout = _Recording("group", group)
+    inner = QWidget()
+    inner_layout = _Recording("inner", inner)
+    inner_layout.addWidget(QComboBox())
+    group_layout.addWidget(inner)
+    outer.addWidget(group)
+
+    settings_dialog._activate_layouts(page)
+
+    assert {"inner", "group", "page"} <= set(visited), visited
+    assert visited.index("inner") < visited.index("group") < visited.index("page")
+
+
+def test_the_dialog_does_not_remember_its_size(qtbot):
+    """No settings-window field exists and none is to be added: the dialog is
+    sized from its content every time it opens."""
+    config = Config()
+    first = SettingsDialog(config)
+    qtbot.addWidget(first)
+    original_height = first.height()
+
+    before = set(Config().model_dump())
+    first.resize(900, 900)
+    first.apply_to(config)
+    assert set(config.model_dump()) == before
+    assert "settings" not in str(config.model_dump().get("window", {}))
+
+    second = SettingsDialog(config)
+    qtbot.addWidget(second)
+    assert second.height() == original_height
+
+
+def test_every_named_field_survives_the_wrapping(qtbot):
+    """findChild is recursive, so it sees through a scroll area - but a widget
+    left behind by a re-parent would not be inside one."""
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    scrolls = dialog._page_scrolls  # noqa: SLF001
+    assert len(scrolls) == 6
+
+    named = [
+        "claude_signin_btn",
+        "codex_paste_cookie_btn",
+        "opencode_go_signin_btn",
+        "azure_colors_btn",
+        "rescan_meters_btn",
+    ]
+    for name in named:
+        widget = _button(dialog, name)
+        assert any(
+            scroll.widget().isAncestorOf(widget) for scroll in scrolls
+        ), f"{name} is not inside any tab page"
+
+    for field in ("azure_subscription", "opencode_go_url", "gh_quota"):
+        widget = getattr(dialog, field)
+        assert any(
+            scroll.widget().isAncestorOf(widget) for scroll in scrolls
+        ), f"{field} is not inside any tab page"
+
+
+def test_a_wrapped_page_does_not_paint_qts_light_background(qtbot):
+    """The trap the widget's tile scroll area already fell into once.
+
+    A QScrollArea's viewport has autoFillBackground() True and a Window
+    background role, so without the descendant rule it paints #efefef through
+    the dark dialog. Measured here: #1f2937 viewport, a #374151 track and a
+    #4b5563 handle on the one tab that overflows, and nothing painted in that
+    column on a tab that fits.
+    """
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    with qtbot.waitExposed(dialog):
+        dialog.show()
+    tabs = _tabs(dialog)
+    tabs.setCurrentIndex(_tab_index(dialog, "Microsoft"))
+    qtbot.wait(0)
+
+    image = dialog.grab().toImage()
+    assert image.pixelColor(30, 200).name() == "#1f2937"
+
+    scroll = tabs.currentWidget()
+    bar = scroll.verticalScrollBar()
+    assert bar.maximum() > 0
+    top_left = bar.mapTo(dialog, bar.rect().topLeft())
+    column = top_left.x() + bar.width() // 2
+    assert image.pixelColor(column, top_left.y() + 12).name() == "#4b5563"
+    assert (
+        image.pixelColor(column, top_left.y() + bar.height() - 6).name() == "#374151"
+    ), "the track is not visible behind the handle"
+
+    tabs.setCurrentIndex(_tab_index(dialog, "General"))
+    qtbot.wait(0)
+    fitted = dialog.grab().toImage()
+    assert fitted.pixelColor(column, 200).name() == "#1f2937", (
+        "a bar was painted for a page with nothing hidden"
     )

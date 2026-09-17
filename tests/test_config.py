@@ -7,7 +7,8 @@ from pydantic import ValidationError
 
 from aigauge.config import (
     DEFAULT_OPENCODE_USAGE_URL,
-    WINDOW_MAX_HEIGHT,
+    WINDOW_MAX_DIMENSION,
+    WINDOW_MIN_WIDTH,
     WINDOW_MIN_HEIGHT,
     BrowserAccount,
     ColorThresholds,
@@ -473,6 +474,10 @@ def test_load_migrates_start_with_windows_to_start_at_login():
 
 
 def test_load_clamps_saved_window_size():
+    """The window is the user's to size from 1.4.0+cfa.8, so a saved width is
+    kept rather than replaced with the constant - but it is still bounded.
+    The bound here is a sanity bound: the loader has no idea which monitor the
+    window will open on, and UsageWidget clamps to that screen's work area."""
     config_path().parent.mkdir(parents=True, exist_ok=True)
     config_path().write_text(
         '{"window": {"width": 5000, "height": 2}}',
@@ -481,8 +486,81 @@ def test_load_clamps_saved_window_size():
 
     c = Config.load()
 
-    assert c.window.width == 340
-    assert c.window.height == 80
+    assert c.window.width == WINDOW_MAX_DIMENSION
+    assert c.window.height == WINDOW_MIN_HEIGHT
+
+
+def test_load_keeps_a_1_3_x_window_block_unchanged():
+    """340x420 was the only size 1.3.x could save. It is inside the new bounds,
+    so an upgrade opens the window exactly where it was left."""
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        '{"window": {"width": 340, "height": 420, "x": 100, "y": 120}}',
+        encoding="utf-8",
+    )
+
+    c = Config.load()
+
+    assert (c.window.width, c.window.height) == (340, 420)
+    assert (c.window.x, c.window.y) == (100, 120)
+
+
+def test_a_1_3_x_config_has_never_been_sized_by_hand():
+    """The upgrade case. 1.3.x wrote its auto-fitted height back on every
+    release, hide and close, so "the size is not the first-run 340x220" said
+    yes for practically every installed config - and auto-fit would have gone
+    off for every existing user on their first launch of 1.4.0. The file
+    itself is the answer: it has no ``user_sized`` key."""
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        '{"window": {"width": 340, "height": 268}}', encoding="utf-8"
+    )
+
+    assert Config.load().window.user_sized is False
+
+
+def test_user_sized_survives_a_round_trip():
+    c = Config()
+    c.window.user_sized = True
+    c.window.width, c.window.height = 500, 300
+    c.save()
+
+    loaded = Config.load()
+    assert loaded.window.user_sized is True
+    assert (loaded.window.width, loaded.window.height) == (500, 300)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["yes", 1, 0, None, [], {"a": 1}, "false"],
+    ids=["yes", "one", "zero", "null", "list", "dict", "false-string"],
+)
+def test_a_hostile_user_sized_coerces_to_never_sized(raw):
+    """It gates auto-fit, and a raise inside WindowState costs the user the
+    whole window block. Anything but a real bool reads as "no"."""
+    from aigauge.config import WindowState
+
+    assert WindowState(user_sized=raw).user_sized is False
+
+
+@pytest.mark.parametrize(
+    "payload,expected",
+    [
+        ({"width": -5}, WINDOW_MIN_WIDTH),
+        ({"width": 99999}, WINDOW_MAX_DIMENSION),
+        ({"width": float("nan")}, 340),
+        ({"width": "wide"}, 340),
+        ({"width": True}, 340),
+        ({"width": None}, 340),
+    ],
+    ids=["negative", "huge", "nan", "string", "bool", "null"],
+)
+def test_window_width_is_coerced_never_rejected(payload, expected):
+    """A raise anywhere inside WindowState reaches Config.load()'s salvage and
+    discards the whole window block, so every one of these coerces."""
+    from aigauge.config import WindowState
+
+    assert WindowState(**payload).width == expected
 
 
 def test_color_thresholds_reject_stylesheet_injection():
@@ -754,7 +832,7 @@ def test_color_thresholds_reject_assignment_of_non_hex_color():
         # satisfied by the raw 5, by the default 220 and by the floor alike,
         # so it could not tell clamping from doing nothing at all.
         ({"window": {"height": 5}}, lambda c: c.window.height == WINDOW_MIN_HEIGHT),
-        ({"window": {"height": 9999}}, lambda c: c.window.height == WINDOW_MAX_HEIGHT),
+        ({"window": {"height": 9999}}, lambda c: c.window.height == WINDOW_MAX_DIMENSION),
         ({"window": {"opacity": 5.0}}, lambda c: c.window.opacity == 1.0),
         ({"window": {"opacity": -1}}, lambda c: c.window.opacity == 0.3),
         ({"window": {"ui_scale": -3}}, lambda c: c.window.ui_scale == 0.75),

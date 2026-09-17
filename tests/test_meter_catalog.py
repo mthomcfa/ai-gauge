@@ -29,7 +29,7 @@ import pytest
 
 from aigauge.config import Config, app_data_dir
 from aigauge.history import HistoryStore
-from aigauge.models import SnapshotStatus, UsageMetric, UsageSnapshot
+from aigauge.models import MAX_NOTE_CHARS, SnapshotStatus, UsageMetric, UsageSnapshot
 from aigauge.providers.catalog import (
     BREAKDOWN_TAG,
     CATALOG_NO_CONTAINER_RETRY,
@@ -397,6 +397,20 @@ def test_a_primary_meter_is_untagged_and_a_breakdown_meter_is_tagged():
     assert session.tag is None
     assert opus.tag == BREAKDOWN_TAG
     assert (session.label, opus.label) == ("Session", "Opus only")
+
+
+def test_a_page_derived_note_is_bounded_before_it_reaches_the_model():
+    """`reset_text` comes straight off the page: it is matched against a whole
+    element's text, with no `clean_label` and - unlike `row_evidence`'s copy -
+    no cap. A usage page with a long block after the word "Resets" handed the
+    model a note the size of the block, which six tooltips then carried."""
+    spec = bundled_catalog("claude").spec_for_key("session")
+
+    metric = metric_for_spec(
+        spec, {"percent": 40.0, "kind": "used", "reset_text": "x" * 200_000}
+    )
+
+    assert metric.note == "x" * MAX_NOTE_CHARS
 
 
 def test_a_remaining_row_is_converted_to_percent_used():

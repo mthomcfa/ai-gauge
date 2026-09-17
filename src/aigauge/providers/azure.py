@@ -1875,7 +1875,17 @@ def reset_states() -> None:
         _STATES.clear()
 
 
-def next_allowed_at(state: _State) -> datetime | None:
+def next_allowed_at(state: _State, now: datetime | None = None) -> datetime | None:
+    """When this tenant may be asked again - never a time already past.
+
+    ``max(candidates)`` alone could answer with a stamp behind the clock: a
+    state with no ``last_fetch_at`` and a ``blocked_until`` that has since
+    expired gave "next attempt at 14:09" at 17:09. Unreachable from the 429
+    handler, which sets ``blocked_until`` to ``now + retry_after`` immediately
+    before asking - flooring is so that the second caller does not inherit it.
+    ``now`` is threaded rather than read here so a caller with its own clock
+    keeps it.
+    """
     candidates = [
         stamp
         for stamp in (
@@ -1884,17 +1894,41 @@ def next_allowed_at(state: _State) -> datetime | None:
         )
         if stamp is not None
     ]
-    return max(candidates) if candidates else None
+    if not candidates:
+        return None
+    return max(max(candidates), now if now is not None else datetime.now())
 
 
-def _stale_settings_note(state: _State) -> str:
+def _throttled_message(state: _State, now: datetime | None = None) -> str:
+    """Name the attempt that will actually happen, not the one the 429 asked for.
+
+    The old wording read the ``Retry-After`` header and said "retrying in N
+    min". That is the server's answer to the server's question; it is not when
+    this tile tries again. ``next_allowed_at`` is - the later of the hourly
+    floor from the last fetch and ``blocked_until`` - and the two disagree in
+    the ordinary case, because a ``Retry-After`` is usually seconds and the
+    floor is an hour. Measured on the user's desktop: a 52 s ``Retry-After`` at
+    11:16:48, a message promising a retry in 1 min, and then every refresh
+    until 12:16 serving the cached error in 0.0 s. An hour of a tile saying
+    "one minute" is worse than an hour of it saying nothing.
+
+    Local time and the same ``%H:%M`` as ``_stale_settings_note``, because they
+    are the same promise about the same clock and appear on the same tile.
+    """
+    when = next_allowed_at(state, now)
+    return "Cost Management is rate limiting this tenant" + (
+        f"; next attempt at {when:%H:%M}." if when is not None else "."
+    )
+
+
+def _stale_settings_note(state: _State, now: datetime | None = None) -> str:
     """Why the tile is showing figures it will not gauge.
 
     The hourly floor is a promise to the tenant, not to this tile, so a
     settings save cannot buy a fetch. Naming the time the next one is due is
     what turns "no gauge" from a fault into a wait.
     """
-    when = next_allowed_at(state)
+    when = next_allowed_at(state, now)
     return (
         "Settings changed; these figures are from the previous settings."
         + (f" Next fetch at {when:%H:%M}." if when is not None else "")
@@ -2060,7 +2094,12 @@ class AzureProvider(Provider):
                     azure_cfg,
                     fetched_at=state.fetched_at,
                     stale_note=(
-                        _stale_settings_note(state)
+                        # The clock this call decided with, not a second
+                        # reading of the wall clock: the gate compared against
+                        # `now`, so a sentence naming the next fetch has to be
+                        # derived from the same one or it can name a minute
+                        # the gate never used.
+                        _stale_settings_note(state, now)
                         if state.stale_settings
                         else None
                     ),
@@ -2083,7 +2122,7 @@ class AzureProvider(Provider):
                 )
             return
 
-        allowed_at = next_allowed_at(state)
+        allowed_at = next_allowed_at(state, now)
         if allowed_at is not None and now < allowed_at:
             if state.aggregate is not None:
                 # info, not debug: this is the ordinary Azure path - the
@@ -2354,18 +2393,13 @@ class AzureProvider(Provider):
                     azure_cfg,
                     fetched_at=state.fetched_at,
                     stale_note=(
-                        _stale_settings_note(state)
+                        _stale_settings_note(state, now)
                         if state.stale_settings
                         else None
                     ),
                 )
             return self._remember_error(
-                state,
-                _error(
-                    "Cost Management is rate limiting this tenant; retrying in "
-                    f"{max(1, exc.retry_after // 60)} min."
-                ),
-                backoff=False,
+                state, _error(_throttled_message(state, now)), backoff=False
             )
         except AzurePermissionError as exc:
             if getattr(exc, "status", 0) == 401:
