@@ -1739,6 +1739,19 @@ def test_an_app_resize_neither_marks_the_window_nor_arms_the_debounce(qtbot):
         widget._geometry_commit.isActive() is False
     ), "an app resize armed the commit debounce"
 
+    # The collapse's own auto-fit is the other app resize, and it is the one
+    # that shrinks the window to a 58 px strip - a size nobody chose.
+    widget._native_gesture = True  # noqa: SLF001
+    widget._native_resize = True  # noqa: SLF001
+    grown = widget.height()
+    widget.set_collapsed(True)
+    qtbot.waitUntil(lambda: widget.height() < grown, timeout=3000)
+
+    assert widget._user_sized is False, "the collapse took the size over"  # noqa: SLF001
+    assert (  # noqa: SLF001
+        widget._geometry_commit.isActive() is False
+    ), "the collapse armed the commit debounce"
+
 
 def test_a_pause_in_a_window_manager_drag_does_not_lose_the_rest_of_it(qtbot, monkeypatch):
     """The debounce is a commit, not the end of the gesture.
@@ -1847,6 +1860,18 @@ def test_the_macos_popover_anchor_is_not_saved_over_the_users_position(qtbot):
     on_disk = Config.load().window
     assert (on_disk.x, on_disk.y) == (chosen.x(), chosen.y()), "the anchor was saved"
     assert (on_disk.width, on_disk.height) == (widget.width(), widget.height())
+
+    # And the first move the user makes hands the position back: the flag is
+    # about the anchor, not about never writing a position again.
+    with qtbot.waitExposed(widget):
+        widget.show()
+    qtbot.wait(0)
+    widget.move(widget.x() + 25, widget.y() + 15)
+    moved = widget.pos()
+    widget.hide()
+
+    on_disk = Config.load().window
+    assert (on_disk.x, on_disk.y) == (moved.x(), moved.y()), "a user move was ignored"
 
 
 def test_a_collapse_is_one_write_and_the_hide_after_it_none(qtbot, monkeypatch):
