@@ -33,7 +33,7 @@ from typing import Any, Iterable, Sequence
 
 from ..atomic_write import atomic_write
 from ..config import _is_safe_profile_id, app_data_dir
-from ..models import MAX_NOTE_CHARS, UsageMetric
+from ..models import UsageMetric, bounded_note
 from ._common import normalize_percent
 from .idle import idle_reset_state
 
@@ -653,14 +653,16 @@ def metric_for_spec(
     )
     # Unlike the sibling at `_row_evidence`, `reset_text` arrives here with no
     # `clean_label` and no bound: it is matched against a whole element's text,
-    # so a page with a long block after "Resets" hands the model the block.
+    # so a page with a long block after "Resets" hands us the block.
+    # `bounded_note` is where that is clipped, and it is the same bound
+    # every provider's page-derived note goes through.
     note = idle_note or card.get("reset_text")
     return UsageMetric(
         label=spec.label,
         percent_used=percent,
         resets_at=resets_at,
         reset_label=reset_label,
-        note=note[:MAX_NOTE_CHARS] if isinstance(note, str) else note,
+        note=bounded_note(note),
         window=spec.window,
         tag=None if spec.primary else BREAKDOWN_TAG,
     )

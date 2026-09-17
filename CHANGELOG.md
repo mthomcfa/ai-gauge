@@ -388,10 +388,17 @@ user sees.
   go through the same clip-and-escape as an error tooltip, and every label on
   a metric row and a compact metric is `Qt.TextFormat.PlainText`: the default
   is `AutoText`, and `metric.label` and `metric.reset_label` reach `setText`.
-  `catalog.py` bounds the note where it is built as well, at
-  `models.MAX_NOTE_CHARS`, because `reset_text` is matched against a whole
-  element's text with no `clean_label` and no cap - a usage page with a long
-  block after "Resets" handed the model a 200 kB note. A sweep over every
+  A page-derived note is bounded where it is read, too, at
+  `models.MAX_NOTE_CHARS` through `models.bounded_note`, because `reset_text`
+  is matched against a whole element's text with no `clean_label` and no cap -
+  a usage page with a long block after "Resets" handed the model a 200 kB
+  note. All three readers of such a note go through it: the meter catalog,
+  and opencode.ai's element reader and its body-text fallback, which built
+  their own `UsageMetric` and so had no bound at all. It is the readers rather
+  than `UsageMetric.__post_init__` because most notes are this app's own prose
+  - Azure writes several sentences of period, lag and gross-of-credits
+  explanation into one - and a blanket clip on the field would truncate ours
+  to bound theirs. A sweep over every
   label and tooltip in a poisoned panel, expanded and collapsed, is the test,
   so the next label added cannot quietly take the default back.
 
