@@ -16,7 +16,7 @@ from aigauge.config import (
 )
 from aigauge.models import SnapshotStatus, UsageMetric, UsageSnapshot
 from aigauge.ratio import RatioEstimate
-from aigauge.ui_style import SCROLLBAR_WIDTH
+from aigauge.ui_style import SCROLLBAR_WIDTH, wheel_step
 from aigauge.widget import (
     NATIVE_GESTURE_COMMIT_MS,
     UsageWidget,
@@ -1720,7 +1720,9 @@ def test_the_scroll_bar_is_painted_in_the_shared_colours(qtbot):
     bar = widget._tile_scroll.verticalScrollBar()  # noqa: SLF001
     assert bar.maximum() > 0
     assert bar.width() == SCROLLBAR_WIDTH
-    # Three lines of text per notch, and a page is the viewport.
+    # Three lines of text per notch, from the shared definition, and a page
+    # is the viewport.
+    assert bar.singleStep() == wheel_step(widget._tile_scroll)  # noqa: SLF001
     assert bar.singleStep() == 3 * widget.fontMetrics().height()
     assert bar.pageStep() == widget._tile_scroll.viewport().height()  # noqa: SLF001
 

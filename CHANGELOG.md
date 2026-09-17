@@ -216,7 +216,11 @@ user sees.
   carrying a spend and an allowance in its reset column measures 304, so at the
   260 px window minimum that content really is wider than the viewport. A wheel
   notch is three lines of text (42 px at this font) against Qt's default 20,
-  and a page step is the viewport.
+  and a page step is the viewport. The step is `ui_style.WHEEL_STEP_LINES` and
+  the Settings pages take it too - they had kept Qt's 20, so the same gesture
+  moved two different distances in the same app. A count of lines and not a
+  pixel number, because the two surfaces have different fonts and the three
+  platforms' differ by up to a third.
 
 ### Fixed
 

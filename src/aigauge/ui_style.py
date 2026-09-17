@@ -11,12 +11,16 @@ The fragment is a function of the surface rather than a constant because the
 track has to be *lighter than the panel it sits on* and the two panels differ;
 ``SCROLLBAR_STYLESHEET`` is the widget's, i.e. the common case.
 
-The rules cover both axes. Neither surface scrolls horizontally today - the
-widget's tile rows compress and the dialog's pages are told never to - but a
-bar that only exists on one axis is how a half-styled horizontal bar appears
-the first time a window is narrow enough, in Qt's default grey.
+The rules cover both axes, and both surfaces can now reach the horizontal one:
+an Azure row carrying a spend and an allowance is wider than the panel's own
+minimum, and a Settings page whose minimum is wider than a narrow work area
+needs the bar rather than the clipping it used to get. A bar that only exists
+on one axis is how a half-styled horizontal bar appears the first time a
+window is narrow enough, in Qt's default grey.
 """
 from __future__ import annotations
+
+from PyQt6.QtWidgets import QAbstractScrollArea, QWidget
 
 # Panel colours the two surfaces paint themselves with.
 WIDGET_PANEL = "#111827"
@@ -25,6 +29,14 @@ DIALOG_PANEL = "#1f2937"
 # The track is one step up the same grey ramp from whichever panel it is on.
 WIDGET_TRACK = "#1f2937"
 DIALOG_TRACK = "#374151"
+
+# Three lines of text per wheel notch, on both surfaces. Qt's default single
+# step is 20 px - under two rows on a tile, and a bar that barely moves - and
+# the dialog's pages kept it while the widget's tile area did not, so the same
+# gesture scrolled two different distances in the same app. A count of lines
+# rather than a pixel number, because the two surfaces have different fonts
+# and the three platforms' fonts differ by up to a third.
+WHEEL_STEP_LINES = 3
 
 SCROLLBAR_WIDTH = 10
 SCROLLBAR_MIN_HANDLE = 24
@@ -37,6 +49,22 @@ _HANDLE_RADIUS = (SCROLLBAR_WIDTH - 2 * _HANDLE_MARGIN) // 2
 HANDLE = "#4b5563"
 HANDLE_HOVER = "#6b7280"
 HANDLE_PRESSED = "#9ca3af"
+
+
+def wheel_step(widget: QWidget) -> int:
+    """How far one wheel notch moves a scroll area painted by this sheet.
+
+    Read off the widget's own font metrics, so a platform whose fonts are a
+    third wider than Linux's gets three of *its* lines, not 42 px of ours.
+    """
+    return WHEEL_STEP_LINES * widget.fontMetrics().height()
+
+
+def apply_wheel_step(area: QAbstractScrollArea) -> None:
+    """Give both of ``area``'s bars the shared single step."""
+    step = wheel_step(area)
+    area.verticalScrollBar().setSingleStep(step)
+    area.horizontalScrollBar().setSingleStep(step)
 
 
 def scrollbar_stylesheet(*, panel: str, track: str) -> str:

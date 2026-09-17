@@ -60,7 +60,7 @@ from .ratio import (
     MIN_WEEKLY_DELTA,
     RatioEstimate,
 )
-from .ui_style import SCROLLBAR_STYLESHEET
+from .ui_style import SCROLLBAR_STYLESHEET, apply_wheel_step
 
 ROW_BAR_HEIGHT = 8
 # How wide the right-hand column may grow for a reset_label that is a phrase
@@ -1677,13 +1677,11 @@ class UsageWidget(QWidget):
             + SCROLLBAR_STYLESHEET
         )
         self._tile_scroll.viewport().setStyleSheet("background:#111827;")
-        # Three lines of text per wheel notch. Qt's default single step is 20
-        # px, which is under two rows on a tile and reads as a bar that barely
-        # moves. The page step is the viewport height, which QScrollArea keeps
-        # in step with its own geometry - asserted rather than set.
-        wheel_step = 3 * self.fontMetrics().height()
-        self._tile_scroll.verticalScrollBar().setSingleStep(wheel_step)
-        self._tile_scroll.horizontalScrollBar().setSingleStep(wheel_step)
+        # Three lines of text per wheel notch, from the one definition the
+        # dialog's pages use as well - see ui_style.WHEEL_STEP_LINES. The page
+        # step is the viewport height, which QScrollArea keeps in step with
+        # its own geometry - asserted rather than set.
+        apply_wheel_step(self._tile_scroll)
         self._tile_scroll.setWidget(self._tile_container)
 
         outer = QVBoxLayout(self)

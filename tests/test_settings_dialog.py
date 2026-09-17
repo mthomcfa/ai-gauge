@@ -9,6 +9,7 @@ from aigauge import settings_dialog
 from aigauge.config import Config
 from aigauge.providers.catalog import record_scan, scan_due
 from aigauge.settings_dialog import SettingsDialog
+from aigauge.ui_style import wheel_step
 
 
 def _button(dialog: SettingsDialog, name: str) -> QPushButton:
@@ -842,6 +843,12 @@ def test_every_tab_page_scrolls(qtbot):
         assert (
             page.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
+        # One wheel notch moves the same distance here as on the panel's tile
+        # area: these pages kept Qt's default 20 px while the widget used 42.
+        step = wheel_step(page)
+        assert step > 20, "the shared step is Qt's own default"
+        assert page.verticalScrollBar().singleStep() == step
+        assert page.horizontalScrollBar().singleStep() == step
 
 
 def test_microsoft_scrolls_at_the_default_size_and_general_does_not(qtbot):

@@ -69,7 +69,7 @@ from .providers.claude import CLAUDE_USAGE_URL
 from .providers.codex import CODEX_USAGE_URL
 from .providers.opencode_go import OPENCODE_GO_USAGE_URL, usage_url as opencode_go_usage_url
 from .startup import set_start_at_login
-from .ui_style import DIALOG_SCROLLBAR_STYLESHEET
+from .ui_style import DIALOG_SCROLLBAR_STYLESHEET, apply_wheel_step
 
 log = logging.getLogger("aigauge.settings_dialog")
 
@@ -1442,6 +1442,10 @@ class SettingsDialog(QDialog):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # Three lines of text per wheel notch, the same definition the panel's
+        # tile area uses. These pages kept Qt's default 20 px, so one notch
+        # moved two different distances in the same app.
+        apply_wheel_step(scroll)
         scroll.setWidget(page)
         tabs.addTab(scroll, title)
         self._page_scrolls.append(scroll)
