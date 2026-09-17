@@ -100,9 +100,15 @@ user sees.
   different OSType holding a bigger PNG. Both parse back in the tests.
 
   The generated files are committed beside the script and a test regenerates
-  all of them into a temp directory and compares **bytes**, not a pixel
-  tolerance: Qt's encoder and its antialiasing are deterministic for a fixed
-  input and offscreen takes the display out of it. `build.ps1` passes the
+  all of them into a temp directory and compares the **decoded pixels**,
+  within 8/255 per channel, plus the container structure exactly - entry
+  lists, declared lengths, offsets and chunk CRCs. Comparing the PNG streams
+  was the first cut and it failed on all three runners: Qt's encoder does not
+  produce the same bytes on every build for the same picture, though the
+  picture itself is deterministic. A moved edge or a changed colour lands at
+  255, so the tolerance buys nothing a drift could hide. The script also sets
+  `sys.dont_write_bytecode` before it imports `aigauge.config` for the band
+  colours, so a run leaves the four assets and nothing else. `build.ps1` passes the
   `.ico`, `build.sh` the `.icns` on macOS and the PNG elsewhere, and a runtime
   copy at `src/aigauge/assets/ai-gauge-256.png` travels inside the package the
   way the meter catalog does, so one package-relative lookup answers in a
@@ -308,10 +314,26 @@ user sees.
 
 ### Notes
 
-- The suite is **1 928 tests**, from 1 859. `tests/test_icon.py` is new and
-  holds 12. `tests/test_widget.py` goes 57 → 92,
-  `tests/test_settings_dialog.py` 33 → 44, `tests/test_config.py` 138 → 145
-  and `tests/test_azure.py` 232 → 236.
+- The suite is **1 981 tests**, from 1 859. `tests/test_icon.py` is new and
+  holds 13. `tests/test_widget.py` goes 57 → 124,
+  `tests/test_settings_dialog.py` 33 → 52, `tests/test_config.py` 138 → 154
+  and `tests/test_azure.py` 232 → 239. Counted at the head of the branch, not
+  at the first draft of it: the figures this entry carried before were the
+  ones from before the CI fixes and the review round below.
+
+- **A review round changed seven behaviours and closed six test gaps.** Two
+  defects in the headline feature: collapsing and expanding wrote the 58 px
+  chip strip's height over the size the user had dragged to, and the geometry
+  was saved only from a mouse release the window manager never delivers. Two
+  in what turns auto-fit off: a motionless click inside the 8 px band, and an
+  inferred `user_sized` that read True for every 1.3.x config. One re-created
+  the focus steal this release exists to fix, on the new error line. One left
+  a Settings page clipped at the dialog's floor with the bar policy hiding the
+  range. One let the height floor out-rank the screen ceiling. Each is
+  described in the section it belongs to above. The six gaps were mutations
+  the suite walked through: the 8 px band's own width, the left/top branches
+  of the fallback resize, the `_collapsed` guard on the size write, the two
+  redundant screen clamps, and the deepest-first layout pass.
 
 - **Two tests had to change**, both because they pinned the behaviour this
   release replaces. `test_widget_uses_fixed_width_despite_extreme_saved_size`
