@@ -3,7 +3,7 @@
 State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#16,
 610 tests passing, all five providers reading.
 
-> **Updated 2026-09-17** by the UI release (`1.4.0+cfa.8`, 1 928 tests): the
+> **Updated 2026-09-17** by the UI release (`1.4.0+cfa.8`, 2 008 tests): the
 > panel is resizable and remembers its size, every Settings tab scrolls, the
 > app has an icon, and three things the user's own desktop turned up were
 > fixed. **It closes nothing in [§4](#4-known-defects-deliberately-not-fixed)

@@ -259,8 +259,10 @@ user sees.
   carrying a spend and an allowance in its reset column measures 304, so at the
   260 px window minimum that content really is wider than the viewport. A wheel
   notch is three lines of text (42 px at this font) against Qt's default 20,
-  and a page step is the viewport. The step is `ui_style.WHEEL_STEP_LINES` and
-  the Settings pages take it too - they had kept Qt's 20, so the same gesture
+  and a page step is the viewport - on the **vertical** axis. Shift+wheel does
+  not scroll a page sideways (measured: 0 px on both surfaces), so a
+  horizontal bar is reached by dragging it or from the keyboard. The step is
+  `ui_style.WHEEL_STEP_LINES` and the Settings pages take it too - they had kept Qt's 20, so the same gesture
   moved two different distances in the same app. A count of lines and not a
   pixel number, because the two surfaces have different fonts and the three
   platforms' differ by up to a third.
@@ -379,12 +381,33 @@ user sees.
 
 ### Notes
 
-- The suite is **1 981 tests**, from 1 859. `tests/test_icon.py` is new and
-  holds 13. `tests/test_widget.py` goes 57 → 124,
-  `tests/test_settings_dialog.py` 33 → 52, `tests/test_config.py` 138 → 154
-  and `tests/test_azure.py` 232 → 239. Counted at the head of the branch, not
-  at the first draft of it: the figures this entry carried before were the
-  ones from before the CI fixes and the review round below.
+- The suite is **2 008 tests**, from 1 859. `tests/test_icon.py` is new and
+  holds 15. `tests/test_widget.py` goes 57 → 144,
+  `tests/test_settings_dialog.py` 33 → 54, `tests/test_config.py` 138 → 154,
+  `tests/test_azure.py` 232 → 241 and `tests/test_meter_catalog.py` 147 → 148.
+  Counted at the head of the branch, not at the first draft of it: the figures
+  this entry carried before were the ones from before the CI fixes and the two
+  review rounds below.
+
+- **A second review round changed nine more behaviours and closed six more
+  test gaps.** The headline one is the same finding as round 1's motionless
+  band click, on the path offscreen cannot reach: `startSystemResize` returns
+  True on every real desktop, the window manager keeps the release, and a
+  gesture ended without moving produced no event at all - so the flags stayed
+  armed and the next auto-fit growth was written back as the user's size. The
+  fix is the app-geometry seam, the press starting the debounce, and a size
+  test on the mark. Then: a drag that pauses for a second was declared over
+  and the rest of it never written, with the clamp fighting a live drag; the
+  collapse and the macOS popover anchor each wrote where the seam should; a
+  metric row's labels and its five note tooltips carried provider text
+  unescaped and unbounded, and the note was unbounded at the catalog too; a
+  tooltip with an `&` and no markup was shown with its escapes; a multi-line
+  or megabyte error was measured whole; three Azure message sites read their
+  own clock; `429` matched inside a request id; a screen could be wired
+  twice; and `_height_terms["grew"]` was the deficit rather than the growth.
+  The gaps: the native marking path, the debounce's guard, the clamp's
+  button test, the work-area bound on the dialog's width and its floor, the
+  detail line's travel boundary, and the icon script's bytecode flag.
 
 - **A review round changed seven behaviours and closed six test gaps.** Two
   defects in the headline feature: collapsing and expanding wrote the 58 px
