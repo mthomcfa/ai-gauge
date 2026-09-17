@@ -105,6 +105,17 @@ user sees.
   reports no button down, and if that state is stale it is skipped - the next
   show or screen change clamps anyway, which is the safe direction.
 
+  The collapse toggle goes through the same seam. It was the one write path
+  outside the dirty check - an unconditional `save()` that left the seam's
+  record of the file untouched, so a collapse and the hide after it wrote the
+  same state twice - and its `_apply_collapsed_state(save=True)` branch had no
+  caller at all. And the commit does **not** persist a position the app chose
+  for itself: `show_as_popover` anchors the panel under the macOS menu-bar
+  item on every open, and with the dismissal's hide now reaching the seam,
+  that x/y would have replaced the position the user dragged to. The size and
+  the collapsed state are still written; the first move the user makes hands
+  the position back.
+
 - **An app icon.** Three stacked pill bars at 47 %, 72 % and 92 % on the app's
   own rounded dark panel - the compact chip row the widget already shows, which
   is what survives 16 px where a dial's needle becomes a smudge. The band

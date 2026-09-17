@@ -1806,6 +1806,60 @@ def test_the_debounce_clamps_an_off_screen_window_only_once_the_button_is_up(
     assert widget.x() >= work_area.left()
 
 
+def test_the_macos_popover_anchor_is_not_saved_over_the_users_position(qtbot):
+    """`show_as_popover` puts the panel under the menu-bar item on every open,
+    and the dismissal hides it - which now reaches the commit seam. Writing
+    that x/y back would replace the position the user chose with the one the
+    app computed from an icon's coordinates."""
+    config = Config()
+    config.window.x, config.window.y = 120, 140
+    config.window.width, config.window.height = 400, 260
+    config.window.user_sized = True
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+    with qtbot.waitExposed(widget):
+        widget.show()
+    qtbot.wait(0)
+    chosen = widget.pos()
+
+    widget.show_as_popover(QApplication.primaryScreen().availableGeometry().center().x(), 24)
+    qtbot.wait(0)
+    assert widget.pos() != chosen, "the popover did not move the window"
+    widget.resize(widget.width() + 20, widget.height())
+
+    widget.hide()
+
+    on_disk = Config.load().window
+    assert (on_disk.x, on_disk.y) == (chosen.x(), chosen.y()), "the anchor was saved"
+    assert (on_disk.width, on_disk.height) == (widget.width(), widget.height())
+
+
+def test_a_collapse_is_one_write_and_the_hide_after_it_none(qtbot, monkeypatch):
+    """`set_collapsed` saved unconditionally and left the commit seam's record
+    of the file untouched, so it was the one write path outside the dirty
+    check: a collapse followed by a hide wrote the same state twice, and its
+    `_apply_collapsed_state(save=True)` branch had no caller at all."""
+    config = Config()
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_ok_snapshot("claude"), "Claude")
+    with qtbot.waitExposed(widget):
+        widget.show()
+    qtbot.wait(0)
+    saves: list[int] = []
+    monkeypatch.setattr(Config, "save", lambda self: saves.append(1))
+
+    for _ in range(5):
+        widget.set_collapsed(True)
+        widget.set_collapsed(True)  # a toggle that changes nothing
+        widget.set_collapsed(False)
+        widget.set_collapsed(False)
+
+    assert len(saves) == 10, "a toggle that changed nothing wrote the file"
+    widget.hide()
+    assert len(saves) == 10, "the hide wrote the state the collapse had just written"
+
+
 def test_a_hide_that_changed_nothing_writes_nothing(qtbot, monkeypatch):
     """The dirty check. Re-applying the always-on-top flag hides and shows the
     window, and the App hides it on quit, so the commit seam is reached far

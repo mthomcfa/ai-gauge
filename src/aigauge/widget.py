@@ -1525,6 +1525,13 @@ class UsageWidget(QWidget):
         # Narrower: the WM is running a *resize*, so the next resizeEvent is
         # the user changing the size and not the app fitting itself.
         self._native_resize = False
+        # The window is where the *app* put it, not where the user left it:
+        # the macOS popover anchors itself under the menu-bar item on every
+        # open. Committing that x/y would save the app's choice over the
+        # user's, so while this is set the commit writes the size and the
+        # collapsed state and leaves the position alone. Cleared by the first
+        # move the user makes.
+        self._app_positioned = False
         # How many app-initiated geometry changes are on the stack. Qt
         # delivers the move or resize the app asks for itself exactly as it
         # delivers the window manager's, so "was this the user?" has to be
@@ -1728,7 +1735,7 @@ class UsageWidget(QWidget):
         # What the file already says, so a hide or a close that changed
         # nothing does not rewrite it.
         self._committed_geometry = self._geometry_state()
-        self._apply_collapsed_state(save=False)
+        self._apply_collapsed_state()
         self._track_hover()
 
     def _mini_button(self, glyph: str, tooltip: str) -> QPushButton:
@@ -2162,12 +2169,15 @@ class UsageWidget(QWidget):
         # expand wrote the strip's height over the size the user had dragged
         # to - on disk, so it survived a relaunch. The size is recorded only
         # once the expanded geometry is back.
-        self._apply_collapsed_state(save=False, restore_height=not collapsed)
-        if not collapsed:
-            self._remember_size()
-        self._config.save()
+        self._apply_collapsed_state(restore_height=not collapsed)
+        # Through the same seam as everything else that changes the geometry:
+        # `collapsed` is in the dirty tuple, so a real toggle is one atomic
+        # write and the hide that follows it is none. It used to save
+        # unconditionally and leave the seam's record of the file untouched,
+        # so a collapse and a hide wrote the same state twice.
+        self._commit_geometry()
 
-    def _apply_collapsed_state(self, *, save: bool, restore_height: bool = False) -> None:
+    def _apply_collapsed_state(self, *, restore_height: bool = False) -> None:
         self._collapsed_widget.setVisible(self._collapsed)
         self._header_widget.setVisible(not self._collapsed)
         self._tile_scroll.setVisible(not self._collapsed)
@@ -2191,9 +2201,6 @@ class UsageWidget(QWidget):
                 self._app_geometry(self.resize, self.width(), self._expanded_height)
             self._apply_screen_bounds()
             self._refit_height()
-        if save:
-            self._config.window.collapsed = self._collapsed
-            self._config.save()
 
     def _apply_always_on_top(self, on: bool) -> None:
         flags = self.windowFlags()
@@ -2250,7 +2257,7 @@ class UsageWidget(QWidget):
             self._config.window.always_on_top and not self._always_on_top_suspensions
         )
         self._collapsed = self._config.window.collapsed
-        self._apply_collapsed_state(save=False)
+        self._apply_collapsed_state()
         if was_visible:
             self.show()  # re-applying flags hides the window
             self._apply_window_opacity()
@@ -2401,6 +2408,7 @@ class UsageWidget(QWidget):
             target_x = max(
                 geo.left() + 4, min(target_x, geo.right() - self.width() - 4)
             )
+        self._app_positioned = True
         self._app_geometry(self.move, target_x, anchor_global_y + 4)
         self.show()
         self.raise_()
@@ -2654,8 +2662,9 @@ class UsageWidget(QWidget):
         """
         self._remember_size()
         window = self._config.window
-        window.x = self.x()
-        window.y = self.y()
+        if not self._app_positioned:
+            window.x = self.x()
+            window.y = self.y()
         window.collapsed = self._collapsed
         state = self._geometry_state()
         if state == self._committed_geometry:
@@ -2733,6 +2742,9 @@ class UsageWidget(QWidget):
 
     def moveEvent(self, event):  # noqa: N802
         super().moveEvent(event)
+        if self._is_user_geometry():
+            # Wherever the window is now, the user put it there.
+            self._app_positioned = False
         self._arm_geometry_commit()
 
     def resizeEvent(self, event):  # noqa: N802
