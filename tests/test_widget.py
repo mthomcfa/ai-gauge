@@ -1347,17 +1347,21 @@ def test_a_top_drag_stops_at_the_maximum_without_moving_the_bottom(qtbot):
     with qtbot.waitExposed(widget):
         widget.show()
     geo = (widget.screen() or QApplication.primaryScreen()).availableGeometry()
-    # Parked against the bottom of the work area, so the capped height still
-    # fits above it and the release's own clamp has nothing to move.
     widget.setGeometry(geo.left() + 100, geo.bottom() - 299, 400, 300)
     qtbot.wait(0)
     before = widget.geometry()
 
-    _drag(widget, QPoint(widget.width() // 2, 2), 0, -5000)
+    # Asserted at the end of the drag rather than after the release: the
+    # release re-clamps the window onto the screen, and that clamp would hide
+    # a bottom edge the resize itself had moved.
+    grab = QPoint(widget.width() // 2, 2)
+    _press(widget, grab)
+    _move_to(widget, widget.mapToGlobal(grab) + QPoint(0, -5000))
 
     after = widget.geometry()
     assert after.height() == geo.height(), "the drag ran past the work area"
     assert after.bottom() == before.bottom(), "the bottom edge walked"
+    _release(widget, grab)
 
 
 def test_a_bottom_right_drag_stops_at_the_work_area(qtbot):
