@@ -2,15 +2,18 @@
 
 The generator and its output are both committed, so the risk is drift - a
 change to the drawing that nobody re-ran the script for. These regenerate into
-a temp directory and compare.
+a temp directory and compare: the containers by structure, the pictures by
+decoded pixels, and the flat colours exactly.
 """
 from __future__ import annotations
 
+import operator
 import struct
 import sys
 from pathlib import Path
 
 import pytest
+from PyQt6.QtGui import QImage
 from PyQt6.QtWidgets import QApplication
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +22,12 @@ sys.path.insert(0, str(REPO_ROOT / "tools"))
 import make_icon  # noqa: E402
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+# Decoded pixels, not bytes. The first cut compared bytes and failed on all
+# three CI runners against assets generated elsewhere: Qt's PNG encoder does
+# not produce the same stream on every build for the same picture. A channel
+# may differ by this much before the assets count as drifted - antialiasing
+# rounds by one or two; a moved edge or a changed colour lands at 255.
+PIXEL_TOLERANCE = 8
 ICO_PATH = REPO_ROOT / "assets" / "icon" / "ai-gauge.ico"
 ICNS_PATH = REPO_ROOT / "assets" / "icon" / "ai-gauge.icns"
 PNG_PATH = REPO_ROOT / "assets" / "icon" / "ai-gauge-256.png"
@@ -55,6 +64,49 @@ def _icns_chunks(data: bytes) -> list[tuple[bytes, int]]:
     return chunks
 
 
+def _ico_payloads(data: bytes) -> list[tuple[int, bytes]]:
+    return [
+        (width, data[offset : offset + length])
+        for width, _height, length, offset in _ico_entries(data)
+    ]
+
+
+def _icns_payloads(data: bytes) -> list[tuple[bytes, bytes]]:
+    payloads = []
+    cursor = 8
+    for ostype, length in _icns_chunks(data):
+        payloads.append((ostype, data[cursor + 8 : cursor + length]))
+        cursor += length
+    return payloads
+
+
+def _rgba(png: bytes) -> tuple[tuple[int, int], bytes]:
+    image = QImage.fromData(png, "PNG")
+    assert not image.isNull(), "not a decodable PNG"
+    image = image.convertToFormat(QImage.Format.Format_RGBA8888)
+    pixels = bytes(image.constBits().asarray(image.sizeInBytes()))
+    return (image.width(), image.height()), pixels
+
+
+def _assert_same_picture(expected: bytes, actual: bytes, label: str) -> None:
+    expected_size, expected_pixels = _rgba(expected)
+    actual_size, actual_pixels = _rgba(actual)
+    assert actual_size == expected_size, label
+    if actual_pixels == expected_pixels:
+        return
+    worst = max(map(abs, map(operator.sub, expected_pixels, actual_pixels)))
+    assert worst <= PIXEL_TOLERANCE, (
+        f"{label}: a channel differs by {worst}; run tools/make_icon.py"
+    )
+
+
+def _bar_centre_line(size: int, index: int) -> int:
+    bar_h = size * 0.14
+    gap = size * 0.09
+    top = size * 0.5 - (3 * bar_h + 2 * gap) / 2
+    return int(top + index * (bar_h + gap) + bar_h / 2)
+
+
 def test_the_ico_holds_a_png_at_every_declared_size():
     entries = _ico_entries(ICO_PATH.read_bytes())
     assert [w for w, _h, _len, _off in entries] == list(make_icon.ICO_SIZES)
@@ -81,22 +133,58 @@ def test_the_256_png_is_a_png_and_the_two_copies_match():
 
 
 def test_the_committed_assets_match_the_generator(qapp, tmp_path):
-    """Byte-equality, not a pixel tolerance.
+    """Structure exactly, pictures within ``PIXEL_TOLERANCE``.
 
-    Qt's PNG encoder and its antialiasing are deterministic for a fixed input
-    on a fixed Qt build, and the offscreen platform takes the display out of
-    it, so a byte compare is available and says more than a tolerance would.
-    If this ever fails on a platform rather than on a change, the honest fix is
-    to compare decoded pixels within a tolerance and say so here.
+    Every entry of both containers is decoded and compared to a fresh render,
+    in order, size by size and type by type, so a drawing change that nobody
+    re-ran the script for fails here on the platform that made it and on
+    every other. What is *not* compared is the PNG stream, which is the
+    encoder's business and differed on every CI runner (see the tolerance).
     """
     ico = tmp_path / "ai-gauge.ico"
     icns = tmp_path / "ai-gauge.icns"
     png = tmp_path / "ai-gauge-256.png"
     make_icon.generate(ico, icns, [png])
 
-    assert ico.read_bytes() == ICO_PATH.read_bytes(), "run tools/make_icon.py"
-    assert icns.read_bytes() == ICNS_PATH.read_bytes(), "run tools/make_icon.py"
-    assert png.read_bytes() == PNG_PATH.read_bytes(), "run tools/make_icon.py"
+    committed_ico = _ico_payloads(ICO_PATH.read_bytes())
+    fresh_ico = _ico_payloads(ico.read_bytes())
+    assert [size for size, _ in fresh_ico] == [size for size, _ in committed_ico]
+    for (size, want), (_, got) in zip(committed_ico, fresh_ico):
+        _assert_same_picture(want, got, f"ico {size}px")
+
+    committed_icns = _icns_payloads(ICNS_PATH.read_bytes())
+    fresh_icns = _icns_payloads(icns.read_bytes())
+    assert [t for t, _ in fresh_icns] == [t for t, _ in committed_icns]
+    for (ostype, want), (_, got) in zip(committed_icns, fresh_icns):
+        _assert_same_picture(want, got, f"icns {ostype!r}")
+
+    _assert_same_picture(PNG_PATH.read_bytes(), png.read_bytes(), "256 png")
+
+
+def test_the_committed_png_carries_the_apps_own_colours(qapp):
+    """Exact, on the committed file, where the tolerance above is not.
+
+    A flat interior is the same on every platform - antialiasing touches
+    edges only - so the base, the track and each band's fill are read from
+    the shipped 256 px PNG and compared exactly to ``ColorThresholds``. This
+    is what catches a colour nudged by less than ``PIXEL_TOLERANCE``.
+    """
+    from aigauge.config import ColorThresholds
+
+    bands = ColorThresholds()
+    image = QImage.fromData(PNG_PATH.read_bytes(), "PNG")
+    assert (image.width(), image.height()) == (256, 256)
+    margin = 256 * 0.17
+    width = 256 - 2 * margin
+    assert image.pixelColor(128, 8).name() == "#1f2937", "the base"
+    for index, expected in enumerate(
+        (bands.green_color, bands.yellow_color, bands.red_color)
+    ):
+        y = _bar_centre_line(256, index)
+        assert image.pixelColor(int(margin + width * 0.10), y).name() == expected
+        assert image.pixelColor(int(margin + width * 0.97), y).name() == "#374151", (
+            "the track beyond every fill"
+        )
 
 
 def test_the_icon_uses_the_apps_own_band_colours(qapp):
@@ -108,9 +196,7 @@ def test_the_icon_uses_the_apps_own_band_colours(qapp):
     image = make_icon.render(256)
     # The first bar is filled to 47%: sample inside the fill and inside the
     # track beyond it, on the same scan line.
-    bar_h = 256 * 0.14
-    gap = 256 * 0.09
-    y = int(256 * 0.5 - (3 * bar_h + 2 * gap) / 2 + bar_h / 2)
+    y = _bar_centre_line(256, 0)
     margin = 256 * 0.17
     width = 256 - 2 * margin
     assert image.pixelColor(int(margin + width * 0.25), y).name() == bands.green_color

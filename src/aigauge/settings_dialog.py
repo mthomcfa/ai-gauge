@@ -317,8 +317,15 @@ _DIALOG_MIN_W = 560
 _DIALOG_MIN_H = 420
 # Never taller than this much of the screen's work area. At 200% display
 # scale the logical screen is 400 px high here, and both the old hardcoded
-# 520 and the derived 595 are taller than the whole desktop.
+# 520 and the derived 589 are taller than the whole desktop.
 _DIALOG_SCREEN_FRACTION = 0.9
+# Added to the measured height. The chrome is read off size hints, and a
+# style rounds its tab-pane frame differently in a hint than in a layout:
+# Fusion's hint carries 4 px of pane where its laid-out pane uses 1, so the
+# measurement is 3 px generous here and could be as much short under another
+# style. Slack this small is invisible; a scroll bar on the landing page is
+# not.
+_DIALOG_HEIGHT_SLACK = 6
 
 
 def _dialog_height(content: int, chrome: int, floor: int, ceiling: int) -> int:
@@ -330,6 +337,51 @@ def _dialog_height(content: int, chrome: int, floor: int, ceiling: int) -> int:
     run has one fixed 800x800 screen.
     """
     return max(floor, min(content + chrome, ceiling))
+
+
+def _activate_layouts(root: QWidget) -> None:
+    """Bring every layout under ``root`` up to date, deepest first.
+
+    A widget's ``updateGeometry()`` invalidates its parent's *top-level*
+    layout and posts a ``LayoutRequest`` to that parent - and a hidden
+    widget drops the request. So before ``show()`` a nested layout can go on
+    serving the hint it cached before its widgets were styled: the UI-scale
+    row's ``QHBoxLayout`` said 22 px for a combo box that was already 32,
+    and General under-read by 10 px. ``QLayout::activate()`` does recompute
+    recursively, but only while its own flag is down, and the dialog's was
+    not: the request had stopped at the group box.
+
+    Deepest first, then: a layout whose flag is down recomputes, and the
+    ``updateGeometry()`` at the end of its ``activate()`` lowers the flag on
+    the layout above, so one pass reaches the top with every cache fresh.
+    ``findChildren`` lists ancestors before descendants; reversed, the
+    descendants come first.
+    """
+    for widget in reversed(root.findChildren(QWidget)):
+        layout = widget.layout()
+        if layout is not None:
+            layout.activate()
+    layout = root.layout()
+    if layout is not None:
+        layout.activate()
+
+
+def _page_height(page: QWidget, width: int) -> int:
+    """The height a widget-resizable ``QScrollArea`` will lay ``page`` out at.
+
+    ``QScrollArea`` gives the page its height-for-width when its layout has
+    one, else its minimum hint, and the viewport's height if that is more.
+    ``sizeHint()`` is the wrong number: a word-wrapped ``QLabel`` hints at
+    80 average characters, not at the width it will get, so General's hint
+    of 498 is 12 px over the 486 it lays out at in a 592-px viewport. Never
+    less than the minimum hint, which is what the scroll bar is measured
+    against; never less than the plain hint without height-for-width, so a
+    page with no wrapped label opens at its preference rather than squeezed.
+    """
+    minimum = page.minimumSizeHint().height()
+    if page.hasHeightForWidth():
+        return max(minimum, page.heightForWidth(width))
+    return max(minimum, page.sizeHint().height())
 
 
 def _hint_label(text: str) -> QLabel:
@@ -1368,49 +1420,59 @@ class SettingsDialog(QDialog):
     def _size_to_general_page(
         self, layout: QVBoxLayout, general_page: QWidget, button_row: QHBoxLayout
     ) -> None:
-        """Open at the height the landing page needs, and no taller.
+        """Open at the height the landing page needs, and little taller.
 
         The old ``resize(620, 520)`` was a number, not a measurement. The
-        landing page is General, so that is what the dialog is sized to: its
-        ``sizeHint()`` (498 px) plus the chrome around it, measured from the
-        live widgets rather than assumed - 12 + 10 margins, 10 spacing, a
-        34-px button row, a 27-px tab bar and 4 px of pane, i.e. 97. The sum
-        is 595. A binary search for the smallest height at which General shows
-        no scroll bar gives 590, so this errs 5 px generous, which is the
-        direction that never clips.
+        landing page is General, so that is what the dialog is sized to: the
+        height General lays out at in the viewport it will get, plus the
+        chrome around it, both read off the live widgets - 12 + 10 margins,
+        10 spacing, a 34-px button row, a 27-px tab bar and 4 px of pane,
+        i.e. 97, plus ``_DIALOG_HEIGHT_SLACK``. General is 486 px at the
+        592-px viewport width (its ``sizeHint()`` says 498, see
+        ``_page_height``), so the dialog opens at 589. A binary search for
+        the smallest height at which General shows no scroll bar gives 580:
+        9 px generous, 3 of them the pane rounding and 6 the slack.
 
-        ``layout.activate()`` first: the hints are otherwise stale and the
-        page has not been hinted at its real width. Do **not** derive the
-        chrome as ``height() - viewport().height()`` before ``show()`` - the
-        viewport is still at its unlaid 640x480 and the subtraction comes out
-        -60, which yields a 428-px dialog in which General itself scrolls.
+        Every layout is activated first, deepest up - see
+        ``_activate_layouts`` for why the top-level ``activate()`` alone left
+        a nested row 10 px stale, and General scrolling by 6-7 px on the
+        macOS and Windows runners. Do **not** derive the chrome as
+        ``height() - viewport().height()`` before ``show()`` - the viewport is
+        still at its unlaid 640x480 and the subtraction comes out -60, which
+        yields a 428-px dialog in which General itself scrolls.
 
         Nothing persists this. ``Config`` has no settings-window field and
         ``apply_to`` writes none, so every open is this calculation again.
         """
-        layout.activate()
+        _activate_layouts(self)
         margins = layout.contentsMargins()
         tabs = self._tabs
         assert tabs is not None  # set by the caller before this runs
         tab_bar_height = tabs.tabBar().sizeHint().height()
-        pane_extra = max(
-            0,
-            tabs.sizeHint().height()
-            - tab_bar_height
-            - max(scroll.sizeHint().height() for scroll in self._page_scrolls),
-        )
+        pages_hint_h = max(scroll.sizeHint().height() for scroll in self._page_scrolls)
+        pages_hint_w = max(scroll.sizeHint().width() for scroll in self._page_scrolls)
+        pane_extra_h = max(0, tabs.sizeHint().height() - tab_bar_height - pages_hint_h)
+        pane_extra_w = max(0, tabs.sizeHint().width() - pages_hint_w)
         chrome = (
             margins.top()
             + margins.bottom()
             + layout.spacing()
             + button_row.sizeHint().height()
             + tab_bar_height
-            + pane_extra
+            + pane_extra_h
+            + _DIALOG_HEIGHT_SLACK
         )
         available = (self.screen() or QApplication.primaryScreen()).availableGeometry()
         ceiling = int(available.height() * _DIALOG_SCREEN_FRACTION)
+        width = min(_DIALOG_DEFAULT_W, available.width())
+        # The page is laid out no narrower than its own minimum: the scroll
+        # area expands the viewport width to it and clips (horizontal bar off).
+        page_width = max(
+            width - margins.left() - margins.right() - pane_extra_w,
+            general_page.minimumSizeHint().width(),
+        )
         height = _dialog_height(
-            general_page.sizeHint().height(), chrome, _DIALOG_MIN_H, ceiling
+            _page_height(general_page, page_width), chrome, _DIALOG_MIN_H, ceiling
         )
         # Clamped against the screen as well: at 200% display scale the work
         # area is 400 px high and an un-shrinkable 560x420 minimum is a dialog
@@ -1419,7 +1481,7 @@ class SettingsDialog(QDialog):
             min(_DIALOG_MIN_W, available.width()),
             min(_DIALOG_MIN_H, available.height()),
         )
-        self.resize(min(_DIALOG_DEFAULT_W, available.width()), height)
+        self.resize(width, height)
 
     def _edit_provider_colors(self, provider: str, label: str) -> None:
         dialog = GaugeColorsDialog(label, self._provider_colors[provider], parent=self)

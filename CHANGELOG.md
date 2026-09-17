@@ -112,14 +112,27 @@ user sees.
   tab widget's **495 x 1046 → 127 x 89**.
 
   The default size is a measurement rather than a number. General is the
-  landing page, so the dialog opens at General's `sizeHint` plus the chrome
-  around it, read off the live widgets - 12 + 10 margins, 10 spacing, a 34 px
-  button row, a 27 px tab bar and 4 px of pane, i.e. 97. General hints 488 px
-  before `show()` (it reflows its word-wrapped hints to 498 after), so the
-  dialog opens **620 x 585** against the hardcoded 520. A binary search for the
-  smallest height at which General shows no scroll bar gives 580 - the binding
-  constraint is the page's 483 px minimum, not its 498 px preference - so 585
-  carries 5 px of slack and errs generous. The chrome is deliberately not
+  landing page, so the dialog opens at the height General lays out at plus the
+  chrome around it, both read off the live widgets. The chrome is 12 + 10
+  margins, 10 spacing, a 34 px button row, a 27 px tab bar and 4 px of pane,
+  i.e. 97, plus 6 px of declared slack, because a style rounds its tab pane
+  differently in a hint than in a layout (Fusion's laid-out pane is 1 px, so
+  the number is 3 px generous here and could be 3 px short elsewhere). The
+  page's need is its height-for-width at the width the viewport will have
+  (592 px), never less than its minimum hint - not its `sizeHint`, which for a
+  page with a word-wrapped label is the height at 80 average characters, not at
+  the width it gets: General is 486 px at 592 (minimum 483, `sizeHint` 498).
+  And it is read only after every layout under the dialog has been activated,
+  deepest first. A widget's `updateGeometry()` reaches only its parent's
+  top-level layout, a hidden widget drops the `LayoutRequest`, and the nested
+  row holding the UI-scale combo box was still serving the 22 px it had cached
+  before the combo was styled to 32. That is how the first cut under-read
+  General by 10 px and opened it with a scroll bar on the Windows and macOS
+  runners (7 and 6 px of range) while offscreen Linux passed on 5 px of font
+  luck. The dialog opens **620 x 589** against the hardcoded 520; a binary
+  search for the smallest height at which General shows no scroll bar gives
+  580, so 9 px of that is slack, and a test now holds the default within the
+  slack of that search from both sides. The chrome is deliberately not
   derived as `height() - viewport().height()` before `show()`: the viewport is
   still at its unlaid 640 x 480 then and the subtraction comes out **-60**,
   which yields a 428 px dialog in which General itself scrolls. Both ends are

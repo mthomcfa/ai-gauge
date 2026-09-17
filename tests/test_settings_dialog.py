@@ -880,7 +880,7 @@ def test_the_default_size_tracks_the_general_page(qtbot):
 @pytest.mark.parametrize(
     "content,chrome,floor,ceiling,expected",
     [
-        (498, 97, 420, 720, 595),
+        (486, 103, 420, 720, 589),
         (40, 97, 420, 720, 420),
         (1765, 97, 420, 360, 420),
         (1765, 97, 100, 360, 360),
@@ -892,6 +892,91 @@ def test_the_height_clamp_has_a_floor_and_a_ceiling(
 ):
     """The two ends are unreachable offscreen: one 800x800 screen, one font."""
     assert settings_dialog._dialog_height(content, chrome, floor, ceiling) == expected
+
+
+def test_the_default_height_is_the_measured_need_plus_the_slack(qtbot):
+    """The regression that reached CI, pinned from both sides.
+
+    The first cut read General's ``sizeHint()`` after one top-level
+    ``activate()``; a nested row was still serving a hint cached before its
+    combo box was styled, General under-read by 10 px, and the landing page
+    opened with 7 px of scroll range on Windows and 6 on macOS (offscreen
+    Linux passed by 5 px of font luck). Now: no range, and the default is
+    within the declared slack plus the style's pane rounding of the smallest
+    height that shows none - so a stale hint fails here whichever way it
+    errs.
+    """
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    default_height = dialog.height()
+    with qtbot.waitExposed(dialog):
+        dialog.show()
+    tabs = _tabs(dialog)
+    general_index = _tab_index(dialog, "General")
+    tabs.setCurrentIndex(general_index)
+    qtbot.wait(0)
+    general = tabs.widget(general_index)
+    assert general.verticalScrollBar().maximum() == 0
+
+    low, high = dialog.minimumHeight(), default_height
+    while low < high:
+        mid = (low + high) // 2
+        dialog.resize(dialog.width(), mid)
+        qtbot.wait(0)
+        if general.verticalScrollBar().maximum() == 0:
+            high = mid
+        else:
+            low = mid + 1
+    smallest = low
+    assert smallest > dialog.minimumHeight(), "the search never engaged"
+    pane_rounding = 4
+    assert 0 <= default_height - smallest <= (
+        settings_dialog._DIALOG_HEIGHT_SLACK + pane_rounding
+    ), (default_height, smallest)
+
+
+def test_activate_layouts_refreshes_a_nested_layouts_stale_hint(qtbot):
+    """The mechanism on its own, with no dialog in the way.
+
+    A combo box in a row layout inside a group box's grid: after the page's
+    top-level ``activate()`` has cached everything, growing the combo box
+    invalidates the group box's grid and posts it a ``LayoutRequest`` that a
+    hidden widget never handles - the page's own layout keeps its cache, and
+    a second top-level ``activate()`` returns early on its raised flag. The
+    deepest-first pass is what brings the page's hint up to date.
+    """
+    from PyQt6.QtWidgets import (
+        QComboBox,
+        QGridLayout,
+        QGroupBox,
+        QHBoxLayout,
+        QVBoxLayout,
+        QWidget,
+    )
+
+    page = QWidget()
+    qtbot.addWidget(page)
+    outer = QVBoxLayout(page)
+    group = QGroupBox("Group")
+    grid = QGridLayout(group)
+    row = QHBoxLayout()
+    combo = QComboBox()
+    combo.addItem("one")
+    row.addWidget(combo)
+    grid.addLayout(row, 0, 0)
+    outer.addWidget(group)
+    outer.activate()
+    before = page.sizeHint().height()
+
+    combo.setMinimumHeight(combo.sizeHint().height() + 40)
+    outer.activate()
+    assert page.sizeHint().height() == before, (
+        "the top-level activate() alone now refreshes the nested row, so the "
+        "deepest-first pass is no longer load-bearing - reconsider it"
+    )
+
+    settings_dialog._activate_layouts(page)
+    assert page.sizeHint().height() >= before + 40
 
 
 def test_the_dialog_does_not_remember_its_size(qtbot):
