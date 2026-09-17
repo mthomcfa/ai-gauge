@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 
 import pytest
 from PyQt6.QtCore import QEvent, QPoint, QPointF, Qt
-from PyQt6.QtGui import QMouseEvent, QResizeEvent
+from PyQt6.QtGui import QGuiApplication, QMouseEvent, QResizeEvent
 from PyQt6.QtWidgets import QApplication
 
 from aigauge.config import (
@@ -1723,6 +1723,87 @@ def test_an_app_resize_neither_marks_the_window_nor_arms_the_debounce(qtbot):
     assert (  # noqa: SLF001
         widget._geometry_commit.isActive() is False
     ), "an app resize armed the commit debounce"
+
+
+def test_a_pause_in_a_window_manager_drag_does_not_lose_the_rest_of_it(qtbot, monkeypatch):
+    """The debounce is a commit, not the end of the gesture.
+
+    A user who holds still for a second in the middle of a drag - align the
+    panel against a window edge, stop to look, carry on - produces exactly the
+    silence that ends one. The timer used to clear the gesture flags, and
+    arming depended on them, so everything after the pause armed nothing: the
+    geometry the user actually let go at reached the file only if they later
+    closed the window.
+    """
+    config = Config()
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+    with qtbot.waitExposed(widget):
+        widget.show()
+    widget._mark_user_sized()  # noqa: SLF001
+    # The same debounce, wound down so the test does not sit out two seconds.
+    widget._geometry_commit.setInterval(1)  # noqa: SLF001
+    real_save = Config.save
+    saves: list[int] = []
+
+    def spy(self):
+        saves.append(1)
+        real_save(self)
+
+    monkeypatch.setattr(Config, "save", spy)
+    widget._native_gesture = True  # noqa: SLF001
+    widget._native_resize = True  # noqa: SLF001
+
+    for step in range(10):
+        widget.resize(360 + step, 240 + step)
+    qtbot.waitUntil(lambda: len(saves) == 1, timeout=3000)
+    paused_at = (config.window.width, config.window.height)
+
+    # The same drag, resumed after the silence the timer read as its end.
+    for step in range(10):
+        widget.resize(420 + step, 300 + step)
+    qtbot.waitUntil(lambda: len(saves) == 2, timeout=3000)
+
+    assert (config.window.width, config.window.height) != paused_at
+    assert (config.window.width, config.window.height) == (
+        widget.width(),
+        widget.height(),
+    )
+    on_disk = Config.load().window
+    assert (on_disk.width, on_disk.height) == (widget.width(), widget.height())
+
+
+def test_the_debounce_clamps_an_off_screen_window_only_once_the_button_is_up(
+    qtbot, monkeypatch
+):
+    """The clamp moves and resizes the window, and the window manager owns the
+    pointer for the whole of a native drag. Running it on every fire meant the
+    app pulling the window out from under a live drag - measured at 240 px -
+    every time the user paused for a second."""
+    config = Config()
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+    with qtbot.waitExposed(widget):
+        widget.show()
+    widget._geometry_commit.setInterval(1)  # noqa: SLF001
+    work_area = QApplication.primaryScreen().availableGeometry()
+    hanging_off = QPoint(work_area.right() - 20, work_area.top() + 10)
+
+    monkeypatch.setattr(
+        QGuiApplication, "mouseButtons", staticmethod(lambda: Qt.MouseButton.LeftButton)
+    )
+    widget.move(hanging_off)
+    qtbot.waitUntil(lambda: not widget._geometry_commit.isActive(), timeout=3000)  # noqa: SLF001
+    assert widget.pos() == hanging_off, "the app moved the window under a live drag"
+
+    monkeypatch.setattr(
+        QGuiApplication, "mouseButtons", staticmethod(lambda: Qt.MouseButton.NoButton)
+    )
+    widget.move(hanging_off - QPoint(1, 0))
+    qtbot.waitUntil(
+        lambda: widget.x() + widget.width() - 1 <= work_area.right(), timeout=3000
+    )
+    assert widget.x() >= work_area.left()
 
 
 def test_a_hide_that_changed_nothing_writes_nothing(qtbot, monkeypatch):

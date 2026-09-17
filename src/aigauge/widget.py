@@ -19,6 +19,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QColor,
+    QGuiApplication,
     QIcon,
     QMouseEvent,
     QPainter,
@@ -2691,21 +2692,43 @@ class UsageWidget(QWidget):
         return self._app_geometry_depth == 0 and self.isVisible()
 
     def _arm_geometry_commit(self) -> None:
-        """Re-start the debounce, but only while the WM owns the gesture.
+        """Re-start the debounce on any geometry change the app did not make.
 
-        Every other resize - auto-fit, a collapse, the screen clamp - is the
-        app moving its own window and is saved (or deliberately not) by
-        whatever asked for it, which is what `_is_user_geometry` reads.
+        Not "while a gesture is live": the flags say a window-manager drag
+        *may* be in flight, and the timer used to clear them, so a drag with a
+        pause in it - align the panel, stop to look, carry on - had its first
+        silence read as its end and every remaining event of the same drag
+        armed nothing. Whatever moved or resized this window without the app
+        asking is worth committing a second later; what the app asked for
+        itself is saved, or deliberately not, by whoever asked.
         """
-        if self._native_gesture and self._is_user_geometry():
+        if self._is_user_geometry():
             self._geometry_commit.start()
 
     def _commit_after_native_gesture(self) -> None:
+        """Commit what the gesture has done so far - not necessarily its end.
+
+        A pointer held still for a second inside a drag produces exactly the
+        silence that ends one, and there is nothing in the event stream that
+        tells them apart. So this writes and lets the next event re-arm: a
+        resumed drag commits again, and the geometry the user let go at is the
+        one that survives.
+
+        The clamp is the part that cannot be guessed at. It moves and resizes
+        the window, and doing that while the window manager still owns the
+        pointer is the app fighting a live drag - measured, a 240 px jump out
+        from under it. So it runs only when Qt reports no button down; if that
+        state is stale the clamp is skipped, which is the safe direction,
+        because the next show or screen change clamps anyway.
+        """
         self._native_gesture = False
         self._native_resize = False
-        # The WM is bounded by the maximum size, not by the work area's
-        # origin, so a drag can still leave the window part-way off a screen.
-        self._clamp_to_visible_screen()
+        if QGuiApplication.mouseButtons() == Qt.MouseButton.NoButton:
+            # The WM is bounded by the maximum size, not by the work area's
+            # origin, so a drag can still leave the window part-way off a
+            # screen. Before the commit, so the clamped geometry is what is
+            # written rather than what the drag left behind.
+            self._clamp_to_visible_screen()
         self._commit_geometry()
 
     def moveEvent(self, event):  # noqa: N802

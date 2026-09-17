@@ -91,7 +91,19 @@ user sees.
   x, y, width, height and collapsed together and saves only when one of them
   changed, so a drag is one atomic write however many events it took, a
   hide/show cycle that moved nothing writes nothing, and the clamp onto a
-  visible screen is re-run when the debounce fires.
+  visible screen is re-run when the debounce fires with no mouse button down.
+
+  **The debounce is a commit, not the end of the gesture.** A pointer held
+  still for a second inside a drag produces exactly the silence that ends one,
+  and nothing in the event stream tells them apart. So the timer writes and
+  lets the next event re-arm - arming is on any geometry change the app did
+  not make itself, whatever the flags say - and a drag with a pause in it is
+  two writes rather than one truncated at the pause. The clamp is the part
+  that cannot be guessed at: it moves and resizes the window, and doing that
+  while the window manager still owns the pointer is the app fighting a live
+  drag, measured at a 240 px jump out from under it. It runs only when Qt
+  reports no button down, and if that state is stale it is skipped - the next
+  show or screen change clamps anyway, which is the safe direction.
 
 - **An app icon.** Three stacked pill bars at 47 %, 72 % and 92 % on the app's
   own rounded dark panel - the compact chip row the widget already shows, which
