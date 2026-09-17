@@ -828,6 +828,27 @@ def _settled(qtbot, scroll) -> None:
         pass
 
 
+def _vertical_settled(qtbot, scroll) -> None:
+    """The vertical twin of `_settled`, for a reading of `maximum()`.
+
+    A tab switch posts a ``LayoutRequest`` and, until it is delivered, the
+    page inside the area is still at the size it had - so ``maximum()`` can
+    read 0 for a page that does not fit, or a range for one that does. One
+    ``qtbot.wait(0)`` is one turn too few; offscreen on Linux it happens to be
+    enough, which is exactly how the same reading on the other axis reached a
+    Windows runner before anyone saw it.
+    """
+    try:
+        qtbot.waitUntil(
+            lambda: scroll.widget().height() <= scroll.viewport().height()
+            or scroll.verticalScrollBar().maximum() > 0,
+            timeout=2000,
+        )
+    except TimeoutError:
+        # Let the caller's own assertion name the page and the number.
+        pass
+
+
 def test_the_microsoft_tab_no_longer_sets_the_dialog_floor(qtbot):
     """Wrapping the pages is what did it, not a page that got smaller.
 
@@ -888,7 +909,7 @@ def test_microsoft_scrolls_at_the_default_size_and_general_does_not(qtbot):
     ranges = {}
     for i in range(tabs.count()):
         tabs.setCurrentIndex(i)
-        qtbot.wait(0)
+        _vertical_settled(qtbot, tabs.widget(i))
         ranges[tabs.tabText(i)] = tabs.widget(i).verticalScrollBar().maximum()
 
     assert ranges["Microsoft"] > 0, ranges
@@ -905,7 +926,7 @@ def test_the_default_size_tracks_the_general_page(qtbot):
 
     general_index = _tab_index(dialog, "General")
     tabs.setCurrentIndex(general_index)
-    qtbot.wait(0)
+    _vertical_settled(qtbot, tabs.widget(general_index))
     assert tabs.widget(general_index).verticalScrollBar().maximum() == 0
 
     microsoft = tabs.widget(_tab_index(dialog, "Microsoft"))

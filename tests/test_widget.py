@@ -2353,6 +2353,16 @@ def test_the_error_line_raises_details_on_a_click_not_a_press(qtbot):
     _release(detail, start)
     assert seen == ["azure"], "a click did not open the dialog"
 
+    # Both sides of the boundary itself, written in terms of the same
+    # threshold the panel applies to its own press: `<` and `<=` are the same
+    # test at 0 px and at 40 px, and only here do they disagree.
+    travel = QApplication.startDragDistance()
+    for distance, expected in ((travel - 1, 1), (travel, 0)):
+        seen.clear()
+        _press(detail, start)
+        _release(detail, QPoint(start.x() + distance, start.y()))
+        assert len(seen) == expected, f"travel of {distance} px against {travel}"
+
 
 def test_a_long_error_is_elided_not_clipped(qtbot):
     widget = UsageWidget(Config())
