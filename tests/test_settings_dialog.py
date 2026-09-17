@@ -803,6 +803,31 @@ def _tab_index(dialog: SettingsDialog, title: str) -> int:
     raise AssertionError(f"no {title} tab")
 
 
+def _settled(qtbot, scroll) -> None:
+    """Wait for a scroll area to finish re-laying its page.
+
+    A tab switch or a resize can bring the vertical bar in, and that narrows
+    the viewport by the bar's extent (774 -> 764 on the Windows runner) and
+    posts a ``LayoutRequest``. Until that is delivered the page is still at
+    its old width *and* the horizontal range has not been recomputed, so a
+    reading taken there says "wider than its viewport, with no bar" about a
+    scroll area that is simply mid-layout. One ``qtbot.wait(0)`` is one
+    event-loop turn too few. Offscreen on Linux the pages fit the viewport,
+    the bar never flips, and the window never opens - which is why this only
+    ever failed on Windows.
+    """
+    try:
+        qtbot.waitUntil(
+            lambda: scroll.widget().width() <= scroll.viewport().width()
+            or scroll.horizontalScrollBar().maximum() > 0,
+            timeout=2000,
+        )
+    except TimeoutError:
+        # Genuinely clipped with no bar: let the caller's assertion say which
+        # page it was and by how much.
+        pass
+
+
 def test_the_microsoft_tab_no_longer_sets_the_dialog_floor(qtbot):
     """Wrapping the pages is what did it, not a page that got smaller.
 
@@ -988,6 +1013,7 @@ def test_the_default_width_fits_the_widest_page(qtbot, monkeypatch):
             tabs.setCurrentIndex(i)
             qtbot.wait(0)
             scroll = tabs.widget(i)
+            _settled(qtbot, scroll)
             clipped = scroll.widget().width() > scroll.viewport().width()
             # No exemption for the work-area bound any more: where the screen
             # is what stops the dialog from being wide enough, the page's own
@@ -1067,6 +1093,7 @@ def test_no_page_is_clipped_at_the_dialog_floor(qtbot, monkeypatch):
             tabs.setCurrentIndex(i)
             qtbot.wait(0)
             scroll = tabs.widget(i)
+            _settled(qtbot, scroll)
             bar = scroll.horizontalScrollBar()
             if dialog.minimumWidth() < available:
                 assert bar.maximum() == 0, (tabs.tabText(i), scroll.widget().width())
