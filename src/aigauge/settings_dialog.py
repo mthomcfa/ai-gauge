@@ -649,6 +649,13 @@ class SettingsDialog(QDialog):
         # the tests both need handles on the tab widget and its scroll areas.
         self._tabs: QTabWidget | None = None
         self._page_scrolls: list[QScrollArea] = []
+        self._general_scroll: QScrollArea | None = None
+        self._fitted_on_show = False
+        # The terms behind the default height, for a test's failure message
+        # and a bug report: "content", "chrome", "slack", "height" from the
+        # pre-show estimate; "viewport_w", "viewport_h", "need", "grew" from
+        # the second measurement in showEvent.
+        self._height_terms: dict[str, int] = {}
         self._config = config
         self._browser_account_rows: list[_BrowserAccountRow] = []
         self._removed_browser_account_ids: list[str] = []
@@ -1471,9 +1478,17 @@ class SettingsDialog(QDialog):
             width - margins.left() - margins.right() - pane_extra_w,
             general_page.minimumSizeHint().width(),
         )
-        height = _dialog_height(
-            _page_height(general_page, page_width), chrome, _DIALOG_MIN_H, ceiling
+        content = _page_height(general_page, page_width)
+        height = _dialog_height(content, chrome, _DIALOG_MIN_H, ceiling)
+        self._general_scroll = next(
+            scroll for scroll in self._page_scrolls if scroll.widget() is general_page
         )
+        self._height_terms = {
+            "content": content,
+            "chrome": chrome - _DIALOG_HEIGHT_SLACK,
+            "slack": _DIALOG_HEIGHT_SLACK,
+            "height": height,
+        }
         # Clamped against the screen as well: at 200% display scale the work
         # area is 400 px high and an un-shrinkable 560x420 minimum is a dialog
         # whose OK button cannot be reached.
@@ -1482,6 +1497,47 @@ class SettingsDialog(QDialog):
             min(_DIALOG_MIN_H, available.height()),
         )
         self.resize(width, height)
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().showEvent(event)
+        if not self._fitted_on_show:
+            self._fitted_on_show = True
+            self._fit_general_page_on_show()
+
+    def _fit_general_page_on_show(self) -> None:
+        """Measure General again with the real viewport, before the first paint.
+
+        The pre-show estimate reads its chrome off size hints, and a style can
+        lay its tab pane out a few pixels away from what it hinted: on the
+        macOS runner the landing page still opened with 3 px of scroll range
+        after the estimate was made exact for Fusion. Here the tree has been
+        polished and shown, so once the dialog's layouts are activated every
+        geometry is the real one, synchronously - a visible widget gets its
+        resize event inside ``setGeometry``. The viewport's width may still
+        reserve a scroll bar at this point, which only errs the page taller.
+        A deficit grows the dialog by that much, under the same ceiling; a
+        resize inside ``showEvent`` lands before the first paint, so there is
+        nothing to see. When the estimate is right, as it is here, this is a
+        measurement and no resize.
+        """
+        scroll = self._general_scroll
+        if scroll is None:
+            return
+        _activate_layouts(self)
+        viewport = scroll.viewport()
+        need = _page_height(scroll.widget(), viewport.width())
+        deficit = need - viewport.height()
+        self._height_terms.update(
+            viewport_w=viewport.width(),
+            viewport_h=viewport.height(),
+            need=need,
+            grew=max(0, deficit),
+        )
+        if deficit <= 0:
+            return
+        available = (self.screen() or QApplication.primaryScreen()).availableGeometry()
+        ceiling = int(available.height() * _DIALOG_SCREEN_FRACTION)
+        self.resize(self.width(), min(self.height() + deficit, ceiling))
 
     def _edit_provider_colors(self, provider: str, label: str) -> None:
         dialog = GaugeColorsDialog(label, self._provider_colors[provider], parent=self)

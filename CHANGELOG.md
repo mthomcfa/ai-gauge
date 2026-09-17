@@ -132,7 +132,12 @@ user sees.
   luck. The dialog opens **620 x 589** against the hardcoded 520; a binary
   search for the smallest height at which General shows no scroll bar gives
   580, so 9 px of that is slack, and a test now holds the default within the
-  slack of that search from both sides. The chrome is deliberately not
+  slack of that search from both sides. Then `showEvent` measures once more,
+  with the real viewport: the tree is polished and shown by then, so after the
+  layouts are activated every geometry is the laid-out one, and a deficit
+  grows the dialog before its first paint. Offscreen this is a measurement
+  and no resize; the macOS runner, whose style lays its pane out 3 px away
+  from what it hinted, is what it exists for. The chrome is deliberately not
   derived as `height() - viewport().height()` before `show()`: the viewport is
   still at its unlaid 640 x 480 then and the subtraction comes out **-60**,
   which yields a 428 px dialog in which General itself scrolls. Both ends are

@@ -1,4 +1,5 @@
 import sys
+import warnings
 
 import pytest
 from PyQt6.QtCore import Qt
@@ -908,7 +909,7 @@ def test_the_default_height_is_the_measured_need_plus_the_slack(qtbot):
     """
     dialog = SettingsDialog(Config())
     qtbot.addWidget(dialog)
-    default_height = dialog.height()
+    estimate = dialog.height()
     with qtbot.waitExposed(dialog):
         dialog.show()
     tabs = _tabs(dialog)
@@ -916,9 +917,22 @@ def test_the_default_height_is_the_measured_need_plus_the_slack(qtbot):
     tabs.setCurrentIndex(general_index)
     qtbot.wait(0)
     general = tabs.widget(general_index)
-    assert general.verticalScrollBar().maximum() == 0
+    assert general.verticalScrollBar().maximum() == 0, dialog._height_terms
 
-    low, high = dialog.minimumHeight(), default_height
+    # The show-time measurement may grow the dialog where a style lays its
+    # pane out away from its hints; more than this and the estimate itself
+    # is wrong, not the style. Any growth is reported so a platform that
+    # needs it shows up in the run's warnings with its terms.
+    grew = dialog.height() - estimate
+    assert 0 <= grew <= 8, dialog._height_terms
+    if grew:
+        warnings.warn(
+            f"the pre-show height estimate was {grew} px short here: "
+            f"{dialog._height_terms}",
+            stacklevel=1,
+        )
+
+    low, high = dialog.minimumHeight(), dialog.height()
     while low < high:
         mid = (low + high) // 2
         dialog.resize(dialog.width(), mid)
@@ -930,9 +944,40 @@ def test_the_default_height_is_the_measured_need_plus_the_slack(qtbot):
     smallest = low
     assert smallest > dialog.minimumHeight(), "the search never engaged"
     pane_rounding = 4
-    assert 0 <= default_height - smallest <= (
+    assert 0 <= estimate + grew - smallest <= (
         settings_dialog._DIALOG_HEIGHT_SLACK + pane_rounding
-    ), (default_height, smallest)
+    ), (estimate, grew, smallest, dialog._height_terms)
+
+
+def test_a_short_estimate_is_corrected_before_the_first_paint(qtbot, monkeypatch):
+    """The show-time measurement, forced to engage.
+
+    Offscreen the estimate is exact and ``showEvent`` measures without
+    resizing, so the correction is exercised by making the estimate wrong on
+    purpose: 40 px of negative slack opens the dialog short, and the first
+    ``showEvent`` grows it back to a height at which General shows no bar.
+    """
+    monkeypatch.setattr(settings_dialog, "_DIALOG_HEIGHT_SLACK", -40)
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    short = dialog.height()
+    with qtbot.waitExposed(dialog):
+        dialog.show()
+    general = _tabs(dialog).widget(_tab_index(dialog, "General"))
+    qtbot.wait(0)
+
+    assert dialog.height() > short, dialog._height_terms
+    assert dialog._height_terms["grew"] == dialog.height() - short
+    assert general.verticalScrollBar().maximum() == 0, dialog._height_terms
+    assert dialog._fitted_on_show
+
+    # Once only: a later show (the dialog is modal and re-created each time,
+    # but a hide/show cycle must not keep growing it).
+    grown = dialog.height()
+    dialog.hide()
+    with qtbot.waitExposed(dialog):
+        dialog.show()
+    assert dialog.height() == grown
 
 
 def test_activate_layouts_refreshes_a_nested_layouts_stale_hint(qtbot):
