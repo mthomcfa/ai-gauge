@@ -260,7 +260,14 @@ user sees.
   window's current width with the full text in the tooltip, and clickable to
   the same details dialog - on the **release**, and only if the pointer stayed
   within `startDragDistance()`, which is the same rule the panel applies to
-  its own press. Emitting on the press would have put a new top-level window
+  its own press. The line is `Qt.TextFormat.PlainText`, explicitly: the
+  default is `AutoText`, so an error string shaped like markup was
+  *interpreted* - measured, a 67 px hint against the 287 px the same string
+  costs as plain text, which is a provider string choosing what an error tile
+  says and in what colour, and a 38 kB `<table>` laid the label out as a
+  table. Both tooltips carrying an error - the line's and the status label's -
+  are clipped to 280 characters and HTML-escaped, since `QToolTip` has no
+  text-format setter and a 10 kB error made a 10 kB popup. Emitting on the press would have put a new top-level window
   under a button that is still down, i.e. the defect below, over 324 px of a
   340 px panel. Only when there is nothing else on the tile: with
   rows present the tag reads "error · stale" beside numbers that explain

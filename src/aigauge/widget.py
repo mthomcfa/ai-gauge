@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import math
 import re
 from datetime import datetime, timedelta
@@ -369,6 +370,28 @@ def _short_error_reason(error: str | None) -> str:
     return "error"
 
 
+# A tooltip carries a provider's error string verbatim, and that string is
+# unbounded - a 10 240-character error produced a 10 260-character tooltip.
+_TOOLTIP_ERROR_CHARS = 280
+
+
+def _safe_tooltip(error: str | None, suffix: str = "") -> str:
+    """Clip an error to a readable length and show it literally.
+
+    ``QToolTip`` has no text-format setter: Qt decides for itself, and anything
+    markup-shaped is rendered as rich text. So a provider string containing
+    ``<span style="color:#111827">`` would paint the rest of the message in the
+    panel's own background colour, and a ``<table>`` would lay the popup out as
+    a table. Escaping is the one honest way to show an arbitrary string as
+    itself. Every string that reaches here is app-composed today - this is the
+    guard for the next error message that interpolates a provider field.
+    """
+    text = error or ""
+    if len(text) > _TOOLTIP_ERROR_CHARS:
+        text = text[:_TOOLTIP_ERROR_CHARS].rstrip() + "…"
+    return html.escape(text + suffix)
+
+
 class _DetailLine(QLabel):
     """One elided, optionally clickable line of explanation under a header.
 
@@ -386,6 +409,12 @@ class _DetailLine(QLabel):
         self._clickable = False
         self._press_at: QPoint | None = None
         self.setVisible(False)
+        # Plain text, explicitly. The default is AutoText, so an error string
+        # that looks like markup was interpreted rather than shown - and the
+        # elide guarantee went with it, because `_elide` measures the raw
+        # string and then hands the result to a rich-text renderer: a 38 kB
+        # `<table>` error laid the label out as a table, 44 px tall.
+        self.setTextFormat(Qt.TextFormat.PlainText)
         self.setWordWrap(False)
         self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
 
@@ -397,9 +426,10 @@ class _DetailLine(QLabel):
             + (" text-decoration: underline;" if self._clickable else "")
         )
         self.setToolTip(
-            (self._full_text + "\n\nClick for details.")
-            if self._clickable
-            else self._full_text
+            _safe_tooltip(
+                self._full_text,
+                "\n\nClick for details." if self._clickable else "",
+            )
         )
         self.setCursor(
             Qt.CursorShape.PointingHandCursor
@@ -1183,7 +1213,7 @@ class _ProviderTile(QFrame):
             self.status.setStyleSheet(
                 "color: #f59e0b; font-size: 10px; font-style: normal;"
             )
-            self.status.setToolTip(snapshot.error or "")
+            self.status.setToolTip(_safe_tooltip(snapshot.error))
             self.status.setCursor(Qt.CursorShape.ArrowCursor)
             can_sign_in = _provider_family(self.provider) in (
                 "claude",
@@ -1218,10 +1248,12 @@ class _ProviderTile(QFrame):
             self.status.setStyleSheet(
                 "color: #ef4444; font-size: 10px; font-style: normal;"
             )
-            tooltip = (snapshot.error or "unknown error") + "\n\nClick for details."
+            suffix = "\n\nClick for details."
             if snapshot.metrics:
-                tooltip += "\nLast successful values are still shown below."
-            self.status.setToolTip(tooltip)
+                suffix += "\nLast successful values are still shown below."
+            self.status.setToolTip(
+                _safe_tooltip(snapshot.error or "unknown error", suffix)
+            )
             self.status.setCursor(Qt.CursorShape.PointingHandCursor)
             self.action_btn.setVisible(False)
             self.ratio_label.setVisible(False)

@@ -1868,6 +1868,58 @@ def test_a_long_error_is_elided_not_clipped(qtbot):
     assert detail.toolTip().startswith(message), "the full text is unreachable"
 
 
+def test_the_detail_line_shows_markup_literally(qtbot):
+    """The label had no text format, so it defaulted to AutoText and a
+    provider string that looks like markup was *interpreted*: measured, a
+    hint of 67 px against the 287 px the same string needs as plain text,
+    i.e. `<span style="color:#111827">` would have painted half an error
+    message in the panel's own background colour. It also took the elide
+    guarantee with it - `_elide` measures the raw string and hands the result
+    to the renderer, and a 38 kB `<table>` came out 44 px tall."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    markup = "<b>bold</b>"
+    widget.update_snapshot(_error_snapshot("azure", markup), "Microsoft · Azure")
+    with qtbot.waitExposed(widget):
+        widget.show()
+    qtbot.wait(0)
+    detail = widget._tiles["azure"].detail  # noqa: SLF001
+
+    assert detail.textFormat() == Qt.TextFormat.PlainText
+    assert detail.text() == markup, "the markup was not drawn as itself"
+    # The measurement rule: a plain-text label needs at least what its own
+    # font metrics say the string costs. A rich-text one needs a quarter of it.
+    assert detail.sizeHint().width() >= detail.fontMetrics().horizontalAdvance(
+        markup
+    )
+
+
+def test_an_error_tooltip_is_clipped_and_shows_markup_literally(qtbot):
+    """A tooltip has no text-format setter - Qt renders anything markup-shaped
+    as rich text - and the string it carries is a provider's, i.e. unbounded:
+    a 10 240-character error made a 10 260-character tooltip. Both copies of
+    it, the detail line's and the status label's, are clipped and escaped."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(
+        _error_snapshot("azure", "<b>x</b>"), "Microsoft · Azure"
+    )
+    tile = widget._tiles["azure"]  # noqa: SLF001
+
+    for tooltip in (tile.detail.toolTip(), tile.status.toolTip()):
+        assert "&lt;b&gt;" in tooltip
+        assert "<b>" not in tooltip
+    assert tile.detail.text() == "<b>x</b>", "the label itself is the literal"
+
+    widget.update_snapshot(
+        _error_snapshot("azure", "x" * 10240), "Microsoft · Azure"
+    )
+    assert len(tile.detail.toolTip()) <= 320
+    assert len(tile.status.toolTip()) <= 400
+    assert tile.detail.toolTip().startswith("x" * 100)
+    assert "…" in tile.detail.toolTip()
+
+
 def test_an_error_tile_that_still_has_rows_does_not_repeat_itself(qtbot):
     """With numbers on the tile the corner tag reads "error · stale" beside
     them and a second red line would be noise."""
