@@ -2048,9 +2048,15 @@ def test_a_recovered_tile_drops_the_error_line(qtbot):
     [
         ("Cost Management is rate limiting this tenant", "error · rate limited"),
         ("the request was throttled", "error · rate limited"),
+        # Said both, and the api branch was tested first, so the tag named
+        # the less specific of the two.
+        ("GitHub API rate limit exceeded", "error · rate limited"),
+        # And said neither word: a bare status line.
+        ("429 Too Many Requests", "error · rate limited"),
+        ("GitHub API returned 500", "error · api"),
         ("something else entirely", "error"),
     ],
-    ids=["rate-limiting", "throttled", "unmatched"],
+    ids=["rate-limiting", "throttled", "github-rate-limit", "429", "api", "unmatched"],
 )
 def test_a_rate_limit_is_named_in_the_corner_tag(error, expected):
     from aigauge.widget import _short_error_reason

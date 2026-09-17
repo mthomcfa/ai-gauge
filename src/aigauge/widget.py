@@ -359,14 +359,16 @@ def _short_error_reason(error: str | None) -> str:
         return "error · layout changed"
     if "extractor returned null" in e or "no data extracted" in e:
         return "error · no data"
+    # Before the api branch, not after it. A throttle is the more specific
+    # reading of a string that says both, and the ones that say both are the
+    # common ones: "GitHub API rate limit exceeded" came out "error · api".
+    # "429" because a bare status line says neither of the words.
+    if "rate limit" in e or "throttl" in e or "429" in e:
+        return "error · rate limited"
     if "github" in e or "api" in e:
         return "error · api"
     if "not signed in" in e or "auth" in e:
         return "error · signed out"
-    # Azure's 429 is the common one that matched nothing and showed a bare
-    # "error" - 26 px of text in the corner of a 340 px header.
-    if "rate limit" in e or "throttl" in e:
-        return "error · rate limited"
     return "error"
 
 

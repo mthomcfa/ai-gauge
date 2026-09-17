@@ -3254,13 +3254,16 @@ def test_the_throttled_message_names_the_real_next_attempt(
     the last fetch and blocked_until. Measured on the user's desktop, a 52 s
     Retry-After at 11:16:48 was followed by an hour of refreshes served from
     the cached error in 0.0 s, under a message promising one minute.
+
+    The clock is simulated, so it is passed in: the answer is floored at
+    ``now`` and a fixed date in the past would otherwise be floored away.
     """
     now = datetime(2026, 4, 27, 11, 16, 48)
     state = az._State()
     state.last_fetch_at = now
     state.blocked_until = now + timedelta(seconds=retry_after_s)
 
-    message = az._throttled_message(state)
+    message = az._throttled_message(state, now)
 
     floor = now + az.MIN_FETCH_INTERVAL
     expected = floor if expected_source == "floor" else state.blocked_until
@@ -3277,6 +3280,33 @@ def test_the_throttled_message_without_a_clock_says_no_time():
     assert az._throttled_message(az._State()) == (
         "Cost Management is rate limiting this tenant."
     )
+
+
+@pytest.mark.parametrize(
+    "last_fetch_ago,blocked_ago",
+    [(None, 3), (5, 3), (None, 0)],
+    ids=["no-fetch", "old-fetch", "just-expired"],
+)
+def test_the_next_attempt_is_never_a_time_already_past(last_fetch_ago, blocked_ago):
+    """`max(candidates)` could answer behind the clock: a state with no
+    `last_fetch_at` and an expired `blocked_until` produced "next attempt at
+    14:09" at 17:09. Unreachable from the 429 handler, which sets
+    `blocked_until` to `now + retry_after` immediately before asking - floored
+    so the next caller does not inherit it."""
+    now = datetime(2026, 4, 27, 17, 9, 0)
+    state = az._State()
+    if last_fetch_ago is not None:
+        state.last_fetch_at = now - timedelta(hours=last_fetch_ago)
+    state.blocked_until = now - timedelta(hours=blocked_ago)
+
+    when = az.next_allowed_at(state, now)
+
+    assert when is not None
+    assert when >= now
+    assert az._throttled_message(state, now) == (
+        f"Cost Management is rate limiting this tenant; next attempt at {now:%H:%M}."
+    )
+    assert az._stale_settings_note(state, now).endswith(f"Next fetch at {now:%H:%M}.")
 
 
 @responses.activate
