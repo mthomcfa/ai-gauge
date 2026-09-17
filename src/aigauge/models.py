@@ -10,6 +10,15 @@ class SnapshotStatus(str, Enum):
     ERROR = "error"
 
 
+# How long a page-derived ``note`` may be by the time it reaches the model.
+# A note is only ever shown in a tooltip, and a tooltip is clipped to the same
+# 280 characters (``widget._TOOLTIP_ERROR_CHARS``) before it is escaped - so
+# nothing reaches the user that this drops, and a 200 kB "Resets ..." string
+# lifted off a usage page stops travelling through the app to be re-clipped by
+# each of the six tooltips that carry it.
+MAX_NOTE_CHARS = 280
+
+
 @dataclass
 class UsageMetric:
     """A single percent-used reading with a reset time."""

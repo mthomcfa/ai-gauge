@@ -362,6 +362,18 @@ user sees.
   label and percentage as well, on every `set_metric`, so a row reused for a
   metric with no note cannot keep the previous one's.
 
+  The note is a **provider's** string, so all six copies of it - the row, the
+  bar, the label, the percentage, the reset column and the collapsed chip -
+  go through the same clip-and-escape as an error tooltip, and every label on
+  a metric row and a compact metric is `Qt.TextFormat.PlainText`: the default
+  is `AutoText`, and `metric.label` and `metric.reset_label` reach `setText`.
+  `catalog.py` bounds the note where it is built as well, at
+  `models.MAX_NOTE_CHARS`, because `reset_text` is matched against a whole
+  element's text with no `clean_label` and no cap - a usage page with a long
+  block after "Resets" handed the model a 200 kB note. A sweep over every
+  label and tooltip in a poisoned panel, expanded and collapsed, is the test,
+  so the next label added cannot quietly take the default back.
+
 ### Notes
 
 - The suite is **1 981 tests**, from 1 859. `tests/test_icon.py` is new and

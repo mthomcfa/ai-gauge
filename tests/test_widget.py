@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 import pytest
 from PyQt6.QtCore import QEvent, QPoint, QPointF, Qt
 from PyQt6.QtGui import QGuiApplication, QMouseEvent, QResizeEvent, QTextDocument
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QLabel, QWidget
 
 from aigauge.config import (
     BrowserAccount,
@@ -2466,6 +2466,138 @@ def test_a_multi_line_error_neither_grows_the_tile_nor_is_measured_whole(qtbot):
     )
 
 
+# --- Provider text on a metric row -----------------------------------------
+
+# A marker the app's own strings never contain, wrapped in markup the app's
+# own strings never contain either: one sweep can then ask both questions -
+# "did this come from the snapshot?" and "is it being interpreted?".
+_POISON_MARKER = "ZZQ"
+_POISON = f"<b>{_POISON_MARKER}</b>"
+
+
+def _tooltip_bound() -> int:
+    """What a tooltip can be, from the clip and the longest escape.
+
+    `&quot;` is six characters for one, the clip is on the raw string plus an
+    ellipsis, and the wrapper is the rest - measured off the helper itself so
+    the number is not written down twice.
+    """
+    return (_TOOLTIP_ERROR_CHARS + 1) * 6 + len(_safe_tooltip("x")) - 1
+
+
+def _poisoned_snapshot(provider, status=SnapshotStatus.OK):
+    note = _POISON * 2000  # 20 000 characters, far past the tooltip clip
+    return UsageSnapshot(
+        provider=provider,
+        status=status,
+        metrics=[
+            UsageMetric(
+                label=f"{_POISON} Session",
+                percent_used=40.0,
+                resets_at=datetime(2026, 4, 27, 14, 0),
+                reset_label=f"{_POISON} soon",
+                note=note,
+                window=timedelta(hours=5),
+            )
+        ],
+        error=note,
+        fetched_at=datetime(2026, 4, 27, 12, 0),
+    )
+
+
+def test_a_metric_note_is_shown_literally_and_bounded(qtbot):
+    """`_MetricRow` puts the note into four tooltips and the collapsed chip
+    into a fifth, and it arrived verbatim and unclipped: a 200 kB `reset_text`
+    lifted off a usage page made five 200 kB tooltips, rendered as rich text
+    because Qt renders anything markup-shaped that way."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_poisoned_snapshot("azure"), "Microsoft · Azure")
+    tile = widget._tiles["azure"]  # noqa: SLF001
+    tile.set_expanded(True, emit=False)
+    row = tile._rows[-1]  # noqa: SLF001
+    bound = _tooltip_bound()
+
+    for name, holder in (
+        ("row", row),
+        ("label", row.label),
+        ("bar", row.bar),
+        ("pct", row.pct),
+        ("reset", row.reset),
+    ):
+        tooltip = holder.toolTip()
+        assert tooltip, name
+        assert len(tooltip) <= bound, name
+        assert Qt.mightBeRichText(tooltip), name
+        assert "<b>" not in tooltip, f"{name} carries the markup unescaped"
+        assert _POISON in _tooltip_text(tooltip), f"{name} does not show it literally"
+
+
+def test_a_metric_label_is_drawn_rather_than_interpreted(qtbot):
+    """`metric.label` and `metric.reset_label` go through `setText` on labels
+    that had no text format, so a page that renders literal angle brackets
+    after a meter's name chose what the row said and in what colour."""
+    row = _MetricRow()
+    qtbot.addWidget(row)
+
+    row.set_metric(f"{_POISON} Session", 40.0, None, "3.1d")
+
+    assert row.label.textFormat() == Qt.TextFormat.PlainText
+    assert row.label.text() == f"{_POISON} Session"
+    assert row.pct.textFormat() == Qt.TextFormat.PlainText
+    assert row.reset.textFormat() == Qt.TextFormat.PlainText
+    # The rule, not a Linux pixel: a plain-text label needs at least what its
+    # own font metrics say the string costs; a rich-text one drops the tags.
+    assert row.label.sizeHint().width() >= row.label.fontMetrics().horizontalAdvance(
+        f"{_POISON} Session"
+    )
+
+
+def test_no_label_or_tooltip_in_the_panel_interprets_provider_text(qtbot):
+    """A sweep rather than a list of five call sites, so a label or a tooltip
+    added later cannot quietly take the default back. This branch added one of
+    the five, and the whole metric row was missed when the detail line and the
+    status label were fixed."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_poisoned_snapshot("claude"), "Claude")
+    widget.update_snapshot(
+        _poisoned_snapshot("azure", SnapshotStatus.ERROR), "Microsoft · Azure"
+    )
+    for tile in widget._tiles.values():  # noqa: SLF001
+        tile.set_expanded(True, emit=False)
+    with qtbot.waitExposed(widget):
+        widget.show()
+    qtbot.wait(0)
+    bound = _tooltip_bound()
+
+    def sweep():
+        labels, tooltips = [], []
+        for child in [widget, *widget.findChildren(QWidget)]:
+            if isinstance(child, QLabel) and _POISON_MARKER in child.text():
+                labels.append(child)
+            tooltip = child.toolTip()
+            if tooltip and _POISON_MARKER in _tooltip_text(tooltip):
+                tooltips.append(child)
+        return labels, tooltips
+
+    for state in (False, True):
+        widget.set_collapsed(state)
+        qtbot.wait(0)
+        labels, tooltips = sweep()
+        # Not a vacuous pass: the sweep has to be finding the poisoned strings.
+        assert len(labels) >= 2, f"the sweep found no provider text at all ({state})"
+        assert len(tooltips) >= 2, f"the sweep found no provider tooltip ({state})"
+        for label in labels:
+            assert (
+                label.textFormat() == Qt.TextFormat.PlainText
+            ), f"{label.text()[:40]!r} is interpreted"
+        for holder in tooltips:
+            tooltip = holder.toolTip()
+            assert len(tooltip) <= bound, f"{type(holder).__name__} tooltip is unbounded"
+            assert "<b>" not in tooltip, f"{type(holder).__name__} tooltip is unescaped"
+
+
 def test_an_error_tile_that_still_has_rows_does_not_repeat_itself(qtbot):
     """With numbers on the tile the corner tag reads "error · stale" beside
     them and a second red line would be noise."""
@@ -2590,9 +2722,9 @@ def test_every_part_of_a_component_row_carries_the_amount(qtbot):
     so each of them now carries it outright."""
     _widget, row = _component_row(qtbot)
 
-    assert row.toolTip() == "CA$1,234.56"
+    assert _tooltip_text(row.toolTip()) == "CA$1,234.56"
     for name in ("label", "bar", "pct"):
-        assert getattr(row, name).toolTip() == "CA$1,234.56", name
+        assert _tooltip_text(getattr(row, name).toolTip()) == "CA$1,234.56", name
 
 
 @pytest.mark.parametrize(
@@ -2612,7 +2744,7 @@ def test_a_tooltip_event_anywhere_on_the_row_shows_the_amount(qtbot, target):
     qtbot.wait(0)
 
     assert event.isAccepted()
-    assert QToolTip.text() == "CA$1,234.56"
+    assert _tooltip_text(QToolTip.text()) == "CA$1,234.56"
     QToolTip.hideText()
 
 
@@ -2625,7 +2757,7 @@ def test_a_row_with_no_note_leaves_no_stale_tooltip_behind(qtbot):
     tile = widget._tiles["azure"]  # noqa: SLF001
     tile.set_expanded(True, emit=False)
     row = tile._rows[-1]  # noqa: SLF001
-    assert row.label.toolTip() == "CA$1,234.56"
+    assert _tooltip_text(row.label.toolTip()) == "CA$1,234.56"
 
     row.set_metric("Azure App Service", 13.0, None, None, None, None)
 

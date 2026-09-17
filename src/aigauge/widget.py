@@ -784,6 +784,11 @@ class _MetricRow(QWidget):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.label = QLabel()
+        # Every label on this row shows a string a provider's usage page
+        # supplied - the meter's name, the reset phrase, the percentage's
+        # neighbours - and the default is AutoText, which *interprets* one
+        # shaped like markup. Same rule as the detail line, one row over.
+        self.label.setTextFormat(Qt.TextFormat.PlainText)
         self.label.setStyleSheet("color: #d1d5db; font-size: 11px;")
         self.label.setMinimumWidth(70)
         self._resets_at: datetime | None = None
@@ -797,6 +802,7 @@ class _MetricRow(QWidget):
         self.bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         self.pct = QLabel("--")
+        self.pct.setTextFormat(Qt.TextFormat.PlainText)
         self.pct.setStyleSheet("color: #f3f4f6; font-size: 11px; font-weight: 600;")
         self.pct.setFixedWidth(34)
         self.pct.setAlignment(
@@ -804,6 +810,7 @@ class _MetricRow(QWidget):
         )
 
         self.reset = QLabel("")
+        self.reset.setTextFormat(Qt.TextFormat.PlainText)
         self.reset.setStyleSheet("color: #9ca3af; font-size: 10px;")
         self.reset.setFixedWidth(58)
         self.reset.setAlignment(
@@ -844,7 +851,7 @@ class _MetricRow(QWidget):
         else:
             self.label.setText(label)
             self.reset.setStyleSheet("color: #9ca3af; font-size: 10px;")
-        self.setToolTip(note or "")
+        self.setToolTip(_safe_tooltip(note))
         self._resets_at = resets_at
         self._window = window
         self.refresh_pace()
@@ -902,7 +909,9 @@ class _MetricRow(QWidget):
         if reset_label:
             # The full phrase, then the note: whatever the column elided is
             # still reachable here, and the amounts are in the note as well.
-            self.reset.setToolTip("\n\n".join(part for part in (rel, note) if part))
+            self.reset.setToolTip(
+                _safe_tooltip("\n\n".join(part for part in (rel, note) if part))
+            )
         elif resets_at:
             self.reset.setToolTip(resets_at.strftime("%Y-%m-%d %H:%M"))
         elif not split_note:
@@ -910,9 +919,11 @@ class _MetricRow(QWidget):
         pace_line = _pace_tooltip_line(resets_at, window)
         if pace_line:
             tooltip = note or ""
-            self.bar.setToolTip((tooltip + "\n\n" if tooltip else "") + pace_line)
+            self.bar.setToolTip(
+                _safe_tooltip((tooltip + "\n\n" if tooltip else "") + pace_line)
+            )
         else:
-            self.bar.setToolTip(note or "")
+            self.bar.setToolTip(_safe_tooltip(note))
         # The note again on the two children that had none of their own. Qt
         # propagates an unanswered ToolTip event up to the parent, so the row's
         # own tooltip should be enough - and measured offscreen it is, from the
@@ -926,7 +937,7 @@ class _MetricRow(QWidget):
         # the assumption the propagation rests on - that every child under the
         # pointer answers a ToolTip event with nothing.
         for child in (self.label, self.pct):
-            child.setToolTip(note or "")
+            child.setToolTip(_safe_tooltip(note))
 
     def refresh_pace(self) -> None:
         self.bar.set_pace(_time_elapsed_percent(self._resets_at, self._window))
@@ -974,6 +985,9 @@ class _CompactMetric(QWidget):
         super().__init__(parent)
         self._colors: ColorThresholds | None = None
         self.code = QLabel("")
+        # As on the expanded row: the code is the first letter of a label the
+        # page supplied, and the reset column is a phrase from it.
+        self.code.setTextFormat(Qt.TextFormat.PlainText)
         self.code.setStyleSheet("color:#d1d5db; font-size:10px; font-weight:700;")
         self.code.setFixedWidth(10)
         self.code.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -984,11 +998,13 @@ class _CompactMetric(QWidget):
         self.bar.setFixedSize(30, 6)
 
         self.pct = QLabel("--")
+        self.pct.setTextFormat(Qt.TextFormat.PlainText)
         self.pct.setStyleSheet("color:#f3f4f6; font-size:10px; font-weight:600;")
         self.pct.setFixedWidth(28)
         self.pct.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         self.reset = QLabel("")
+        self.reset.setTextFormat(Qt.TextFormat.PlainText)
         self.reset.setStyleSheet("color:#9ca3af; font-size:10px;")
         self.reset.setFixedWidth(38)
         self.reset.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -1021,7 +1037,7 @@ class _CompactMetric(QWidget):
             tooltip += f" · resets {reset}"
         if metric.note:
             tooltip += f"\n{metric.note}"
-        self.setToolTip(tooltip)
+        self.setToolTip(_safe_tooltip(tooltip))
 class _ProviderTile(QFrame):
     """A provider section: header line + N metric rows."""
 
@@ -2183,7 +2199,7 @@ class UsageWidget(QWidget):
         chip.set_state(
             text, percent, kind, pace, thresholds_for_provider(self._config, provider)
         )
-        chip.setToolTip(tooltip)
+        chip.setToolTip(_safe_tooltip(tooltip))
         return chip
 
     def set_collapsed(self, collapsed: bool) -> None:

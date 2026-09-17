@@ -33,7 +33,7 @@ from typing import Any, Iterable, Sequence
 
 from ..atomic_write import atomic_write
 from ..config import _is_safe_profile_id, app_data_dir
-from ..models import UsageMetric
+from ..models import MAX_NOTE_CHARS, UsageMetric
 from ._common import normalize_percent
 from .idle import idle_reset_state
 
@@ -651,12 +651,16 @@ def metric_for_spec(
         # window nothing can exceed so only the no-countdown case reads idle.
         window=spec.window if spec.window is not None else timedelta.max,
     )
+    # Unlike the sibling at `_row_evidence`, `reset_text` arrives here with no
+    # `clean_label` and no bound: it is matched against a whole element's text,
+    # so a page with a long block after "Resets" hands the model the block.
+    note = idle_note or card.get("reset_text")
     return UsageMetric(
         label=spec.label,
         percent_used=percent,
         resets_at=resets_at,
         reset_label=reset_label,
-        note=idle_note or card.get("reset_text"),
+        note=note[:MAX_NOTE_CHARS] if isinstance(note, str) else note,
         window=spec.window,
         tag=None if spec.primary else BREAKDOWN_TAG,
     )
