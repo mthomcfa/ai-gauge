@@ -2547,6 +2547,16 @@ class UsageWidget(QWidget):
         self.setGeometry(left, top, width, height)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if event.button() != Qt.MouseButton.LeftButton:
+            # `mousePressEvent` returns immediately for any other button, so
+            # this release belongs to a press this handler never saw - and it
+            # used to run the whole body anyway: a right-click on the panel
+            # wrote `config.json` and, since `_press_moved` was still False
+            # from the previous left click, emitted `activated_requested`,
+            # which brings the Settings window forward. On a Linux desktop
+            # with no tray that same right-click is what opens the panel's own
+            # context menu.
+            return
         was_resizing = bool(self._resize_edges)
         self._resize_edges = Qt.Edge(0)
         self._resize_origin = None

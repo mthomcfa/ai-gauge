@@ -1216,13 +1216,13 @@ def _move_to(widget, global_point):
     )
 
 
-def _release(widget, point):
+def _release(widget, point, button=Qt.MouseButton.LeftButton):
     widget.mouseReleaseEvent(
         QMouseEvent(
             QEvent.Type.MouseButtonRelease,
             QPointF(point),
             QPointF(widget.mapToGlobal(point)),
-            Qt.MouseButton.LeftButton,
+            button,
             Qt.MouseButton.NoButton,
             Qt.KeyboardModifier.NoModifier,
         )
@@ -1556,6 +1556,31 @@ def test_a_config_that_says_user_sized_keeps_its_size(qtbot):
 
     assert widget._user_sized is True  # noqa: SLF001
     assert (widget.width(), widget.height()) == (500, 300)
+
+
+def test_a_right_click_neither_raises_settings_nor_writes_the_config(qtbot, monkeypatch):
+    """`mousePressEvent` returns early for any non-left button, so a right
+    release belonged to a press this widget never saw - and the release
+    handler checked no button at all. It emitted `activated_requested`, which
+    the App answers by showing, raising and activating the Settings window,
+    and it wrote `config.json`. On a Linux desktop with no tray, that same
+    right-click is what opens the panel's own context menu."""
+    config = Config()
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_ok_snapshot("claude"), "Claude")
+    widget.move(50, 50)
+    raised: list[int] = []
+    widget.activated_requested.connect(lambda: raised.append(1))
+    saves: list[int] = []
+    monkeypatch.setattr(Config, "save", lambda self: saves.append(1))
+
+    middle = QPoint(widget.width() // 2, widget.height() // 2)
+    _press(widget, middle, button=Qt.MouseButton.RightButton)
+    _release(widget, middle, button=Qt.MouseButton.RightButton)
+
+    assert raised == [], "a right-click raised Settings"
+    assert saves == [], "a right-click rewrote the config"
 
 
 def test_a_deleted_widget_is_not_called_by_a_screen_signal(qtbot):
