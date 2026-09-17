@@ -1158,12 +1158,19 @@ def test_a_short_estimate_is_corrected_before_the_first_paint(qtbot, monkeypatch
 def test_activate_layouts_refreshes_a_nested_layouts_stale_hint(qtbot):
     """The mechanism on its own, with no dialog in the way.
 
-    A combo box in a row layout inside a group box's grid: after the page's
-    top-level ``activate()`` has cached everything, growing the combo box
-    invalidates the group box's grid and posts it a ``LayoutRequest`` that a
-    hidden widget never handles - the page's own layout keeps its cache, and
-    a second top-level ``activate()`` returns early on its raised flag. The
-    deepest-first pass is what brings the page's hint up to date.
+    A combo box in a row layout inside an inner widget inside a group box's
+    grid: after the page's top-level ``activate()`` has cached everything,
+    growing the combo box invalidates the inner widget's layout and posts it a
+    ``LayoutRequest`` that a hidden widget never handles - the page's own
+    layout keeps its cache, and a second top-level ``activate()`` returns
+    early on its raised flag.
+
+    Two widgets deep, not one. With the row directly under the group box,
+    ``findChildren`` lists one widget with a layout and the pass has nothing
+    to order: dropping ``reversed`` changed nothing and the test still passed.
+    With an inner widget between them, the ancestor-first order activates the
+    group box against the inner widget's *stale* hint and never returns to it,
+    so only the deepest-first pass reaches the page.
     """
     from PyQt6.QtWidgets import (
         QComboBox,
@@ -1179,11 +1186,14 @@ def test_activate_layouts_refreshes_a_nested_layouts_stale_hint(qtbot):
     outer = QVBoxLayout(page)
     group = QGroupBox("Group")
     grid = QGridLayout(group)
+    inner = QWidget()
+    inner_layout = QVBoxLayout(inner)
     row = QHBoxLayout()
     combo = QComboBox()
     combo.addItem("one")
     row.addWidget(combo)
-    grid.addLayout(row, 0, 0)
+    inner_layout.addLayout(row)
+    grid.addWidget(inner, 0, 0)
     outer.addWidget(group)
     outer.activate()
     before = page.sizeHint().height()

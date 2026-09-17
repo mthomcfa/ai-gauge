@@ -19,7 +19,9 @@ from aigauge.ratio import RatioEstimate
 from aigauge.ui_style import SCROLLBAR_WIDTH, wheel_step
 from aigauge.widget import (
     NATIVE_GESTURE_COMMIT_MS,
+    RESIZE_BAND,
     UsageWidget,
+    _QT_SIZE_MAX,
     _format_ratio_inline,
     _MetricRow,
     _SummaryChip,
@@ -1249,13 +1251,161 @@ def _drag_corner(widget, dx, dy):
         ((2, 298), Qt.Edge.LeftEdge | Qt.Edge.BottomEdge),
         ((338, 298), Qt.Edge.RightEdge | Qt.Edge.BottomEdge),
         ((170, 150), Qt.Edge(0)),
+        # The band's own width, sampled either side of each of its four
+        # boundaries. Without these the 8 px is not pinned at all: the tests
+        # above sit 2-3 px inside it, so a band one pixel narrower or wider
+        # reads the same.
+        ((RESIZE_BAND - 1, 150), Qt.Edge.LeftEdge),
+        ((RESIZE_BAND, 150), Qt.Edge(0)),
+        ((340 - RESIZE_BAND, 150), Qt.Edge.RightEdge),
+        ((340 - RESIZE_BAND - 1, 150), Qt.Edge(0)),
+        ((170, RESIZE_BAND - 1), Qt.Edge.TopEdge),
+        ((170, RESIZE_BAND), Qt.Edge(0)),
+        ((170, 300 - RESIZE_BAND), Qt.Edge.BottomEdge),
+        ((170, 300 - RESIZE_BAND - 1), Qt.Edge(0)),
     ],
-    ids=["left", "right", "top", "bottom", "tl", "tr", "bl", "br", "middle"],
+    ids=[
+        "left", "right", "top", "bottom", "tl", "tr", "bl", "br", "middle",
+        "l-in", "l-out", "r-in", "r-out", "t-in", "t-out", "b-in", "b-out",
+    ],
 )
 def test_edge_hit_testing_names_all_eight_zones(point, expected):
     from aigauge.widget import _edges_for_point
 
     assert _edges_for_point(QPoint(*point), 340, 300) == expected
+
+
+def _drag(widget, grab, dx, dy):
+    """Drag ``grab`` (widget coordinates) by (dx, dy) through the fallback."""
+    _press(widget, grab)
+    _move_to(widget, widget.mapToGlobal(grab) + QPoint(dx, dy))
+    _release(widget, grab)
+
+
+@pytest.mark.parametrize(
+    "corner,dx,dy",
+    [("left", 50, 0), ("top", 0, 50), ("tl", 50, 40)],
+    ids=["left", "top", "tl"],
+)
+def test_dragging_a_left_or_top_edge_leaves_the_opposite_edge_where_it_was(
+    qtbot, corner, dx, dy
+):
+    """Every resize test before this one dragged the bottom-right corner, so
+    the branches that move the *origin* as well as the size had no coverage at
+    all - and getting them wrong walks the window across the screen instead of
+    resizing it."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_ok_snapshot("claude"), "Claude")
+    widget.setGeometry(200, 200, 400, 300)
+    qtbot.wait(0)
+    before = widget.geometry()
+    grab = {
+        "left": QPoint(2, widget.height() // 2),
+        "top": QPoint(widget.width() // 2, 2),
+        "tl": QPoint(2, 2),
+    }[corner]
+
+    _drag(widget, grab, dx, dy)
+
+    after = widget.geometry()
+    assert after.right() == before.right(), "the right edge walked"
+    assert after.bottom() == before.bottom(), "the bottom edge walked"
+    assert after.width() == before.width() - dx
+    assert after.height() == before.height() - dy
+    assert after.left() == before.left() + dx
+    assert after.top() == before.top() + dy
+
+
+def test_a_left_or_top_drag_stops_at_the_minimum_without_moving_the_far_edge(qtbot):
+    """The clamp and the origin arithmetic together: an unclamped width goes
+    negative, and the left edge is derived from it, so the window would jump
+    off to the right rather than simply stop shrinking."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_ok_snapshot("claude"), "Claude")
+    widget.setGeometry(200, 200, 400, 300)
+    qtbot.wait(0)
+    before = widget.geometry()
+
+    _drag(widget, QPoint(2, 2), 4000, 4000)
+
+    after = widget.geometry()
+    assert (after.width(), after.height()) == (WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
+    assert after.right() == before.right()
+    assert after.bottom() == before.bottom()
+
+
+def test_a_top_drag_stops_at_the_maximum_without_moving_the_bottom(qtbot):
+    """The maximum is the monitor's work area, applied on show. Dragging the
+    top edge upward past it has to stop at the cap *and* leave the bottom
+    where it was - the top is computed from the height, so an unclamped height
+    puts the top far off the top of the screen."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_ok_snapshot("claude"), "Claude")
+    with qtbot.waitExposed(widget):
+        widget.show()
+    geo = (widget.screen() or QApplication.primaryScreen()).availableGeometry()
+    # Parked against the bottom of the work area, so the capped height still
+    # fits above it and the release's own clamp has nothing to move.
+    widget.setGeometry(geo.left() + 100, geo.bottom() - 299, 400, 300)
+    qtbot.wait(0)
+    before = widget.geometry()
+
+    _drag(widget, QPoint(widget.width() // 2, 2), 0, -5000)
+
+    after = widget.geometry()
+    assert after.height() == geo.height(), "the drag ran past the work area"
+    assert after.bottom() == before.bottom(), "the bottom edge walked"
+
+
+def test_a_bottom_right_drag_stops_at_the_work_area(qtbot):
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_ok_snapshot("claude"), "Claude")
+    with qtbot.waitExposed(widget):
+        widget.show()
+    geo = (widget.screen() or QApplication.primaryScreen()).availableGeometry()
+    widget.move(geo.left(), geo.top())
+
+    _drag_corner(widget, 5000, 5000)
+
+    assert widget.width() == geo.width()
+    assert widget.height() == geo.height()
+
+
+def test_the_screen_clamp_shrinks_a_window_that_no_longer_fits(qtbot):
+    """`_clamp_to_visible_screen` on its own. It and `_apply_screen_bounds`'
+    maximum are redundant paths to the same outcome, so the two tests that
+    covered them were satisfied by either one alone - the maximum is lifted
+    here so only the clamp can produce the answer."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget._mark_user_sized()  # noqa: SLF001
+    geo = (widget.screen() or QApplication.primaryScreen()).availableGeometry()
+    widget.setMaximumSize(_QT_SIZE_MAX, _QT_SIZE_MAX)
+    widget.resize(geo.width() + 400, geo.height() + 400)
+    widget.move(geo.right() - 10, geo.bottom() - 10)
+
+    widget._clamp_to_visible_screen()  # noqa: SLF001
+
+    assert (widget.width(), widget.height()) == (geo.width(), geo.height())
+    assert (widget.x(), widget.y()) == (geo.left(), geo.top())
+
+
+def test_the_screen_bounds_cap_the_window_at_the_work_area(qtbot):
+    """`_apply_screen_bounds` on its own: the cap it sets is what stops a
+    window-manager drag, which no clamp of ours ever sees."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    geo = (widget.screen() or QApplication.primaryScreen()).availableGeometry()
+    widget.setMaximumSize(_QT_SIZE_MAX, _QT_SIZE_MAX)
+
+    widget._apply_screen_bounds()  # noqa: SLF001
+
+    assert widget.maximumWidth() == geo.width()
+    assert widget.maximumHeight() == geo.height()
 
 
 def test_a_resize_is_saved_to_config_on_release(qtbot):
