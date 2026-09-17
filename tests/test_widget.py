@@ -1558,6 +1558,42 @@ def test_a_config_that_says_user_sized_keeps_its_size(qtbot):
     assert (widget.width(), widget.height()) == (500, 300)
 
 
+def test_a_deleted_widget_is_not_called_by_a_screen_signal(qtbot):
+    """The connection was a context-free lambda, so it had no receiver and
+    outlived the widget: the next `availableGeometryChanged` from a monitor
+    the widget had once been shown on raised `RuntimeError: wrapped C/C++
+    object of type UsageWidget has been deleted` inside Qt's own emit. Not
+    registered with qtbot - the test deletes it itself."""
+    from PyQt6 import sip
+
+    widget = UsageWidget(Config())
+    with qtbot.waitExposed(widget):
+        widget.show()
+    screen = QApplication.primaryScreen()
+
+    sip.delete(widget)
+    assert sip.isdeleted(widget)
+
+    screen.availableGeometryChanged.emit(screen.availableGeometry())
+
+
+def test_a_screen_plugged_in_later_is_wired_too(qtbot, monkeypatch):
+    """The loop only ever saw the screens present at the first show, and a
+    monitor added afterwards is exactly when the work area the window is
+    bounded by changes."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    with qtbot.waitExposed(widget):
+        widget.show()
+    screen = QApplication.primaryScreen()
+
+    wired: list[object] = []
+    monkeypatch.setattr(widget, "_wire_screen", wired.append)
+    QApplication.instance().screenAdded.emit(screen)
+
+    assert wired == [screen]
+
+
 def test_a_click_raises_settings_but_a_drag_does_not(qtbot):
     """The drag defect: activated_requested used to fire on every press, and
     the App answers it by activating the Settings window - which takes the

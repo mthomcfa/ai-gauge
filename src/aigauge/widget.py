@@ -2309,16 +2309,38 @@ class UsageWidget(QWidget):
 
         The QWindow only exists once the widget has been created, so this runs
         from showEvent rather than __init__, and only once.
+
+        Bound methods, not lambdas. A lambda has no receiver, so PyQt cannot
+        drop the connection when the widget goes: a deleted widget went on
+        being called by its old monitor's signal and raised ``RuntimeError:
+        wrapped C/C++ object of type UsageWidget has been deleted`` inside
+        Qt's own emit. And the loop only ever saw the screens that existed at
+        the first show - a monitor plugged in later was never wired, which is
+        exactly when the work area the window is bounded by can change.
         """
         handle = self.windowHandle()
         if handle is None or self._screen_signals_wired:
             return
         self._screen_signals_wired = True
-        handle.screenChanged.connect(lambda _screen: self._apply_screen_bounds())
+        handle.screenChanged.connect(self._on_screen_changed)
         for screen in QApplication.screens():
-            screen.availableGeometryChanged.connect(
-                lambda _geo: self._apply_screen_bounds()
-            )
+            self._wire_screen(screen)
+        app = QApplication.instance()
+        if app is not None:
+            app.screenAdded.connect(self._on_screen_added)
+
+    def _wire_screen(self, screen) -> None:
+        screen.availableGeometryChanged.connect(self._on_available_geometry_changed)
+
+    def _on_screen_added(self, screen) -> None:
+        self._wire_screen(screen)
+        self._apply_screen_bounds()
+
+    def _on_screen_changed(self, _screen) -> None:
+        self._apply_screen_bounds()
+
+    def _on_available_geometry_changed(self, _geometry) -> None:
+        self._apply_screen_bounds()
 
     def showEvent(self, event):  # noqa: N802
         # A DPI/scale or monitor change can happen while the widget is hidden;
