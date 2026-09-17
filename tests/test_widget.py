@@ -1586,8 +1586,15 @@ def test_a_window_manager_drag_is_written_once_when_its_events_stop(qtbot, monke
     config = Config()
     widget = UsageWidget(config)
     qtbot.addWidget(widget)
+    with qtbot.waitExposed(widget):
+        widget.show()
     widget._mark_user_sized()  # noqa: SLF001
     assert widget._geometry_commit.isSingleShot()  # noqa: SLF001
+    # The claim is a band, not the constant: a debounce short enough to fire
+    # inside a gesture, or long enough to lose the geometry to a crash, is a
+    # different design. Asserting `interval() == NATIVE_GESTURE_COMMIT_MS`
+    # alone cannot fail, whatever the constant is changed to.
+    assert 500 <= NATIVE_GESTURE_COMMIT_MS <= 3000
     assert widget._geometry_commit.interval() == NATIVE_GESTURE_COMMIT_MS  # noqa: SLF001
     # The same timer, wound down so the test does not sit out a second.
     widget._geometry_commit.setInterval(1)  # noqa: SLF001
@@ -1596,10 +1603,10 @@ def test_a_window_manager_drag_is_written_once_when_its_events_stop(qtbot, monke
     monkeypatch.setattr(Config, "save", lambda self: saves.append(1))
 
     widget._native_gesture = True  # startSystemResize returned True  # noqa: SLF001
-    before = widget.size()
     for step in range(20):
+        # A shown widget gets its resize event inside the call, which is how
+        # a window manager's own resize arrives: nothing the app asked for.
         widget.resize(360 + step, 240 + step)
-        widget.resizeEvent(QResizeEvent(widget.size(), before))
     assert saves == [], "the drag itself wrote to the file"
 
     qtbot.waitUntil(lambda: bool(saves), timeout=3000)
@@ -1610,6 +1617,112 @@ def test_a_window_manager_drag_is_written_once_when_its_events_stop(qtbot, monke
         widget.height(),
     )
     assert widget._native_gesture is False  # noqa: SLF001
+
+
+def test_a_native_resize_that_never_moved_does_not_end_auto_fit(qtbot, monkeypatch):
+    """A press in the 8 px band that the window manager accepts, and a release
+    the user makes without moving.
+
+    ``startSystemResize`` returns True on Windows, macOS and X11 and False
+    offscreen, which is why the suite had only ever seen the fallback. On the
+    native path the window manager keeps the release, so a motionless gesture
+    produces no event at all: the two flags the press set stayed set for the
+    life of the window, and the next resize the *app* made - an auto-fit
+    growth when a second provider arrives - was read as the user taking the
+    size over, written to disk as their size, and auto-fit was off for good.
+    """
+    config = Config()
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_ok_snapshot("claude"), "Claude")
+    with qtbot.waitExposed(widget):
+        widget.show()
+    qtbot.wait(0)
+    handle = widget.windowHandle()
+    monkeypatch.setattr(handle, "startSystemResize", lambda _edges: True)
+    # The same debounce, wound down so the test does not sit out a second.
+    widget._geometry_commit.setInterval(1)  # noqa: SLF001
+    fitted = widget.height()
+
+    _press(widget, QPoint(2, widget.height() // 2))
+    assert widget._native_resize is True, "the native branch was not taken"  # noqa: SLF001
+
+    # No move and no release: the window manager took the pointer and the user
+    # let go. The debounce armed by the press is the only thing that can end it.
+    qtbot.waitUntil(lambda: not widget._native_resize, timeout=3000)  # noqa: SLF001
+    assert widget._native_gesture is False  # noqa: SLF001
+    assert widget._user_sized is False  # noqa: SLF001
+
+    widget.update_snapshot(_ok_snapshot("codex"), "Codex")
+    # The re-fit is deferred to the next turn and a shown window needs its
+    # layout back before the hint grows, so this waits for the answer rather
+    # than reading one turn after asking.
+    qtbot.waitUntil(lambda: widget.height() > fitted, timeout=3000)
+    assert widget._user_sized is False  # noqa: SLF001
+    assert Config.load().window.user_sized is False, "the file says the user sized it"
+
+
+def test_a_window_manager_resize_marks_the_window_user_sized(qtbot):
+    """The native half of the rule, and the half every real desktop takes.
+
+    Offscreen ``startSystemResize`` returns False, so only the pure-Qt
+    fallback was covered: nothing asserted that a size change the window
+    manager delivers - the only thing that comes back from such a drag - is
+    the user taking the size over. A resize event carrying no size change is
+    not: the window manager sends one whenever it has re-laid the window out.
+    """
+    config = Config()
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_ok_snapshot("claude"), "Claude")
+    with qtbot.waitExposed(widget):
+        widget.show()
+    qtbot.wait(0)
+    widget._native_gesture = True  # what a press the WM accepted leaves  # noqa: SLF001
+    widget._native_resize = True  # noqa: SLF001
+    assert widget._user_sized is False  # noqa: SLF001
+
+    widget.resizeEvent(QResizeEvent(widget.size(), widget.size()))
+    assert widget._user_sized is False, "a zero-delta resize chose a size"  # noqa: SLF001
+
+    # A shown widget gets its resize event inside the call, which is how the
+    # window manager's own arrives: a size change the app did not ask for.
+    widget.resize(widget.width() + 40, widget.height() + 30)
+
+    assert widget._user_sized is True  # noqa: SLF001
+    assert config.window.user_sized is True
+
+
+def test_an_app_resize_neither_marks_the_window_nor_arms_the_debounce(qtbot):
+    """Auto-fit, with the native flags left stale behind it.
+
+    Qt delivers the resize the app asked for exactly as it delivers the window
+    manager's, so the two were told apart only by a flag that nothing reliably
+    cleared. Every app-initiated geometry change now runs behind a depth
+    counter: an event that arrives with it above zero chooses no size and
+    starts no commit timer - otherwise every auto-fit growth would end in a
+    write and a re-clamp a second later.
+    """
+    config = Config()
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_ok_snapshot("claude"), "Claude")
+    with qtbot.waitExposed(widget):
+        widget.show()
+    qtbot.wait(0)
+    widget._native_gesture = True  # noqa: SLF001
+    widget._native_resize = True  # noqa: SLF001
+    widget._geometry_commit.stop()  # noqa: SLF001
+    before = widget.height()
+
+    widget.update_snapshot(_ok_snapshot("codex"), "Codex")
+    qtbot.waitUntil(lambda: widget.height() > before, timeout=3000)
+
+    assert widget._user_sized is False, "an app resize took the size over"  # noqa: SLF001
+    assert config.window.user_sized is False
+    assert (  # noqa: SLF001
+        widget._geometry_commit.isActive() is False
+    ), "an app resize armed the commit debounce"
 
 
 def test_a_hide_that_changed_nothing_writes_nothing(qtbot, monkeypatch):

@@ -59,11 +59,25 @@ user sees.
   file has no such key, which is the right answer - False - and its width is
   still restored. It is set by a resize that **changed the size**: in the
   fallback path on the first delta that moves an edge, and on the native path
-  on the first `resizeEvent` the window manager's drag produces. It used to be
-  set on the *press*, so one motionless click 1 px inside the 8 px band ended
-  auto-fit for good and the release wrote that size to disk. Like the other
-  bounded window fields it is coerced rather than trusted: anything that is
-  not a real bool reads as False.
+  on the first `resizeEvent` the window manager's drag produces that changes
+  the size. It used to be set on the *press*, so one motionless click 1 px
+  inside the 8 px band ended auto-fit for good and the release wrote that size
+  to disk. Like the other bounded window fields it is coerced rather than
+  trusted: anything that is not a real bool reads as False.
+
+  **Which resize is the user's is recorded, not inferred.** Qt delivers the
+  move or resize the app asks for itself exactly as it delivers the window
+  manager's, so auto-fit, the collapse/expand height restore, the screen
+  clamp, the work-area cap and the macOS popover anchor all run behind a depth
+  counter, and an event that arrives with it above zero chooses no size and
+  arms no write. Without it a motionless click in the band was still fatal on
+  the native path: `startSystemResize` returns True there, the window manager
+  keeps the release, and a gesture the user ends without moving produces no
+  event at all - so the flags the press set stayed set for the life of the
+  window and the next auto-fit growth was written back as the size the user
+  chose. The press now starts the same one-second debounce, which is what ends
+  such a gesture; offscreen `startSystemResize` returns False, so the test for
+  it patches the `QWindow` to return True the way every real desktop does.
 
   **The geometry is written back from one seam, `_commit_geometry()`**, and
   everything that can end a gesture reaches it: the mouse release, a hide (the

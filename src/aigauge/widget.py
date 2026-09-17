@@ -1524,6 +1524,20 @@ class UsageWidget(QWidget):
         # Narrower: the WM is running a *resize*, so the next resizeEvent is
         # the user changing the size and not the app fitting itself.
         self._native_resize = False
+        # How many app-initiated geometry changes are on the stack. Qt
+        # delivers the move or resize the app asks for itself exactly as it
+        # delivers the window manager's, so "was this the user?" has to be
+        # recorded rather than inferred: every geometry call the app makes on
+        # its own window goes through `_app_geometry`, and an event arriving
+        # with this above zero is the app's own and marks nothing.
+        self._app_geometry_depth = 0
+        # Created here rather than beside the rest of the window state,
+        # because it is armed from moveEvent/resizeEvent and the geometry the
+        # constructor restores below can deliver one.
+        self._geometry_commit = QTimer(self)
+        self._geometry_commit.setSingleShot(True)
+        self._geometry_commit.setInterval(NATIVE_GESTURE_COMMIT_MS)
+        self._geometry_commit.timeout.connect(self._commit_after_native_gesture)
         # The height to come back to when the chip strip is expanded again;
         # seeded from the restored geometry at the end of __init__, because a
         # widget that starts collapsed never passes through set_collapsed.
@@ -1698,9 +1712,9 @@ class UsageWidget(QWidget):
         # The saved size, bounded by WindowState; the monitor's work area is
         # applied on top of it at show time, because only then is it known
         # which monitor that is.
-        self.resize(QSize(config.window.width, config.window.height))
+        self._app_geometry(self.resize, QSize(config.window.width, config.window.height))
         if config.window.x is not None and config.window.y is not None:
-            self.move(QPoint(config.window.x, config.window.y))
+            self._app_geometry(self.move, QPoint(config.window.x, config.window.y))
         self._clamp_to_visible_screen()
 
         # Drag-by-anywhere
@@ -1713,10 +1727,6 @@ class UsageWidget(QWidget):
         # What the file already says, so a hide or a close that changed
         # nothing does not rewrite it.
         self._committed_geometry = self._geometry_state()
-        self._geometry_commit = QTimer(self)
-        self._geometry_commit.setSingleShot(True)
-        self._geometry_commit.setInterval(NATIVE_GESTURE_COMMIT_MS)
-        self._geometry_commit.timeout.connect(self._commit_after_native_gesture)
         self._apply_collapsed_state(save=False)
         self._track_hover()
 
@@ -1888,7 +1898,7 @@ class UsageWidget(QWidget):
                 ),
             )
             if self.height() != target_height:
-                self.resize(self.width(), target_height)
+                self._app_geometry(self.resize, self.width(), target_height)
             return
         self._track_hover()
         if self._user_sized:
@@ -1909,7 +1919,7 @@ class UsageWidget(QWidget):
         self._tile_scroll.setFixedHeight(min(tile_height, max_tile_height))
         target_height = _autofit_height(header_height + self._tile_scroll.height())
         if target_height != self.height():
-            self.resize(self.width(), target_height)
+            self._app_geometry(self.resize, self.width(), target_height)
 
 
     def set_refreshing(self, refreshing: bool, *, total: int | None = None) -> None:
@@ -2165,19 +2175,19 @@ class UsageWidget(QWidget):
         if self._collapsed:
             # A chip strip is one row tall and says so; only its width is the
             # user's. The vertical maximum is released again on expand.
-            self.setMinimumHeight(COLLAPSED_MIN_HEIGHT)
-            self.setMaximumHeight(WINDOW_AUTOFIT_MAX_HEIGHT)
+            self._app_geometry(self.setMinimumHeight, COLLAPSED_MIN_HEIGHT)
+            self._app_geometry(self.setMaximumHeight, WINDOW_AUTOFIT_MAX_HEIGHT)
             self._do_refit_height()
         else:
-            self.setMinimumHeight(WINDOW_MIN_HEIGHT)
-            self.setMaximumHeight(_QT_SIZE_MAX)
+            self._app_geometry(self.setMinimumHeight, WINDOW_MIN_HEIGHT)
+            self._app_geometry(self.setMaximumHeight, _QT_SIZE_MAX)
             # Back to the height the window had before it became a strip -
             # after the maximum is released, because the collapsed one is 420.
             # Only on the way out of a collapse: every other caller is
             # re-applying a state the window is already in. Auto-fit overrides
             # it a tick later on a window the user has never sized.
             if restore_height and self._expanded_height:
-                self.resize(self.width(), self._expanded_height)
+                self._app_geometry(self.resize, self.width(), self._expanded_height)
             self._apply_screen_bounds()
             self._refit_height()
         if save:
@@ -2266,7 +2276,7 @@ class UsageWidget(QWidget):
         width = min(self.width(), geo.width())
         height = min(self.height(), geo.height())
         if width != self.width() or height != self.height():
-            self.resize(width, height)
+            self._app_geometry(self.resize, width, height)
         pos = self.pos()
         # geo.right()/bottom() are inclusive, so the last fully-visible top-left
         # is right - width + 1 (clamped below left/top for tiny screens).
@@ -2275,7 +2285,7 @@ class UsageWidget(QWidget):
         x = max(geo.left(), min(pos.x(), max_x))
         y = max(geo.top(), min(pos.y(), max_y))
         if x != pos.x() or y != pos.y():
-            self.move(x, y)
+            self._app_geometry(self.move, x, y)
 
     def _current_screen(self):
         return (
@@ -2299,8 +2309,10 @@ class UsageWidget(QWidget):
         if screen is None:
             return
         geo = screen.availableGeometry()
-        self.setMaximumSize(
-            max(WINDOW_MIN_WIDTH, geo.width()), max(WINDOW_MIN_HEIGHT, geo.height())
+        self._app_geometry(
+            self.setMaximumSize,
+            max(WINDOW_MIN_WIDTH, geo.width()),
+            max(WINDOW_MIN_HEIGHT, geo.height()),
         )
         self._clamp_to_visible_screen()
 
@@ -2388,7 +2400,7 @@ class UsageWidget(QWidget):
             target_x = max(
                 geo.left() + 4, min(target_x, geo.right() - self.width() - 4)
             )
-        self.move(target_x, anchor_global_y + 4)
+        self._app_geometry(self.move, target_x, anchor_global_y + 4)
         self.show()
         self.raise_()
         self.activateWindow()
@@ -2469,6 +2481,12 @@ class UsageWidget(QWidget):
                 self._resize_edges = Qt.Edge(0)
                 self._native_gesture = True
                 self._native_resize = True
+                # The window manager keeps the release, and a gesture the user
+                # ends without moving produces no event at all - so the flags
+                # were left armed for the life of the window and the next
+                # auto-fit growth was read as the user taking the size over.
+                # Starting the debounce here is what ends such a gesture.
+                self._geometry_commit.start()
             else:
                 self._resize_edges = edges
                 self._resize_origin = event.globalPosition().toPoint()
@@ -2644,14 +2662,42 @@ class UsageWidget(QWidget):
         self._committed_geometry = state
         self._config.save()
 
+    def _app_geometry(self, call, *args) -> None:
+        """Run a geometry change the *app* asked for, behind the depth guard.
+
+        Auto-fit, the collapse/expand restore, the screen clamp, the work-area
+        cap and the macOS popover anchor all move or resize this window, and Qt
+        hands the resulting ``moveEvent``/``resizeEvent`` to us exactly as it
+        hands over the window manager's. Without this the two were
+        indistinguishable, and a stale ``_native_resize`` - which a motionless
+        click in the resize band left set for the life of the window - turned
+        the next auto-fit growth into "the user chose this size", wrote it to
+        disk and ended auto-fit for good.
+        """
+        self._app_geometry_depth += 1
+        try:
+            call(*args)
+        finally:
+            self._app_geometry_depth -= 1
+
+    def _is_user_geometry(self) -> bool:
+        """Whether a geometry event just delivered could be the user's.
+
+        Two things say it is not: the app is inside its own geometry call, or
+        the window is not on screen - a ``resize()`` on a hidden widget is
+        *posted* and arrives on the next ``show()``, long after whoever asked
+        for it has returned.
+        """
+        return self._app_geometry_depth == 0 and self.isVisible()
+
     def _arm_geometry_commit(self) -> None:
         """Re-start the debounce, but only while the WM owns the gesture.
 
         Every other resize - auto-fit, a collapse, the screen clamp - is the
         app moving its own window and is saved (or deliberately not) by
-        whatever asked for it.
+        whatever asked for it, which is what `_is_user_geometry` reads.
         """
-        if self._native_gesture:
+        if self._native_gesture and self._is_user_geometry():
             self._geometry_commit.start()
 
     def _commit_after_native_gesture(self) -> None:
@@ -2668,9 +2714,18 @@ class UsageWidget(QWidget):
 
     def resizeEvent(self, event):  # noqa: N802
         super().resizeEvent(event)
-        if self._native_resize:
+        if (
+            self._native_resize
+            and self._is_user_geometry()
+            and event.size() != event.oldSize()
+        ):
             # The native half of the same rule: the window manager owns the
             # drag, so its first size change is the user taking the size over.
+            # All three tests matter. `_native_resize` says a WM resize may be
+            # in flight; `_is_user_geometry()` says this event is not one the
+            # app asked for itself, which is what a stale flag used to make
+            # indistinguishable; and a zero-delta resize has changed no size
+            # for anyone to have chosen.
             self._mark_user_sized()
         self._arm_geometry_commit()
 
