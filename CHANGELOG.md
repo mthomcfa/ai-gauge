@@ -151,11 +151,17 @@ user sees.
   On the macOS runner the same label takes one more line at 584 than at 594
   (505 px against 493), which is what measuring at the wider width missed. A
   page whose own minimum is wider than the viewport is laid out at that
-  minimum and clipped, horizontal scrolling being off, so it is measured
-  there - and the dialog's width, 620 by default, grows to the widest page's
-  minimum plus the same chrome, up to the work area - which is how the Windows
-  runner's fonts, a third wider than Linux's (General 612 px against 454), get
-  a dialog as wide as its pages need rather than one that clips them.
+  minimum and clipped, so it is measured there - and the dialog's width, 620
+  by default, grows to the widest page's minimum plus the same chrome, up to
+  the work area - which is how the Windows runner's fonts, a third wider than
+  Linux's (General 612 px against 454), get a dialog as wide as its pages need
+  rather than one that clips them. **The floor the user may drag to is the
+  same rule**, not the bare 560: at 560 on those fonts a page lost its
+  right-hand 46-80 px with the range sitting in a bar the policy hid. And the
+  pages' horizontal bars are `ScrollBarAsNeeded` like their vertical ones -
+  `AlwaysOff` never made a page fit, it only hid the evidence - so on a work
+  area narrower than a page, where the floor has to give way to the screen,
+  the rest of the page is still reachable.
   And it is read only after every layout under the dialog has been activated,
   deepest first. A widget's `updateGeometry()` reaches only its parent's
   top-level layout, a hidden widget drops the `LayoutRequest`, and the nested

@@ -310,10 +310,13 @@ def _build_stylesheet() -> str:
 
 
 # The dialog's own geometry. 620 wide by default, or as much wider as the
-# widest page's minimum needs: horizontal scrolling is off, so a page wider
-# than the viewport is clipped, and on the Windows runner's fonts General's
-# minimum is 612 px against 454 offscreen on Linux. 560 stays the floor a
-# user may shrink to. Height is no longer a guess - see _dialog_height.
+# widest page's minimum needs: on the Windows runner's fonts General's minimum
+# is 612 px against 454 offscreen on Linux. 560 is the *smallest* floor a user
+# may shrink to; the real floor is that same widest-page rule, so a user cannot
+# drag the dialog to a width at which a page is clipped. Both are bounded by
+# the work area - on a screen narrower than a page the floor gives way and the
+# page's horizontal scroll bar takes over. Height is no longer a guess - see
+# _dialog_height.
 _DIALOG_DEFAULT_W = 620
 _DIALOG_MIN_W = 560
 _DIALOG_MIN_H = 420
@@ -1422,7 +1425,15 @@ class SettingsDialog(QDialog):
         scroll.setObjectName(f"{title.lower()}_scroll")
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # Both axes as-needed. Horizontal used to be AlwaysOff, which does not
+        # make a page fit - it hides the bar and leaves the page clipped, with
+        # the range sitting there unreachable: measured, a dialog dragged to
+        # its 560 floor clipped Claude by 46 px with hmax=46 and no bar. The
+        # width rule now keeps that from happening where the screen allows it,
+        # and where it does not - a work area narrower than a page - this is
+        # what shows the rest. The widget's tile area got the same treatment
+        # in this release, for the same reason.
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         scroll.setWidget(page)
@@ -1514,8 +1525,13 @@ class SettingsDialog(QDialog):
         # Clamped against the screen as well: at 200% display scale the work
         # area is 400 px high and an un-shrinkable 560x420 minimum is a dialog
         # whose OK button cannot be reached.
+        #
+        # The *width* floor is the same widest-page rule as the default, so a
+        # user cannot drag the dialog narrower than its pages need wherever the
+        # screen allows it; on a screen that does not, the work area wins and
+        # the pages' horizontal bars take the rest.
         self.setMinimumSize(
-            min(_DIALOG_MIN_W, available.width()),
+            min(max(_DIALOG_MIN_W, pages_min_w + horizontal_chrome), available.width()),
             min(_DIALOG_MIN_H, available.height()),
         )
         self.resize(width, height)

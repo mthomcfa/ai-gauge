@@ -833,9 +833,11 @@ def test_every_tab_page_scrolls(qtbot):
         page = tabs.widget(i)
         assert isinstance(page, QScrollArea), tabs.tabText(i)
         assert page.widgetResizable()
+        # Both axes as-needed. AlwaysOff on the horizontal did not make a
+        # page fit - it hid the bar and left the page clipped with the range
+        # unreachable.
         assert (
-            page.horizontalScrollBarPolicy()
-            == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            page.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
         assert (
             page.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAsNeeded
@@ -969,14 +971,17 @@ def test_the_default_width_fits_the_widest_page(qtbot, monkeypatch):
     """
 
     def every_page_fits(dialog: SettingsDialog) -> None:
-        available = dialog.screen().availableGeometry().width()
         tabs = _tabs(dialog)
         for i in range(tabs.count()):
             tabs.setCurrentIndex(i)
             qtbot.wait(0)
             scroll = tabs.widget(i)
             clipped = scroll.widget().width() > scroll.viewport().width()
-            assert not clipped or dialog.width() >= available, (
+            # No exemption for the work-area bound any more: where the screen
+            # is what stops the dialog from being wide enough, the page's own
+            # horizontal bar has to carry the rest. Clipped with no bar is the
+            # one answer that is never allowed.
+            assert not clipped or scroll.horizontalScrollBar().maximum() > 0, (
                 tabs.tabText(i),
                 dialog._height_terms,
             )
@@ -999,6 +1004,56 @@ def test_the_default_width_fits_the_widest_page(qtbot, monkeypatch):
     with qtbot.waitExposed(dialog):
         dialog.show()
     every_page_fits(dialog)
+
+
+def test_no_page_is_clipped_at_the_dialog_floor(qtbot, monkeypatch):
+    """The floor a user can drag to is the same widest-page rule as the
+    default, so the 560 constant can no longer put a page 50-80 px off the
+    right-hand edge - which is what it did on the Windows fonts, where
+    General's minimum is 612: measured at 480, Claude clipped by 46 px with
+    the range sitting there and the bar policy hiding it.
+
+    The constant is forced below the rule in the second half, because
+    offscreen on Linux every page's minimum already fits inside 560 and the
+    rule would otherwise never engage here.
+    """
+
+    def nothing_is_clipped_at_the_floor(dialog: SettingsDialog) -> None:
+        available = dialog.screen().availableGeometry().width()
+        tabs = _tabs(dialog)
+        dialog.resize(dialog.minimumWidth(), dialog.height())
+        qtbot.wait(0)
+        for i in range(tabs.count()):
+            tabs.setCurrentIndex(i)
+            qtbot.wait(0)
+            scroll = tabs.widget(i)
+            bar = scroll.horizontalScrollBar()
+            if dialog.minimumWidth() < available:
+                assert bar.maximum() == 0, (tabs.tabText(i), scroll.widget().width())
+            else:
+                # A work area narrower than the pages need: the floor gave way
+                # to the screen, and the bar is what makes the rest reachable.
+                assert (
+                    scroll.widget().width() <= scroll.viewport().width()
+                    or bar.maximum() > 0
+                ), tabs.tabText(i)
+
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    with qtbot.waitExposed(dialog):
+        dialog.show()
+    nothing_is_clipped_at_the_floor(dialog)
+
+    monkeypatch.setattr(settings_dialog, "_DIALOG_MIN_W", 300)
+    narrow = SettingsDialog(Config())
+    qtbot.addWidget(narrow)
+    available = narrow.screen().availableGeometry().width()
+    assert narrow.minimumWidth() > min(300, available), (
+        "the floor ignored the widest page"
+    )
+    with qtbot.waitExposed(narrow):
+        narrow.show()
+    nothing_is_clipped_at_the_floor(narrow)
 
 
 def test_page_height_measures_at_the_pages_own_minimum_when_wider(qtbot):
