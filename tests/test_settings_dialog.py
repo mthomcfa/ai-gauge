@@ -2,7 +2,8 @@ import sys
 import warnings
 
 import pytest
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QRect, Qt
+from PyQt6.QtGui import QScreen
 from PyQt6.QtWidgets import QPushButton
 
 from aigauge import settings_dialog
@@ -914,6 +915,36 @@ def test_microsoft_scrolls_at_the_default_size_and_general_does_not(qtbot):
 
     assert ranges["Microsoft"] > 0, ranges
     assert ranges["General"] == 0, ranges
+
+
+def test_the_dialog_and_its_floor_stay_inside_a_narrow_work_area(qtbot, monkeypatch):
+    """Both the size and the floor the user may drag to are the widest page's
+    rule bounded by the work area. On a screen narrower than a page the work
+    area has to win and the page's own horizontal bar takes the rest -
+    otherwise the dialog opens wider than the desktop with an OK button that
+    cannot be reached. An offscreen run has one 800 x 800 screen, so the work
+    area is forced and the page rule is forced past it."""
+    work_area = QRect(0, 0, 420, 700)
+    monkeypatch.setattr(QScreen, "availableGeometry", lambda self: work_area)
+    # The widest-page rule, forced wider than that screen. Both the default
+    # and the floor take it, and both are bounded by the same `min`.
+    monkeypatch.setattr(settings_dialog, "_DIALOG_DEFAULT_W", 2000)
+    monkeypatch.setattr(settings_dialog, "_DIALOG_MIN_W", 2000)
+
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+
+    assert dialog.width() <= work_area.width(), dialog._height_terms
+    assert dialog.minimumWidth() <= work_area.width(), dialog.minimumSize()
+    with qtbot.waitExposed(dialog):
+        dialog.show()
+    qtbot.wait(0)
+    assert dialog.width() <= work_area.width(), dialog._height_terms
+    # And the dialog can still be dragged down to that floor, which is the
+    # point of bounding it: a minimum wider than the screen is unshrinkable.
+    dialog.resize(work_area.width(), dialog.height())
+    qtbot.wait(0)
+    assert dialog.width() <= work_area.width()
 
 
 def test_the_default_size_tracks_the_general_page(qtbot):

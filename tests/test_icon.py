@@ -8,7 +8,9 @@ decoded pixels, and the flat colours exactly.
 from __future__ import annotations
 
 import operator
+import os
 import struct
+import subprocess
 import sys
 from pathlib import Path
 
@@ -242,3 +244,50 @@ def test_the_build_output_directories_stay_ignored():
     assert "dist/" in ignored
     assert "build/" in ignored
     assert not any(line.strip().startswith("assets") for line in ignored)
+
+
+def test_the_generator_asks_for_no_bytecode_before_it_imports_the_app(monkeypatch):
+    """`_band_colors()` imports `aigauge.config` so the icon's bands and the
+    tiles' cannot drift, and without the flag that import left five `.pyc`
+    files under `src/` - from a tool whose job is to write four assets. The
+    README says the script writes nothing but those four files; nothing
+    enforced it."""
+    monkeypatch.setattr(make_icon, "_BAND_CACHE", None)
+    monkeypatch.setattr(sys, "dont_write_bytecode", False)
+
+    make_icon._band_colors()
+
+    assert sys.dont_write_bytecode is True
+
+
+def test_the_flag_is_set_before_any_aigauge_module_is_imported():
+    """The order is the guarantee: a flag set after the import is a flag set
+    after the `.pyc` has been written. Read in a subprocess, because this one
+    imported `aigauge` long before the generator was asked for anything."""
+    probe = (
+        "import sys\n"
+        "sys.dont_write_bytecode = False\n"
+        f"sys.path.insert(0, {str(REPO_ROOT / 'tools')!r})\n"
+        "import make_icon\n"
+        "before = (sys.dont_write_bytecode,\n"
+        "          any(m == 'aigauge' or m.startswith('aigauge.') for m in sys.modules))\n"
+        "make_icon._band_colors()\n"
+        "print(before[0], before[1], sys.dont_write_bytecode,\n"
+        "      'aigauge.config' in sys.modules)\n"
+    )
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, result.stderr
+    flag_before, aigauge_before, flag_after, imported = result.stdout.split()[-4:]
+    assert flag_before == "False", "importing the module alone asked for it"
+    assert aigauge_before == "False", "the module pulls in aigauge at import time"
+    assert imported == "True", "_band_colors() never imported aigauge.config"
+    assert flag_after == "True", "the import ran without the flag"
