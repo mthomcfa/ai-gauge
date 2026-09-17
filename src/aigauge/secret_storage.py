@@ -22,9 +22,9 @@ import logging
 import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
+from .atomic_write import atomic_write
 from .config import app_data_dir
 
 log = logging.getLogger("aigauge.secret_storage")
@@ -172,48 +172,11 @@ def _load_all() -> dict[str, str]:
         return {}
 
 
-def _atomic_write(
-    path: Path,
-    payload: bytes,
-    *,
-    mode: int | None = None,
-    prefix: str = ".secrets-",
-) -> None:
-    """Write ``payload`` to ``path`` atomically via a same-dir temp + os.replace.
-
-    A crash or concurrent read can never observe a half-written secrets file:
-    readers see either the old file or the complete new one. When ``mode`` is
-    given the temp file is created with it before any bytes are written, so the
-    payload is never briefly world-readable.
-
-    ``prefix`` names the temp file, so a leftover says which caller left it.
-    """
-    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=prefix, suffix=".tmp")
-    tmp = Path(tmp_name)
-    try:
-        # Own the fd through the with-block so it is closed exactly once on every
-        # path. fchmod on the open descriptor (rather than chmod on the name
-        # before fdopen) avoids leaking the fd if setting the mode fails.
-        with os.fdopen(fd, "wb") as handle:
-            if mode is not None:
-                # Windows has no os.fchmod. The Windows secrets path asks for
-                # no mode, so this was unreachable there - but the guard
-                # belongs with the call, not in every caller: the first one to
-                # forget got an AttributeError instead of a file.
-                if hasattr(os, "fchmod"):
-                    os.fchmod(handle.fileno(), mode)
-                else:
-                    os.chmod(tmp, mode)
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        raise
+# Moved to `atomic_write.py` when `config.json` became its third caller: this
+# module's import pulls in ctypes.wintypes and subprocess, and `config` cannot
+# import it at all - `secret_storage` imports `config`. Kept under the old
+# private name because the meter catalog and the tests reach for it here.
+_atomic_write = atomic_write
 
 
 def _icacls_path() -> str:

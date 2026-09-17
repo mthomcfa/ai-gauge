@@ -3,6 +3,13 @@
 State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#16,
 610 tests passing, all five providers reading.
 
+> **Updated 2026-09-16** by the REST-deadline follow-up (`1.3.2+cfa.7`,
+> 1 859 tests), which closed the three residuals that release left in
+> [§8.3](#83-known-soft-spots-in-what-was-built): the unbounded REST socket,
+> the non-atomic `Config.save()`, and what `SECURITY.md` did not say about
+> "Clear all browser data". It also gave the egress guard's glob-side case
+> fold the test that mutation S6a walked through ([§9](#9-delegating-to-opencode--evaluated-guarded-not-adopted)).
+>
 > **Updated 2026-09-15** by the hardening follow-up (`1.3.1+cfa.6`,
 > 1 277 tests), which closed most of what the refresh-cadence work left in
 > [§8.3](#83-known-soft-spots-in-what-was-built): the REST park, the
@@ -705,13 +712,177 @@ unnecessary source of behaviour change.
   workers - one an hour per provider instead of one every few minutes - not
   the wedged worker itself.
 
-  **What is left is option (a): a total-response deadline on the REST
-  side** - `stream=True` plus an elapsed check while reading - which is the
-  only one that actually bounds the socket, and the only one that frees a
-  worker already stuck. (b), a dedicated `QThreadPool` per provider, is
-  still available as containment and still does not free anything. (d), a
-  busy flag on the provider, is now moot: the park does that job from the
+  **Option (a) was taken in 1.3.2+cfa.7: a total-response deadline on the
+  REST side** - `providers/_http.py`, `stream=True` plus an elapsed check
+  and a byte count while reading, *and* a `threading.Timer` armed with the
+  same deadline that shuts the connection's socket down from another thread.
+  It is the only one of the four that bounds the socket, and the only one
+  that frees a worker already stuck. The bound covers **connect, headers and
+  body** - everything from the socket onwards, name resolution excepted (see
+  below): the in-band check cannot see inside one read, and two phases live
+  there - the header block (every arriving byte resets the per-socket
+  timeout, and `bounded_request`'s own clock is not reached until the headers
+  are complete) and a `Content-Encoding` body that decodes to nothing
+  (urllib3's `read1` loops internally until the decoder yields). Both were
+  found by the round-1 reviews after the first cut of this release shipped
+  with the check only, and both are the same failure the release exists to
+  remove, one protocol phase earlier. The socket shutdown is the only thing
+  that reaches a thread blocked in `recv`; urllib3's `Timeout(total=…)` does
+  not (it clamps the value of the per-read timeout, which every byte resets -
+  measured, a 30 s header drip returned at 30.01 s against a 3 s total). The
+  connection is learned by mounting a small `HTTPAdapter` subclass on a
+  `Session` built for the one call, which also keeps the property
+  `requests.request` had: no pool, cookie jar or connection across refreshes.
+
+  One call now returns or raises by `max(connect, total_seconds) + read`,
+  which is 45 s at a 15 s timeout and 40 s at a 10 s one; a whole refresh is
+  130 s for Copilot, 135 s for OpenRouter and 495 s for Azure, and each
+  provider tells the App that number. The formula did not move when the timer
+  landed - `total_seconds` is the larger term at every timeout here, so the
+  bound is `total_seconds + read`, and the `+ read` is the one read the cut
+  socket can leave in flight. A timer that fires before the socket exists
+  cannot cut anything, so it **re-arms every 0.25 s until the call ends**
+  rather than giving up: the first cut of this release gave up there, and a
+  resolver slower than the deadline then left the status line, the header
+  block and the body bounded by nothing again (measured at the scaled
+  constants: 40 s and 70 s against a 4.0 s bound, ended by the harness rather
+  than by the app, and 3.75 s once the timer looks again). The third review
+  found the same hole one layer along, on the path every production host
+  uses: for the whole of a **TLS handshake** the object urllib3 keeps in
+  `conn.sock` is the plain socket, which `ssl.wrap_socket` detaches before
+  the handshake runs, so `shutdown()` on it raises EBADF - and that branch
+  swallowed the error and did not look again, which gave the deadline away
+  for the rest of the call. Measured over real TLS against a 12.0 s bound: a
+  deadline landing inside the handshake 23.0 s, a re-arm landing there after
+  a slow resolve 22.5 s, and one dripped header line unbounded - still inside
+  the call at the harness's give-up - against 3.25 s and 2.56 s now that the
+  EBADF looks again too. A timer that cannot be *started* at all - the
+  process is out of threads - is the one remaining way the bound can go: the
+  first arm now refuses the call with `DeadlineUnavailable` rather than
+  letting a bare `RuntimeError` past every caller's `except
+  requests.RequestException`, and a failed re-arm writes
+  `provider http deadline_rearm_failed=True` and marks the deadline instead
+  of dying in `threading.excepthook`. The mark is not the bound back: it
+  bites at the next in-band check, and a call already stalled in a header
+  read never reaches one, so that call stays unbounded - measured, still
+  inside it at a 14 s give-up against a 4.0 s bound. What changed there is
+  that it is no longer silent. What the bound
+  does **not** cover is name resolution: `getaddrinfo` runs before any socket
+  exists, so neither the connect timeout nor the timer reaches it and the OS
+  resolver's own timeout is what ends it - added to the 45 s rather than
+  counted inside it, through plain `requests` just the same (a resolver
+  blocking 20 s held both for 20.00 s against a 4.0 s bound). The App
+  watchdog is the backstop there and not a fix: it ends the App's wait, and
+  the worker stays in `getaddrinfo` until the resolver gives up; the real
+  answer is resolution on a thread, which is a bigger change than this one.
+  What moved is that it is now a bound. Measured against
+  a dripping loopback server with the constants scaled down (1 s socket
+  timeout, 3 s total, promised bound 4.0 s): a 40-byte body drip returned
+  after 7.81 s with the timeout never firing and a 5 000-byte drip still held
+  the worker at 30.0 s, both before; a dripped status line, a dripped header
+  block, a header block that never ends and a chunked or `Content-Length`
+  gzip-of-nothing each held the worker to the harness's 40 s cap before, and
+  all of them raise `ResponseDeadlineExceeded` at 3.00 s after. In shipped
+  units a header drip of a byte every 10 s went from unbounded - still inside
+  the call when a 100 s harness gave up watching - to 30.0 s against a
+  declared 45 s. (An earlier draft of this paragraph said "90.0 s" there.
+  That was the second at which the *server* stopped dripping, not the one at
+  which the call ended, so it understated the before-state.)
+
+  What is still true: **the pool is still shared**. Three REST providers
+  still submit to `QThreadPool.globalInstance()`, so they still compete for
+  slots with each other and with anything else that uses it - what has
+  changed is that a slot is now held for a bounded time rather than for the
+  life of the process. (b), a dedicated `QThreadPool` per provider, is still
+  available as containment for that, and still frees nothing on its own. (d),
+  a busy flag on the provider, is still moot: the park does that job from the
   App side, without writing a provider attribute from a pool thread.
+
+  The residuals of the transport itself, recorded rather than fixed. **Name
+  resolution is outside the bound** - the paragraph above - so a worker can
+  be held for the OS resolver's own timeout on top of the 130/135/495 s these
+  budgets promise, and a watchdog can therefore still fire inside a refresh
+  that has not exceeded its own bound. Fixing it means resolving on a thread
+  and cancelling that, which is a change to how every call is made rather
+  than a clause in this one. **A server that closes the connection inside the
+  header block is a successful, empty 200** - `http.client` treats EOF as the
+  end of the headers, so `bounded_request` hands back a 200 with no body and
+  the call site reports whatever `.json()` says about an empty document
+  (plain `requests` does the same, so it is not this release's doing). The
+  helper cannot tell that from a legitimate empty body - a 204, or a HEAD -
+  so the judgement belongs at the call sites; Copilot's username resolve,
+  where it produced "PAT may lack read:user" for a truncated reply, is the
+  one that had it wrong and is fixed. The third review found that two rounds
+  had closed two routes to that message without touching the rule behind
+  them - `_resolve_username` answered `None` for **any** transport failure,
+  so a deadline, an oversized reply, a refused encoding, a 500 and an
+  ordinary offline machine all told the user to re-issue a credential that
+  was fine. The rule is now what the message is a diagnosis of: GitHub
+  answered and refused, a 401 or a 403 on `/user`. Everything else reaches
+  the tile as what it was. **A `Session`, an adapter, a pool and a timer per
+  call**, with no connection reuse: that is what makes the deadline possible
+  (a mounted adapter is the only way to learn the socket) and what keeps a
+  hostile endpoint's cookies and pool out of the next refresh, and it is what
+  `requests.request` already did. It costs about 1 ms per call of machinery -
+  measured 1.04 ms against plain `requests`' 0.83 ms on loopback - plus a TCP
+  connect and a TLS handshake where a kept-alive pool would have neither,
+  which is eleven of each on Azure's worst refresh. The fix, if that ever
+  matters, is a session per provider with an explicit close between
+  refreshes, which trades the isolation away.
+
+  The rest of the list, a sentence each, from the two confirmation reviews.
+  **The comma rule refuses more than urllib3 would** - `Content-Encoding: ,`
+  builds no decoder there and is refused here - which is over-refusal in the
+  fail-closed direction, is stated in the docstring, and reaches no host this
+  app speaks to. **A single-layer gzip bomb is still open on a sub-floor
+  urllib3**: `pyproject.toml` declares `urllib3>=2.6` and `release.yml`
+  builds in a fresh venv, but `build.sh` and `build.ps1` install nothing, so
+  a developer `.venv` left on 2.5 is not caught - one `pip install -e .` line
+  closes it. **`cancel()` cannot stop a `_fire` already past its `_ended`
+  check**, so a shutdown can land after the `finally` has run; harmless
+  because the session, the pool and the connection are that call's own and
+  are being closed, and the class docstring now says why rather than leaving
+  it to luck. **`_watch_pool` is still unguarded**, deliberately: a pool
+  shape it cannot wrap fails the call closed with its own `AttributeError`,
+  a non-`RequestException` that each provider's blanket handler takes. **A
+  2xx on `/user` that is not a 200, and a 200 whose JSON has no `login`,
+  still read as "PAT may lack read:user"** - GitHub answered and did not
+  refuse, so the rule's own wording does not quite cover them; neither is
+  reachable against `api.github.com`, and `_resolve_username`'s docstring
+  records both. **The CHANGELOG's own test counts are pinned by nothing**,
+  by decision: a test that asserted them would have to re-collect the suite
+  from inside it, and the counts are re-collected by hand each round
+  instead. **Pre-existing and unchanged by this release**: `snapshot.raw`
+  reaches Copy diagnostics by design, `x-github-request-id` is still logged,
+  OpenRouter's tile still shows `str(exc)` for a `RequestException` (a host,
+  no identifier) and its blanket handler still logs a traceback, and the
+  `QThreadPool` is still shared, so the three REST providers still compete
+  for slots - for a bounded time now.
+
+  Two of that list closed in the confirmation pass rather than being
+  recorded. `_unwatch_pools` was guarded from the caller but not total
+  inside, so one pool that refused the `del` left every pool after it wrapped
+  and `_watched` uncleared - each pool comes off under its own guard now, and
+  the first failure is re-raised once the loop is done so the one log line is
+  still written where it was. And `deadline.cancel()` sat above the guarded
+  chain, where a `cancel()` that raised would have skipped the un-watch and
+  `session.close()` with it (measured: session closed False); it is inside
+  the chain now, with the close in a `finally` under it.
+
+  Two things surfaced in the doing, and are worth not re-learning. First,
+  `Response.iter_content(chunk_size=N)` cannot implement this. urllib3's
+  `stream()` blocks until `N` bytes have arrived or the connection closes,
+  and the per-socket read timeout never fires on a server dripping inside it,
+  so the elapsed check would not run again until 64 KiB had been dripped.
+  Measured at one byte per 50 ms behind a 2 s socket timeout,
+  `iter_content(64 KiB)` never yielded at all. The drain is `raw.read1()`,
+  with `iter_content(1)` behind it for a handle that has none (urllib3 1.x):
+  correct there too, and 3 854 ms per MiB against `read1`'s 0.5 ms. Second,
+  *no* read granularity bounds a read that never returns. `read1` loops
+  inside urllib3 until the decoder yields something, and `iter_content(1)`
+  goes through the same decode, so a stream of empty DEFLATE stored blocks
+  (five bytes in, zero bytes out) blocked both paths until the harness gave
+  up. Between-reads checks are for the size cap; the clock needs the socket.
 
   **Every dispatch of a hung REST provider costs a slot, which is why the
   kept retry is folded into the cadence.** An earlier draft of the retry
@@ -723,23 +894,35 @@ unnecessary source of behaviour change.
   is what keeps the due riding ordinary cadence wakes - pinned over eleven
   five-minute wakes inside one park - rather than arming an hour-long timer
   of its own.
-- **On a one-core host every REST watchdog is about six minutes.**
+- **On a one-core host every REST watchdog is thirteen minutes.**
   `_pool_wait_slack` adds `sum(every other REST budget) / maxThreadCount` to a
   dispatch's watchdog, because the cycle hands openrouter, copilot and azure
   to the shared pool in one burst and a budget that starts at dispatch would
   otherwise fire inside a refresh that has not exceeded its own bound. With
-  the real numbers (openrouter 60, copilot 60, azure 225) that is 365 s at
-  capacity 1, 222 s at 2 and 151 s at 4 for the two REST providers, and
-  365/305/275 s for Azure - so on a single-core machine a REST watchdog is
-  six minutes (up from 80 s) and the park ceiling twelve. While that cycle is
-  open the scheduler timer is stopped, so one wedged REST provider blocks
-  every refresh for six minutes rather than eighty seconds. The model is also
-  pessimistic by construction: it assumes full serialisation of every other
-  budget even at capacity 3, where the real wait is zero. It is still the
-  right trade - a watchdog that fires early manufactures the failure it exists
-  to catch, and feeds the parking machinery - but the alternative is to scale
-  the allowance by pool size (or to have providers report when their work
-  actually starts, which is a Provider-API change: the API is one callback).
+  1.3.2+cfa.7's numbers (openrouter 135, copilot 130, azure 495) that is
+  **780 s for all three at capacity 1** - the sum plus the slack, whoever is
+  waiting - 465/468/648 s at capacity 2 and 308/311/581 s at 4. The
+  1.3.1+cfa.6 numbers were 365/365/365, 222/222/305 and 151/151/275, so this
+  is up by a factor of two; the reason is that the per-request term used to be
+  a per-socket timeout, which bounded nothing, and is now a whole call.
+
+  It reads worse than it is. A watchdog ends the App's wait, not the
+  provider's work, and until 1.3.2+cfa.7 it was the *only* thing that ended a
+  wedged REST refresh - the worker itself never came back. A REST provider now
+  gives up on its own at 130, 135 or 495 s and closes its own cycle, so the
+  watchdog is a ceiling that is reached less often than before rather than
+  more. What has not changed: while a cycle is open the scheduler timer is
+  stopped, and a REST park still lasts until the worker reports back or one
+  hour (`_REST_PARK_BACKSTOP_SECONDS`), whichever comes first, rather than
+  twice the budget.
+
+  The model is also pessimistic by construction: it assumes full serialisation
+  of every other budget even at capacity 3, where the real wait is zero. It is
+  still the right trade - a watchdog that fires early manufactures the failure
+  it exists to catch, and feeds the parking machinery - but the alternative is
+  to scale the allowance by pool size (or to have providers report when their
+  work actually starts, which is a Provider-API change: the API is one
+  callback).
 - ~~**"Clear all browser data" still purges a profile the App may be
   scraping.**~~ **Closed in 1.3.1+cfa.6.** The dialog emits the id list on
   `browser_data_clear_requested` and the App defers each one exactly as it
@@ -782,11 +965,15 @@ unnecessary source of behaviour change.
   one helper and one `Config.save()` per drain. The alternative was leaving
   that list in memory, which loses a live account's session cookie to a quit
   inside the deferral window, and the write is the cheaper of the two.
-  A third writer is still worth thinking twice about. **It is also not
-  atomic** - a bare `path.write_text` - so a crash or a power cut inside one
-  of those unasked writes truncates the file that holds every setting; the
-  loader survives it (`config.json.corrupt` and defaults, executed) but the
-  settings are gone, and `tmp` plus `os.replace` is six lines. (It also means
+  A third writer is still worth thinking twice about. **It was made atomic
+  in 1.3.2+cfa.7** - `atomic_write.py`, a same-directory temp plus `fsync`
+  plus `os.replace`, the helper `secrets.dat` and the meter catalog already
+  used - so a crash or a power cut inside one of those unasked writes no
+  longer truncates the file that holds every setting. It moved out of
+  `secret_storage` to get there: that module imports `config`, so `config`
+  cannot import it. One consequence to know about: the file is now `0600` on
+  POSIX rather than `0644`, because `mkstemp` creates at `0600` and
+  `os.replace` carries the temp file's mode across. (It still means
   an ad-hoc harness that
   drives `_run_profile_purges` must set `APPDATA` - an override on every OS,
   which `tests/conftest.py` sets for the suite - or it edits the developer's
@@ -842,12 +1029,12 @@ unnecessary source of behaviour change.
   bounded at 300. Note that `_load_failure_context` still puts the raw title
   into the *payload*, which is bounded downstream by `_raw_summary` and by
   `error_dialog._sanitize_raw` rather than at source.
-- **`CopilotProvider` and `OpenRouterProvider` do not declare
-  `refresh_budget_seconds`.** Both take the flat 60 s default. Copilot's real
-  nominal ceiling is 10 + 15 + 15 s of `requests` timeouts, each per socket
-  operation rather than total, so the flat number happens to be about right;
-  making it explicit would keep them inside the "read the budget off the
-  provider" doctrine and was not done here.
+- ~~**`CopilotProvider` and `OpenRouterProvider` do not declare
+  `refresh_budget_seconds`.**~~ **Closed in 1.3.2+cfa.7**, and the flat 60 s
+  turned out not to be about right after all. It was read off the nominal
+  sum of per-socket timeouts (10 + 15 + 15), which is not a bound on
+  anything; with a real per-call bound the same three calls are 130 s for
+  Copilot and 135 s for OpenRouter, so both now name their own.
 - **The tile and tray tooltips rely on `snapshot.error` being clean at
   source.** `_exception_summary` is what keeps a request URL out of it;
   `widget.py` renders the string as-is, and only `app.py`'s log lines and the
@@ -935,15 +1122,23 @@ unnecessary source of behaviour change.
   *ceiling* itself stops holding: the wedged run makes 31 dispatches against
   a control of 12 over the same six hours, because a watchdog wait longer
   than the cycle spacing keeps `_unchanged_cycles` down and the app on its
-  short cadence. No provider in the tree has a budget near that (Azure's is
-  225 s and it has its own in-flight gate), so this is a note about the
-  fixture's reach rather than a live rate defect - but it is the shape a
-  future long-budget provider would arrive in.
-- **`SECURITY.md` does not describe "Clear all browser data".** It covers
-  egress, secrets and the Azure rate floor, but not the one button that
-  deletes a directory tree and a set of keyring entries, and not that the
-  request is now persisted across a quit in `config.json`. Two sentences
-  under the existing local-data heading.
+  short cadence. The quantity that governs that fixture is the **watchdog
+  wait**, not the budget: `refresh_budget_seconds` plus
+  `_WATCHDOG_SLACK_SECONDS` plus `_pool_wait_slack`. At pool capacity 1
+  that is **780 s for all three REST providers** after 1.3.2+cfa.7 (openrouter
+  and copilot are now in the same band as azure, which they were not before),
+  so the margin against the 900 s at which the ceiling stops holding is
+  **120 s, not 405**. Azure's 495 s budget is the smaller number and not the
+  one to compare. It is still a note about the fixture's reach rather than a
+  live rate defect: the 60-seed six-fake-hour fuzz was re-run with the real
+  budgets rather than the fixture's 60/60/90, and is clean - no dead
+  scheduler, no runaway, no double browser scrape, nothing dispatched while
+  parked, worst concurrent REST workers 5/6/5 - with the median total
+  dispatch rate going *down*, 55.3/h to 50.7/h. Bigger budgets cost the
+  invariants nothing; what they cost is how long a wedged tile shows its last
+  state.
+- ~~**`SECURITY.md` does not describe "Clear all browser data".**~~
+  **Closed in 1.3.2+cfa.7**, under its own heading beside the local-data one.
 - **One CI job segfaulted in a native thread, once, and the cause is not
   pinned.** Run 67 on `aab1de9` died with `Fatal Python error: Segmentation
   fault` in the Ubuntu 22.04 / 3.11 job while the other five jobs and every
@@ -1276,6 +1471,15 @@ characters or more is redacted, where the floor used to be eight; `posture`
 prints the policy source the other commands already print; and the hook's
 literal-endpoint branch — the only thing that catches a POST to the pinned
 server on a path other than `/session` — finally has a test.
+
+One finding of the round-3 *confirmation* pass is closed in 1.3.2+cfa.7:
+mutation S6a - dropping `.lower()` from the deny-glob compile side - survived
+the whole suite, because every built-in deny glob is already lower-case and
+lowering it again changes nothing. `paths.deny` is operator-editable and this
+repository is told below to edit it, so eight parametrised cases now cover
+both halves of the fold. Run both ways against `tests/test_egress_guard.py`
+(460 tests): pattern side unlowered, 4 fail; candidate side unlowered, 5 fail,
+one of which is the pre-existing `C:\Users\m\.AWS\CREDENTIALS` case.
 
 What this round leaves open, deliberately:
 

@@ -669,3 +669,124 @@ def test_a_hostile_payload_cannot_flood_the_log(caplog, endpoint):
     assert len(line) < 2000, f"one log record was {len(line)} bytes"
     # The count is still reported, so the line remains diagnostic.
     assert "key_count=5000" in line
+
+
+# --- the total-response deadline -------------------------------------------
+
+
+class _InlinePool:
+    """A QThreadPool double that runs the runnable on this thread."""
+
+    def __init__(self):
+        self.started = 0
+
+    def start(self, runnable):
+        self.started += 1
+        runnable.run()
+
+
+def test_a_response_deadline_ends_the_refresh_as_an_error(monkeypatch):
+    """A dripping openrouter.ai held a pool slot for as long as it liked.
+
+    It now fails like any other transport failure: ERROR, not AUTH_REQUIRED -
+    the keys are fine - and `on_done` is called exactly once.
+    """
+    import aigauge.providers.openrouter as or_mod
+    from aigauge.providers._http import ResponseDeadlineExceeded
+    from aigauge.providers.openrouter import OpenRouterProvider
+
+    monkeypatch.setattr(or_mod, "get_openrouter_key", lambda: "inference-key")
+    monkeypatch.setattr(or_mod, "get_openrouter_mgmt_key", lambda: "mgmt-key")
+
+    def boom(*args, **kwargs):
+        raise ResponseDeadlineExceeded("Response deadline exceeded (30s).")
+
+    monkeypatch.setattr(or_mod, "bounded_request", boom)
+
+    captured: list = []
+    pool = _InlinePool()
+    OpenRouterProvider(Config(), pool=pool).refresh(captured.append)
+
+    assert pool.started == 1
+    assert len(captured) == 1, "on_done was not called exactly once"
+    snap = captured[0]
+    assert snap.status == SnapshotStatus.ERROR
+    assert "deadline" in (snap.error or "").lower()
+    assert "openrouter.ai" not in (snap.error or "")
+
+
+@responses.activate
+def test_a_redirect_is_reported_as_one_rather_than_as_a_parse_error(monkeypatch):
+    """A 3xx is not followed, and `raise_for_status()` does not raise on one,
+    so before this release it reached `.json()` and the tile read "Expecting
+    value: line 1 column 1 (char 0)" - which names neither the redirect nor
+    the host."""
+    import aigauge.providers.openrouter as or_mod
+    from aigauge.providers.openrouter import OpenRouterProvider
+
+    monkeypatch.setattr(or_mod, "get_openrouter_key", lambda: "inference-key")
+    monkeypatch.setattr(or_mod, "get_openrouter_mgmt_key", lambda: "mgmt-key")
+    responses.add(
+        responses.GET,
+        f"{OPENROUTER_API}/credits",
+        body="",
+        status=307,
+        headers={"Location": "https://openrouter.invalid/credits"},
+    )
+
+    captured: list = []
+    OpenRouterProvider(Config(), pool=_InlinePool()).refresh(captured.append)
+
+    snapshot = captured[0]
+    assert snapshot.status == SnapshotStatus.ERROR
+    # This provider's branches report the message rather than the type name,
+    # which the redirect refusal is written for: it says what happened and
+    # names no host.
+    assert "redirected (307)" in (snapshot.error or "")
+    assert "openrouter.invalid" not in (snapshot.error or "")
+    assert "Expecting value" not in (snapshot.error or "")
+
+
+def test_the_activity_classification_line_names_the_type_not_the_message(
+    monkeypatch, caplog
+):
+    """`/activity` is the tolerant one - it degrades to a row on the tile - and
+    its existing diagnosis line is what a deadline shows up on."""
+    import logging
+
+    import aigauge.providers.openrouter as or_mod
+    from aigauge.providers._http import ResponseDeadlineExceeded
+    from aigauge.providers.openrouter import _fetch_activity
+
+    def boom(*args, **kwargs):
+        raise ResponseDeadlineExceeded("Response deadline exceeded (30s).")
+
+    monkeypatch.setattr(or_mod, "bounded_request", boom)
+
+    with caplog.at_level(logging.WARNING, logger="aigauge"):
+        rows, error = _fetch_activity("mgmt-key")
+
+    assert rows == []
+    assert "deadline" in (error or "").lower()
+    assert "openrouter.ai" not in (error or "")
+    line = next(
+        record.getMessage()
+        for record in caplog.records
+        if "classification=activity_request_error" in record.getMessage()
+    )
+    assert "type=ResponseDeadlineExceeded" in line
+    assert "30s" not in line
+
+
+def test_openrouter_advertises_the_budget_its_three_calls_need():
+    from aigauge.providers._http import request_worst_case_seconds
+    from aigauge.providers.openrouter import (
+        REFRESH_WORST_CASE_SECONDS,
+        REQUEST_TIMEOUT,
+        OpenRouterProvider,
+    )
+
+    assert OpenRouterProvider.refresh_budget_seconds == REFRESH_WORST_CASE_SECONDS
+    assert REFRESH_WORST_CASE_SECONDS == 3 * request_worst_case_seconds(
+        REQUEST_TIMEOUT
+    )

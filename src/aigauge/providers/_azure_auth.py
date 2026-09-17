@@ -21,10 +21,15 @@ from datetime import datetime, timedelta
 
 import requests
 
+from ._http import bounded_request
+
 log = logging.getLogger("aigauge.providers.azure.auth")
 
 LOGIN_HOST = "https://login.microsoftonline.com"
 MANAGEMENT_SCOPE = "https://management.azure.com/.default"
+# Per socket operation, like everywhere else; bounded_request is what bounds
+# the whole exchange. Counted in azure.REFRESH_WORST_CASE_SECONDS as one of
+# the fixed calls, at the same worst case as an ARM call.
 REQUEST_TIMEOUT = 15
 # Drop a token this long before it actually expires, so a request that starts
 # just under the wire cannot be rejected mid-flight.
@@ -130,7 +135,8 @@ def get_token(
         if cached is not None and cached.expires_at > now:
             return cached.token
 
-    response = requests.post(
+    response = bounded_request(
+        "POST",
         token_endpoint(tenant_id),
         data={
             "client_id": client_id,

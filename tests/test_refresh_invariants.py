@@ -302,8 +302,23 @@ def _run_azure_hour(clock, caplog, *, watchdog_route: bool) -> int:
         app.refresh_now(manual=True)
         assert app._inflight == {"azure"}  # noqa: SLF001
         # Azure's watchdog budget is its real worst case, so give the
-        # watchdog time to fire before the hour under test starts.
-        clock.run_until(400.0)
+        # watchdog time to fire before the hour under test starts. Derived
+        # from the provider's own bound rather than written out: 1.3.2+cfa.7
+        # re-derived that bound from a per-*call* worst case instead of a
+        # per-socket timeout, and a hard-coded 400 s silently stopped waiting
+        # long enough for the watchdog to fire at all. All three terms of
+        # `_arm_watchdog`'s sum, including the pool-wait allowance - which is
+        # 0 for this dispatch, because a manual refresh with only azure
+        # configured puts nothing ahead of it in the pool. Asserted rather
+        # than assumed, so a fixture that grows a second REST provider moves
+        # this wait instead of silently stopping short of the watchdog.
+        from aigauge.app import _WATCHDOG_SLACK_SECONDS
+
+        pool_wait = app._pool_wait_slack("azure")  # noqa: SLF001
+        assert pool_wait == 0.0, "something else was dispatched beside azure"
+        clock.run_until(
+            az.REFRESH_WORST_CASE_SECONDS + _WATCHDOG_SLACK_SECONDS + pool_wait
+        )
         assert app._snapshots["azure"].status is SnapshotStatus.ERROR  # noqa: SLF001
     else:
         # The ordinary user sequence. The offline burst: one live fetch that

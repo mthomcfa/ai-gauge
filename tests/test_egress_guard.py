@@ -590,9 +590,18 @@ def test_scan_stays_linear_in_the_number_of_findings():
     elapsed = {}
     for size in (100_000, 400_000):
         payload = _filled(filler, size)
-        started = time.monotonic()
-        findings = eg.scan(payload, policy())
-        elapsed[size] = time.monotonic() - started
+        # Best of three. The ratio below is about the algorithm, not about the
+        # runner's scheduler, and a shared CI host can stall one sample by
+        # more than the whole 100 KB scan takes: one macOS runner measured
+        # 0.07 s against 0.62 s, a ratio of 8.6, with every other job on the
+        # same commit inside 4. The minimum of three is the sample least
+        # touched by anything other than the scan.
+        samples = []
+        for _ in range(3):
+            started = time.monotonic()
+            findings = eg.scan(payload, policy())
+            samples.append(time.monotonic() - started)
+        elapsed[size] = min(samples)
         assert len(findings) > size // 20, (size, len(findings))
     # Four times the input is four times the work when the loop is linear and
     # sixteen when it is quadratic. Eight is comfortably between them.
@@ -695,6 +704,38 @@ def test_a_longer_deny_list_still_denies_what_it_names():
     assert any(f.rule == "denied-path" for f in eg.scan("read src/custom7/x.txt", pol))
     assert any(f.rule == "denied-path" for f in eg.scan("read /home/u/.aws/credentials", pol))
     assert not [f for f in eg.scan("read src/aigauge/app.py", pol) if f.rule == "denied-path"]
+
+
+@pytest.mark.parametrize(
+    "glob, denied",
+    [
+        pytest.param("**/CREDENTIALS", "a/credentials", id="UPPER glob"),
+        pytest.param("**/Secrets/**", "x/secrets/y", id="Mixed glob"),
+        pytest.param("**/ID_RSA", "k/id_rsa", id="UPPER stem"),
+        pytest.param("**/*.PEM", "k/cert.pem", id="UPPER suffix"),
+        pytest.param("**/credentials", "A/CREDENTIALS", id="UPPER path"),
+        pytest.param("**/secrets/**", "X/SECRETS/Y", id="UPPER dir"),
+        pytest.param("**/id_rsa", "K/ID_RSA", id="UPPER file"),
+        pytest.param("**/*.pem", "K/CERT.PEM", id="UPPER ext"),
+    ],
+)
+def test_a_deny_glob_is_case_folded_on_both_sides(glob, denied):
+    """Both sides are lowered, and only the candidate side had a test.
+
+    `fnmatch` is case-sensitive on POSIX and insensitive on Windows, so a deny
+    list that depends on the case a path was typed in is not a deny list. The
+    candidate half is covered by `C:\\Users\\m\\.AWS\\CREDENTIALS` in
+    `test_this_repos_own_secret_stores_are_denied`; the *pattern* half was not
+    covered by anything, because every built-in deny glob is already
+    lower-case - so dropping `.lower()` from the compile side survived the
+    whole suite. `paths.deny` is an operator-editable list and section 9 of
+    `docs/next-session.md` tells this repository to edit it, so an
+    operator-written `**/Secrets/**` has to deny `x/secrets/y`.
+    """
+    pol = policy(paths={"deny": [glob]})
+    assert any(
+        f.rule == "denied-path" for f in eg.scan(f"please read {denied}", pol)
+    ), f"{glob!r} did not deny {denied!r}"
 
 
 def _quantifiers(pattern: str, verbose: bool = False):

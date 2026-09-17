@@ -6,6 +6,384 @@
 > earlier `0.6.4` entry predates that convention and **is not** upstream's
 > `v0.6.4`, which is different code.
 
+## 1.3.2+cfa.7 - 2026-09-16
+
+The residuals of the hardening follow-up: the socket itself, the write that
+holds every setting, and two things the documents did not say. No behaviour
+changes for a healthy provider - the same requests to the same hosts, and a
+call that answers in under a second answers exactly as it did.
+
+### Changed
+
+- **A REST request is bounded end to end, not per socket read.** `requests`'
+  `timeout=` bounds one connect or one read, never the exchange, so a server
+  sending a byte every 14 s against a 15 s timeout is a healthy connection as
+  far as `requests` is concerned - and it held the `QThreadPool` worker
+  reading it for as long as it cared to keep dripping. 1.3.1+cfa.6 bounded
+  how many such workers could pile up and what one cost the log; nothing
+  bounded how long one lived, and the pool is global, so a stuck worker was a
+  stuck slot until the process exited. One helper,
+  `providers/_http.py`, now bounds the exchange in both halves it has. In
+  band: a clock started before the call, `stream=True`, and the body drained
+  here, with the elapsed time and the running byte count checked between
+  reads. Out of band: a `threading.Timer` armed with the same deadline, which
+  shuts that connection's socket down from another thread. Copilot's five
+  call sites, OpenRouter's three, Azure's two and the Entra ID token POST all
+  go through it. Every failure here subclasses `requests.RequestException`, so
+  the handlers already at those sites take them, and none of them retries.
+  (One site did not have such a handler at all - see Copilot's, below.)
+
+  **The timer is what makes it a bound**, and it is not belt and braces. A
+  check between reads bounds nothing that happens *inside* one read, and two
+  things do: the response headers (`http.client` reads them with repeated
+  `readline()`s, and each arriving byte resets the per-socket timeout) and a
+  `Content-Encoding` body whose bytes decode to nothing (urllib3's `read1`
+  loops internally until the decoder yields, and an empty DEFLATE stored
+  block is five bytes in and zero bytes out). `requests` asks for
+  `gzip, deflate` on every call, so both are reachable everywhere. urllib3's
+  own `Timeout(total=…)` does not help - it clamps the value of the per-read
+  timeout, which every byte resets; measured, a 30 s header drip returned at
+  30.01 s against a 3 s total. Shutting the socket down is the one thing that
+  reaches a thread blocked in `recv`, on POSIX and on Windows alike. The
+  connection to shut down is learned from a small `HTTPAdapter` subclass
+  mounted on a `Session` built for that one call and discarded with it - so
+  no pool, cookie jar or connection survives a refresh, exactly as
+  `requests.request` already behaved.
+
+  **A timer that fires before the socket exists looks again**, every 0.25 s
+  until the call ends. `getaddrinfo` runs before any socket is made and
+  outside every timeout this app sets, so a resolver slower than the deadline
+  used to leave the timer with nothing to shut down - and, because it fired
+  only once, with nothing bounding the status line, the header block or the
+  body after it either. Measured at the scaled constants, that was 40 s and
+  70 s against a 4.0 s bound, both ended by the harness rather than by the
+  app; with the re-arm it is 3.75 s. The same look-again covers a socket the
+  timer can see but cannot reach: for the whole of a TLS handshake urllib3
+  still holds the plain socket, which `wrap_socket` has already detached, so
+  the shutdown raises EBADF - and swallowing that gave the deadline away for
+  the rest of the call on the path all four hosts use. Measured over real
+  TLS against a 12.0 s bound, a deadline landing inside the handshake cost
+  **23.0 s** and a re-arm landing there **22.5 s**, and one dripped header
+  line was unbounded - still inside the call when the harness gave up; with
+  that branch looking again too they are 3.25 s and 2.56 s. Name resolution
+  itself is still outside the bound, here as in plain `requests`, and the
+  docstring, `SECURITY.md` and `docs/next-session.md` 8.3 now say so instead
+  of implying otherwise: one call returns or raises within 45 s **of the
+  socket**, plus whatever the resolver spends before it.
+
+  **A deadline that cannot be armed refuses the call.** `threading.Timer`
+  needs a thread, and `Thread.start()` raises `RuntimeError` when the process
+  has none to give. On the first arm that walked out of the helper past every
+  `except requests.RequestException` branch its callers have; it now raises
+  `DeadlineUnavailable`, a `RequestException` with a fixed message, before
+  the request is made. A re-arm that cannot start used to die on the timer's
+  own thread - a traceback to stderr, which the packaged build discards -
+  leaving the exchange bounded by nothing and the log empty; it now writes
+  one `provider http deadline_rearm_failed=True` and marks the deadline, so
+  the next in-band check ends the call. That is not the bound restored: a
+  call already stalled in a header read never reaches an in-band check, so it
+  stays unbounded in that state - measured, still inside the call at a 14 s
+  give-up against a 4.0 s bound. What changed is that it is no longer silent.
+
+  Measured on a dripping loopback server with the constants scaled down
+  (1 s socket timeout, 3 s total, so the promised bound is 4.0 s). Before, on
+  the body: a 40-byte drip - 8 s of server - returned after **7.81 s**, the
+  1 s timeout never firing once; a 5 000-byte drip **still held the worker
+  when the harness gave up watching at 30.0 s**, and would have held it for
+  1 000 s. Before, in the phases a between-reads check cannot see: a dripped
+  status line, a dripped header block, a header block that never ends, and a
+  chunked or `Content-Length` gzip stream that decodes to nothing all **held
+  the worker to the 40 s cap the harness watched to**, with the
+  `iter_content(1)` fallback no better. After: **`ResponseDeadlineExceeded`
+  at 3.00 s on every one of them**, and on the body drips, inside the
+  predicted 4.0 s. In the shipped units (30 s total, 15 s timeout, declared
+  worst case 45 s) a header drip of one byte every 10 s went from
+  **unbounded** - still inside the call when a 100 s harness gave up watching
+  - to **30.0 s**. (An earlier draft of this entry said 90.0 s there. That is
+  the second at which the harness's server stopped dripping, not the one at
+  which the call ended.) A server flooding chunked data against a 1 MiB cap:
+  `ResponseTooLarge` at 0.00 s. (An earlier draft of this entry said how many
+  bytes that server had managed to push; that number says how fast the server
+  got going, not anything about the bound, and it did not reproduce.)
+
+  The obvious implementation does not work, which is the part worth knowing.
+  `iter_content(chunk_size=N)` goes through urllib3's `stream()`, which
+  blocks "until `amt` bytes have been read from the connection or until the
+  connection is closed" - and the per-socket timeout never fires on a server
+  dripping inside it. Against a loopback server at one byte per 50 ms behind
+  a 2 s socket timeout, `iter_content(64 KiB)` **never yielded at all**,
+  `iter_content(1)` yielded at once, and `raw.read1()` yielded at once; on a
+  1 MiB body delivered in one go the three cost 0.8 ms, **3 854 ms** and
+  0.5 ms. So the drain is `read1`, with `iter_content(1)` behind it for a
+  handle that has none.
+
+- **The three REST providers now tell the App a budget that is true.** One
+  call returns or raises by `max(connect, total) + read`, which at a 30 s
+  total is 45 s for a 15 s timeout and 40 s for a 10 s one. Azure's
+  `REFRESH_WORST_CASE_SECONDS` was 90 + 9 x 15 = **225 s** with the
+  per-request term a socket timeout; it is 90 + 9 x 45 = **495 s** with the
+  per-request term a whole call. The number grew because it is now true.
+  Copilot's three sequential calls are 40 + 45 + 45 = **130 s** and
+  OpenRouter's three are 3 x 45 = **135 s**, neither of which fits the flat
+  60 s a plain REST provider used to take, so both now declare
+  `refresh_budget_seconds` the way Azure does - which also closes the
+  "neither declares one" note in `docs/next-session.md` 8.3. A longer
+  watchdog is the right direction: the watchdog ends the App's wait, and
+  until now it was the only thing that ended a wedged REST refresh at all. A
+  provider that gives up on its own at 130, 135 or 495 s closes its own cycle,
+  so the ceiling is reached less often than before rather than more.
+
+- **The 8 MiB memory ceiling now has the floor it was standing on, and a
+  refusal that does not need one.** The cap counts *decoded* bytes, and that
+  only bounds memory if one read cannot produce a gigabyte by itself. Every
+  urllib3 2.x returns at most `chunk_bytes` of decoded bytes from `read1`, but
+  only 2.6 and later stop the decoder at `max_length`: on 2.4 and 2.5 the whole
+  raw read is decoded first and the surplus buffered. `requests>=2.32` asks
+  only for `urllib3>=1.21.1,<3`, and neither `build.sh` nor `build.ps1` pins
+  one, so the comment promising that "a hostile or broken endpoint cannot make
+  a background worker allocate a gigabyte" was true of the resolved version
+  rather than of this code. Measured on 2.5.0, a **988-byte** response with
+  `Content-Encoding: gzip, gzip` cost **1 070 MiB** and the whole 30 s
+  deadline (9.8 MiB on the shipped 2.6.3).
+
+  Both halves are taken. `pyproject.toml` declares `urllib3>=2.6` - requests'
+  own transitive dependency made explicit, not a new one - and a response
+  whose `Content-Encoding` header contains a **comma** is refused before a
+  byte of its body is read, with `ResponseEncodingRefused`, another
+  `requests.RequestException`. No host this app speaks to serves nested
+  codings. After: **0.2 MiB and 0.01 s** on 2.6.3 *and* on 2.5.0, with the
+  body never read. A single-layer gzip bomb is unchanged - `ResponseTooLarge`
+  at the cap, with a `tracemalloc` peak the suite now pins under 32 MiB.
+
+  The comma, rather than a count of the codings named, because the comma is
+  what urllib3 decides on: `_init_decoder` sends any header containing one to
+  `MultiDecoder`, which splits without dropping empty entries and gives every
+  name it does not recognise - `""` included - a `DeflateDecoder`. A first cut
+  of this refusal counted the non-empty names, which made
+  `Content-Encoding: gzip,` one coding here and two decoder layers there:
+  measured, a `deflate(gzip(16 MiB of zeros))` body under that header walked
+  through the refusal and had both layers decoded (8.8 MiB of peak on the
+  shipped 2.6.3, and on 2.5.0 it is the 1 070 MiB shape the refusal exists to
+  stop). `identity, gzip` and `gzip, identity` are refused too, though each
+  names one real coding: urllib3 builds the same two-layer decoder for them,
+  whose `identity` layer is a `DeflateDecoder` that fails on the plain
+  output.
+
+- **`allow_redirects=False` on every REST call, and a 3xx is reported as
+  one.** Every host this app speaks to is fixed and listed in `SECURITY.md`,
+  so a redirect is a failure, not something to follow. Azure already said so;
+  Copilot and OpenRouter get the helper's default. Refusing the hop is only
+  half of it, though: `raise_for_status()` says nothing about a 3xx, so the
+  redirect went on to `.json()` and the tile read *"Expecting value: line 1
+  column 1 (char 0)"* - and on Copilot's username resolve it became a `None`,
+  which the tile reports as *"PAT may lack read:user"*, sending the user to
+  re-issue a credential that is fine. A 3xx now raises `ResponseRedirected`,
+  another `requests.RequestException`, carrying the status and neither the
+  URL nor the `Location`. `_resolve_username` lets that one through rather
+  than swallowing it, because "the PAT may lack read:user" is the wrong
+  diagnosis for a redirect.
+
+  Whether these paths ever redirect is an assumption, not a measurement: it
+  was not tested against the live hosts, and `api.github.com` is documented
+  to answer a renamed user or organisation with a 301. If one does, the tile
+  now says so instead of guessing.
+
+  Only the statuses that carry a `Location` are called a redirect -
+  `{301, 302, 303, 307, 308}`. The rest of the 3xx range still fails closed,
+  because this app reads a 2xx and nothing else, but says "The endpoint
+  returned 304; this app reads only a 2xx." A `304 Not Modified` is not a
+  redirect, and it is the one status in that range a caller here could
+  actually meet: no call site sends `If-None-Match` today, but that is the
+  natural way to spend fewer of GitHub's rate-limit units, and a caching
+  proxy can send one unasked.
+
+### Fixed
+
+- **Going offline no longer puts the GitHub username in the log, on the tile
+  and in Copy diagnostics.** Copilot's `work()` caught `requests.HTTPError` -
+  a reply GitHub actually sent - at each of its three branches, and nothing
+  caught the rest, so an unresolvable host or a dropped connection fell
+  through to the worker's blanket handler, which did `log.exception` (a
+  traceback whose last line is the exception message) and reported
+  `str(exc)`. A `requests` connection error carries the URL it failed on, and
+  a Copilot usage URL carries the username as a path segment, so the account
+  identifier reached all three sinks SECURITY.md says it never reaches - twice
+  in the log. Not a regression: byte-identical on 1.3.1+cfa.6. The PAT was
+  never in any of them.
+
+  `work()` now has its own `except requests.RequestException` branch -
+  `GitHub request failed (TypeName).`, with a
+  `classification=request_failed type=…` log line and no traceback - and it
+  wraps the username resolve as well as the two fetches. The blanket handler
+  behind it reports the type name too, the way azure's already did. This is
+  also what makes the transport helper's own claim true: until now
+  `_http.py` said every call site had a `RequestException` branch, and one
+  did not.
+
+  The type name is the rule for a `requests` exception, whose message *is*
+  the URL it failed on. The five the bounded helper raises are built out of a
+  status, a count or a bound and carry no URL by construction, so those reach
+  the tile as themselves - `GitHub request failed: The endpoint redirected
+  (301); this app does not follow redirects.` - as OpenRouter's and Azure's
+  already do.
+
+- **A truncated reply no longer reads as a bad PAT.** A server or a middlebox
+  that drops the connection inside the header block produces an ordinary 200
+  with no body: `http.client` treats EOF as the end of the headers, so the
+  call gets `status_code=200`, `content=b''` (plain `requests` does the same
+  - not this release's doing). `.json()` on that raises
+  `requests.exceptions.JSONDecodeError`, which is a `RequestException`, so
+  `_resolve_username` turned it into `None` and the tile into *"Could not
+  resolve GitHub username (PAT may lack read:user)"* - the same wrong
+  diagnosis the redirect fix above removed, reached by a different route.
+  `InvalidJSONError` now goes to `work()`'s branch instead:
+  `GitHub request failed (JSONDecodeError).`
+
+  That was the second route closed one at a time, and the rule behind them
+  was what was wrong: `_resolve_username` answered `None` - "PAT may lack
+  read:user" - for **every** transport failure it did not name, which still
+  covered four of the five exceptions this release's own helper raises, a
+  500, and an ordinary offline machine. The rule is now the one the message
+  is a diagnosis of: GitHub answered and refused, which is a 401 or a 403 on
+  `/user`. Measured through the tile, the deadline, an oversized reply, a
+  refused encoding, a `ConnectionError`, a `ReadTimeout` and a 500 all moved
+  from AUTH_REQUIRED *"PAT may lack read:user"* to an ERROR that says what
+  happened; a 401 and a 403 are untouched, which is what that message is
+  for.
+
+- **A healthy call's socket no longer waits for the cyclic collector.** The
+  hook that learns the connection replaces `pool._get_conn` with a closure
+  over the pool's own bound method, and pool -> closure -> cell -> bound
+  method -> pool is a reference cycle: `session.close()` dropped the pool,
+  refcounting did not free it, and the connection it held - with its socket -
+  lived until a gen-2 collection. Measured over 300 healthy calls against a
+  loopback server, **17 established sockets open at once** where plain
+  `requests` left none. Bounded and always reclaimed, but until then the app
+  held open connections to the four hosts after the refresh that opened them
+  had finished, which is the one thing `_new_session`'s docstring says cannot
+  happen. The wrapper is taken off again in the same `finally` that cancels
+  the timer, before the close: **0 after**, with nothing left for the
+  collector to free. That loop is total - each pool comes off under its own
+  guard, so one that refuses does not leave the pools after it wrapped - and
+  the `finally` now runs the cancel inside the same guarded chain, so the
+  un-watch and `session.close()` cannot be skipped by it.
+
+- **`Config.save()` is atomic.** It was a bare `path.write_text`, which
+  truncates before it writes. That was tolerable while the only writes were
+  the user's own, and 1.3.1+cfa.6 gave the app two reasons to write this file
+  unasked - the deferred-purge drain runs from `App.__init__` and from the
+  five-minute heartbeat - so a crash or a power cut inside a write nobody
+  asked for truncated the file holding every setting plus both pending lists.
+  The loader survives that (`config.json.corrupt` and defaults, executed) and
+  the settings do not. Same discipline as `secrets.dat` and the meter
+  catalog: a temp file in the same directory, `fsync`, `os.replace`, temp
+  unlinked on any failure. The helper moved to `atomic_write.py` rather than
+  being imported where it was, because `secret_storage` imports `config` and
+  so cannot be imported from it. One side effect, pinned rather than left as
+  a surprise: the file is now `0600` on macOS and Linux, where a bare
+  `write_text` gave `0644` under the usual umask - `mkstemp` creates at
+  `0600` and `os.replace` carries that across. Windows is unaffected and
+  still relies on the user-scoped `%APPDATA%` location. The exception
+  contract does not move: `save()` still raises `OSError`, and the nine
+  callers - four of which swallow it, five of which do not - are unchanged.
+
+- **The glob side of the egress guard's case fold has a test.** The deny
+  matcher lowers both the pattern and the candidate, because `fnmatch` is
+  case-sensitive on POSIX and insensitive on Windows. Only the candidate half
+  was covered, and the round-3 confirmation of PR #23 found that removing
+  `.lower()` from the *pattern* side survived the whole suite - every
+  built-in deny glob is already lower-case, so lowering it again changes
+  nothing. `paths.deny` is operator-editable and this repository is told to
+  edit it, so an operator's `**/Secrets/**` has to deny `x/secrets/y`. Eight
+  parameters, run both ways against `tests/test_egress_guard.py`: with the
+  pattern side unlowered, **4 fail and 456 pass** - the four upper-case globs
+  and nothing else in the file; with the candidate side unlowered, **5 fail
+  and 455 pass** - the four mirrors plus the existing
+  `C:\Users\m\.AWS\CREDENTIALS` case that was already there.
+
+### Documentation
+
+- **`SECURITY.md` describes "Clear all browser data".** It covered egress,
+  secrets and the Azure rate floor, and said nothing about the one button
+  that deletes a directory tree and a set of keyring entries - or that since
+  1.3.1+cfa.6 the request is written into `config.json` and carried out at
+  the next start. A new heading says what it removes and for which accounts,
+  that the cookie secrets go at the click while the profile directories are
+  handed to the app (Qt requires a profile to outlive its pages, so one being
+  refreshed is deleted when that refresh finishes), and that the deferral is
+  a list of account ids only - bounded at 64 entries of 64 characters, never
+  a cookie or anything from a provider page, with a symlink never followed or
+  deleted through. The "written atomically" paragraph now covers
+  `config.json` as well.
+
+- **`SECURITY.md` describes the transport it now has.** The sentence about
+  Azure traffic said "plain `requests` with a 15-second timeout, like Copilot
+  and OpenRouter" - true of one socket operation, and incomplete about
+  everything this release added. It now names the per-socket timeouts (15 s,
+  10 s on Copilot's `/user`), the 30-second deadline on the whole exchange
+  and how it is enforced, the 8 MiB response ceiling, the refusal to follow
+  or to misreport a redirect, and that nothing retries.
+
+- **Three comments and a docstring that had drifted.**
+  `Config.save()` now says that the file lands `0600` on macOS and Linux and
+  why, and that a symlinked `config.json` is replaced rather than written
+  through (pinned by a test on both counts, the second one new).
+  `azure.REFRESH_DEADLINE_SECONDS`' justification quoted "~13 min" for 50
+  unguarded page calls, which was the arithmetic at a per-socket timeout;
+  at a whole call it is ~37 min, and the comment says what the deadline is
+  for rather than restating a number that moved. `providers/catalog.py`
+  imported the private `secret_storage._atomic_write` inside a function, to
+  keep `ctypes.wintypes` out of a non-Windows startup - a reason that expired
+  when the helper moved to `atomic_write.py`; it imports the public
+  `atomic_write` at module scope, and importing the catalog no longer pulls
+  in `secret_storage` at all.
+
+### Notes
+
+- The suite is **1 859 tests**, from 1 729. `tests/test_http.py` is new and
+  holds 85 of them; the Copilot file is at 34, OpenRouter's at 38, Azure's at
+  232, the config file at 138, and the egress guard's at 460. Ninety of
+  the hundred and thirty came from the review rounds. Round 1's
+  thirty-six: the out-of-band deadline (12), the urllib3 floor and the
+  nested-coding refusal (5), Copilot's named transport failures (2), the
+  redirect refusal (10), the five mutation survivors the code lane found (6)
+  and the symlinked-`config.json` note (1). Round 2's thirty: the timer's
+  re-arm (4), the adapter hook driven from `requests` itself (4), the
+  un-watched pool (1), the comma refusal (9 with its parameters), the 304
+  (3), Copilot's truncated reply (2) and four edges that survived the code
+  lane's mutations (7). Round 3's eighteen, less the one they replaced: the
+  detached socket a handshake leaves behind (1), Copilot's username rule (10
+  with its parameters), the missed-hook line's meaning (1), the timer that
+  cannot start (2), the un-watch that must not mask a call's failure (2),
+  and two the mutation runs walked through - the re-arm interval against the
+  read timeouts, and the count inside the refusal message. One existing test
+  also had its derivation completed rather than left with a magic constant
+  in it. The confirmation pass's seven, all of them pins on lines round 3
+  added: a pool with `__slots__` against the un-watch's `__dict__` default
+  (1), `DeadlineUnavailable` in `HELPER_EXCEPTIONS` and on Copilot's tile
+  (2), the un-watch guard's breadth against an `AttributeError` (1), the
+  un-watch loop finishing past a pool that refuses (1), a `cancel()` that
+  raises leaving the session closed (1), and the re-arm being armed before
+  the missed-hook line is written (1).
+- **The hook the whole bound rests on is now driven by `requests`.** Every
+  other transport test injects at `Session.request`, which is above the
+  adapter, so `_ConnectionRecordingAdapter.get_connection_with_tls_context` -
+  a `requests` 2.32 method feeding urllib3's private `_get_conn` - was
+  covered by nothing: renaming it left the suite green while a TLS header
+  drip went from 3.00 s to unbounded - still inside the call when the harness
+  gave up watching. (An earlier draft said "14.03 s and stuck" there, which
+  was one harness's give-up rather than a bound.) Two tests now run
+  `requests`' own send path with the urllib3 pool faked below the adapter,
+  and when the deadline comes due with no connection recorded at all the
+  timer writes one `provider http deadline_hook_missed=True` - a fixed
+  literal - so a future `requests` that moves the seam shows up somewhere
+  rather than nowhere. A call that merely has no socket yet, which is what
+  a slow resolver looks like from there, says nothing: writing the line for
+  that too made the signal unreadable on exactly the networks it matters on.
+- Not one `responses.add(...)` in the existing provider tests needed editing.
+  `responses` supports `stream=True` and hands back a real urllib3 handle, so
+  the whole transport change is invisible to them - which is the point.
+
 ## 1.3.1+cfa.6 - 2026-09-15
 
 The residuals of the refresh-cadence release, and two coercions on

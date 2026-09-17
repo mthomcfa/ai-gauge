@@ -9,6 +9,11 @@ import requests
 
 from ..config import Config, get_github_pat
 from ..models import SnapshotStatus, UsageMetric, UsageSnapshot
+from ._http import (
+    HELPER_EXCEPTIONS,
+    bounded_request,
+    request_worst_case_seconds,
+)
 from .base import Provider
 
 GITHUB_API = "https://api.github.com"
@@ -17,6 +22,22 @@ COPILOT_PRODUCT = "copilot"
 COPILOT_AI_CREDITS_SKU = "copilot_ai_credits"
 COPILOT_AI_UNIT_SKU = "copilot_ai_unit"
 LEGACY_PREMIUM_REQUEST_SKU = "copilot_premium_request"
+# Per-socket timeouts, unchanged. They bound one connect or one read; what
+# bounds the whole exchange is bounded_request's own deadline - see _http.py.
+USERNAME_TIMEOUT = 10
+USAGE_TIMEOUT = 15
+# What one refresh may spend on the wire, so the App's watchdog can be told
+# the truth instead of the flat 60 s default. work() makes at most three
+# sequential calls: the username resolve, the credit-usage read, and the
+# legacy premium fallback (reached either from a 400/404 on the credit read
+# or from a credit read that came back with no credit rows - never both).
+#   40 + 45 + 45 = 130 s
+# Before this release the same sum was unbounded, because a dripping server
+# held any one of those three forever; the flat 60 s was a guess at a nominal
+# ceiling (10 + 15 + 15 of per-socket timeouts) that nothing enforced.
+REFRESH_WORST_CASE_SECONDS = request_worst_case_seconds(
+    USERNAME_TIMEOUT
+) + 2 * request_worst_case_seconds(USAGE_TIMEOUT)
 log = logging.getLogger("aigauge.providers.copilot")
 
 
@@ -54,28 +75,63 @@ def _next_month_start_utc(now_utc: datetime) -> datetime:
     return datetime(now_utc.year, now_utc.month + 1, 1, tzinfo=timezone.utc)
 
 
+# The two replies that are GitHub refusing this PAT: 401 for a credential it
+# will not take at all, 403 for one it takes without the scope this call
+# reads. They are the whole of what "PAT may lack read:user" is a diagnosis
+# of - see _resolve_username.
+_PAT_REFUSED_STATUSES = frozenset({401, 403})
+
+
 def _resolve_username(pat: str, configured: str | None) -> str | None:
+    """The username behind the PAT, or ``None`` if GitHub refused to say.
+
+    ``None`` is reported as "PAT may lack read:user", and the rule for it is
+    that GitHub answered and refused: a 401 or a 403 on ``/user``. Nothing
+    else is an answer about the credential, and everything else used to be
+    turned into one - a deadline, an oversized reply, a refused encoding, a
+    redirect, a reply that was not JSON, a 500, and an ordinary offline
+    machine all told the user to re-issue a PAT that was fine. Two rounds of
+    this release took two of those routes off the list one at a time; the
+    rule behind them is what was wrong, so it is the rule that changed.
+
+    A 200 with a ``login`` gives the login. Every other reply and every
+    transport failure - the five this package's helper raises included -
+    leaves ``work()``'s branch to say what actually happened.
+
+    Two 2xx shapes are the exception, and still read as a refusal today: a
+    2xx other than 200 (a 201 or a 204, whose body is not the user object)
+    and a 200 whose JSON carries no ``login`` both come back as ``None``, so
+    the tile says "PAT may lack read:user" where GitHub answered and did not
+    refuse. Neither is reachable against ``api.github.com``, which answers
+    ``/user`` with 200 and a ``login`` or with the 401/403 above, so this is
+    recorded rather than fixed: the honest answer needs a shape the rule can
+    report as "GitHub answered something else", which is `work()`'s branch
+    and a change to what this function returns.
+    """
     if configured:
         return configured
-    try:
-        r = requests.get(
-            f"{GITHUB_API}/user",
-            headers=_github_headers(pat),
-            timeout=10,
-        )
-        if r.status_code == 200:
-            return r.json().get("login")
-    except requests.RequestException:
+    r = bounded_request(
+        "GET",
+        f"{GITHUB_API}/user",
+        headers=_github_headers(pat),
+        timeout=USERNAME_TIMEOUT,
+    )
+    if r.status_code in _PAT_REFUSED_STATUSES:
         return None
-    return None
+    # Any other non-2xx is a `requests.HTTPError`, which `work()` reports by
+    # type name - its message is the URL it failed on, and a Copilot URL
+    # carries the GitHub username.
+    r.raise_for_status()
+    return r.json().get("login")
 
 
 def _fetch_user_premium_usage(pat: str, username: str) -> dict:
-    r = requests.get(
+    r = bounded_request(
+        "GET",
         f"{GITHUB_API}/users/{username}/settings/billing/premium_request/usage",
         params=_usage_params(),
         headers=_github_headers(pat),
-        timeout=15,
+        timeout=USAGE_TIMEOUT,
     )
     r.raise_for_status()
     payload = r.json()
@@ -84,11 +140,12 @@ def _fetch_user_premium_usage(pat: str, username: str) -> dict:
 
 
 def _fetch_user_credit_usage(pat: str, username: str) -> dict:
-    r = requests.get(
+    r = bounded_request(
+        "GET",
         f"{GITHUB_API}/users/{username}/settings/billing/usage/summary",
         params=_summary_params(),
         headers=_github_headers(pat),
-        timeout=15,
+        timeout=USAGE_TIMEOUT,
     )
     r.raise_for_status()
     payload = r.json()
@@ -97,11 +154,12 @@ def _fetch_user_credit_usage(pat: str, username: str) -> dict:
 
 
 def _fetch_org_premium_usage(pat: str, org: str, username: str) -> dict:
-    r = requests.get(
+    r = bounded_request(
+        "GET",
         f"{GITHUB_API}/organizations/{org}/settings/billing/premium_request/usage",
         params=_usage_params(username),
         headers=_github_headers(pat),
-        timeout=15,
+        timeout=USAGE_TIMEOUT,
     )
     r.raise_for_status()
     payload = r.json()
@@ -110,11 +168,12 @@ def _fetch_org_premium_usage(pat: str, org: str, username: str) -> dict:
 
 
 def _fetch_org_credit_usage(pat: str, org: str) -> dict:
-    r = requests.get(
+    r = bounded_request(
+        "GET",
         f"{GITHUB_API}/organizations/{org}/settings/billing/usage/summary",
         params=_summary_params(),
         headers=_github_headers(pat),
-        timeout=15,
+        timeout=USAGE_TIMEOUT,
     )
     r.raise_for_status()
     payload = r.json()
@@ -369,6 +428,10 @@ def _log_snapshot_decision(
 class CopilotProvider(Provider):
     name = "copilot"
     display_name = "Copilot"
+    # Declared rather than taking app.py's flat _REST_REFRESH_BUDGET_SECONDS:
+    # three bounded calls do not fit 60 s, and the watchdog must not fire
+    # inside a refresh that is still inside its own bound.
+    refresh_budget_seconds = REFRESH_WORST_CASE_SECONDS
 
     def __init__(self, config: Config, pool=None):
         self._config = config
@@ -393,7 +456,7 @@ class CopilotProvider(Provider):
 
         config = self._config
 
-        def work() -> UsageSnapshot:
+        def fetch() -> UsageSnapshot:
             username = _resolve_username(pat, config.copilot.username)
             if not username:
                 log.info(
@@ -514,6 +577,46 @@ class CopilotProvider(Provider):
             )
             return snapshot
 
+        def work() -> UsageSnapshot:
+            """``fetch``, with the transport failures named.
+
+            Every branch inside ``fetch`` catches ``requests.HTTPError`` - a
+            reply GitHub actually sent - and nothing caught the rest, so an
+            ordinary offline failure fell to the worker's blanket handler,
+            which reported ``str(exc)``. A ``requests`` connection error
+            carries the URL it failed on, and a Copilot URL carries the
+            GitHub username as a path segment, so going offline put an
+            account identifier in ai-gauge.log, on the tile and in Copy
+            diagnostics - the one thing SECURITY.md says never reaches them.
+            The type name says as much as the user can act on.
+
+            It wraps the username resolve as well as the two fetches, because
+            that call re-raises the failures whose diagnosis is not "the PAT
+            may lack read:user".
+            """
+            try:
+                return fetch()
+            except requests.RequestException as exc:
+                log.warning(
+                    "provider api diagnosis provider=copilot "
+                    "classification=request_failed type=%s",
+                    type(exc).__name__,
+                )
+                # The type name is the rule because a `requests` exception's
+                # message is the URL it failed on. The five the bounded
+                # helper raises are built from a status, a count or a bound
+                # and carry no URL by construction, so those say what
+                # actually happened - as OpenRouter's and Azure's tiles do.
+                if isinstance(exc, HELPER_EXCEPTIONS):
+                    detail = f": {exc}"
+                else:
+                    detail = f" ({type(exc).__name__})."
+                return UsageSnapshot(
+                    provider="copilot",
+                    status=SnapshotStatus.ERROR,
+                    error=f"GitHub request failed{detail}",
+                )
+
         self._run_async(work, on_done)
 
     def _run_async(
@@ -528,7 +631,14 @@ class CopilotProvider(Provider):
                 try:
                     snapshot = work()
                 except Exception as exc:  # noqa: BLE001
-                    log.exception(
+                    # The type name only, and no traceback: `log.exception`
+                    # prints one whose last line is the exception message,
+                    # and a message can carry the request URL - which on this
+                    # provider carries the GitHub username. Same shape as
+                    # azure's blanket handler, for the same reason. This line
+                    # goes to the file the error dialog invites the user to
+                    # attach to a bug report.
+                    log.warning(
                         "provider api diagnosis provider=copilot "
                         "classification=unexpected_exception type=%s",
                         type(exc).__name__,
@@ -536,7 +646,7 @@ class CopilotProvider(Provider):
                     snapshot = UsageSnapshot(
                         provider="copilot",
                         status=SnapshotStatus.ERROR,
-                        error=str(exc),
+                        error=f"Copilot refresh failed ({type(exc).__name__}).",
                     )
                 on_done(snapshot)
 

@@ -66,17 +66,49 @@ Not secrets, but written from provider pages and worth knowing about:
 
 Both are written atomically — a temp file in the same directory plus
 `os.replace` — so a reader sees the old document or the new one, never half of
-either. On macOS and Linux the file is created `0600`, owner-only, before any
-bytes are written. **On Windows there is no POSIX mode**: the override file
-relies on the user-scoped `%APPDATA%` location, exactly like `config.json` and
-the browser profiles beside it, and it is not DPAPI-encrypted or given an
-explicit DACL the way `secrets.dat` is. It holds no credentials — page labels,
-an account id and redacted evidence — but another account with administrative
+either. Since 1.3.2+cfa.7 `config.json` is written the same way, and for a
+sharper reason: the app writes that file on its own (see below), so a crash or
+a power cut inside a write nobody asked for must not be able to truncate every
+setting you have. On macOS and Linux all three are created `0600`, owner-only,
+before any bytes are written. **On Windows there is no POSIX mode**: those
+files rely on the user-scoped `%APPDATA%` location, exactly like the browser
+profiles beside them, and are not DPAPI-encrypted or given an explicit DACL the
+way `secrets.dat` is. The override file holds no credentials — page labels, an
+account id and redacted evidence — but another account with administrative
 rights on the machine can read it.
 
 The catalog is built entirely from what the embedded browser already rendered:
 nothing is downloaded, there is no remote catalog, and none of it is sent
 anywhere.
+
+### What "Clear all browser data" removes
+
+The button in Settings removes two things for each account it covers: the
+stored cookie secret, and the embedded browser's profile directory under
+`<app-data>/profiles/` — that account's cookie store, cache and local storage.
+The accounts it covers are every account you have configured, the three fixed
+ids (`claude`, `codex`, `opencode_go`), and every directory already in
+`profiles/` that the app can confirm is a profile of its own: a legal profile
+id, resolving inside that directory, and not a symlink. Those leftovers are
+exactly what this button exists to sweep up.
+
+The cookie secrets are deleted at the click. The profile directories are handed
+to the app rather than deleted by the dialog, because Qt requires a
+`QWebEngineProfile` to outlive the pages using it: a profile whose account is
+being refreshed at that moment is deleted as soon as that refresh finishes.
+The dialog says so, and says how many folders in `profiles/` it could not match
+to an account and therefore left alone.
+
+A deletion the app could not finish before you quit is recorded in
+`config.json` and carried out at the next start, before any cookie is loaded
+and before any provider exists. The record is a list of **account ids only** —
+`pending_data_clears` for this button, and `pending_profile_purges` for an
+account you removed in Settings — never a cookie, a token or anything from a
+provider page. Both lists are bounded, at 64 entries of at most 64 characters
+each, and every id on them is re-checked before it is acted on: a name that is
+not a legal profile id is refused, a path that does not resolve strictly inside
+`profiles/` is refused, and a symlink is never followed or deleted through,
+whatever it points at.
 
 ### Why the split on Windows?
 
@@ -161,8 +193,22 @@ action, not a loop.
 
 The embedded browser's navigation allowlist is separate from and stricter than
 this table; see [Embedded Browser](#embedded-browser). No Azure traffic goes
-through the embedded browser — it is plain `requests` with a 15-second timeout,
-like Copilot and OpenRouter.
+through the embedded browser — it is `requests`, like Copilot and OpenRouter,
+and since 1.3.2+cfa.7 every one of those calls goes through one bounded
+helper: a 15-second per-socket timeout (10 seconds on Copilot's `/user`) and a
+30-second deadline on the whole exchange — the connect, the TLS handshake, the
+response headers and the body — so one call returns or raises within
+**45 seconds** (40 on Copilot's `/user`): the deadline plus the one read it can
+leave in flight. The deadline is enforced by shutting the socket down from a
+timer rather than by hoping a read returns, and a deadline that comes due
+before there is a socket the timer can reach keeps trying every quarter-second
+until there is one — which is what covers the connect and the handshake, where
+there is either no socket yet or one the TLS layer has already detached. It
+covers the exchange from the socket onwards and not before it: name resolution
+happens before there is a socket at all, and is bounded by the operating
+system's resolver alone, on top of those 45 seconds. The helper also imposes
+an 8 MiB ceiling on the response, follows no redirect and hands no 3xx back to
+a caller as though it were a reply, and retries nothing of any kind.
 
 Diagnostic logs are written locally to `<app-data>/ai-gauge.log`. Logs
 are intended to avoid recording
