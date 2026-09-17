@@ -46,10 +46,8 @@ from .config import (
     Config,
     WINDOW_AUTOFIT_MAX_HEIGHT,
     WINDOW_COLLAPSED_HEIGHT,
-    WINDOW_DEFAULT_HEIGHT,
     WINDOW_MIN_HEIGHT,
     WINDOW_MIN_WIDTH,
-    WINDOW_WIDTH,
     browser_account,
     display_name_for_account,
 )
@@ -1462,18 +1460,20 @@ class UsageWidget(QWidget):
         # True between the moment the window manager took a move or resize
         # over and the moment its events stop arriving - see _arm_geometry_commit.
         self._native_gesture = False
+        # Narrower: the WM is running a *resize*, so the next resizeEvent is
+        # the user changing the size and not the app fitting itself.
+        self._native_resize = False
         # The height to come back to when the chip strip is expanded again;
         # seeded from the restored geometry at the end of __init__, because a
         # widget that starts collapsed never passes through set_collapsed.
         self._expanded_height = 0
-        # Has the user ever given this window a size of their own? A config
-        # still carrying both first-run values has not, and that is what keeps
-        # auto-fit switched on. Nothing writes the size back until this is
-        # True, so moving a fresh window does not silently end auto-fit.
-        self._user_sized = (
-            config.window.width != WINDOW_WIDTH
-            or config.window.height != WINDOW_DEFAULT_HEIGHT
-        )
+        # Has the user ever given this window a size of their own? Recorded in
+        # the config, not inferred from the size: "not exactly 340x220" said
+        # yes for every 1.3.x install, because 1.3.x wrote its auto-fitted
+        # height back on every release, hide and close. Nothing writes the
+        # size back until this is True, so moving a fresh window does not
+        # silently end auto-fit.
+        self._user_sized = config.window.user_sized
         self.setMinimumSize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
         self.setMouseTracking(True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
@@ -2387,12 +2387,12 @@ class UsageWidget(QWidget):
             if handle is not None and handle.startSystemResize(edges):
                 self._resize_edges = Qt.Edge(0)
                 self._native_gesture = True
+                self._native_resize = True
             else:
                 self._resize_edges = edges
                 self._resize_origin = event.globalPosition().toPoint()
                 self._resize_geometry = self.geometry()
             self._press_moved = True  # a resize is never also a click
-            self._mark_user_sized()
             event.accept()
             return
         self._press_global = event.globalPosition().toPoint()
@@ -2458,6 +2458,11 @@ class UsageWidget(QWidget):
             top = start.bottom() - height + 1
         elif self._resize_edges & Qt.Edge.BottomEdge:
             height = max(minimum.height(), min(maximum.height(), start.height() + dy))
+        if (width, height) != (start.width(), start.height()):
+            # Here, not on the press: a motionless click 1 px inside the 8 px
+            # band used to end auto-fit for good, and a drag already at the
+            # minimum or the maximum has not resized anything either.
+            self._mark_user_sized()
         self.setGeometry(left, top, width, height)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
@@ -2474,6 +2479,7 @@ class UsageWidget(QWidget):
         # A release that did arrive ends the gesture here; the debounce is for
         # the ones that do not.
         self._native_gesture = False
+        self._native_resize = False
         self._geometry_commit.stop()
         self._commit_geometry()
         if not self._press_moved:
@@ -2483,10 +2489,15 @@ class UsageWidget(QWidget):
         self._press_moved = False
 
     def _mark_user_sized(self) -> None:
-        """The user has taken the window's size over from the app."""
+        """The user has taken the window's size over from the app.
+
+        Called from a size that actually changed - never from a press, which
+        is a click the user may have meant for the panel underneath.
+        """
         if self._user_sized:
             return
         self._user_sized = True
+        self._config.window.user_sized = True
         # Whatever auto-fit pinned the tile area at is no longer the rule.
         self._tile_scroll.setMinimumHeight(0)
         self._tile_scroll.setMaximumHeight(_QT_SIZE_MAX)
@@ -2502,9 +2513,16 @@ class UsageWidget(QWidget):
         self._config.window.width = self.width()
         self._config.window.height = self.height()
 
-    def _geometry_state(self) -> tuple[int | None, int | None, int, int, bool]:
+    def _geometry_state(self) -> tuple[int | None, int | None, int, int, bool, bool]:
         window = self._config.window
-        return (window.x, window.y, window.width, window.height, window.collapsed)
+        return (
+            window.x,
+            window.y,
+            window.width,
+            window.height,
+            window.collapsed,
+            window.user_sized,
+        )
 
     def _commit_geometry(self) -> None:
         """The one place the window's geometry reaches the file.
@@ -2547,6 +2565,7 @@ class UsageWidget(QWidget):
 
     def _commit_after_native_gesture(self) -> None:
         self._native_gesture = False
+        self._native_resize = False
         # The WM is bounded by the maximum size, not by the work area's
         # origin, so a drag can still leave the window part-way off a screen.
         self._clamp_to_visible_screen()
@@ -2558,6 +2577,10 @@ class UsageWidget(QWidget):
 
     def resizeEvent(self, event):  # noqa: N802
         super().resizeEvent(event)
+        if self._native_resize:
+            # The native half of the same rule: the window manager owns the
+            # drag, so its first size change is the user taking the size over.
+            self._mark_user_sized()
         self._arm_geometry_commit()
 
     def hideEvent(self, event):  # noqa: N802

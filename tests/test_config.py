@@ -505,6 +505,44 @@ def test_load_keeps_a_1_3_x_window_block_unchanged():
     assert (c.window.x, c.window.y) == (100, 120)
 
 
+def test_a_1_3_x_config_has_never_been_sized_by_hand():
+    """The upgrade case. 1.3.x wrote its auto-fitted height back on every
+    release, hide and close, so "the size is not the first-run 340x220" said
+    yes for practically every installed config - and auto-fit would have gone
+    off for every existing user on their first launch of 1.4.0. The file
+    itself is the answer: it has no ``user_sized`` key."""
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        '{"window": {"width": 340, "height": 268}}', encoding="utf-8"
+    )
+
+    assert Config.load().window.user_sized is False
+
+
+def test_user_sized_survives_a_round_trip():
+    c = Config()
+    c.window.user_sized = True
+    c.window.width, c.window.height = 500, 300
+    c.save()
+
+    loaded = Config.load()
+    assert loaded.window.user_sized is True
+    assert (loaded.window.width, loaded.window.height) == (500, 300)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["yes", 1, 0, None, [], {"a": 1}, "false"],
+    ids=["yes", "one", "zero", "null", "list", "dict", "false-string"],
+)
+def test_a_hostile_user_sized_coerces_to_never_sized(raw):
+    """It gates auto-fit, and a raise inside WindowState costs the user the
+    whole window block. Anything but a real bool reads as "no"."""
+    from aigauge.config import WindowState
+
+    assert WindowState(user_sized=raw).user_sized is False
+
+
 @pytest.mark.parametrize(
     "payload,expected",
     [

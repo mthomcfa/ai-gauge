@@ -203,7 +203,8 @@ class WindowState(BaseModel):
     ``width`` and ``height`` became real in 1.4.0+cfa.8. Before it the panel
     was 340 px wide with a height re-fitted to its content, so the saved width
     was overwritten with the constant on every load and the height capped at
-    420. Both are now whatever the user dragged the window to.
+    420. Both are now whatever the user dragged the window to, and
+    ``user_sized`` is what says whether they have.
 
     Bounded, never trusted: these reach ``QWidget.resize`` and a config file is
     hand-editable. The bound here is a sanity bound rather than the real one -
@@ -215,6 +216,14 @@ class WindowState(BaseModel):
     y: int | None = None
     width: int = WINDOW_WIDTH
     height: int = WINDOW_DEFAULT_HEIGHT
+    # Has the user ever dragged an edge? Recorded rather than inferred. The
+    # first cut asked "is the size still exactly 340x220" - and 1.3.x wrote
+    # its auto-fitted height back on every release, hide and close, so an
+    # upgrading config almost never carried 220 and every existing install
+    # arrived with auto-fit already off. A 1.3.x file has no such key, which
+    # is exactly the answer: False, and the panel goes on fitting itself to
+    # its content until the user takes the size over.
+    user_sized: bool = False
     collapsed: bool = False
     always_on_top: bool = True
     opacity: float = 0.8
@@ -224,6 +233,13 @@ class WindowState(BaseModel):
     # become illegible. Applied via Qt's QT_SCALE_FACTOR at launch — see
     # qt_scale_factor_env().
     ui_scale: float = 1.0
+
+    @field_validator("user_sized", mode="before")
+    @classmethod
+    def _coerce_user_sized(cls, value: object) -> bool:
+        # Anything but a real bool is a file this app did not write; the safe
+        # reading of it is "no", which leaves auto-fit on.
+        return value if isinstance(value, bool) else False
 
     @field_validator("width", "height", "opacity", "ui_scale", mode="before")
     @classmethod

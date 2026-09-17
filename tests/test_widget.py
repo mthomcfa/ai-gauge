@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import QApplication
 from aigauge.config import (
     BrowserAccount,
     Config,
+    config_path,
     WINDOW_DEFAULT_HEIGHT,
     WINDOW_MIN_HEIGHT,
     WINDOW_MIN_WIDTH,
@@ -1274,18 +1275,33 @@ def test_a_resize_is_saved_to_config_on_release(qtbot):
 
 
 def test_the_saved_size_is_restored_on_the_next_construction(qtbot):
+    """And is still there once the deferred re-fit has run.
+
+    One `qtbot.wait(0)` is not enough: `_refit_height` posts through
+    `QTimer.singleShot(0, ...)` and the tile add posts its own layout work, so
+    the size an auto-fit would overwrite was asserted before auto-fit had had
+    a turn - the assertion held with `_user_sized` broken.
+    """
     config = Config()
     config.window.width = 512
     config.window.height = 333
+    config.window.user_sized = True
 
     widget = UsageWidget(config)
     qtbot.addWidget(widget)
     widget.update_snapshot(_ok_snapshot("claude"), "Claude")
     qtbot.wait(0)
+    qtbot.wait(0)
 
     assert (widget.width(), widget.height()) == (512, 333), (
         "auto-fit overrode a size the user had chosen"
     )
+
+    with qtbot.waitExposed(widget):
+        widget.show()
+    qtbot.wait(0)
+    qtbot.wait(0)
+    assert (widget.width(), widget.height()) == (512, 333)
 
 
 def test_a_saved_size_larger_than_the_screen_is_shrunk_and_moved_on(qtbot):
@@ -1449,6 +1465,7 @@ def test_a_hide_that_changed_nothing_writes_nothing(qtbot, monkeypatch):
     config = Config()
     config.window.x, config.window.y = 60, 70
     config.window.width, config.window.height = 420, 280
+    config.window.user_sized = True
     widget = UsageWidget(config)
     qtbot.addWidget(widget)
     with qtbot.waitExposed(widget):
@@ -1462,6 +1479,80 @@ def test_a_hide_that_changed_nothing_writes_nothing(qtbot, monkeypatch):
     widget.hide()
 
     assert saves == []
+
+
+def test_a_click_on_the_edge_does_not_end_auto_fit(qtbot):
+    """`_mark_user_sized()` used to run on the press, before any movement was
+    known, so one stray click within 8 px of an edge switched auto-fit off
+    for good - and the release then wrote that size to disk, so it survived
+    every restart."""
+    config = Config()
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_ok_snapshot("claude"), "Claude")
+    widget.move(50, 50)
+    widget._do_refit_height()  # noqa: SLF001
+    fitted = widget.height()
+
+    edge = QPoint(2, widget.height() // 2)
+    _press(widget, edge)
+    _release(widget, edge)
+
+    assert widget._user_sized is False  # noqa: SLF001
+    assert config.window.user_sized is False
+    assert (config.window.width, config.window.height) == (
+        WINDOW_WIDTH,
+        WINDOW_DEFAULT_HEIGHT,
+    )
+    widget.update_snapshot(_ok_snapshot("codex"), "Codex")
+    widget._do_refit_height()  # noqa: SLF001
+    assert widget.height() > fitted, "a click in the band stopped auto-fit"
+
+    _drag_corner(widget, 0, 20)
+
+    assert widget._user_sized is True  # noqa: SLF001
+    assert config.window.user_sized is True
+
+
+def test_a_1_3_x_config_still_auto_fits(qtbot):
+    """1.3.x saved its auto-fitted height on every release, hide and close, so
+    "the size is not 340x220" meant "user-sized" for practically every
+    installed config. Every existing user would have lost auto-fit on the
+    first launch of 1.4.0 without touching an edge."""
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        '{"window": {"width": 340, "height": 268}}', encoding="utf-8"
+    )
+    config = Config.load()
+
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_ok_snapshot("claude"), "Claude")
+    widget._do_refit_height()  # noqa: SLF001
+    fitted = widget.height()
+
+    assert widget._user_sized is False  # noqa: SLF001
+    widget.update_snapshot(_ok_snapshot("codex"), "Codex")
+    widget._do_refit_height()  # noqa: SLF001
+    assert widget.height() > fitted, "the upgraded config arrived user-sized"
+
+
+def test_a_config_that_says_user_sized_keeps_its_size(qtbot):
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        '{"window": {"width": 500, "height": 300, "user_sized": true}}',
+        encoding="utf-8",
+    )
+    config = Config.load()
+
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_ok_snapshot("claude"), "Claude")
+    qtbot.wait(0)
+    qtbot.wait(0)
+
+    assert widget._user_sized is True  # noqa: SLF001
+    assert (widget.width(), widget.height()) == (500, 300)
 
 
 def test_a_click_raises_settings_but_a_drag_does_not(qtbot):

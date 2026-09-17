@@ -47,10 +47,23 @@ user sees.
   **Auto-fit did not go away; it became conditional, and the docstring says
   which rule applies when.** Collapsed is always auto-fitted: a chip strip has
   one right height and the user cannot drag it into two rows. Expanded is
-  auto-fitted only while the config still carries both first-run values, i.e.
-  while the window has never been sized by hand. After that the saved size
-  wins and the tile area takes the difference - re-fitting on the next refresh
-  is exactly what would undo the drag.
+  auto-fitted only while the window has never been sized by hand. After that
+  the saved size wins and the tile area takes the difference - re-fitting on
+  the next refresh is exactly what would undo the drag.
+
+  "Sized by hand" is a **recorded** answer, `WindowState.user_sized`, not one
+  inferred from the numbers. Inferring it as "the size is not exactly
+  340 x 220" would have switched auto-fit off for every existing user on their
+  first launch: 1.3.x wrote its *auto-fitted* height back on every release,
+  hide and close, so an upgrading config almost never carries 220. A 1.3.x
+  file has no such key, which is the right answer - False - and its width is
+  still restored. It is set by a resize that **changed the size**: in the
+  fallback path on the first delta that moves an edge, and on the native path
+  on the first `resizeEvent` the window manager's drag produces. It used to be
+  set on the *press*, so one motionless click 1 px inside the 8 px band ended
+  auto-fit for good and the release wrote that size to disk. Like the other
+  bounded window fields it is coerced rather than trusted: anything that is
+  not a real bool reads as False.
 
   **The geometry is written back from one seam, `_commit_geometry()`**, and
   everything that can end a gesture reaches it: the mouse release, a hide (the
