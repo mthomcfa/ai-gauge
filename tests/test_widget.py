@@ -1496,6 +1496,9 @@ def test_a_click_on_the_edge_does_not_end_auto_fit(qtbot):
 
     edge = QPoint(2, widget.height() // 2)
     _press(widget, edge)
+    # And a move that travels nowhere: the pointer jitters inside one pixel
+    # and the geometry the fallback computes is the geometry it started from.
+    _move_to(widget, widget.mapToGlobal(edge))
     _release(widget, edge)
 
     assert widget._user_sized is False  # noqa: SLF001
