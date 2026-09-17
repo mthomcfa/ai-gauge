@@ -3329,6 +3329,41 @@ def _clock_spy(monkeypatch):
     return clocks
 
 
+def _ticking_clock(monkeypatch):
+    """Give the provider a `datetime.now()` that is strictly increasing.
+
+    "The gate and the fetch captured different clocks" has to be true by
+    construction, not by how finely the platform measures time: Windows
+    advances the real clock in 1-16 ms ticks, so two reads a few hundred
+    microseconds apart came back identical to the microsecond and a test
+    asserting they differ was asserting the timer's resolution. A counter
+    settles it, and it settles the other direction too - on a coarse clock,
+    "these calls share one `now`" passes for a caller that read its own.
+
+    One second per read, starting from the real clock so the state a previous
+    fetch left behind is not suddenly in the future (which the refresh reads
+    as a clock that jumped and corrects for). Aware reads are left real:
+    `datetime.now(timezone.utc)` dates Cost Management's query window, it is
+    not the `now` under test, and faking it would move the period.
+
+    Returns the list of instants handed out, in order.
+    """
+    ticks: list = []
+    epoch = datetime.now()
+
+    class _Ticking(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is not None:
+                return datetime.now(tz)
+            moment = epoch + timedelta(seconds=len(ticks))
+            ticks.append(moment)
+            return moment
+
+    monkeypatch.setattr(az, "datetime", _Ticking)
+    return ticks
+
+
 @responses.activate
 def test_the_stale_settings_note_is_composed_with_the_gates_clock(monkeypatch, config):
     """`serve_cache` is inside the same call that captured `now` and compared
@@ -3337,6 +3372,7 @@ def test_the_stale_settings_note_is_composed_with_the_gates_clock(monkeypatch, c
     _stub_everything()
     _run(az.AzureProvider(config), monkeypatch)
     config.azure.reset_day = 15  # the cached answer no longer fits the question
+    ticks = _ticking_clock(monkeypatch)
     clocks = _clock_spy(monkeypatch)
 
     second = _run(az.AzureProvider(config), monkeypatch)
@@ -3344,7 +3380,10 @@ def test_the_stale_settings_note_is_composed_with_the_gates_clock(monkeypatch, c
     assert "Next fetch at" in (second.metrics[0].note or "")
     assert clocks, "next_allowed_at was not reached"
     assert None not in clocks, "a message site read the wall clock of its own"
-    assert len(set(clocks)) == 1, "two clocks inside one refresh"
+    # `serve_cache` runs inside the call that captured `now` for the gate, so
+    # every reading here is that one instant - and a reading of its own would
+    # be a later tick, whatever the platform's timer resolution.
+    assert set(clocks) == {ticks[0]}, "two clocks inside one refresh"
 
 
 @responses.activate
@@ -3354,6 +3393,7 @@ def test_the_throttled_message_is_composed_with_the_fetchs_clock(monkeypatch, co
     monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
     _stub_everything()
     _throttle("forecast")
+    ticks = _ticking_clock(monkeypatch)
     clocks = _clock_spy(monkeypatch)
 
     snapshot = _run(az.AzureProvider(config), monkeypatch)
@@ -3363,10 +3403,17 @@ def test_the_throttled_message_is_composed_with_the_fetchs_clock(monkeypatch, co
     )
     assert clocks, "next_allowed_at was not reached"
     assert None not in clocks, "the throttled message read the wall clock of its own"
-    # Two, and only two: the gate's `now`, captured in `refresh`, and the
-    # fetch's own, captured before it started asking. Both message sites in
-    # the 429 handler are inside the second.
-    assert len(set(clocks)) == 2
+    # The gate and the fetch are two calls that capture two clocks, and the
+    # 429 handler is inside the second: every message site there used the
+    # fetch's `now`. Strictly later than the gate's because the clock ticks
+    # per read, not because the two happened to land on different microseconds
+    # - on Windows the real clock advances in 1-16 ms steps and they did not.
+    gate_now, *message_clocks = clocks
+    assert message_clocks, "the 429 handler's message sites were not reached"
+    gate_read, fetch_read = ticks[0], ticks[1]
+    assert gate_now == gate_read, "the gate was not the first to read the clock"
+    assert set(message_clocks) == {fetch_read}, "not the clock the fetch decided with"
+    assert fetch_read != gate_read
 
 
 @responses.activate
