@@ -1887,6 +1887,28 @@ def next_allowed_at(state: _State) -> datetime | None:
     return max(candidates) if candidates else None
 
 
+def _throttled_message(state: _State) -> str:
+    """Name the attempt that will actually happen, not the one the 429 asked for.
+
+    The old wording read the ``Retry-After`` header and said "retrying in N
+    min". That is the server's answer to the server's question; it is not when
+    this tile tries again. ``next_allowed_at`` is - the later of the hourly
+    floor from the last fetch and ``blocked_until`` - and the two disagree in
+    the ordinary case, because a ``Retry-After`` is usually seconds and the
+    floor is an hour. Measured on the user's desktop: a 52 s ``Retry-After`` at
+    11:16:48, a message promising a retry in 1 min, and then every refresh
+    until 12:16 serving the cached error in 0.0 s. An hour of a tile saying
+    "one minute" is worse than an hour of it saying nothing.
+
+    Local time and the same ``%H:%M`` as ``_stale_settings_note``, because they
+    are the same promise about the same clock and appear on the same tile.
+    """
+    when = next_allowed_at(state)
+    return "Cost Management is rate limiting this tenant" + (
+        f"; next attempt at {when:%H:%M}." if when is not None else "."
+    )
+
+
 def _stale_settings_note(state: _State) -> str:
     """Why the tile is showing figures it will not gauge.
 
@@ -2360,12 +2382,7 @@ class AzureProvider(Provider):
                     ),
                 )
             return self._remember_error(
-                state,
-                _error(
-                    "Cost Management is rate limiting this tenant; retrying in "
-                    f"{max(1, exc.retry_after // 60)} min."
-                ),
-                backoff=False,
+                state, _error(_throttled_message(state)), backoff=False
             )
         except AzurePermissionError as exc:
             if getattr(exc, "status", 0) == 401:

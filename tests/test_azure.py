@@ -3236,3 +3236,61 @@ def test_an_entra_token_deadline_does_not_read_as_a_rejected_registration(
     assert "ResponseDeadlineExceeded" in (snapshot.error or "")
     assert TENANT not in (snapshot.error or "")
     assert az.state_for(SUB).last_error is not None
+
+
+# --- The throttled message names the attempt that will happen ---------------
+
+
+@pytest.mark.parametrize(
+    "retry_after_s,expected_source",
+    [(52, "floor"), (6 * 3600, "retry_after")],
+    ids=["shorter-than-the-floor", "longer-than-the-floor"],
+)
+def test_the_throttled_message_names_the_real_next_attempt(
+    retry_after_s, expected_source
+):
+    """A Retry-After is the server's answer to the server's question. What
+    governs this tile is next_allowed_at: the later of the hourly floor from
+    the last fetch and blocked_until. Measured on the user's desktop, a 52 s
+    Retry-After at 11:16:48 was followed by an hour of refreshes served from
+    the cached error in 0.0 s, under a message promising one minute.
+    """
+    now = datetime(2026, 4, 27, 11, 16, 48)
+    state = az._State()
+    state.last_fetch_at = now
+    state.blocked_until = now + timedelta(seconds=retry_after_s)
+
+    message = az._throttled_message(state)
+
+    floor = now + az.MIN_FETCH_INTERVAL
+    expected = floor if expected_source == "floor" else state.blocked_until
+    assert message == (
+        "Cost Management is rate limiting this tenant; "
+        f"next attempt at {expected:%H:%M}."
+    )
+    assert "retrying in" not in message
+
+
+def test_the_throttled_message_without_a_clock_says_no_time():
+    """next_allowed_at answers None when nothing has been fetched and nothing
+    is blocked; a message must not invent an hour to fill the sentence."""
+    assert az._throttled_message(az._State()) == (
+        "Cost Management is rate limiting this tenant."
+    )
+
+
+@responses.activate
+def test_a_live_429_reports_the_hourly_floor(monkeypatch, config):
+    """End to end through the provider, not just the helper."""
+    monkeypatch.setattr(az, "get_azure_client_secret", lambda: "shhh")
+    _stub_everything()
+    _throttle("forecast")
+
+    snapshot = _run(az.AzureProvider(config), monkeypatch)
+
+    state = az.state_for(SUB)
+    assert snapshot.status == SnapshotStatus.ERROR
+    assert (snapshot.error or "").startswith(
+        "Cost Management is rate limiting this tenant; next attempt at "
+    )
+    assert f"{az.next_allowed_at(state):%H:%M}." in (snapshot.error or "")
