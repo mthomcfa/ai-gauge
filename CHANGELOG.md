@@ -325,7 +325,20 @@ user sees.
   says and in what colour, and a 38 kB `<table>` laid the label out as a
   table. Both tooltips carrying an error - the line's and the status label's -
   are clipped to 280 characters and HTML-escaped, since `QToolTip` has no
-  text-format setter and a 10 kB error made a 10 kB popup. Emitting on the press would have put a new top-level window
+  text-format setter and a 10 kB error made a 10 kB popup. Escaped **and
+  wrapped**: `Qt::mightBeRichText` reads only the *first line* for a `<` or a
+  literal `&lt;`, so an escaped string with no markup up there was drawn as
+  plain text and the escapes themselves were shown - `R&D` came out `R&amp;D`,
+  and markup on line two came out as entities. A
+  `<div style='white-space:pre-wrap'>` takes the decision away from the
+  heuristic and keeps the blank line HTML would collapse, while the clip stays
+  on the raw string where it cannot cut an entity in half - which bounds the
+  tooltip at 281 x 6 characters plus the suffix and the wrapper, 1 181 for a
+  10 kB error made entirely of `<`. The line itself is flattened to one line
+  and clipped to 1 000 characters before it is elided: `setWordWrap(False)`
+  does not stop an explicit newline, so a 5 000-line error laid the label out
+  660 px tall, and `elidedText` measures what it is handed - a 1 MB error cost
+  284 ms on the UI thread. Emitting on the press would have put a new top-level window
   under a button that is still down, i.e. the defect below, over 324 px of a
   340 px panel. Only when there is nothing else on the tile: with
   rows present the tag reads "error · stale" beside numbers that explain

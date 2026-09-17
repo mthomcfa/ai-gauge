@@ -376,23 +376,43 @@ def _short_error_reason(error: str | None) -> str:
 # A tooltip carries a provider's error string verbatim, and that string is
 # unbounded - a 10 240-character error produced a 10 260-character tooltip.
 _TOOLTIP_ERROR_CHARS = 280
+# How much of an error the detail line itself draws. The label is elided to
+# the window's width, but `elidedText` measures the whole string first: a 1 MB
+# single-line error cost 284 ms on the UI thread before anything was painted.
+# No window is a thousand characters wide, and the tooltip carries the text.
+_DETAIL_DISPLAY_CHARS = 1000
 
 
 def _safe_tooltip(error: str | None, suffix: str = "") -> str:
-    """Clip an error to a readable length and show it literally.
+    """Clip an arbitrary string to a readable length and show it literally.
 
-    ``QToolTip`` has no text-format setter: Qt decides for itself, and anything
-    markup-shaped is rendered as rich text. So a provider string containing
-    ``<span style="color:#111827">`` would paint the rest of the message in the
-    panel's own background colour, and a ``<table>`` would lay the popup out as
-    a table. Escaping is the one honest way to show an arbitrary string as
-    itself. Every string that reaches here is app-composed today - this is the
-    guard for the next error message that interpolates a provider field.
+    ``QToolTip`` has no text-format setter: Qt decides per string, with
+    ``Qt::mightBeRichText``, which reads the **first line** for a ``<`` or a
+    literal ``&lt;``. So a provider string containing
+    ``<span style="color:#111827">`` would paint the rest of the message in
+    the panel's own background colour and a ``<table>`` would lay the popup
+    out as a table - and escaping alone fixes only half of it, because a
+    string the heuristic then reads as plain shows the escapes themselves:
+    ``R&D`` came out ``R&amp;D``, and markup below the first line came out as
+    entities. The ``<div>`` settles the question - every tooltip is rich text,
+    so every escape is undone by the renderer - and ``pre-wrap`` keeps the
+    newlines HTML would otherwise collapse.
+
+    **Bounded by construction.** The clip is ``_TOOLTIP_ERROR_CHARS`` *raw*
+    characters, so the escaped body is at most ``(_TOOLTIP_ERROR_CHARS + 1)``
+    (the ellipsis) times 6 - ``&quot;`` is the longest expansion - plus the
+    escaped suffix and the wrapper: a 10 kB error made entirely of ``<`` comes
+    out at 1 181 characters. Clipping the raw string rather than the escaped
+    one is deliberate; a clip applied afterwards can cut an entity in half.
     """
     text = error or ""
     if len(text) > _TOOLTIP_ERROR_CHARS:
         text = text[:_TOOLTIP_ERROR_CHARS].rstrip() + "…"
-    return html.escape(text + suffix)
+    body = text + suffix
+    if not body:
+        # An empty tooltip is no tooltip; a wrapper around nothing is a popup.
+        return ""
+    return "<div style='white-space:pre-wrap'>" + html.escape(body) + "</div>"
 
 
 class _DetailLine(QLabel):
@@ -442,13 +462,24 @@ class _DetailLine(QLabel):
         self.setVisible(bool(self._full_text))
         self._elide()
 
+    def _display_text(self) -> str:
+        """One line of it, bounded, which is what the label is given to elide.
+
+        ``setWordWrap(False)`` does not stop an *explicit* newline, so a
+        5 000-line error laid this label out 660 px tall and took the tile's
+        height with it. And ``elidedText`` measures what it is handed before
+        it shortens anything, which is why the length matters as well as the
+        line count.
+        """
+        return " ".join(self._full_text.split())[:_DETAIL_DISPLAY_CHARS]
+
     def _elide(self) -> None:
         if not self._full_text:
             super().setText("")
             return
         super().setText(
             self.fontMetrics().elidedText(
-                self._full_text, Qt.TextElideMode.ElideRight, max(0, self.width())
+                self._display_text(), Qt.TextElideMode.ElideRight, max(0, self.width())
             )
         )
 

@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 
 import pytest
 from PyQt6.QtCore import QEvent, QPoint, QPointF, Qt
-from PyQt6.QtGui import QGuiApplication, QMouseEvent, QResizeEvent
+from PyQt6.QtGui import QGuiApplication, QMouseEvent, QResizeEvent, QTextDocument
 from PyQt6.QtWidgets import QApplication
 
 from aigauge.config import (
@@ -22,10 +22,25 @@ from aigauge.widget import (
     RESIZE_BAND,
     UsageWidget,
     _QT_SIZE_MAX,
+    _TOOLTIP_ERROR_CHARS,
     _format_ratio_inline,
     _MetricRow,
+    _safe_tooltip,
     _SummaryChip,
 )
+
+
+def _tooltip_text(tooltip: str) -> str:
+    """What a tooltip shows the user, not what it is made of.
+
+    `_safe_tooltip` escapes the string and wraps it so Qt's rich-text
+    heuristic cannot decide per string - without the wrapper `R&D` was shown
+    as `R&amp;D`. A `QTextDocument` is the renderer `QToolTip` itself uses, so
+    the round trip is the assertion that the escaping is undone again.
+    """
+    document = QTextDocument()
+    document.setHtml(tooltip)
+    return document.toPlainText()
 
 
 def _ok_snapshot(provider: str) -> UsageSnapshot:
@@ -2271,7 +2286,7 @@ def test_an_error_tile_with_no_rows_says_what_happened(qtbot):
 
     assert tile.detail.isVisible()
     assert tile.detail.width() > tile.header.width()
-    assert tile.detail.toolTip().startswith(message)
+    assert _tooltip_text(tile.detail.toolTip()).startswith(message)
     assert message.startswith(tile.detail.text().rstrip("…")), (
         "the line does not show the beginning of the message"
     )
@@ -2330,7 +2345,9 @@ def test_a_long_error_is_elided_not_clipped(qtbot):
     drawn = detail.text()
     assert drawn.endswith("…")
     assert detail.fontMetrics().horizontalAdvance(drawn) <= detail.width()
-    assert detail.toolTip().startswith(message), "the full text is unreachable"
+    assert _tooltip_text(detail.toolTip()).startswith(
+        message
+    ), "the full text is unreachable"
 
 
 def test_the_detail_line_shows_markup_literally(qtbot):
@@ -2373,16 +2390,80 @@ def test_an_error_tooltip_is_clipped_and_shows_markup_literally(qtbot):
 
     for tooltip in (tile.detail.toolTip(), tile.status.toolTip()):
         assert "&lt;b&gt;" in tooltip
-        assert "<b>" not in tooltip
+        assert "<b>" not in _tooltip_text(tooltip).replace("<b>x</b>", "")
+        assert _tooltip_text(tooltip).startswith("<b>x</b>")
     assert tile.detail.text() == "<b>x</b>", "the label itself is the literal"
 
     widget.update_snapshot(
         _error_snapshot("azure", "x" * 10240), "Microsoft · Azure"
     )
-    assert len(tile.detail.toolTip()) <= 320
-    assert len(tile.status.toolTip()) <= 400
-    assert tile.detail.toolTip().startswith("x" * 100)
-    assert "…" in tile.detail.toolTip()
+    # The bound is a rule, not a number: the clip is on the *raw* string, so
+    # the tooltip is at most that many characters (plus the ellipsis) times
+    # the longest escape, `&quot;`, plus this tooltip's own fixed overhead.
+    overhead = len(_safe_tooltip("x", "\n\nClick for details.")) - 1
+    assert len(tile.detail.toolTip()) <= (_TOOLTIP_ERROR_CHARS + 1) * 6 + overhead
+    assert len(tile.status.toolTip()) <= (_TOOLTIP_ERROR_CHARS + 1) * 6 + 200
+    assert _tooltip_text(tile.detail.toolTip()).startswith("x" * 100)
+    assert "…" in _tooltip_text(tile.detail.toolTip())
+
+    # And the same bound where every character is one that has to be escaped,
+    # which is what a 280-character clip applied before escaping has to carry.
+    widget.update_snapshot(
+        _error_snapshot("azure", "<" * 10240), "Microsoft · Azure"
+    )
+    assert len(tile.detail.toolTip()) <= (_TOOLTIP_ERROR_CHARS + 1) * 6 + overhead
+    assert _tooltip_text(tile.detail.toolTip()).startswith("<" * 100)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param("R&D quota exceeded", id="ampersand"),
+        pytest.param("<b>x</b>", id="markup"),
+        pytest.param("a < b", id="angle"),
+        pytest.param("plain error", id="plain"),
+        pytest.param("Request failed:\n<html>boom</html>", id="markup-line-2"),
+    ],
+)
+def test_an_error_tooltip_is_shown_as_itself_whatever_it_contains(qtbot, error):
+    """`QToolTip` has no text-format setter and `Qt::mightBeRichText` reads
+    only the **first line** for a `<` or a literal `&lt;`, so an escaped
+    string with no markup on line one was drawn as plain text and the user was
+    shown the escapes: `R&D` came out `R&amp;D`. Escaping the string and then
+    wrapping it takes the decision away from the heuristic - and `pre-wrap`
+    keeps the blank line before "Click for details.", which HTML collapses."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_error_snapshot("azure", error), "Microsoft · Azure")
+    tile = widget._tiles["azure"]  # noqa: SLF001
+
+    tooltip = tile.detail.toolTip()
+    assert Qt.mightBeRichText(tooltip), "the format is left to the string's contents"
+    assert _tooltip_text(tooltip) == error + "\n\nClick for details."
+
+
+def test_a_multi_line_error_neither_grows_the_tile_nor_is_measured_whole(qtbot):
+    """`setTextFormat(PlainText)` restored the elide guarantee per line, not
+    per string: `setWordWrap(False)` does not stop an explicit newline, so a
+    5 000-line error laid the label out 660 px tall. And `elidedText` measures
+    what it is handed before it shortens anything - a 1 MB single-line error
+    cost 284 ms on the UI thread."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_error_snapshot("azure", "one line"), "Microsoft · Azure")
+    detail = widget._tiles["azure"].detail  # noqa: SLF001
+    one_line = detail.sizeHint().height()
+
+    widget.update_snapshot(
+        _error_snapshot("azure", "\n".join(["line"] * 5000)), "Microsoft · Azure"
+    )
+    assert detail.sizeHint().height() == one_line, "the label is 5 000 lines tall"
+    assert "\n" not in detail.text()
+
+    widget.update_snapshot(_error_snapshot("azure", "x" * 1_000_000), "Microsoft · Azure")
+    assert len(detail._display_text()) <= 1000, (  # noqa: SLF001
+        "the whole megabyte is handed to elidedText"
+    )
 
 
 def test_an_error_tile_that_still_has_rows_does_not_repeat_itself(qtbot):
@@ -2419,7 +2500,7 @@ def test_a_provider_with_no_sign_in_button_says_why_it_is_unauthenticated(qtbot)
     )
     tile = widget._tiles["azure"]  # noqa: SLF001
     assert tile.detail.isVisibleTo(tile)
-    assert tile.detail.toolTip() == "The client secret has expired."
+    assert _tooltip_text(tile.detail.toolTip()) == "The client secret has expired."
     assert tile.detail.cursor().shape() == Qt.CursorShape.ArrowCursor
 
     widget.update_snapshot(
