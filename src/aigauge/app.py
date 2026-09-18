@@ -30,6 +30,7 @@ from .config import (
     account_kind,
     app_data_dir,
     browser_accounts,
+    compact_name_for_account,
     display_name_for_account,
     qt_scale_factor_env,
 )
@@ -1013,25 +1014,33 @@ class App(QObject):
                 "copilot", CopilotProvider
             ) or CopilotProvider(self._config)
             desired_tiles.add("copilot")
-            self._widget.ensure_tile("copilot", "Copilot")
+            self._widget.ensure_tile(
+                "copilot", display_name_for_account(self._config, "copilot")
+            )
         if getattr(self._config.providers, "azure", False):
             self._providers["azure"] = _kept("azure", AzureProvider) or AzureProvider(
                 self._config
             )
             desired_tiles.add("azure")
-            self._widget.ensure_tile("azure", "Microsoft · Azure")
+            self._widget.ensure_tile(
+                "azure", display_name_for_account(self._config, "azure")
+            )
         if self._config.providers.openrouter:
             self._providers["openrouter"] = _kept(
                 "openrouter", OpenRouterProvider
             ) or OpenRouterProvider(self._config)
             desired_tiles.add("openrouter")
-            self._widget.ensure_tile("openrouter", "OpenRouter")
+            self._widget.ensure_tile(
+                "openrouter", display_name_for_account(self._config, "openrouter")
+            )
         if self._config.providers.opencode_go:
             self._providers["opencode_go"] = _kept(
                 "opencode_go", OpenCodeGoProvider
             ) or OpenCodeGoProvider(self._config, parent=self)
             desired_tiles.add("opencode_go")
-            self._widget.ensure_tile("opencode_go", "OpenCode")
+            self._widget.ensure_tile(
+                "opencode_go", display_name_for_account(self._config, "opencode_go")
+            )
         for tile_id in list(self._widget._tiles):  # noqa: SLF001
             if tile_id not in desired_tiles:
                 self._widget.remove_tile(tile_id)
@@ -1271,13 +1280,14 @@ class App(QObject):
     # ----- Refresh -----
 
     def _display_names(self, names: list[str]) -> dict[str, str]:
+        """Tile id -> header text, for ``mark_loading``.
+
+        One call per name and no table of its own: this used to carry a third
+        copy of the provider names, which is how a rename could reach the tile
+        and miss the loading state it is replaced by.
+        """
         return {
-            name: {
-                "copilot": "Copilot",
-                "openrouter": "OpenRouter",
-                "azure": "Microsoft · Azure",
-            }.get(name, display_name_for_account(self._config, name))
-            for name in names
+            name: display_name_for_account(self._config, name) for name in names
         }
 
     def _begin_cycle(
@@ -2444,7 +2454,10 @@ class App(QObject):
             snap = self._snapshots.get(name)
             if not snap:
                 continue
-            display_name = display_name_for_account(self._config, name)
+            # The compact name here, not the full one: this tooltip carries a
+            # line per metric per provider, so the company would be repeated on
+            # every one of them.
+            display_name = compact_name_for_account(self._config, name)
             if snap.status == SnapshotStatus.AUTH_REQUIRED:
                 lines.append(f"{display_name}: setup needed")
                 continue

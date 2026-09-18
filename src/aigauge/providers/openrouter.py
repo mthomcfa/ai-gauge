@@ -400,7 +400,6 @@ def _build_snapshot(
 
 class OpenRouterProvider(Provider):
     name = "openrouter"
-    display_name = "OpenRouter"
     refresh_budget_seconds = REFRESH_WORST_CASE_SECONDS
 
     def __init__(self, config: Config, pool=None):

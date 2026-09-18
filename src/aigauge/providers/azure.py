@@ -1980,7 +1980,6 @@ def _exception_summary(exc: BaseException) -> str:
 
 class AzureProvider(Provider):
     name = "azure"
-    display_name = "Microsoft · Azure"
     # What the App's watchdog is told to allow. NOT REFRESH_DEADLINE_SECONDS:
     # that bounds the page loops only (see MAX_ARM_REQUESTS_PER_REFRESH), so
     # it is a floor on a refresh's real ceiling rather than the ceiling, and a

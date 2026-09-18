@@ -6,7 +6,7 @@ from PyQt6.QtCore import QRect, Qt
 from PyQt6.QtGui import QScreen
 from PyQt6.QtWidgets import QPushButton
 
-from aigauge import settings_dialog
+from aigauge import naming, settings_dialog
 from aigauge.config import Config
 from aigauge.providers.catalog import record_scan, scan_due
 from aigauge.settings_dialog import SettingsDialog
@@ -325,22 +325,62 @@ def _group_titles(dialog: SettingsDialog) -> list[str]:
     return [box.title() for box in dialog.findChildren(QGroupBox)]
 
 
-def test_microsoft_tab_holds_the_three_sub_headings(qtbot):
-    """Azure, Foundry and Copilot are one vendor relationship to the person
-    configuring them, and Foundry only means anything beside the Azure block
-    it configures."""
+def _group_titles_on_tab(dialog: SettingsDialog, title: str) -> list[str]:
+    from PyQt6.QtWidgets import QGroupBox
+
+    page = _tabs(dialog).widget(_tab_index(dialog, title))
+    return [box.title() for box in page.findChildren(QGroupBox)]
+
+
+def test_tabs_are_vendors_in_tile_order(qtbot):
+    """One tab per vendor, named after the company, in the order the tiles are
+    stacked. Copilot is GitHub's, not Microsoft's, so it has a tab of its own."""
     dialog = SettingsDialog(Config())
     qtbot.addWidget(dialog)
 
-    assert "Microsoft" in _tab_titles(dialog)
-    assert "GitHub Copilot" not in _tab_titles(dialog)
+    assert _tab_titles(dialog) == [
+        "General",
+        naming.COMPANY["claude"],
+        naming.COMPANY["codex"],
+        naming.SURFACE["opencode_go"],
+        naming.COMPANY["azure"],
+        naming.COMPANY["copilot"],
+        naming.SURFACE["openrouter"],
+    ]
+
+
+def test_microsoft_tab_holds_azure_and_foundry(qtbot):
+    """Azure and Foundry are one subscription and one set of credentials, and
+    Foundry only means anything beside the Azure block it configures. Copilot
+    is not here: it is GitHub's product on a GitHub credential."""
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+
+    titles = _group_titles_on_tab(dialog, naming.COMPANY["azure"])
+    assert naming.full("azure") in titles
+    assert f'{naming.COMPANY["azure"]}{naming.SEPARATOR}Foundry' in titles
+    assert naming.full("copilot") not in titles
+    assert _group_titles_on_tab(dialog, naming.COMPANY["copilot"]) == [
+        naming.full("copilot")
+    ]
+
+
+def test_every_group_box_carries_its_company(qtbot):
+    """The group boxes are the widest surface in the app, so they take the full
+    name - and take it from the one table, not from a literal each."""
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+
     titles = _group_titles(dialog)
-    for heading in ("Azure", "Foundry", "Copilot"):
-        assert heading in titles
+    for kind in ("azure", "copilot", "openrouter", "opencode_go"):
+        assert naming.full(kind) in titles, kind
+    for kind in ("claude", "codex"):
+        assert f"{naming.full(kind)} accounts" in titles, kind
 
 
 def test_copilot_controls_survive_the_move_unchanged(qtbot, monkeypatch):
-    """Copilot moved under the Microsoft heading; nothing about it changed."""
+    """Copilot moved out of the Microsoft tab into a GitHub tab of its own;
+    nothing about the controls themselves changed."""
     monkeypatch.setattr(settings_dialog, "set_start_at_login", lambda enabled: None)
     config = Config()
     dialog = SettingsDialog(config)
@@ -862,7 +902,7 @@ def test_the_microsoft_tab_no_longer_sets_the_dialog_floor(qtbot):
 
     assert dialog.minimumSizeHint().height() < 300
 
-    microsoft = _tabs(dialog).widget(_tab_index(dialog, "Microsoft"))
+    microsoft = _tabs(dialog).widget(_tab_index(dialog, naming.COMPANY["azure"]))
     assert microsoft.widget().sizeHint().height() > 1000, (
         "the page shrank instead of the scroll area absorbing it"
     )
@@ -876,7 +916,7 @@ def test_every_tab_page_scrolls(qtbot):
     qtbot.addWidget(dialog)
     tabs = _tabs(dialog)
 
-    assert tabs.count() == 6
+    assert tabs.count() == len(naming.KINDS) + 1
     for i in range(tabs.count()):
         page = tabs.widget(i)
         assert isinstance(page, QScrollArea), tabs.tabText(i)
@@ -1378,7 +1418,7 @@ def test_every_named_field_survives_the_wrapping(qtbot):
     dialog = SettingsDialog(Config())
     qtbot.addWidget(dialog)
     scrolls = dialog._page_scrolls  # noqa: SLF001
-    assert len(scrolls) == 6
+    assert len(scrolls) == len(naming.KINDS) + 1
 
     named = [
         "claude_signin_btn",

@@ -414,12 +414,16 @@ def test_activity_model_costs_empty_no_log():
 
 
 def test_provider_construction_smoke():
+    from aigauge import naming
     from aigauge.providers.openrouter import OpenRouterProvider
 
     cfg = Config()
     provider = OpenRouterProvider(cfg, pool=None)
     assert provider.name == "openrouter"
-    assert provider.display_name == "OpenRouter"
+    # A provider carries an id and nothing else. Its display name comes from
+    # aigauge.naming, which every surface reads.
+    assert not hasattr(provider, "display_name")
+    assert naming.full("openrouter") == "OpenRouter"
 
 
 def test_management_key_helpers_roundtrip(monkeypatch):
