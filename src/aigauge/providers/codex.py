@@ -49,6 +49,10 @@ EXTRACTOR_TEMPLATE = r"""
   // Weekly self-scan: also return every candidate card the usage container
   // renders, so Python can adopt cards this build has never heard of.
   const DISCOVER = __AG_DISCOVER__;
+  // How long a discovered label may be, from catalog.MAX_LABEL_CHARS.
+  // Python applies the same bound before anything is adopted; this one
+  // stops a row that could never be adopted travelling back at all.
+  const MAX_LABEL = __AG_MAX_LABEL__;
 
   function visibleText(el) {
     return ((el && (el.innerText || el.textContent)) || '').replace(/\s+/g, ' ').trim();
@@ -378,7 +382,7 @@ EXTRACTOR_TEMPLATE = r"""
       const labelMatch = /^(.*?)(?=\s*(?:Resets?\b|\d+(?:\.\d+)?\s*%))/i.exec(text);
       if (!labelMatch) continue;
       const label = labelMatch[1].trim();
-      if (!label || label.length > 60) continue;
+      if (!label || label.length > MAX_LABEL) continue;
       const key = label.toLowerCase();
       if (seen[key]) continue;
       seen[key] = true;

@@ -771,9 +771,6 @@ def test_junk_labels_are_never_adopted(label, tmp_path):
     [
         "Current session",                    # the alias itself
         "Session",                            # a display label
-        "Current",                            # a fragment of "Current session"
-        "Opus",                               # of "Opus only"
-        "Design",                             # of "Claude Design"
         "Daily included routine runs 3 of 10",  # that row with its count glued on
         "Weekly 42",                          # the same, with the count alone
         "Opus only 91",
@@ -781,15 +778,91 @@ def test_junk_labels_are_never_adopted(label, tmp_path):
     ],
 )
 def test_a_label_that_is_a_known_meter_again_is_not_adopted(label, tmp_path):
-    """Three shapes, all of them an existing meter under a second name.
+    """Two shapes, both of them an existing meter under a second name.
 
-    A fragment ("Current", "Opus") reports the known meter's number twice and
-    used to poison the extractor's rival-label attribution as well; a known
+    A candidate carrying a known display label or alias is that meter; a known
     label with a count glued onto it ("... 3 of 10") is that meter's row read
-    with the count included. "of" and "3" are not new words.
+    with the count included. "of" and "3" are not new words. Both refusals are
+    unconditional - they do not depend on what else the page rendered.
     """
     assert is_adoptable_label(label, catalog=bundled_catalog("claude")) is False
     assert adopt_rows("claude", [_row(label)], base_dir=tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    "label,longer",
+    [
+        ("Current", "Current session"),
+        ("Opus", "Opus only"),
+        ("Sonnet", "Sonnet only"),
+        ("Design", "Claude Design"),
+    ],
+)
+def test_a_fragment_beside_the_meter_it_names_is_not_adopted(label, longer, tmp_path):
+    """While both are on the page, the short one is the known meter under a
+    second name: adopting it files a meter that reports the same number twice
+    and puts a rival label in the extractor's way."""
+    rows = [_row(longer, percent=91.0), _row(label, percent=91.0)]
+
+    assert (
+        is_adoptable_label(
+            label,
+            catalog=bundled_catalog("claude"),
+            present={normalize_label(row["label"]) for row in rows},
+        )
+        is False
+    )
+    assert [spec.label for spec in adopt_rows("claude", rows, base_dir=tmp_path)] == []
+
+
+@pytest.mark.parametrize(
+    "label,longer",
+    [
+        ("Opus", "Opus only"),
+        ("Sonnet", "Sonnet only"),
+        ("Cowork", "Cowork only"),
+    ],
+)
+def test_a_bare_model_name_that_replaced_a_longer_one_is_adopted(label, longer, tmp_path):
+    """The rename case, and the reason this rule needed a second half.
+
+    If Claude relabels its per-model rows to bare model names, the catalog's
+    alias stops matching *and* the fragment rule refuses the replacement, so
+    the rows vanish with nothing in the log to say why. When the longer label
+    is not among the labels this scan saw, there is no number to report twice.
+    """
+    rows = [_row("Current session", percent=64.0), _row(label, percent=91.0)]
+    assert longer not in [row["label"] for row in rows]
+
+    assert (
+        is_adoptable_label(
+            label,
+            catalog=bundled_catalog("claude"),
+            present={normalize_label(row["label"]) for row in rows},
+        )
+        is True
+    )
+    adopted = adopt_rows("claude", rows, base_dir=tmp_path)
+    assert [spec.label for spec in adopted] == [label]
+    assert adopted[0].aliases == (label,)
+    assert adopted[0].primary is False
+
+
+def test_the_relaxation_is_off_unless_the_scan_says_what_it_saw(tmp_path):
+    """``present`` defaults to None and nothing changes: a caller that cannot
+    say what the page rendered gets the old, unconditional refusal."""
+    assert is_adoptable_label("Opus", catalog=bundled_catalog("claude")) is False
+    assert is_adoptable_label("Sonnet", catalog=bundled_catalog("claude")) is False
+
+
+def test_a_fragment_of_a_label_adopted_in_the_same_scan_is_still_refused(tmp_path):
+    """A label adopted earlier in this scan is in ``present`` by construction,
+    so it shields its own fragments exactly as a bundled one does."""
+    rows = [_row("Fable only", percent=91.0), _row("Fable", percent=91.0)]
+
+    adopted = [spec.label for spec in adopt_rows("claude", rows, base_dir=tmp_path)]
+
+    assert adopted == ["Fable only"]
 
 
 @pytest.mark.parametrize(
