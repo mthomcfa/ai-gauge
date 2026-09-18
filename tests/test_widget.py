@@ -3110,7 +3110,7 @@ def test_a_rate_limit_is_named_in_the_corner_tag(error, expected):
 # --- The note is reachable by hovering any part of a row --------------------
 
 
-def _azure_component_snapshot(note="CA$1,234.56"):
+def _azure_component_snapshot(note="CA$1,234.56", reset_label=None):
     return UsageSnapshot(
         provider="azure",
         status=SnapshotStatus.OK,
@@ -3119,6 +3119,7 @@ def _azure_component_snapshot(note="CA$1,234.56"):
             UsageMetric(
                 label="Azure App Service",
                 percent_used=13.0,
+                reset_label=reset_label,
                 note=note,
                 tag="meter_breakdown",
             ),
@@ -3298,3 +3299,80 @@ def test_the_eliding_label_drops_its_tail_at_any_width(qtbot):
     resized(advance + 8)
     assert label.elided_text() == full, "the label did not recover its full text"
     assert label.toolTip() == ""
+
+
+def _azure_rows_snapshot():
+    return UsageSnapshot(
+        provider="azure",
+        status=SnapshotStatus.OK,
+        metrics=[
+            UsageMetric(label="Spend this month", percent_used=24.0,
+                        reset_label="CA$36.10 · resets 1 Oct"),
+            UsageMetric(label="Foundry", percent_used=34.0,
+                        reset_label="CA$12.40", note="CA$12.40 across 1 Foundry resource.",
+                        tag="meter_breakdown"),
+            UsageMetric(label="Azure OpenAI", percent_used=22.0,
+                        reset_label="CA$8.05", note="CA$8.05", tag="meter_breakdown"),
+            UsageMetric(label="Storage", percent_used=3.0,
+                        reset_label="CA$1.10", note="CA$1.10", tag="meter_breakdown"),
+        ],
+        fetched_at=datetime(2026, 4, 27, 12, 0),
+    )
+
+
+def test_each_azure_component_row_renders_its_amount_in_the_right_column(qtbot):
+    """Three components, three amounts on the rows - right-aligned in the
+    column the Spend row already uses, not hidden in a tooltip."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_azure_rows_snapshot(), naming.full("azure"))
+    tile = widget._tiles["azure"]  # noqa: SLF001
+    tile.set_expanded(True, emit=False)
+    with qtbot.waitExposed(widget):
+        widget.show()
+    widget._do_refit_height()  # noqa: SLF001
+    qtbot.wait(0)
+
+    rendered = {row.label.text(): row for row in tile._rows}  # noqa: SLF001
+    for label, amount in (
+        ("Foundry", "CA$12.40"),
+        ("Azure OpenAI", "CA$8.05"),
+        ("Storage", "CA$1.10"),
+    ):
+        row = rendered[label]
+        assert row.reset.isVisible(), label
+        assert row.reset.text() == amount, label
+        assert row.reset.alignment() & Qt.AlignmentFlag.AlignRight
+        # The percentage stays: the share and the amount answer two questions.
+        assert row.pct.isVisible() and row.pct.text().endswith("%"), label
+
+
+def test_a_component_row_does_not_say_its_amount_twice_in_one_tooltip(qtbot):
+    """The right-hand column's tooltip is "the full phrase, then the note", and
+    for a plain component row those are the same string."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(
+        _azure_component_snapshot(note="CA$1,234.56", reset_label="CA$1,234.56"),
+        naming.full("azure"),
+    )
+    tile = widget._tiles["azure"]  # noqa: SLF001
+    tile.set_expanded(True, emit=False)
+    row = tile._rows[-1]  # noqa: SLF001
+
+    assert _tooltip_text(row.reset.toolTip()) == "CA$1,234.56"
+
+
+def test_a_component_row_keeps_a_note_that_says_more_than_the_column(qtbot):
+    """Foundry's note explains that its spend is already inside the total, so
+    it is not the amount repeated and must survive."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_azure_rows_snapshot(), naming.full("azure"))
+    tile = widget._tiles["azure"]  # noqa: SLF001
+    tile.set_expanded(True, emit=False)
+    row = next(r for r in tile._rows if r.label.text() == "Foundry")  # noqa: SLF001
+
+    tip = _tooltip_text(row.reset.toolTip())
+    assert tip.startswith("CA$12.40")
+    assert "across 1 Foundry resource" in tip

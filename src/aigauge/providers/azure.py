@@ -921,6 +921,20 @@ def build_snapshot(
             UsageMetric(
                 label=_truncate(name),
                 percent_used=share,
+                # The amount on the row, not only in the tooltip. A share of a
+                # total says which component is the big one; it does not say
+                # what it cost, and "42%" of an unremembered total is not a
+                # number anybody can act on. reset_label is the row's
+                # right-hand column - the same one the Spend row already puts
+                # its amount in - and _MetricRow right-aligns it, widens it for
+                # a phrase and elides past 240 px with the full text in the
+                # tooltip.
+                #
+                # Bound: this string is composed here from a float and the
+                # billing currency code, which _fetch clips to CURRENCY_MAX_LEN.
+                # No provider string is interpolated into it; the service name
+                # stays in `label`, where _truncate bounds it.
+                reset_label=_money(cost, currency),
                 note=note,
                 tag=BREAKDOWN_TAG,
             )

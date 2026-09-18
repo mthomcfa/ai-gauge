@@ -3466,3 +3466,44 @@ def test_a_live_429_reports_the_hourly_floor(monkeypatch, config):
         "Cost Management is rate limiting this tenant; next attempt at "
     )
     assert f"{az.next_allowed_at(state):%H:%M}." in (snapshot.error or "")
+
+
+def test_every_component_row_shows_its_amount_on_the_row():
+    """The share says which component is the big one; it does not say what it
+    cost, and the amount used to be in the tooltip only. It now sits in the
+    row's right-hand column, in the same currency formatting the Spend row
+    uses, and the tooltip keeps it too."""
+    snapshot = az.build_snapshot(
+        _aggregate(
+            total=36.10,
+            buckets=[("Foundry", 12.40), ("Azure OpenAI", 8.05), ("Storage", 1.10)],
+        ),
+        AzureConfig(monthly_allowance=150.0),
+    )
+    rows = [m for m in snapshot.metrics if m.tag == az.BREAKDOWN_TAG]
+
+    amounts = {"Foundry": 12.40, "Azure OpenAI": 8.05, "Storage": 1.10}
+    assert {m.label for m in rows} >= set(amounts)
+    for row in rows:
+        if row.label not in amounts:
+            continue  # the forecast row, which has no component amount
+        expected = az._money(amounts[row.label], "CAD")  # noqa: SLF001
+        assert row.reset_label == expected, row.label
+        assert expected in (row.note or ""), row.label
+        assert row.percent_used is not None, row.label
+
+
+def test_a_component_amount_is_composed_here_not_taken_from_azure():
+    """The right-hand column is app-composed from a float and the currency
+    code, so no provider string is interpolated into it. The service name -
+    the one page-derived string on the row - stays in the bounded label."""
+    long_name = "Azure " + "Long" * 40
+    snapshot = az.build_snapshot(
+        _aggregate(buckets=[(long_name, 5.0)], currency="CAD"),
+        AzureConfig(monthly_allowance=150.0),
+    )
+    row = next(m for m in snapshot.metrics if m.tag == az.BREAKDOWN_TAG)
+
+    assert row.reset_label == az._money(5.0, "CAD")  # noqa: SLF001
+    assert long_name not in row.reset_label
+    assert len(row.label) <= az.LABEL_MAX_LEN

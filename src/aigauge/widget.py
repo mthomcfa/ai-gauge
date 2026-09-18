@@ -1016,9 +1016,12 @@ class _MetricRow(QWidget):
         if reset_label:
             # The full phrase, then the note: whatever the column elided is
             # still reachable here, and the amounts are in the note as well.
-            self.reset.setToolTip(
-                _safe_tooltip("\n\n".join(part for part in (rel, note) if part))
-            )
+            # Not twice, though - an Azure component row carries its amount in
+            # both, so the two parts are identical and one of them is dropped.
+            parts = [part for part in (rel, note) if part]
+            if len(parts) == 2 and parts[0] == parts[1]:
+                parts.pop()
+            self.reset.setToolTip(_safe_tooltip("\n\n".join(parts)))
         elif resets_at:
             self.reset.setToolTip(resets_at.strftime("%Y-%m-%d %H:%M"))
         elif not split_note:
