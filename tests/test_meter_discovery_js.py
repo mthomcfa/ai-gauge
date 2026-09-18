@@ -22,6 +22,7 @@ import subprocess
 import pytest
 
 from aigauge.providers.catalog import (
+    MAX_LABEL_CHARS,
     SOURCE_BUNDLED,
     SOURCE_DISCOVERY,
     MeterCatalog,
@@ -279,6 +280,56 @@ def test_discovery_never_leaves_the_usage_container():
     discovered = _run(_claude_block(), CLAUDE_DOM, "discoverRows()")
 
     assert "Storage" not in [row["label"] for row in discovered]
+
+
+def _label_bound_dom(base, panel_index):
+    """The DOM plus two rows: a label at the bound, and one character past it."""
+    at_bound = "Ab" + "c" * (MAX_LABEL_CHARS - 2)
+    past_bound = at_bound + "d"
+    assert len(at_bound) == MAX_LABEL_CHARS
+    return (
+        list(base)
+        + [
+            (f"{at_bound} Resets in 3 days 11% used", 40, panel_index),
+            (f"{past_bound} Resets in 3 days 12% used", 40, panel_index),
+        ],
+        at_bound,
+        past_bound,
+    )
+
+
+def test_the_claude_walk_uses_the_one_label_bound():
+    """The extractor carried its own `label.length > 60` while Python refused
+    anything past `MAX_LABEL_CHARS`, so a 41-to-60-character row travelled all
+    the way back from the page to be thrown away. One constant, both ends."""
+    dom, at_bound, past_bound = _label_bound_dom(CLAUDE_DOM, 1)
+
+    labels = [row["label"] for row in _run(_claude_block(), dom, "discoverRows()")]
+
+    assert at_bound in labels
+    assert past_bound not in labels
+
+
+def test_the_codex_walk_uses_the_one_label_bound():
+    dom, at_bound, past_bound = _label_bound_dom(CODEX_DOM, 1)
+
+    labels = [row["label"] for row in _run(_codex_block(), dom, "discoverCards()")]
+
+    assert at_bound in labels
+    assert past_bound not in labels
+
+
+def test_the_bound_reaches_the_javascript_as_the_python_constant():
+    """A guard on the wiring: the marker has to be substituted, not left in the
+    source, and it has to carry this constant rather than a number typed twice."""
+    for template in (CLAUDE_TEMPLATE, CODEX_TEMPLATE):
+        source = extractor_source(
+            template, bundled_catalog("claude"), discover=True
+        )
+        assert "__AG_MAX_LABEL__" not in source
+        assert f"const MAX_LABEL = {MAX_LABEL_CHARS};" in source
+        # And no literal bound left behind in either walk.
+        assert "label.length > 60" not in source
 
 
 def test_discovery_skips_an_element_wrapping_several_meters():

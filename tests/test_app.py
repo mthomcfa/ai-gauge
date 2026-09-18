@@ -11,8 +11,14 @@ from aigauge.app import (
     _raw_summary,
     _snapshot_signature,
 )
+from aigauge import naming
 from aigauge.config import BrowserAccount, Config
-from aigauge.models import SnapshotStatus, UsageMetric, UsageSnapshot
+from aigauge.models import (
+    MAX_DISPLAY_LABEL_CHARS,
+    SnapshotStatus,
+    UsageMetric,
+    UsageSnapshot,
+)
 
 
 class _Timer:
@@ -193,7 +199,7 @@ def test_manual_refresh_marks_tiles_loading():
     app.refresh_now(manual=True)
 
     assert app._widget.loading_calls == [  # noqa: SLF001
-        {"claude": "Claude", "codex": "Codex"}
+        {"claude": naming.full("claude"), "codex": naming.full("codex")}
     ]
     assert app._refresh_queue == ["claude", "codex"]  # noqa: SLF001
     assert app._unchanged_cycles == 0  # noqa: SLF001
@@ -209,7 +215,7 @@ def test_scheduled_refresh_marks_its_tiles_more_quietly():
     app.refresh_now(manual=False)
 
     assert app._widget.loading_calls == [  # noqa: SLF001
-        {"claude": "Claude", "codex": "Codex"}
+        {"claude": naming.full("claude"), "codex": naming.full("codex")}
     ]
     assert app._widget.loading_kwargs == [{"subtle": True}]  # noqa: SLF001
     assert app._refresh_queue == ["claude", "codex"]  # noqa: SLF001
@@ -1988,3 +1994,108 @@ def test_the_log_summariser_cannot_raise():
     assert _raw_summary(_ItemsRaises(a="z" * 5_000_000)) == (
         "<unsummarisable _ItemsRaises>"
     )
+
+
+class _TrayStub:
+    """Just enough QSystemTrayIcon for _update_tray."""
+
+    def __init__(self):
+        self.tooltip = None
+
+    def setIcon(self, icon):  # noqa: N802
+        pass
+
+    def setToolTip(self, text):  # noqa: N802
+        self.tooltip = text
+
+
+def _tray_app(config, snapshots):
+    app = App.__new__(App)
+    app._config = config  # noqa: SLF001
+    app._snapshots = snapshots  # noqa: SLF001
+    app._native_status = None  # noqa: SLF001
+    app._tray = _TrayStub()  # noqa: SLF001
+    app._ui_mode = "tray"  # noqa: SLF001
+    app._render_tray_icon = lambda: None  # noqa: SLF001
+    return app
+
+
+def test_the_tray_tooltip_uses_compact_names(qapp):
+    """One line per metric per provider, so the company would be repeated on
+    every one of them. The tiles carry "Anthropic · Claude"; this carries
+    "Claude", and a named account keeps the name the user gave it."""
+    config = Config()
+    config.browser_accounts.append(
+        BrowserAccount(id="codex-work", kind="codex", name="Work")
+    )
+    fetched = datetime(2026, 4, 27, 12, 0)
+    snapshots = {
+        "claude": UsageSnapshot(
+            provider="claude",
+            status=SnapshotStatus.OK,
+            metrics=[UsageMetric("Session", 50.0, fetched)],
+            fetched_at=fetched,
+        ),
+        "codex-work": UsageSnapshot(
+            provider="codex-work",
+            status=SnapshotStatus.OK,
+            metrics=[UsageMetric("Weekly", 21.0, fetched)],
+            fetched_at=fetched,
+        ),
+    }
+    app = _tray_app(config, snapshots)
+
+    app._update_tray()  # noqa: SLF001
+
+    lines = app._tray.tooltip.splitlines()  # noqa: SLF001
+    assert f"{naming.compact('claude')} Session: 50%" in lines
+    assert f"{naming.compact('codex')} (Work) Weekly: 21%" in lines
+    for company in (c for c in naming.COMPANY.values() if c):
+        assert company not in app._tray.tooltip  # noqa: SLF001
+
+
+def test_the_tray_tooltip_bounds_a_providers_metric_label(qapp):
+    """A tile row clips a long label by geometry; this string has no layout at
+    all, so a meter name lifted off a page - or typed into an app-data override
+    file, which nothing validates on the way in - would travel into the tooltip
+    whole and take the tooltip with it."""
+    fetched = datetime(2026, 4, 27, 12, 0)
+    snapshots = {
+        "claude": UsageSnapshot(
+            provider="claude",
+            status=SnapshotStatus.OK,
+            metrics=[UsageMetric("R" * 200_000, 50.0, fetched)],
+            fetched_at=fetched,
+        )
+    }
+    app = _tray_app(Config(), snapshots)
+
+    app._update_tray()  # noqa: SLF001
+
+    line = next(
+        line for line in app._tray.tooltip.splitlines() if line.startswith("Claude ")  # noqa: SLF001
+    )
+    assert line == f"Claude {'R' * MAX_DISPLAY_LABEL_CHARS}: 50%"
+    assert len(line) < 100
+
+
+def test_the_tray_tooltip_shows_markup_rather_than_interpreting_it(qapp):
+    """A QSystemTrayIcon tooltip is plain text, so a meter name shaped like
+    markup is shown as written. The bound is the whole defence here; nothing is
+    escaped, and nothing should be."""
+    fetched = datetime(2026, 4, 27, 12, 0)
+    label = "<b>Session</b>"
+    snapshots = {
+        "claude": UsageSnapshot(
+            provider="claude",
+            status=SnapshotStatus.OK,
+            metrics=[UsageMetric(label, 50.0, fetched)],
+            fetched_at=fetched,
+        )
+    }
+    app = _tray_app(Config(), snapshots)
+
+    app._update_tray()  # noqa: SLF001
+
+    assert f"Claude {label}: 50%" in app._tray.tooltip  # noqa: SLF001
+    assert "&lt;" not in app._tray.tooltip  # noqa: SLF001

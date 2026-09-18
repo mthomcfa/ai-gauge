@@ -16,7 +16,10 @@ class Provider(ABC):
     """
 
     name: str = ""
-    display_name: str = ""
+    # No ``display_name`` here. It existed on all six providers and was
+    # read by nothing but one test: a provider is an id, and what the user
+    # is shown comes from ``aigauge.naming`` so that one table answers it
+    # for the tile, the chip, the menu bar and Settings alike.
     # True for the QtWebEngine-backed providers. They are refreshed strictly
     # one at a time: QtWebEngine is GUI-thread-only and each scrape holds a
     # profile. Everything else is a handful of HTTPS calls on a thread pool

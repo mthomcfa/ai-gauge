@@ -18,6 +18,7 @@ from pydantic import (
     model_validator,
 )
 
+from . import naming
 from .atomic_write import atomic_write
 from .platforms import APP_NAME, get_platform
 
@@ -1067,13 +1068,17 @@ def qt_scale_factor_env(config: Config) -> str | None:
 
 
 def provider_base_name(kind: str) -> str:
-    return {"claude": "Claude", "codex": "Codex"}.get(kind, kind.title())
+    """The full display name for a kind - ``naming`` decides, not this module.
+
+    Kept as a name the UI already imports rather than folded away, because the
+    two are not the same question: this one is asked about a *browser account's*
+    kind, and the table it used to carry was a third copy of the six names.
+    """
+    return naming.full(kind)
 
 
 def account_display_name(account: BrowserAccount) -> str:
-    base = provider_base_name(account.kind)
-    label = (account.name or "").strip()
-    return f"{base} ({label})" if label else base
+    return naming.account_label(account.kind, account.name)
 
 
 def browser_accounts(
@@ -1117,17 +1122,35 @@ def account_kind(config: Config, account_id: str) -> str | None:
 
 
 def display_name_for_account(config: Config, account_id: str) -> str:
+    """What the panel, the dialogs and Settings call this tile.
+
+    A named account wins - it is the only part of the string the user wrote -
+    and everything else comes from ``naming``. The six-entry dict this used to
+    end with was the de-facto source of truth while three other copies of it
+    disagreed; there is now one table and this reads it.
+    """
     account = browser_account(config, account_id)
     if account is not None:
         return account_display_name(account)
-    return {
-        "claude": "Claude",
-        "codex": "Codex",
-        "copilot": "Copilot",
-        "openrouter": "OpenRouter",
-        "opencode_go": "OpenCode",
-        "azure": "Microsoft · Azure",
-    }.get(account_id, account_id)
+    return naming.full(account_id)
+
+
+def compact_name_for_account(config: Config, account_id: str) -> str:
+    """The short name, for a surface with no room for the company.
+
+    The tray tooltip prints one line per metric per provider, so the company
+    would be repeated on every one of them ("Anthropic · Claude Session: 50%",
+    "Anthropic · Claude Weekly: 21%", ...); the collapsed chips are sized to
+    their own text and wrap into another row when they overflow. Both want the
+    product alone. A named account keeps its name - that is the only part of
+    the string the user wrote, and it is what tells two accounts apart.
+    """
+    account = browser_account(config, account_id)
+    if account is not None:
+        name = (account.name or "").strip()
+        base = naming.compact(account.kind)
+        return f"{base} ({name})" if name else base
+    return naming.compact(account_id)
 
 
 def generate_browser_account_id(config: Config, kind: str) -> str:

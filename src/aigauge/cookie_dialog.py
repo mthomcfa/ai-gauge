@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
+from . import naming
 from .config import COOKIE_NAMES, set_provider_cookie
 from .config import get_provider_cookie
 from .webview.cookies import _parse_cookie_pairs, inject_session_cookie
@@ -19,10 +20,13 @@ from .webview.verify import VERIFY_TARGETS, verify_session
 
 log = logging.getLogger("aigauge.cookie_dialog")
 
+# Provider id -> the steps for that provider's page. The dialog's own title is
+# composed from ``naming`` rather than written out beside these, so a provider
+# renamed on the tiles is renamed on this window too - the three titles that
+# used to live here ("Claude.ai session cookie", "ChatGPT session cookie",
+# "OpenCode session cookie") were a fourth place a provider had a name.
 INSTRUCTIONS = {
-    "claude": (
-        "Claude.ai session cookie",
-        f"""\
+    "claude": f"""\
 1. Open <a style='color:#60a5fa;' href='https://claude.ai/settings/usage'>claude.ai/settings/usage</a>
    in <b>Chrome / Edge / Firefox</b> (whichever you're already signed into).
 2. Press <b>F12</b> → <b>Network</b>, then reload the page.
@@ -31,10 +35,7 @@ INSTRUCTIONS = {
    <code>Cookie:</code> header and paste it below. It must include
    <code>{COOKIE_NAMES['claude']}</code>.
 """,
-    ),
-    "codex": (
-        "ChatGPT session cookie",
-        f"""\
+    "codex": """\
 1. Open <a style='color:#60a5fa;' href='https://chatgpt.com/codex/cloud/settings/analytics'>
    chatgpt.com/codex/cloud/settings/analytics</a> in your normal browser.
 2. Press <b>F12</b> → <b>Network</b>, then reload the page.
@@ -44,10 +45,7 @@ INSTRUCTIONS = {
    <code>Cookie:</code> header and paste it below.
    This is more reliable than copying individual split session-token rows.
 """,
-    ),
-    "opencode_go": (
-        "OpenCode session cookie",
-        """\
+    "opencode_go": """\
 1. Open your OpenCode <b>Go</b> usage page in <b>Chrome / Edge / Firefox</b>
    (whichever browser is already signed in).
 2. Press <b>F12</b> → <b>Network</b>, then reload the page.
@@ -55,7 +53,6 @@ INSTRUCTIONS = {
 4. In <b>Headers</b> → <b>Request Headers</b>, copy the full
    <code>Cookie:</code> header and paste it below.
 """,
-    ),
 }
 
 
@@ -97,11 +94,15 @@ class CookieDialog(QDialog):
         self._account_id = account_id or provider
         self._verify_url = verify_url
         self._verifier = None
-        title, instructions_html = INSTRUCTIONS[provider]
+        instructions_html = INSTRUCTIONS[provider]
         # Not stays-on-top: the user has to switch to their normal browser to
         # copy the cookie, and the main widget is suspended from always-on-top
         # by the caller while this is open.
-        self.setWindowTitle(f"Paste {display_name or title}")
+        # The account's own name when there is one ("Anthropic · Claude (Work)"),
+        # otherwise the provider's full name with what is being pasted.
+        self.setWindowTitle(
+            f"Paste {display_name or f'{naming.full(provider)} session cookie'}"
+        )
         self.resize(540, 460)
         self.setStyleSheet(_DARK_STYLESHEET)
 

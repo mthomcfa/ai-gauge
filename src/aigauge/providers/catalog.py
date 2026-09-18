@@ -57,6 +57,13 @@ CATALOG_NO_CONTAINER_RETRY = timedelta(days=1)
 # Adoption guards. A discovered row has to look like a meter label - short,
 # alphabetic, with a percentage beside it - or the override file fills up with
 # page furniture and every refresh grows another junk gauge.
+#
+# One bound, in one place. The extractors carried their own - `label.length >
+# 60` in both discovery walks - so a 41-to-60-character row travelled the whole
+# way back from the page, through the payload, into the log's discovered-rows
+# list, and was refused here. Two numbers for one rule is how they drift; the
+# JS reads this one through `__AG_MAX_LABEL__` (see `extractor_source`), so
+# changing it here changes both ends.
 MAX_LABEL_CHARS = 40
 # A catalog is a page's meters, not a page's elements. A file this long is a
 # runaway scan or a hand-edit gone wrong, and every entry costs a DOM walk.
@@ -684,7 +691,9 @@ def _overlaps(needle: str, haystack: str) -> bool:
     return re.search(rf"\b{re.escape(needle)}\b", haystack) is not None
 
 
-def _collides_with_known(label: Any, known: Iterable[str]) -> bool:
+def _collides_with_known(
+    label: Any, known: Iterable[str], *, present: Iterable[str] | None = None
+) -> bool:
     """Whether a candidate label is a meter the catalog already has.
 
     Deliberately narrower than "either label contains the other as whole
@@ -706,12 +715,27 @@ def _collides_with_known(label: Any, known: Iterable[str]) -> bool:
       is the known meter's row with its count glued on. Three letters or more
       makes a word new: "of", "in" and "to" are how a count is written, not
       what a meter is named after.
+
+    ``present`` is the set of labels the page rendered in *this* scan, and it
+    relaxes the second refusal alone. That rule reads a bare model name as the
+    known meter under a shorter name — "Opus" inside "Opus only", "Sonnet"
+    inside "Sonnet only" — which is right while both are on the page and wrong
+    once the page has relabelled its per-model rows to bare model names: the
+    alias stops matching *and* adoption refuses the replacement, so the rows
+    disappear with nothing in the log to say why. When the longer label is not
+    among the labels this scan saw, there is no number to report twice, so the
+    shorter name is a rename and is adopted. Equality and the trailing-junk
+    rule are unconditional; and a label adopted earlier in the same scan is in
+    ``present`` by construction, so it still shields its own fragments.
     """
     normalized = normalize_label(label)
     if not normalized:
         return True
+    rendered = None if present is None else set(present)
     for other in known:
-        if normalized == other or _overlaps(normalized, other):
+        if normalized == other:
+            return True
+        if _overlaps(normalized, other) and (rendered is None or other in rendered):
             return True
         if normalized.startswith(f"{other} ") and not _ALPHA_WORD_RE.search(
             normalized[len(other) :]
@@ -720,7 +744,12 @@ def _collides_with_known(label: Any, known: Iterable[str]) -> bool:
     return False
 
 
-def is_adoptable_label(label: Any, *, catalog: MeterCatalog | None = None) -> bool:
+def is_adoptable_label(
+    label: Any,
+    *,
+    catalog: MeterCatalog | None = None,
+    present: Iterable[str] | None = None,
+) -> bool:
     """Whether a discovered row's label may become a new meter.
 
     Rejects page furniture: anything long, non-alphabetic, or carrying wording
@@ -741,7 +770,9 @@ def is_adoptable_label(label: Any, *, catalog: MeterCatalog | None = None) -> bo
     normalized = normalize_label(text)
     if any(marker in normalized for marker in _NON_METER_MARKERS):
         return False
-    if catalog is not None and _collides_with_known(text, catalog.known_labels()):
+    if catalog is not None and _collides_with_known(
+        text, catalog.known_labels(), present=present
+    ):
         return False
     return True
 
@@ -844,6 +875,15 @@ def adopt_rows(
     taken_keys = {spec.key for spec in known.specs}
     seen_labels = set(known.known_labels())
 
+    # Every label this scan saw, known and unknown alike. It is what tells a
+    # bare model name that replaced a longer one ("Opus" where the page used to
+    # render "Opus only") from one sitting beside it.
+    present = {
+        normalize_label(row.get("label"))
+        for row in rows
+        if isinstance(row, dict) and normalize_label(row.get("label"))
+    }
+
     adopted: list[MeterSpec] = []
     for row in rows:
         if existing_adopted + len(adopted) >= MAX_ADOPTED_METERS:
@@ -854,7 +894,7 @@ def adopt_rows(
             )
             break
         label = _adoptable_row(row)
-        if label is None or _collides_with_known(label, seen_labels):
+        if label is None or _collides_with_known(label, seen_labels, present=present):
             continue
         seen_labels.add(normalize_label(label))
         key = _adopted_key(label, taken_keys)
@@ -1152,7 +1192,7 @@ def rival_row_labels(catalog: MeterCatalog) -> list[str]:
     return out
 
 
-_MARKER_RE = re.compile(r"__AG_(ROW_LABELS|CATALOG|DISCOVER)__")
+_MARKER_RE = re.compile(r"__AG_(ROW_LABELS|CATALOG|DISCOVER|MAX_LABEL)__")
 
 
 def extractor_source(
@@ -1186,5 +1226,9 @@ def extractor_source(
         ),
         "CATALOG": json.dumps(catalog.to_js()),
         "DISCOVER": "true" if discover else "false",
+        # The label bound, so the page-side walk and the adoption guard cannot
+        # disagree about how long a meter name may be. An int, formatted, never
+        # a value from the page.
+        "MAX_LABEL": str(MAX_LABEL_CHARS),
     }
     return _MARKER_RE.sub(lambda match: values[match.group(1)], template)

@@ -6,6 +6,112 @@
 > earlier `0.6.4` entry predates that convention and **is not** upstream's
 > `v0.6.4`, which is different code.
 
+## 1.4.1+cfa.9 - 2026-09-18
+
+Presentation, plus two small bounds and two catalog fixes. Every provider
+surface now names the company behind the product, from one table instead of
+nine copies. Patch rather than minor: nothing here is a new capability.
+
+### Changed
+
+- **Every tile, dialog title and Settings label reads `Company · Surface`.**
+  The scheme is company first, separated by U+00B7 with a space either side -
+  matching `Microsoft · Azure`, which was the only label that already named a
+  company:
+
+  | id (unchanged) | before | now | short form |
+  | --- | --- | --- | --- |
+  | `claude` | Claude | **Anthropic · Claude** | `Claude` / `Cl` |
+  | `codex` | Codex | **OpenAI · ChatGPT + Codex** | `Codex` / `Cx` |
+  | `opencode_go` | OpenCode | **OpenCode** | `OpenCode` / `Go` |
+  | `azure` | Microsoft · Azure | **Microsoft · Azure** | `Azure` / `Az` |
+  | `copilot` | Copilot | **GitHub · Copilot** | `Copilot` / `Cp` |
+  | `openrouter` | OpenRouter | **OpenRouter** | `OpenRouter` / `OR` |
+
+  A named account keeps the company and puts your own name last:
+  `Anthropic · Claude (Work)`. Where there is no room for a company - the
+  collapsed summary chips, the tray tooltip, the macOS menu bar - the product
+  name alone is used, because a chip that wraps costs the collapsed panel a
+  whole row and the tooltip prints a line per metric per provider. The
+  two-letter menu-bar codes are unchanged.
+
+  **Copilot's company is GitHub, not Microsoft.** The credential is a GitHub
+  fine-grained PAT and the host is `api.github.com`. Microsoft owns GitHub,
+  which is why Settings used to file Copilot under a Microsoft tab; the tile
+  names the vendor whose page the number came from.
+
+  Nothing stored changes. Every `UsageSnapshot.provider`, config key, profile
+  directory, keyring entry and log line is an id and stays one, and
+  `history.py` keys an in-flight period on `id::metric-label`, so no history
+  is orphaned and no period restarts. The **Foundry row** inside the Azure
+  tile still reads `Foundry` for exactly that reason - it is a metric label,
+  not a provider label. Its Settings *group box* says `Microsoft · Foundry`.
+
+- **Settings has one tab per vendor, in the order the tiles are stacked:**
+  General, Anthropic, OpenAI, OpenCode, Microsoft, GitHub, OpenRouter.
+  **Copilot moved out of the Microsoft tab into a GitHub tab of its own** and
+  is its own group in the panel rather than the second half of a "Microsoft
+  pair", so the tiles stack Anthropic, OpenAI, OpenCode, Microsoft, GitHub,
+  OpenRouter. The Microsoft tab is Azure and Foundry: one subscription, one
+  set of credentials, and Foundry only means anything beside the Azure block
+  it configures.
+
+- **A tile header too long for the panel elides instead of widening it.**
+  Measured offscreen at the 260 px floor, with a ratio chip and the status tag
+  on the same row: `Microsoft · Azure` needs a 197 px tile and fits,
+  `Anthropic · Claude` needs 207 and fits, `OpenAI · ChatGPT + Codex` needs 261
+  and does not, and `OpenAI · ChatGPT + Codex (Work)` needs 311 - which put a
+  horizontal scroll bar under the tiles and pushed the header controls off the
+  right. The header is the one element on that row that can lose characters
+  without losing a control, so it is elided from the right and the whole name
+  is in its tooltip. The window minimum is untouched.
+
+- **Each Azure component row shows its amount on the row.** `Foundry`,
+  `Azure OpenAI`, `Container Apps` and the rest carried a share of the month's
+  spend and put the money in the tooltip only. The amount is now in the row's
+  right-hand column, right-aligned and in the same currency formatting the
+  `Spend this month` row uses - a share says which component is the big one,
+  it does not say what it cost. The tooltip keeps it too.
+
+### Fixed
+
+- **The meter-label length bound was two numbers.** Both page-side discovery
+  walks allowed 60 characters while the adoption guard refused anything past
+  40, so a 41-to-60-character row travelled all the way back from the page to
+  be thrown away at the last step. One constant now, injected into the
+  extractor the way the catalog already is.
+
+- **A per-model row renamed to a bare model name is no longer refused.** The
+  collision rule reads `Opus` as `Opus only` under a shorter name, which is
+  right while both are on the page and wrong once the page has relabelled its
+  rows: the alias stops matching *and* adoption refuses the replacement, so
+  the rows vanish with nothing in the log to say why. That one refusal is now
+  skipped when the longer label is not among the labels the scan actually saw.
+  Refusing an exact known label, and refusing a known label with a count glued
+  onto it (`Weekly 42`), are unchanged.
+
+- **Two unbounded strings, both carried over from 1.4.0+cfa.8's residual
+  list.** The tray tooltip interpolated a provider's metric label into a plain
+  string with no bound - a tile row is clipped by its own geometry, a tooltip
+  is not - so it now goes through `models.bounded_label`. No escaping, and the
+  comment says why: a `QSystemTrayIcon` tooltip is plain text, so markup in a
+  meter name is shown rather than interpreted. And `openrouter.py` built a
+  note from an API-supplied model id with no bound, which is now
+  `bounded_note` like every other page-derived note.
+
+### Notes
+
+- 2 085 tests, from 2 024. `test_naming.py` is new (32), and it carries the
+  rule that keeps the table the only one: no module under `src/` may hold a
+  string literal equal to a display name, or join a vendor to a middle dot.
+  Per file: `test_widget.py` 161 (from 154), `test_azure.py` 244 (242),
+  `test_meter_catalog.py` 154 (148), `test_app.py` 79 (75),
+  `test_settings_dialog.py` 56 (54), `test_meter_discovery_js.py` 47 (44),
+  `test_openrouter.py` 40 (38), `test_docs_consistency.py` 27 (25),
+  `test_models.py` 9 (7), `test_config.py` 154 (unchanged).
+- The dead `display_name` class attribute is gone from `providers/base.py` and
+  all six providers. Its only reader anywhere was one test assertion.
+
 ## 1.4.0+cfa.8 - 2026-09-17
 
 A release about the window rather than about the numbers in it. The panel had

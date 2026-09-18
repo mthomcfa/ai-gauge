@@ -51,8 +51,10 @@ from .config import (
     WINDOW_MIN_HEIGHT,
     WINDOW_MIN_WIDTH,
     browser_account,
+    compact_name_for_account,
     display_name_for_account,
 )
+from . import naming
 from .gauge import color_for_percent, thresholds_for_provider
 from .models import SnapshotStatus, UsageSnapshot
 from .ratio import (
@@ -72,11 +74,11 @@ _RESET_LABEL_MAX_WIDTH = 240
 PACE_TICK_OVERHANG = 2
 CHIP_NOTCH_HEIGHT = 4
 CHIP_NOTCH_HALF_WIDTH = 3.5
-# Azure sits next to Copilot so the two Microsoft tiles render as a pair.
-PROVIDER_ORDER = ("claude", "codex", "opencode_go", "copilot", "azure", "openrouter")
-# The tile header has room for "Microsoft · Azure"; a summary chip does not,
-# and a chip that wraps costs a whole row in the collapsed panel.
-COMPACT_DISPLAY_NAMES = {"azure": "Azure"}
+# Tile order: Anthropic, OpenAI, OpenCode, Microsoft, GitHub, OpenRouter.
+# Azure and Copilot used to sit together as "the two Microsoft tiles"; they are
+# two vendors - Copilot is GitHub's - so they are now simply adjacent rather
+# than paired, and the order follows the Settings tabs.
+PROVIDER_ORDER = naming.KINDS
 COLLAPSED_MIN_HEIGHT = WINDOW_COLLAPSED_HEIGHT
 
 # How long after the last move/resize event of a window-manager drag the
@@ -169,11 +171,8 @@ def _cursor_for_edges(edges: Qt.Edge) -> Qt.CursorShape:
 
 
 def _provider_family(provider: str) -> str:
-    if provider == "claude" or provider.startswith("claude-"):
-        return "claude"
-    if provider == "codex" or provider.startswith("codex-"):
-        return "codex"
-    return provider
+    """The kind a tile id belongs to - one rule, shared with the name table."""
+    return naming.kind_of(provider)
 
 
 def _provider_sort_key(provider: str) -> tuple[int, str]:
@@ -741,6 +740,80 @@ class _SummaryChip(QWidget):
             painter.drawPolygon(notch)
 
 
+class _ElidingLabel(QLabel):
+    """A label that gives up its tail rather than the window's width.
+
+    ``QLabel.minimumSizeHint`` is the width of the whole text, so a tile header
+    is a floor on how narrow the panel's content can be. Measured offscreen at
+    ``WINDOW_MIN_WIDTH`` (260), with a ratio chip and the status tag on the same
+    row: "Microsoft · Azure" needs a 197 px tile and fits, "Anthropic · Claude"
+    needs 207 and fits, "OpenAI · ChatGPT + Codex" needs 261 and does not, and
+    "OpenAI · ChatGPT + Codex (Work)" needs 311 - which put a horizontal scroll
+    bar under the tiles and clipped the header controls on the right.
+
+    Widening ``WINDOW_MIN_WIDTH`` would spend the user's screen on a name. The
+    header is the one element on that row that can lose characters without
+    losing a control - the four buttons are ``setFixedSize`` - so it elides from
+    the right and the full name moves into the tooltip. ``text()`` still answers
+    with the full name; only what is painted is shortened.
+    """
+
+    # Enough for a short name and an ellipsis at the header's 12 px bold. Below
+    # this the header stops being a label and becomes a smudge, and the tile
+    # would rather be scrolled than be unreadable.
+    MIN_WIDTH = 48
+
+    def __init__(self, text: str = "", parent: QWidget | None = None):
+        super().__init__(parent)
+        self._full_text = ""
+        self._eliding = False
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setText(text)
+
+    def setText(self, text: str) -> None:  # noqa: N802
+        self._full_text = text or ""
+        self._apply_elide()
+
+    def text(self) -> str:
+        return self._full_text
+
+    def elided_text(self) -> str:
+        """What is actually painted - the same string for a header that fits."""
+        return super().text()
+
+    def sizeHint(self):  # noqa: N802
+        hint = super().sizeHint()
+        hint.setWidth(self.fontMetrics().horizontalAdvance(self._full_text) + 1)
+        return hint
+
+    def minimumSizeHint(self):  # noqa: N802
+        hint = super().minimumSizeHint()
+        hint.setWidth(min(hint.width(), self.MIN_WIDTH))
+        return hint
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        self._apply_elide()
+
+    def _apply_elide(self) -> None:
+        # setText re-enters here through resizeEvent when the new string
+        # changes the label's geometry; one level is enough to settle it.
+        if self._eliding:
+            return
+        self._eliding = True
+        try:
+            width = max(0, self.width())
+            elided = self.fontMetrics().elidedText(
+                self._full_text, Qt.TextElideMode.ElideRight, width
+            )
+            QLabel.setText(self, elided)
+            # Only when something was actually dropped: a tooltip repeating a
+            # header the user can already read is noise on every hover.
+            self.setToolTip(self._full_text if elided != self._full_text else "")
+        finally:
+            self._eliding = False
+
+
 class _PaceTickOverlay(QWidget):
     _PACE = QColor(243, 244, 246, 180)
     _PACE_SHADOW = QColor(17, 24, 39, 120)
@@ -943,9 +1016,12 @@ class _MetricRow(QWidget):
         if reset_label:
             # The full phrase, then the note: whatever the column elided is
             # still reachable here, and the amounts are in the note as well.
-            self.reset.setToolTip(
-                _safe_tooltip("\n\n".join(part for part in (rel, note) if part))
-            )
+            # Not twice, though - an Azure component row carries its amount in
+            # both, so the two parts are identical and one of them is dropped.
+            parts = [part for part in (rel, note) if part]
+            if len(parts) == 2 and parts[0] == parts[1]:
+                parts.pop()
+            self.reset.setToolTip(_safe_tooltip("\n\n".join(parts)))
         elif resets_at:
             self.reset.setToolTip(resets_at.strftime("%Y-%m-%d %H:%M"))
         elif not split_note:
@@ -1086,7 +1162,7 @@ class _ProviderTile(QFrame):
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-        self.header = QLabel(display_name)
+        self.header = _ElidingLabel(display_name)
         self.header.setStyleSheet("color: #e5e7eb; font-size: 12px; font-weight: 700;")
 
         self.status = QLabel("loading…")
@@ -2171,16 +2247,19 @@ class UsageWidget(QWidget):
         self._collapsed_label.show()
 
     def _summary_chip(self, provider: str) -> _SummaryChip:
+        # Compact names here, always. A chip is sized to its text
+        # (_SummaryChip.set_state) and the collapsed strip adds a row when the
+        # chips overflow, so "OpenAI · ChatGPT + Codex" would cost the panel a
+        # whole row to say what "Codex" says.
         account = browser_account(self._config, provider)
+        name = (account.name or "").strip() if account is not None else ""
+        # An extra account the user has named is already unique: its own name
+        # is shorter than anything this app could compose, and a chip that
+        # wraps costs the collapsed panel a whole row.
         display = (
-            account.name.strip()
-            if account is not None
-            and provider not in ("claude", "codex")
-            and account.name
-            and account.name.strip()
-            else COMPACT_DISPLAY_NAMES.get(
-                provider, display_name_for_account(self._config, provider)
-            )
+            name
+            if name and provider not in ("claude", "codex")
+            else compact_name_for_account(self._config, provider)
         )
         snapshot = self._snapshots.get(provider)
         percent: float | None = None

@@ -1,5 +1,5 @@
 name: Provider layout broken
-description: Claude or Codex tile shows `error · layout changed` or empty values after a provider UI update.
+description: The Anthropic · Claude or OpenAI · ChatGPT + Codex tile shows `error · layout changed` or empty values after a provider UI update.
 labels: [provider-layout]
 body:
   - type: markdown
@@ -21,8 +21,8 @@ body:
     attributes:
       label: Which provider tile is broken?
       options:
-        - Claude.ai
-        - ChatGPT Codex
+        - Anthropic · Claude
+        - OpenAI · ChatGPT + Codex
         - OpenCode
         - More than one
     validations:

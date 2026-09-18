@@ -5,6 +5,7 @@ import sys
 import pytest
 from pydantic import ValidationError
 
+from aigauge import naming
 from aigauge.config import (
     DEFAULT_OPENCODE_USAGE_URL,
     WINDOW_MAX_DIMENSION,
@@ -445,9 +446,12 @@ def test_load_migrates_legacy_provider_toggles_to_browser_accounts():
 
 
 def test_browser_account_display_names():
+    """The company stays on a named account and the user's own identifier is
+    last, in brackets: "OpenAI · ChatGPT + Codex (Work)"."""
     account = BrowserAccount(id="codex-work", kind="codex", name="Work")
 
-    assert account_display_name(account) == "Codex (Work)"
+    assert account_display_name(account) == naming.full("codex") + " (Work)"
+    assert account_display_name(account) == "OpenAI \u00b7 ChatGPT + Codex (Work)"
 
 
 def test_display_name_for_configured_account():
@@ -456,7 +460,7 @@ def test_display_name_for_configured_account():
         BrowserAccount(id="claude-team", kind="claude", name="Team")
     )
 
-    assert display_name_for_account(c, "claude-team") == "Claude (Team)"
+    assert display_name_for_account(c, "claude-team") == "Anthropic \u00b7 Claude (Team)"
     assert [a.id for a in browser_accounts(c, kind="claude")] == [
         "claude",
         "claude-team",

@@ -5,6 +5,7 @@ from PyQt6.QtCore import QEvent, QPoint, QPointF, Qt
 from PyQt6.QtGui import QGuiApplication, QMouseEvent, QResizeEvent, QTextDocument
 from PyQt6.QtWidgets import QApplication, QLabel, QWidget
 
+from aigauge import naming
 from aigauge.config import (
     BrowserAccount,
     Config,
@@ -126,19 +127,19 @@ def test_reenabled_provider_returns_to_canonical_order(qtbot):
     assert _tile_order(widget) == ["claude", "codex", "copilot"]
 
 
-def test_microsoft_tiles_render_as_a_pair(qtbot):
-    """Copilot and Azure are the two halves of the Microsoft section, so they
-    must sit next to each other however the tiles happen to be created."""
+def test_tiles_stack_in_the_one_canonical_vendor_order(qtbot):
+    """Tile order is naming.KINDS - Anthropic, OpenAI, OpenCode, Microsoft,
+    GitHub, OpenRouter - however the tiles happen to be created. Azure and
+    Copilot are no longer a "Microsoft pair": Copilot is GitHub's."""
     widget = UsageWidget(Config())
     qtbot.addWidget(widget)
 
-    widget.ensure_tile("openrouter", "OpenRouter")
-    widget.ensure_tile("azure", "Microsoft · Azure")
-    widget.ensure_tile("claude", "Claude")
-    widget.ensure_tile("copilot", "Copilot")
+    for provider in ("openrouter", "azure", "claude", "copilot"):
+        widget.ensure_tile(provider, naming.full(provider))
 
     order = _tile_order(widget)
-    assert order == ["claude", "copilot", "azure", "openrouter"]
+    assert order == [k for k in naming.KINDS if k in order]
+    assert order == ["claude", "azure", "copilot", "openrouter"]
 
 
 def test_azure_summary_chip_uses_the_short_name(qtbot):
@@ -3109,7 +3110,7 @@ def test_a_rate_limit_is_named_in_the_corner_tag(error, expected):
 # --- The note is reachable by hovering any part of a row --------------------
 
 
-def _azure_component_snapshot(note="CA$1,234.56"):
+def _azure_component_snapshot(note="CA$1,234.56", reset_label=None):
     return UsageSnapshot(
         provider="azure",
         status=SnapshotStatus.OK,
@@ -3118,6 +3119,7 @@ def _azure_component_snapshot(note="CA$1,234.56"):
             UsageMetric(
                 label="Azure App Service",
                 percent_used=13.0,
+                reset_label=reset_label,
                 note=note,
                 tag="meter_breakdown",
             ),
@@ -3189,3 +3191,188 @@ def test_a_row_with_no_note_leaves_no_stale_tooltip_behind(qtbot):
     assert row.toolTip() == ""
     for name in ("label", "bar", "pct"):
         assert getattr(row, name).toolTip() == "", name
+
+
+def _longest_header_tile(qtbot, display_name):
+    """A tile at WINDOW_MIN_WIDTH carrying every header control at once."""
+    from PyQt6.QtWidgets import QScrollArea
+
+    config = Config()
+    widget = UsageWidget(config)
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_ok_snapshot("codex"), display_name)
+    tile = widget._tiles["codex"]  # noqa: SLF001
+    tile.set_ratio(_estimate(True, 4.2, source="history"), recent=[3.1, 3.4], live=None)
+    with qtbot.waitExposed(widget):
+        widget.show()
+    widget.resize(WINDOW_MIN_WIDTH, widget.height())
+    widget._do_refit_height()  # noqa: SLF001
+    qtbot.wait(0)
+    qtbot.waitUntil(lambda: widget.width() == WINDOW_MIN_WIDTH)
+    scrolls = widget.findChildren(QScrollArea)
+    return widget, tile, scrolls
+
+
+def test_the_longest_tile_header_fits_the_narrowest_panel(qtbot):
+    """The header may not be what forces the panel wider than its own minimum.
+
+    "OpenAI · ChatGPT + Codex (Work)" is the longest name the scheme can
+    produce - the longest full label, with the longest bracketed account form
+    on top of it - and it is measured here beside a ratio chip and the status
+    tag, which is the fullest a header row ever gets. Measured, not pinned to a
+    pixel count: the font is the platform's and the numbers differ on Windows,
+    macOS and Linux.
+    """
+    name = naming.account_label("codex", "Work")
+    widget, tile, scrolls = _longest_header_tile(qtbot, name)
+
+    # No horizontal overflow anywhere: a tile wider than the viewport is what
+    # put a scroll bar under the tiles and clipped the controls on the right.
+    for scroll in scrolls:
+        assert scroll.horizontalScrollBar().maximum() == 0
+    assert tile.width() <= widget.width()
+    # Every header control still inside the tile.
+    for control in (tile.header, tile.ratio_label, tile.status):
+        assert control.geometry().right() <= tile.width()
+    assert tile.ratio_label.isVisible()
+
+
+def test_a_header_too_long_to_fit_elides_and_keeps_the_name_in_its_tooltip(qtbot):
+    """Eliding, not clipping, and never a silent loss: whatever the column
+    drops is still reachable by hovering."""
+    name = naming.account_label("codex", "Work")
+    _widget, tile, _scrolls = _longest_header_tile(qtbot, name)
+
+    # text() is always the whole name; only what is painted is shortened.
+    assert tile.header.text() == name
+    painted = tile.header.elided_text()
+    assert painted
+    # Whatever is painted fits the room the header was given - that is the
+    # whole point, and it holds whether or not this font needed the ellipsis.
+    assert (
+        tile.header.fontMetrics().horizontalAdvance(painted)
+        <= tile.header.width() + 1
+    )
+    if painted != name:
+        assert painted.endswith("…")
+        assert name.startswith(painted.rstrip("…"))
+        assert _tooltip_text(tile.header.toolTip()) == name
+
+
+def test_a_header_that_fits_carries_no_tooltip(qtbot):
+    """A tooltip repeating a header the user can already read is noise."""
+    _widget, tile, _scrolls = _longest_header_tile(qtbot, naming.compact("codex"))
+
+    assert tile.header.elided_text() == naming.compact("codex")
+    assert tile.header.toolTip() == ""
+
+
+def test_the_eliding_label_drops_its_tail_at_any_width(qtbot):
+    """Deterministic on every platform: the label is given less room than its
+    own text measures, whatever that measurement happens to be here."""
+    from aigauge.widget import _ElidingLabel
+
+    label = _ElidingLabel(naming.account_label("codex", "Work"))
+    qtbot.addWidget(label)
+    full = label.text()
+    advance = label.fontMetrics().horizontalAdvance(full)
+    with qtbot.waitExposed(label):
+        label.show()
+
+    def resized(width):
+        # A hidden widget gets its resize event posted, not sent; the label is
+        # shown above so this settles synchronously on every platform.
+        label.resize(width, label.sizeHint().height())
+        qtbot.waitUntil(lambda: label.width() == width)
+        qtbot.wait(0)
+
+    resized(advance + 8)
+    assert label.elided_text() == full
+    assert label.toolTip() == ""
+
+    resized(max(_ElidingLabel.MIN_WIDTH, advance // 2))
+    assert label.elided_text() != full
+    assert _tooltip_text(label.toolTip()) == full
+    # A label that has lost its tail must not also cost the panel its width.
+    assert label.minimumSizeHint().width() <= _ElidingLabel.MIN_WIDTH
+
+    resized(advance + 8)
+    assert label.elided_text() == full, "the label did not recover its full text"
+    assert label.toolTip() == ""
+
+
+def _azure_rows_snapshot():
+    return UsageSnapshot(
+        provider="azure",
+        status=SnapshotStatus.OK,
+        metrics=[
+            UsageMetric(label="Spend this month", percent_used=24.0,
+                        reset_label="CA$36.10 · resets 1 Oct"),
+            UsageMetric(label="Foundry", percent_used=34.0,
+                        reset_label="CA$12.40", note="CA$12.40 across 1 Foundry resource.",
+                        tag="meter_breakdown"),
+            UsageMetric(label="Azure OpenAI", percent_used=22.0,
+                        reset_label="CA$8.05", note="CA$8.05", tag="meter_breakdown"),
+            UsageMetric(label="Storage", percent_used=3.0,
+                        reset_label="CA$1.10", note="CA$1.10", tag="meter_breakdown"),
+        ],
+        fetched_at=datetime(2026, 4, 27, 12, 0),
+    )
+
+
+def test_each_azure_component_row_renders_its_amount_in_the_right_column(qtbot):
+    """Three components, three amounts on the rows - right-aligned in the
+    column the Spend row already uses, not hidden in a tooltip."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_azure_rows_snapshot(), naming.full("azure"))
+    tile = widget._tiles["azure"]  # noqa: SLF001
+    tile.set_expanded(True, emit=False)
+    with qtbot.waitExposed(widget):
+        widget.show()
+    widget._do_refit_height()  # noqa: SLF001
+    qtbot.wait(0)
+
+    rendered = {row.label.text(): row for row in tile._rows}  # noqa: SLF001
+    for label, amount in (
+        ("Foundry", "CA$12.40"),
+        ("Azure OpenAI", "CA$8.05"),
+        ("Storage", "CA$1.10"),
+    ):
+        row = rendered[label]
+        assert row.reset.isVisible(), label
+        assert row.reset.text() == amount, label
+        assert row.reset.alignment() & Qt.AlignmentFlag.AlignRight
+        # The percentage stays: the share and the amount answer two questions.
+        assert row.pct.isVisible() and row.pct.text().endswith("%"), label
+
+
+def test_a_component_row_does_not_say_its_amount_twice_in_one_tooltip(qtbot):
+    """The right-hand column's tooltip is "the full phrase, then the note", and
+    for a plain component row those are the same string."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(
+        _azure_component_snapshot(note="CA$1,234.56", reset_label="CA$1,234.56"),
+        naming.full("azure"),
+    )
+    tile = widget._tiles["azure"]  # noqa: SLF001
+    tile.set_expanded(True, emit=False)
+    row = tile._rows[-1]  # noqa: SLF001
+
+    assert _tooltip_text(row.reset.toolTip()) == "CA$1,234.56"
+
+
+def test_a_component_row_keeps_a_note_that_says_more_than_the_column(qtbot):
+    """Foundry's note explains that its spend is already inside the total, so
+    it is not the amount repeated and must survive."""
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(_azure_rows_snapshot(), naming.full("azure"))
+    tile = widget._tiles["azure"]  # noqa: SLF001
+    tile.set_expanded(True, emit=False)
+    row = next(r for r in tile._rows if r.label.text() == "Foundry")  # noqa: SLF001
+
+    tip = _tooltip_text(row.reset.toolTip())
+    assert tip.startswith("CA$12.40")
+    assert "across 1 Foundry resource" in tip

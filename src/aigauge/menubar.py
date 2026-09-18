@@ -15,6 +15,7 @@ from typing import Iterable
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QPainter, QPixmap
 
+from . import naming
 from .config import ColorThresholds, Config
 from .gauge import color_for_percent, thresholds_for_provider
 from .models import SnapshotStatus, UsageSnapshot
@@ -25,14 +26,6 @@ PROVIDER_GAP = 1
 PIXMAP_HEIGHT = 22  # macOS menu-bar standard height
 PIXMAP_WIDTH = 22
 SIDE_PADDING = (PIXMAP_WIDTH - DOT_DIAMETER) // 2
-PROVIDER_LABELS = {
-    "claude": "Cl",
-    "codex": "Cx",
-    "opencode_go": "Go",
-    "copilot": "Cp",
-    "azure": "Az",
-    "openrouter": "OR",
-}
 
 OK_COLORS = {
     "low": "#22c55e",
@@ -117,7 +110,11 @@ def status_items(
     """Return ``(provider_label, value, color)`` items for native menu bars."""
     return [
         (
-            PROVIDER_LABELS.get(provider, provider[:2].title()),
+            # naming.abbrev returns "" for an id it has never heard of - a
+            # multi-account id ("claude-3f9a…") resolves to its family, an
+            # unknown provider does not - so the first two letters remain the
+            # fallback rather than a guessed abbreviation.
+            naming.abbrev(provider) or provider[:2].title(),
             _provider_value(snapshots.get(provider)),
             _provider_color(
                 snapshots.get(provider), thresholds_for_provider(config, provider)
