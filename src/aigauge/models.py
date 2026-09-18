@@ -40,6 +40,33 @@ def bounded_note(text: str | None) -> str | None:
     return text
 
 
+# How long a **provider-supplied** ``label`` may be on a surface that has no
+# layout to clip it for us. A tile row does: the label column is 70 px wide and
+# Qt elides what will not fit. The tray tooltip is a plain string built by
+# concatenation, so a meter name lifted off a page - or typed into an app-data
+# override file, which nothing validates on the way in - travels into it whole
+# and takes the tooltip with it.
+#
+# Sixty, not MAX_NOTE_CHARS' 280: a label is a name, not a sentence. The meter
+# catalog already refuses to *adopt* one past 40 characters
+# (``providers.catalog.MAX_LABEL_CHARS``, a deliberately stricter guard on what
+# the app invents for itself), and Azure truncates a service name to 20. This
+# is the backstop for the labels those two do not cover.
+MAX_DISPLAY_LABEL_CHARS = 60
+
+
+def bounded_label(text: str | None) -> str | None:
+    """Clip a provider's metric label to ``MAX_DISPLAY_LABEL_CHARS``.
+
+    Beside ``bounded_note`` and for the same reason: the bound belongs with the
+    field it bounds rather than being re-decided at each surface that renders
+    one. Callers are the surfaces with no layout of their own.
+    """
+    if isinstance(text, str) and len(text) > MAX_DISPLAY_LABEL_CHARS:
+        return text[:MAX_DISPLAY_LABEL_CHARS]
+    return text
+
+
 @dataclass
 class UsageMetric:
     """A single percent-used reading with a reset time."""

@@ -40,7 +40,7 @@ from .history import HistoryStore
 from .logging_setup import setup_logging
 from .gauge import highest_indicator
 from .menubar import render_menubar_pixmap
-from .models import SnapshotStatus, UsageSnapshot
+from .models import SnapshotStatus, UsageSnapshot, bounded_label
 from .platforms import autostart_command, get_platform
 from .providers.base import Provider, ProviderSignals
 from .providers.claude import ClaudeProvider
@@ -2469,7 +2469,16 @@ class App(QObject):
                     continue
                 if m.tag:
                     continue
-                lines.append(f"{display_name} {m.label}: {m.percent_used:.0f}%")
+                # The label is the provider's, and this string has no layout
+                # to clip it the way a tile row does - so it is bounded here,
+                # the same rule the tiles' notes go through. No escaping: a
+                # QSystemTrayIcon tooltip is plain text on every platform the
+                # app ships to, so markup in a meter name is shown, not
+                # interpreted. (The rich-text surfaces escape; this is not one.)
+                lines.append(
+                    f"{display_name} {bounded_label(m.label)}: "
+                    f"{m.percent_used:.0f}%"
+                )
         tooltip = (
             f"AI Gauge {__version__}\n" + "\n".join(lines)
             if lines

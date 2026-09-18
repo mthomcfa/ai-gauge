@@ -2,7 +2,7 @@ import pytest
 import responses
 
 from aigauge.config import Config
-from aigauge.models import SnapshotStatus
+from aigauge.models import MAX_NOTE_CHARS, SnapshotStatus
 from aigauge.providers.openrouter import (
     ACTIVITY_LABEL,
     MAX_MODEL_BREAKDOWN_ROWS,
@@ -794,3 +794,25 @@ def test_openrouter_advertises_the_budget_its_three_calls_need():
     assert REFRESH_WORST_CASE_SECONDS == 3 * request_worst_case_seconds(
         REQUEST_TIMEOUT
     )
+
+
+def test_a_model_id_from_the_api_cannot_grow_the_note_without_bound():
+    """`/activity` supplies the model id and nothing bounds it on the way in.
+    The row's label is clipped to MODEL_DISPLAY_MAX_LEN, but the full id goes
+    into the note - which is carried for the life of the tile and re-clipped by
+    each of the six tooltips that show it."""
+    model = "vendor/" + "m" * 200_000
+
+    metrics = _build_model_metrics([(model, 1.25)])
+
+    row = metrics[-1]
+    assert row.label != model
+    assert len(row.note) == MAX_NOTE_CHARS
+    assert row.note.startswith("vendor/mmm")
+
+
+def test_a_short_model_id_keeps_its_whole_note():
+    metrics = _build_model_metrics([("anthropic/claude-opus", 1.25)])
+
+    row = metrics[-1]
+    assert row.note == "anthropic/claude-opus\n$1.25"

@@ -3,10 +3,12 @@ from datetime import datetime
 import pytest
 
 from aigauge.models import (
+    MAX_DISPLAY_LABEL_CHARS,
     MAX_NOTE_CHARS,
     SnapshotStatus,
     UsageMetric,
     UsageSnapshot,
+    bounded_label,
     bounded_note,
 )
 from aigauge.providers import opencode_go
@@ -113,3 +115,17 @@ def test_a_note_this_app_composed_is_not_clipped_to_a_page_bound():
     composed = "Sentence. " * 60
     assert len(composed) > MAX_NOTE_CHARS
     assert UsageMetric(label="Spend this month", note=composed).note == composed
+
+
+def test_bounded_label_clips_only_what_is_too_long():
+    assert bounded_label(None) is None
+    assert bounded_label("Session") == "Session"
+    exact = "x" * MAX_DISPLAY_LABEL_CHARS
+    assert bounded_label(exact) == exact
+    assert bounded_label("x" * 200_000) == "x" * MAX_DISPLAY_LABEL_CHARS
+
+
+def test_the_label_bound_is_tighter_than_the_note_bound():
+    """A label is a name, not a sentence, and it shares a tooltip line with a
+    provider name and a percentage."""
+    assert MAX_DISPLAY_LABEL_CHARS < MAX_NOTE_CHARS

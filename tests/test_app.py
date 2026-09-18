@@ -13,7 +13,12 @@ from aigauge.app import (
 )
 from aigauge import naming
 from aigauge.config import BrowserAccount, Config
-from aigauge.models import SnapshotStatus, UsageMetric, UsageSnapshot
+from aigauge.models import (
+    MAX_DISPLAY_LABEL_CHARS,
+    SnapshotStatus,
+    UsageMetric,
+    UsageSnapshot,
+)
 
 
 class _Timer:
@@ -2047,3 +2052,50 @@ def test_the_tray_tooltip_uses_compact_names(qapp):
     assert f"{naming.compact('codex')} (Work) Weekly: 21%" in lines
     for company in (c for c in naming.COMPANY.values() if c):
         assert company not in app._tray.tooltip  # noqa: SLF001
+
+
+def test_the_tray_tooltip_bounds_a_providers_metric_label(qapp):
+    """A tile row clips a long label by geometry; this string has no layout at
+    all, so a meter name lifted off a page - or typed into an app-data override
+    file, which nothing validates on the way in - would travel into the tooltip
+    whole and take the tooltip with it."""
+    fetched = datetime(2026, 4, 27, 12, 0)
+    snapshots = {
+        "claude": UsageSnapshot(
+            provider="claude",
+            status=SnapshotStatus.OK,
+            metrics=[UsageMetric("R" * 200_000, 50.0, fetched)],
+            fetched_at=fetched,
+        )
+    }
+    app = _tray_app(Config(), snapshots)
+
+    app._update_tray()  # noqa: SLF001
+
+    line = next(
+        line for line in app._tray.tooltip.splitlines() if line.startswith("Claude ")  # noqa: SLF001
+    )
+    assert line == f"Claude {'R' * MAX_DISPLAY_LABEL_CHARS}: 50%"
+    assert len(line) < 100
+
+
+def test_the_tray_tooltip_shows_markup_rather_than_interpreting_it(qapp):
+    """A QSystemTrayIcon tooltip is plain text, so a meter name shaped like
+    markup is shown as written. The bound is the whole defence here; nothing is
+    escaped, and nothing should be."""
+    fetched = datetime(2026, 4, 27, 12, 0)
+    label = "<b>Session</b>"
+    snapshots = {
+        "claude": UsageSnapshot(
+            provider="claude",
+            status=SnapshotStatus.OK,
+            metrics=[UsageMetric(label, 50.0, fetched)],
+            fetched_at=fetched,
+        )
+    }
+    app = _tray_app(Config(), snapshots)
+
+    app._update_tray()  # noqa: SLF001
+
+    assert f"Claude {label}: 50%" in app._tray.tooltip  # noqa: SLF001
+    assert "&lt;" not in app._tray.tooltip  # noqa: SLF001
