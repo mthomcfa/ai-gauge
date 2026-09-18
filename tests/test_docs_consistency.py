@@ -152,6 +152,21 @@ def test_provider_list_is_complete(name):
         assert provider in text, f"{name} does not mention {provider}"
 
 
+@pytest.mark.parametrize("name", ["README.md", "AI Gauge-datasheet.md"])
+def test_the_docs_name_the_company_behind_each_product(name):
+    """Since 1.4.1+cfa.9 every surface reads `Company · Surface`, and the docs
+    are where a reader checks what the app will actually say. The table is
+    `aigauge.naming`; this asserts the prose agrees with it."""
+    from aigauge import naming
+
+    text = _read(name)
+    for kind in naming.KINDS:
+        company = naming.COMPANY[kind]
+        if company is None:
+            continue
+        assert naming.full(kind) in text, f"{name} does not show {naming.full(kind)!r}"
+
+
 def test_security_policy_lists_every_host_the_app_contacts():
     """The egress table is the claim a reader checks the code against.
 

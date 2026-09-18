@@ -3,6 +3,32 @@
 State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#16,
 610 tests passing, all five providers reading.
 
+> **Updated 2026-09-18** by the naming release (`1.4.1+cfa.9`, 2 085 tests):
+> every provider surface now names the company behind the product, from one
+> table (`src/aigauge/naming.py`) instead of the nine copies that had drifted
+> apart - `Anthropic · Claude`, `OpenAI · ChatGPT + Codex`, `Microsoft · Azure`,
+> `GitHub · Copilot`, `OpenRouter`, `OpenCode` - with the product name alone
+> where there is no room for a company. Copilot moved out of the Microsoft
+> Settings tab into a GitHub tab of its own, because the credential is a GitHub
+> PAT and the host is `api.github.com`. Tile headers elide rather than widen the
+> 260 px floor, Azure's component rows carry their amounts on the row, and the
+> meter catalog's label bound is one number shared with the extractors.
+>
+> **It closes two items from 1.4.0+cfa.8's residual list** - the unbounded
+> metric label in the tray tooltip (now `models.bounded_label`; no escaping,
+> because a `QSystemTrayIcon` tooltip is plain text) and the unbounded
+> API-supplied model id in OpenRouter's note (now `bounded_note`). It closes
+> nothing in [§4](#4-known-defects-deliberately-not-fixed) or
+> [§8.3](#83-known-soft-spots-in-what-was-built): "History still keys on the
+> display label" (§8.3) is untouched and still correct - provider *display*
+> names never reach `history._state_key`, which keys on `provider::metric-label`,
+> and no metric label was renamed here. It does add one soft spot of its own:
+> the collision relaxation for a renamed per-model row trusts the labels a
+> single scan saw, so a scan that runs while the page is half-rendered can
+> adopt a bare model name beside a longer one that simply had not painted yet.
+> The cost is one extra informational meter against the 24-meter ratchet, which
+> is the failure this direction was chosen for.
+>
 > **Updated 2026-09-17** by the UI release (`1.4.0+cfa.8`, 2 024 tests): the
 > panel is resizable and remembers its size, every Settings tab scrolls, the
 > app has an icon, and three things the user's own desktop turned up were
