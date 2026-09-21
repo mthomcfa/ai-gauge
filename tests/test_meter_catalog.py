@@ -917,13 +917,13 @@ def test_a_decoration_clean_label_keeps_does_not_hide_a_label_either(
     """The shield covers every decoration, not the eight characters one
     helper happens to strip.
 
-    ``clean_label`` trims ``" \\t\u00b7\u2022:,-\u2013\u2014"``. Every other character a page can
-    put beside a label - a semicolon, a bracket, a pipe, a zero-width space,
-    an arrow, or the ellipsis Claude's own elided rows end in - survives into
-    the set of labels the scan saw, so comparing that set by equality hands
-    the page the shield back. The comparison asks whether the known label
-    sits inside something the page rendered instead, which no decoration
-    changes.
+    ``clean_label`` trims ``" \\t·•:,-–—"``, and every other
+    character a page can put beside a label - a semicolon, a bracket, a pipe,
+    a zero-width space, an arrow, or the ellipsis an elided row ends in -
+    survives into the set of labels the scan saw. Compare that set by
+    equality and the page hands itself the shield back by typing one of
+    them. The comparison asks whether the known label sits inside something
+    the page rendered instead, which no decoration changes.
     """
     rows = [_row(rendered, percent=91.0), _row("Opus", percent=91.0)]
     # The half of the class the cleaning does not reach: what the catalog
@@ -947,12 +947,12 @@ def test_a_new_meter_is_adopted_beside_a_decorated_row_it_is_no_fragment_of(
     rows = [
         _row("Opus only\u2026", percent=91.0),
         _row("Opus", percent=91.0),
-        _row("Fable 5.1", percent=12.0),
+        _row("Team pool", percent=12.0),
     ]
 
     adopted = adopt_rows("claude", rows, base_dir=tmp_path)
 
-    assert [spec.label for spec in adopted] == ["Fable 5.1"]
+    assert [spec.label for spec in adopted] == ["Team pool"]
 
 
 @pytest.mark.parametrize(
