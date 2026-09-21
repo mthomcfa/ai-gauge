@@ -46,6 +46,7 @@ from aigauge.providers.catalog import (
     adopt_rows,
     bundled_catalog,
     bundled_path,
+    clean_label,
     clear_scans,
     extractor_source,
     is_adoptable_label,
@@ -863,6 +864,36 @@ def test_a_fragment_of_a_label_adopted_in_the_same_scan_is_still_refused(tmp_pat
     adopted = [spec.label for spec in adopt_rows("claude", rows, base_dir=tmp_path)]
 
     assert adopted == ["Fable only"]
+
+
+@pytest.mark.parametrize(
+    "rendered",
+    [
+        "Opus only:",
+        "• Opus only",
+        "Opus only -",
+    ],
+    ids=["trailing-colon", "leading-bullet", "trailing-dash"],
+)
+def test_the_page_cannot_hide_a_label_from_the_shield_with_punctuation(
+    rendered, tmp_path
+):
+    """The set of labels the scan saw is built in the form it is read in.
+
+    Both extractors cut a row's label at the reset wording or the number and
+    keep whatever punctuation stood before it, so a page rendering
+    ``Opus only: 42%`` hands Python ``Opus only:`` verbatim - and a decorated
+    label is exactly what ``clean_label`` exists to tidy. Build the set from
+    the raw text and the page decides whether the shield applies: the longer
+    label is on the page, the bare name is a second reading of its number,
+    and nothing stops it being adopted beside it.
+    """
+    rows = [_row(rendered, percent=91.0), _row("Opus", percent=91.0)]
+    # The decoration is the whole point: what the page sent is not what the
+    # catalog reads, and the shield has to be built on the form it reads.
+    assert clean_label(rendered) == "Opus only" != rendered
+
+    assert [spec.label for spec in adopt_rows("claude", rows, base_dir=tmp_path)] == []
 
 
 @pytest.mark.parametrize(

@@ -878,10 +878,20 @@ def adopt_rows(
     # Every label this scan saw, known and unknown alike. It is what tells a
     # bare model name that replaced a longer one ("Opus" where the page used to
     # render "Opus only") from one sitting beside it.
+    #
+    # Through `clean_label` first, because that is the form every label is
+    # compared in: `_adoptable_row` cleans the candidate and
+    # `_collides_with_known` normalizes what it cleaned. Normalizing the raw
+    # text instead leaves the page in charge of the shield - a row rendering
+    # "Opus only: 42%" hands Python "Opus only:" (both extractors cut the
+    # label at the reset wording or the number and keep whatever punctuation
+    # was before it), the colon `clean_label` strips keeps "opus only" out of
+    # this set, and "Opus" is adopted beside the very label it is a fragment
+    # of. A leading bullet does the same.
     present = {
-        normalize_label(row.get("label"))
+        normalize_label(clean_label(row.get("label")))
         for row in rows
-        if isinstance(row, dict) and normalize_label(row.get("label"))
+        if isinstance(row, dict) and normalize_label(clean_label(row.get("label")))
     }
 
     adopted: list[MeterSpec] = []
