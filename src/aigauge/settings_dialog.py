@@ -41,6 +41,7 @@ from PyQt6.QtWidgets import (
 
 from . import naming
 from .config import (
+    ACCOUNT_NAME_MAX_CHARS,
     BrowserAccount,
     ColorThresholds,
     Config,
@@ -587,6 +588,11 @@ class _BrowserAccountRow(QWidget):
         self.colors = account.colors.model_copy(deep=True)
 
         self.name_edit = QLineEdit()
+        # The model clips a name to this, so the field that writes one stops
+        # there too: Qt's own default is 32 767 characters, and a dialog that
+        # accepts what the config will silently shorten is a dialog that lies
+        # about what it saved.
+        self.name_edit.setMaxLength(ACCOUNT_NAME_MAX_CHARS)
         self.name_edit.setText(account.name or "")
         self.name_edit.setPlaceholderText(
             "Default account" if account.id in ("claude", "codex") else "Account name"
@@ -1507,6 +1513,17 @@ class SettingsDialog(QDialog):
         runner lays General out 612 px wide, 18 px more than the viewport
         620 leaves it. Both are bounded by the screen's work area.
 
+        The **tab bar** is a third term, and it has to be its own: the pane
+        width the pages are measured through is ``QTabWidget.sizeHint()``,
+        which answers for the pages and not for the bar above them (495 px
+        here against the bar's own 606). Leave it out and the bar is the one
+        part of the dialog nothing sizes: with seven tabs and the company
+        names it opened 596 px wide for a 606-px bar, Qt turned on the
+        tab-bar scroll arrows, and ``OpenRouter`` sat behind them at the
+        default size - unreachable until the user found the arrows or
+        dragged the window wider. Wider fonts only make the gap bigger, so
+        this is measured from the bar rather than added to the constant.
+
         Every layout is activated first, deepest up - see
         ``_activate_layouts`` for why the top-level ``activate()`` alone left
         a nested row 10 px stale, and General scrolling by 6-7 px on the
@@ -1546,8 +1563,20 @@ class SettingsDialog(QDialog):
         pages_min_w = max(
             scroll.widget().minimumSizeHint().width() for scroll in self._page_scrolls
         )
+        # `pane_extra_w` and not the whole `horizontal_chrome`: the vertical
+        # scroll bar in that sum is a page's, and the bar never has one. The
+        # pane extra is kept because the style that draws a frame around a
+        # page is the style that may inset the bar inside it - 4 px here, and
+        # a term that can only ever make the dialog wider.
+        tab_bar_w = (
+            tabs.tabBar().sizeHint().width()
+            + margins.left()
+            + margins.right()
+            + pane_extra_w
+        )
         width = min(
-            max(_DIALOG_DEFAULT_W, pages_min_w + horizontal_chrome), available.width()
+            max(_DIALOG_DEFAULT_W, pages_min_w + horizontal_chrome, tab_bar_w),
+            available.width(),
         )
         page_width = width - horizontal_chrome
         content = _page_height(general_page, page_width)
