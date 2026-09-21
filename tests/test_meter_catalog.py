@@ -859,11 +859,11 @@ def test_the_relaxation_is_off_unless_the_scan_says_what_it_saw(tmp_path):
 def test_a_fragment_of_a_label_adopted_in_the_same_scan_is_still_refused(tmp_path):
     """A label adopted earlier in this scan is in ``present`` by construction,
     so it shields its own fragments exactly as a bundled one does."""
-    rows = [_row("Fable only", percent=91.0), _row("Fable", percent=91.0)]
+    rows = [_row("Research only", percent=91.0), _row("Research", percent=91.0)]
 
     adopted = [spec.label for spec in adopt_rows("claude", rows, base_dir=tmp_path)]
 
-    assert adopted == ["Fable only"]
+    assert adopted == ["Research only"]
 
 
 @pytest.mark.parametrize(
