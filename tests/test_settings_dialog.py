@@ -1265,6 +1265,49 @@ def test_every_tab_is_reachable_at_the_default_size(qtbot):
         assert not arrows, terms
 
 
+def test_the_width_rule_reserves_the_pane_the_tab_bar_may_be_drawn_inside(qtbot):
+    """The bar's term is the bar, the dialog's margins and the pane extra.
+
+    The width rule can only measure what the bar asks for; where the bar is
+    *put* is the style's business. A style that draws a frame around a page
+    is a style that may inset the bar inside that frame, and then the room
+    reserved for the bar is short by exactly the inset - which is what
+    `pane_extra_w`, the tab widget's own horizontal extra over its pages,
+    stands for. It is a term that can only widen the dialog and is bounded
+    by the work area like every other one, so it is safe on a style that
+    insets nothing, where it is zero and this rule is the rule without it.
+
+    Written against the width the dialog asked for, like the reachability
+    rule above it, and in terms recomputed from the widgets rather than in
+    pixels: the tab titles are as wide as the runner's fonts make them.
+    """
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    with qtbot.waitExposed(dialog):
+        dialog.show()
+    tabs = _tabs(dialog)
+    bar = tabs.tabBar()
+    _tab_bar_settled(qtbot, bar)
+    margins = dialog.layout().contentsMargins()
+    available = dialog.screen().availableGeometry().width()
+    pages_hint_w = max(
+        scroll.sizeHint().width() for scroll in dialog._page_scrolls  # noqa: SLF001
+    )
+    pane_extra_w = max(0, tabs.sizeHint().width() - pages_hint_w)
+
+    needed = (
+        bar.sizeHint().width() + margins.left() + margins.right() + pane_extra_w
+    )
+
+    assert dialog.width() >= min(needed, available), (
+        bar.sizeHint().width(),
+        pane_extra_w,
+        needed,
+        available,
+        dialog.width(),
+    )
+
+
 def test_the_screen_fraction_is_the_effective_ceiling(qtbot, monkeypatch):
     """Including the minimum size, which used to out-rank it.
 

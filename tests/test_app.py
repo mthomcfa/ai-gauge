@@ -2233,3 +2233,51 @@ def test_the_tray_tooltip_bounds_the_half_of_a_line_the_user_wrote(qapp):
     lines = app._tray.tooltip.splitlines()  # noqa: SLF001
     assert len(lines) >= 4, lines
     assert all(len(line) <= ceiling for line in lines), max(lines, key=len)
+
+
+def test_open_login_opens_the_sign_in_page_documented_for_each_kind(monkeypatch):
+    """`LOGIN_URLS` maps an account kind to one URL and nothing else.
+
+    It used to carry a window title beside each URL, which `open_login` never
+    read - the title is composed from the account's display name - so the
+    pair went. Nothing had ever read the URL half in a test either: restore
+    the tuple and `open_login` hands `LoginWindow` a tuple where a URL
+    belongs, which fails at the moment a user signs in and nowhere sooner.
+    The URLs are written out here rather than read back out of the table, so
+    that this says where sign-in goes rather than that it goes wherever the
+    table points.
+    """
+    import aigauge.app as app_module
+
+    opened: list[tuple[str, object, str]] = []
+
+    class _Login:
+        def __init__(self, kind, url, title, *, account_id=None, verify_url=None):
+            opened.append((kind, url, title))
+
+        def exec(self):
+            return 0  # the user closed it; nothing refreshes
+
+    monkeypatch.setattr(app_module, "LoginWindow", _Login)
+    config = Config()
+    config.browser_accounts.append(
+        BrowserAccount(id="claude-3f9a12cd", kind="claude", name="Work")
+    )
+    app = App.__new__(App)
+    app._config = config  # noqa: SLF001
+    app._widget = SimpleNamespace(  # noqa: SLF001
+        suspend_always_on_top=lambda: None,
+        restore_always_on_top=lambda: None,
+    )
+
+    for account_id in ("claude", "codex", "claude-3f9a12cd", "nothing-of-ours"):
+        app.open_login(account_id)
+
+    assert [(kind, url) for kind, url, _ in opened] == [
+        ("claude", "https://claude.ai/login"),
+        ("codex", "https://chatgpt.com/auth/login"),
+        ("claude", "https://claude.ai/login"),
+    ], "an unknown id opens nothing, and each kind opens its own page"
+    assert opened[-1][2] == "Sign in to " + display_name_for_account(
+        config, "claude-3f9a12cd"
+    )
