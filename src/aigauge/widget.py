@@ -814,10 +814,11 @@ class _ElidingLabel(QLabel):
             # and for the reason its docstring gives: the header carries an
             # account's display name, which is config text, and `QToolTip`
             # decides per string whether it is markup. A name containing
-            # `<span style=...>` laid the popup out as rich text (measured:
-            # 161x46 against 655x14 for the same string shown literally), and
-            # the name has no length of its own to lean on - the clip here is
-            # what keeps a hover off the length of whatever is in the file.
+            # `<span style=...>` laid the popup out as rich text - a different
+            # size from the same string shown literally, which is how it was
+            # caught - and the name has no length of its own to lean on, so the
+            # clip here is what keeps a hover off the length of whatever is in
+            # the file.
             self.setToolTip(
                 _safe_tooltip(self._full_text) if elided != self._full_text else ""
             )

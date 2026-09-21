@@ -123,8 +123,8 @@ nine copies. Patch rather than minor: nothing here is a new capability.
 - **An account's display name had no length and no shape.** It is the half of
   every provider label you supply, and it reaches surfaces with no layout to
   clip it: the tray tooltip is one plain string built by joining lines, and a
-  collapsed chip is sized to its own text, so a 10 kB name asked for a chip
-  74 238 px wide and a tray tooltip of 20 131 characters. Worse, a name
+  collapsed chip is sized to its own text, so the width of a chip and the
+  length of that tooltip were both whatever the name was. Worse, a name
   carrying newlines wrote its own lines into that tooltip, including a
   convincing second version banner. The name is now collapsed to a single
   line and clipped to 60 characters where the field is, so the tile header,
