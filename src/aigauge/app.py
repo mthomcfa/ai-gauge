@@ -61,9 +61,15 @@ from .widget import UsageWidget
 
 log = logging.getLogger("aigauge.app")
 
+# The sign-in page per account kind, and nothing else. Each entry used to
+# carry a window title written out beside the URL; `open_login` composes that
+# title from the account's display name and never read them. They were also
+# the shape the consistency rule is blind to - a literal that *contains* a
+# provider name rather than being one - so they could have drifted out of step
+# with the tiles indefinitely.
 LOGIN_URLS = {
-    "claude": ("https://claude.ai/login", "Sign in to Claude"),
-    "codex": ("https://chatgpt.com/auth/login", "Sign in to ChatGPT"),
+    "claude": "https://claude.ai/login",
+    "codex": "https://chatgpt.com/auth/login",
 }
 
 _ACTIVE_MODE_MINUTES = 30
@@ -2558,7 +2564,7 @@ class App(QObject):
         if kind == "opencode_go":
             url = opencode_go_usage_url(self._config)
         elif kind in LOGIN_URLS:
-            url, _title = LOGIN_URLS[kind]
+            url = LOGIN_URLS[kind]
         else:
             return
         display_name = display_name_for_account(self._config, provider)

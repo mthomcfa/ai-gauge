@@ -165,6 +165,27 @@ def _modules_under_test() -> list[Path]:
     return [p for p in sorted(SRC.rglob("*.py")) if p.name != "naming.py"]
 
 
+def _is_a_provider_display_name(value: str) -> bool:
+    """Whether a literal *is* one of the six names, full or compact.
+
+    The two real tests and the self-test below all call this rather than each
+    spelling the comparison out: a self-test that re-implements the filter it
+    guards would go on passing after the filter it guards was loosened.
+    """
+    names = {naming.full(k) for k in naming.KINDS} | {
+        naming.compact(k) for k in naming.KINDS
+    }
+    return value in names
+
+
+def _joins_a_vendor_to_a_surface(value: str) -> bool:
+    """Whether a literal puts a vendor on either side of ``SEPARATOR``."""
+    vendors = {c for c in naming.COMPANY.values() if c} | set(naming.SURFACE.values())
+    return naming.SEPARATOR in value and bool(
+        {part.strip() for part in value.split(naming.SEPARATOR)} & vendors
+    )
+
+
 def test_the_scan_actually_sees_the_source():
     """A guard on the guard: a bad path would make the two tests below pass by
     finding nothing at all."""
@@ -181,14 +202,11 @@ def test_no_module_writes_a_provider_name_of_its_own():
     ``naming`` for it. This is what stops a seventh copy of "Microsoft · Azure"
     appearing in the module that needs it next.
     """
-    names = {naming.full(k) for k in naming.KINDS} | {
-        naming.compact(k) for k in naming.KINDS
-    }
     offenders = [
         f"{path.relative_to(SRC)}:{lineno}: {value!r}"
         for path in _modules_under_test()
         for lineno, value in _module_string_literals(path)
-        if value in names
+        if _is_a_provider_display_name(value)
     ]
     assert offenders == []
 
@@ -199,36 +217,60 @@ def test_no_module_joins_a_company_to_a_surface_itself():
     middle dot". It is that no literal may put a *vendor* on either side of one:
     that string is a provider name, and provider names come from one table.
     """
-    vendors = {c for c in naming.COMPANY.values() if c} | set(naming.SURFACE.values())
     offenders = [
         f"{path.relative_to(SRC)}:{lineno}: {value!r}"
         for path in _modules_under_test()
         for lineno, value in _module_string_literals(path)
-        if naming.SEPARATOR in value
-        and {part.strip() for part in value.split(naming.SEPARATOR)} & vendors
+        if _joins_a_vendor_to_a_surface(value)
     ]
     assert offenders == []
 
 
 def test_the_consistency_rule_would_catch_a_regression(tmp_path):
-    """The rule itself, against a module that breaks it both ways."""
+    """The rule itself, against a module that breaks it both ways.
+
+    Through the same two predicates the tests above use, so loosening one of
+    them fails here too. Re-spelling the filters here instead would leave this
+    passing over a rule that no longer refuses anything.
+    """
     module = tmp_path / "offender.py"
     module.write_text(
         'HEADER = "Microsoft · Azure"\nCHIP = "Copilot"\n', encoding="utf-8"
     )
-    names = {naming.full(k) for k in naming.KINDS} | {
-        naming.compact(k) for k in naming.KINDS
-    }
-    vendors = {c for c in naming.COMPANY.values() if c} | set(naming.SURFACE.values())
     literals = _module_string_literals(module)
 
-    assert [v for _, v in literals if v in names] == [
+    assert [v for _, v in literals if _is_a_provider_display_name(v)] == [
         "Microsoft · Azure",
         "Copilot",
     ]
-    assert [
-        v
-        for _, v in literals
-        if naming.SEPARATOR in v
-        and {part.strip() for part in v.split(naming.SEPARATOR)} & vendors
-    ] == ["Microsoft · Azure"]
+    assert [v for _, v in literals if _joins_a_vendor_to_a_surface(v)] == [
+        "Microsoft · Azure"
+    ]
+    # And that they refuse what they should: a sentence that merely starts
+    # with a vendor's name is not a display literal, and a middle dot with no
+    # vendor beside it is the general-purpose UI separator.
+    assert not _is_a_provider_display_name("Microsoft · Azure accounts")
+    assert not _joins_a_vendor_to_a_surface("error · rate limited")
+
+
+def test_the_composed_dialog_titles_carry_the_full_name(qtbot):
+    """The one surface the consistency rule is blind to, pinned by hand.
+
+    That rule matches a literal *equal* to a display name, so the three
+    titles this replaced - "Claude.ai session cookie" and its siblings -
+    could come back tomorrow without it noticing: they contain a name, they
+    are not one. Widening the rule to containment would flag hundreds of
+    innocent sentences, so this is the trade: one assertion per title.
+    """
+    from aigauge.cookie_dialog import CookieDialog
+
+    for provider in ("claude", "codex", "opencode_go"):
+        dialog = CookieDialog(provider, display_name=None)
+        qtbot.addWidget(dialog)
+        assert dialog.windowTitle() == f"Paste {naming.full(provider)} session cookie"
+
+    named = CookieDialog(
+        "claude", display_name=naming.account_label("claude", "Work")
+    )
+    qtbot.addWidget(named)
+    assert named.windowTitle() == "Paste Anthropic · Claude (Work)"

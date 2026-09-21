@@ -150,6 +150,15 @@ def test_status_items_use_compact_provider_labels():
     ]
 
 
+def test_status_items_falls_back_to_two_letters_for_an_unknown_provider():
+    """`naming.abbrev` answers "" for an id it has never heard of rather than
+    guessing one, so the two-letter fallback is what stands between a provider
+    added without touching the table and a blank menu-bar slot."""
+    items = status_items({}, ("mystery",))
+
+    assert [label for label, _value, _color in items] == ["My"]
+
+
 def test_native_mac_status_item_forwards_config_to_status_items(monkeypatch):
     """The macOS status item is the primary UI on Mac, not a fallback.
 
