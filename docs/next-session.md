@@ -3,6 +3,105 @@
 State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#16,
 610 tests passing, all five providers reading.
 
+> **Updated 2026-09-18** by the naming release (`1.4.1+cfa.9`, 2 119 tests):
+> every provider surface now names the company behind the product, from one
+> table (`src/aigauge/naming.py`) instead of the nine copies that had drifted
+> apart - `Anthropic · Claude`, `OpenAI · ChatGPT + Codex`, `Microsoft · Azure`,
+> `GitHub · Copilot`, `OpenRouter`, `OpenCode` - with the product name alone
+> where there is no room for a company. Copilot moved out of the Microsoft
+> Settings tab into a GitHub tab of its own, because the credential is a GitHub
+> PAT and the host is `api.github.com`. Tile headers elide rather than widen the
+> 260 px floor, Azure's component rows carry their amounts on the row, and the
+> meter catalog's label bound is one number shared with the extractors.
+>
+> **It closes two items from 1.4.0+cfa.8's residual list** - the unbounded
+> metric label in the tray tooltip (now `models.bounded_label`; no escaping,
+> because a `QSystemTrayIcon` tooltip is plain text) and the unbounded
+> API-supplied model id in OpenRouter's note (now `bounded_note`). It closes
+> nothing in [§4](#4-known-defects-deliberately-not-fixed) or
+> [§8.3](#83-known-soft-spots-in-what-was-built): "History still keys on the
+> display label" (§8.3) is untouched and still correct - provider *display*
+> names never reach `history._state_key`, which keys on `provider::metric-label`,
+> and no metric label was renamed here. It does add one soft spot of its own:
+> the collision relaxation for a renamed per-model row trusts the labels a
+> single scan saw, so a scan that runs while the page is half-rendered can
+> adopt a bare model name beside a longer one that simply had not painted yet.
+> The cost is one extra informational meter against the 24-meter ratchet, which
+> is the failure this direction was chosen for.
+>
+> **And seven things it looked at and left as they are:**
+>
+> * **The relaxation is wider than "a renamed model row", and it is the page
+>   that decides.** The shield only holds while the longer label is among the
+>   labels the scan saw, so a page that simply omits it defeats the shield -
+>   and against the bundled Claude catalog that makes `Design`, `Claude` and
+>   `Daily` adoptable as well, each being a whole word inside a bundled label.
+>   A meter row labelled `Claude` can therefore appear inside a tile headed
+>   `Anthropic · Claude`. Bounded by `MAX_ADOPTED_METERS` (24) and by
+>   `primary=False`, so an adopted row can never take the tray colour.
+>
+>   What the shield *does* cover is every decoration: the longer label counts
+>   as seen when it sits inside a label the scan saw, as whole words, so
+>   `Opus only:`, `Opus only;`, `(Opus only)`, `Opus only |`, a trailing
+>   zero-width space and the `Opus only…` an elided row ends in are all still
+>   shielded - and so is a row that carries words of its own around the
+>   label, which shields it exactly as a decoration does. Omitting the longer
+>   label entirely is the one route left, and it is the route this relaxation
+>   exists to allow. One shape it does not cover, pre-existing: a page that
+>   renders `Opus only.` gets that adopted as a meter in its own right,
+>   duplicating the bundled one, because the full stop misses equality against
+>   `known_labels()` by one character (`primary=False`, one of the 24 slots).
+>   A label whose own edges are punctuation is not a whole-word match for
+>   itself, so the rule tests exact membership beside the containment to keep
+>   such a label shielding its own fragments.
+> * **A named extra account's collapsed chip shows the bare name.** A Claude
+>   account the user called "Microsoft · Azure" gets a chip reading exactly
+>   `Microsoft · Azure`, while the tile header, the tray line and the tooltip
+>   all keep the qualifier. Deliberate since 1.4.0: it is what stops a chip
+>   from wrapping and costing the collapsed panel a whole row. Composing
+>   `compact (name)` for every id instead would widen every chip, and the
+>   chip-row width rule is unchanged from 1.4.0, so it stays as it is until
+>   something else moves that rule.
+> * **Two named Codex accounts are indistinguishable on the panel at its
+>   260 px minimum.** `OpenAI · ChatGPT + Codex` and
+>   `OpenAI · ChatGPT + Codex (Work)` both paint as `OpenAI · ChatGPT + Co…`
+>   in the room the header gets; the tooltip and the collapsed chip tell them
+>   apart. `ElideRight` is what the header was specified with.
+>   `Qt.TextElideMode.ElideMiddle` would keep the bracketed identifier - the
+>   part the user chose - at the cost of the company prefix, which is the part
+>   this release added. An open question for the next release, not a change to
+>   make inside it.
+> * **`widget._session_summary_for` is dead code.** No caller anywhere in
+>   `src/` or `tests/`. Pre-existing, correct (it reads from
+>   `display_name_for_account`), and left alone to keep this diff to the
+>   release's subject.
+> * **The 60-character bound can collide two display names, and Settings then
+>   refuses every save.** Two names for accounts of one kind that differ only
+>   past character 60 are the same name after the clip, and
+>   `_validate_browser_accounts` keys its uniqueness check on the display
+>   name - so `_accept` returns early and *nothing* in Settings can be saved,
+>   the refresh interval included, until one of the two is renamed. Narrow, and
+>   recoverable in the dialog that reports it; the accounts stay addressable
+>   throughout, because `_providers`, the tiles, the history keys and the
+>   profiles are all keyed on the id. The shortening now says so in the log,
+>   which is what it did not do before. Comparing the names before the clip, or
+>   keying the check on the id, is a change to the uniqueness rule and belongs
+>   in a release that is about that rule.
+> * **`BrowserAccount` has no `validate_assignment`.** The name bound is a
+>   `mode="before"` validator, so it runs on construction and on
+>   `Config.load()` but not on `account.name = "B" * 10_000` afterwards. No
+>   production path assigns the field - the Settings dialog builds a new
+>   account - so this is a hardening line (`model_config` with
+>   `validate_assignment=True`, plus a test) rather than a hole, and it was
+>   left out of a release that had no reason to touch the model's config.
+> * **`highest_indicator` breaks an exact tie on the order it is handed.**
+>   `gauge.py` compares `(rank, percent)` with a strict `>`, so the first
+>   provider in the list wins an exact tie, and this release reordered that
+>   list to the panel's order. Only `indicator.color` is read from the winner
+>   and an exact tie is by definition the same severity band, so the tray dot
+>   is the same colour either way - but which provider it came from can differ
+>   from 1.4.0's answer.
+>
 > **Updated 2026-09-17** by the UI release (`1.4.0+cfa.8`, 2 024 tests): the
 > panel is resizable and remembers its size, every Settings tab scrolls, the
 > app has an icon, and three things the user's own desktop turned up were

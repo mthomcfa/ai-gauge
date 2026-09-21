@@ -4,10 +4,10 @@ import warnings
 import pytest
 from PyQt6.QtCore import QRect, Qt
 from PyQt6.QtGui import QScreen
-from PyQt6.QtWidgets import QPushButton
+from PyQt6.QtWidgets import QAbstractButton, QPushButton
 
-from aigauge import settings_dialog
-from aigauge.config import Config
+from aigauge import naming, settings_dialog
+from aigauge.config import ACCOUNT_NAME_MAX_CHARS, Config
 from aigauge.providers.catalog import record_scan, scan_due
 from aigauge.settings_dialog import SettingsDialog
 from aigauge.ui_style import wheel_step
@@ -325,22 +325,113 @@ def _group_titles(dialog: SettingsDialog) -> list[str]:
     return [box.title() for box in dialog.findChildren(QGroupBox)]
 
 
-def test_microsoft_tab_holds_the_three_sub_headings(qtbot):
-    """Azure, Foundry and Copilot are one vendor relationship to the person
-    configuring them, and Foundry only means anything beside the Azure block
-    it configures."""
+def _group_titles_on_tab(dialog: SettingsDialog, title: str) -> list[str]:
+    from PyQt6.QtWidgets import QGroupBox
+
+    page = _tabs(dialog).widget(_tab_index(dialog, title))
+    return [box.title() for box in page.findChildren(QGroupBox)]
+
+
+def test_tabs_are_vendors_in_tile_order(qtbot):
+    """One tab per vendor, named after the company, in the order the tiles are
+    stacked. Copilot is GitHub's, not Microsoft's, so it has a tab of its own."""
     dialog = SettingsDialog(Config())
     qtbot.addWidget(dialog)
 
-    assert "Microsoft" in _tab_titles(dialog)
-    assert "GitHub Copilot" not in _tab_titles(dialog)
+    assert _tab_titles(dialog) == [
+        "General",
+        naming.COMPANY["claude"],
+        naming.COMPANY["codex"],
+        naming.SURFACE["opencode_go"],
+        naming.COMPANY["azure"],
+        naming.COMPANY["copilot"],
+        naming.SURFACE["openrouter"],
+    ]
+
+
+def test_microsoft_tab_holds_azure_and_foundry(qtbot):
+    """Azure and Foundry are one subscription and one set of credentials, and
+    Foundry only means anything beside the Azure block it configures. Copilot
+    is not here: it is GitHub's product on a GitHub credential."""
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+
+    titles = _group_titles_on_tab(dialog, naming.COMPANY["azure"])
+    assert naming.full("azure") in titles
+    assert f'{naming.COMPANY["azure"]}{naming.SEPARATOR}Foundry' in titles
+    assert naming.full("copilot") not in titles
+    assert _group_titles_on_tab(dialog, naming.COMPANY["copilot"]) == [
+        naming.full("copilot")
+    ]
+
+
+def test_the_display_name_field_stops_where_the_model_does(qtbot):
+    """A dialog that accepts what the config will silently shorten is a dialog
+    that lies about what it saved. Qt's own default is 32 767 characters."""
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+
+    rows = dialog._browser_account_rows  # noqa: SLF001
+    assert rows, "no account rows to check"
+    for row in rows:
+        assert row.name_edit.maxLength() == ACCOUNT_NAME_MAX_CHARS
+        row.name_edit.setText("A" * (ACCOUNT_NAME_MAX_CHARS * 3))
+        assert len(row.name_edit.text()) == ACCOUNT_NAME_MAX_CHARS
+
+
+def test_every_group_box_carries_its_company(qtbot):
+    """The group boxes are the widest surface in the app, so they take the full
+    name - and take it from the one table, not from a literal each."""
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+
     titles = _group_titles(dialog)
-    for heading in ("Azure", "Foundry", "Copilot"):
-        assert heading in titles
+    for kind in ("azure", "copilot", "openrouter", "opencode_go"):
+        assert naming.full(kind) in titles, kind
+    for kind in ("claude", "codex"):
+        assert f"{naming.full(kind)} accounts" in titles, kind
+
+
+def test_every_general_checkbox_carries_its_company(qtbot):
+    """The General tab is the list of providers, so it reads them out in full
+    - the same decision the group boxes took, and from the same table."""
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+
+    boxes = {
+        "claude": dialog.claude_cb,
+        "codex": dialog.codex_cb,
+        "opencode_go": dialog.opencode_go_cb,
+        "copilot": dialog.copilot_cb,
+        "azure": dialog.azure_cb,
+        "openrouter": dialog.openrouter_cb,
+    }
+    assert sorted(boxes) == sorted(naming.KINDS)
+    for kind, box in boxes.items():
+        assert box.text() == naming.full(kind), kind
+
+
+def test_the_add_account_buttons_name_the_provider_compactly(qtbot):
+    """The button is 150 px wide, so it takes the compact name - but it does
+    take a name: "Add another account" on both buttons is what this replaced,
+    and the two lists sit one above the other."""
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+
+    labels = {
+        button.text()
+        for button in dialog.findChildren(QPushButton)
+        if button.text().startswith("Add another")
+    }
+    assert labels == {
+        f"Add another {naming.compact('claude')}",
+        f"Add another {naming.compact('codex')}",
+    }
 
 
 def test_copilot_controls_survive_the_move_unchanged(qtbot, monkeypatch):
-    """Copilot moved under the Microsoft heading; nothing about it changed."""
+    """Copilot moved out of the Microsoft tab into a GitHub tab of its own;
+    nothing about the controls themselves changed."""
     monkeypatch.setattr(settings_dialog, "set_start_at_login", lambda enabled: None)
     config = Config()
     dialog = SettingsDialog(config)
@@ -862,7 +953,7 @@ def test_the_microsoft_tab_no_longer_sets_the_dialog_floor(qtbot):
 
     assert dialog.minimumSizeHint().height() < 300
 
-    microsoft = _tabs(dialog).widget(_tab_index(dialog, "Microsoft"))
+    microsoft = _tabs(dialog).widget(_tab_index(dialog, naming.COMPANY["azure"]))
     assert microsoft.widget().sizeHint().height() > 1000, (
         "the page shrank instead of the scroll area absorbing it"
     )
@@ -876,7 +967,7 @@ def test_every_tab_page_scrolls(qtbot):
     qtbot.addWidget(dialog)
     tabs = _tabs(dialog)
 
-    assert tabs.count() == 6
+    assert tabs.count() == len(naming.KINDS) + 1
     for i in range(tabs.count()):
         page = tabs.widget(i)
         assert isinstance(page, QScrollArea), tabs.tabText(i)
@@ -1096,6 +1187,125 @@ def test_the_default_width_fits_the_widest_page(qtbot, monkeypatch):
     with qtbot.waitExposed(dialog):
         dialog.show()
     every_page_fits(dialog)
+
+
+def _tab_bar_settled(qtbot, bar) -> None:
+    """Wait for the tab bar to finish laying its tabs out.
+
+    ``show()`` posts the layout request that hands the bar its width; read
+    ``tabRect`` before that is delivered and every rect is the unlaid
+    answer. Waiting for *either* outcome - every tab inside the bar, or the
+    scroll arrows Qt turns on when they are not - settles in one turn
+    whichever way the bar came out, so this cannot pass by measuring a bar
+    that was never laid out. One ``qtbot.wait(0)`` is one turn too few, and
+    on the wider runner fonts it is the crowded bar that arrives late.
+    """
+    try:
+        qtbot.waitUntil(
+            lambda: bar.width() > 0
+            and (
+                bar.tabRect(bar.count() - 1).right() < bar.width()
+                or any(b.isVisible() for b in bar.findChildren(QAbstractButton))
+            ),
+            timeout=2000,
+        )
+    except TimeoutError:
+        # Let the caller's assertion name the tab and the numbers.
+        pass
+
+
+def test_every_tab_is_reachable_at_the_default_size(qtbot):
+    """The seventh tab is not hidden behind the tab-bar scroll arrows.
+
+    The width rule took the widest page and the chrome around it; the bar
+    above the pages was in neither term, because the pane width comes from
+    ``QTabWidget.sizeHint()``, which answers for the pages. So a bar that
+    outgrew the dialog went unnoticed: Qt does not clip it, it turns on two
+    little arrows and scrolls it, and the last tab sits behind them at the
+    size the window opens at.
+
+    Every assertion is a rule. The tab titles are as wide as the runner's
+    fonts make them, so nothing here is a pixel count; and the *second* is
+    written against the width the dialog asked for rather than the width the
+    bar was laid out at, because how much of a tab widget a style hands its
+    tab bar is the style's business - a macOS pane that insets the bar inside
+    its frame would otherwise read as this bug.
+    """
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    with qtbot.waitExposed(dialog):
+        dialog.show()
+    tabs = _tabs(dialog)
+    bar = tabs.tabBar()
+    _tab_bar_settled(qtbot, bar)
+    margins = dialog.layout().contentsMargins()
+    available = dialog.screen().availableGeometry().width()
+    outside = [
+        tabs.tabText(i)
+        for i in range(bar.count())
+        if bar.tabRect(i).left() < 0 or bar.tabRect(i).right() >= bar.width()
+    ]
+    arrows = [
+        b.objectName() or type(b).__name__
+        for b in bar.findChildren(QAbstractButton)
+        if b.isVisible()
+    ]
+    terms = (outside, arrows, bar.width(), bar.sizeHint().width(), dialog.width())
+
+    # No tab is ever out of reach: inside the bar, or the arrows are there to
+    # scroll to it. True on any screen, including one too narrow for the bar.
+    assert not outside or arrows, terms
+    # And the width rule reserves what the bar asks for, unless the work area
+    # is what stops the dialog - the same exemption the widest-page rule takes.
+    needed = bar.sizeHint().width() + margins.left() + margins.right()
+    assert dialog.width() >= min(needed, available), terms
+    # Where the bar did get the room it asked for, nothing scrolled.
+    if bar.width() >= bar.sizeHint().width():
+        assert not outside, terms
+        assert not arrows, terms
+
+
+def test_the_width_rule_reserves_the_pane_the_tab_bar_may_be_drawn_inside(qtbot):
+    """The bar's term is the bar, the dialog's margins and the pane extra.
+
+    The width rule can only measure what the bar asks for; where the bar is
+    *put* is the style's business. A style that draws a frame around a page
+    is a style that may inset the bar inside that frame, and then the room
+    reserved for the bar is short by exactly the inset - which is what
+    `pane_extra_w`, the tab widget's own horizontal extra over its pages,
+    stands for. It is a term that can only widen the dialog and is bounded
+    by the work area like every other one, so it is safe on a style that
+    insets nothing, where it is zero and this rule is the rule without it.
+
+    Written against the width the dialog asked for, like the reachability
+    rule above it, and in terms recomputed from the widgets rather than in
+    pixels: the tab titles are as wide as the runner's fonts make them.
+    """
+    dialog = SettingsDialog(Config())
+    qtbot.addWidget(dialog)
+    with qtbot.waitExposed(dialog):
+        dialog.show()
+    tabs = _tabs(dialog)
+    bar = tabs.tabBar()
+    _tab_bar_settled(qtbot, bar)
+    margins = dialog.layout().contentsMargins()
+    available = dialog.screen().availableGeometry().width()
+    pages_hint_w = max(
+        scroll.sizeHint().width() for scroll in dialog._page_scrolls  # noqa: SLF001
+    )
+    pane_extra_w = max(0, tabs.sizeHint().width() - pages_hint_w)
+
+    needed = (
+        bar.sizeHint().width() + margins.left() + margins.right() + pane_extra_w
+    )
+
+    assert dialog.width() >= min(needed, available), (
+        bar.sizeHint().width(),
+        pane_extra_w,
+        needed,
+        available,
+        dialog.width(),
+    )
 
 
 def test_the_screen_fraction_is_the_effective_ceiling(qtbot, monkeypatch):
@@ -1378,7 +1588,7 @@ def test_every_named_field_survives_the_wrapping(qtbot):
     dialog = SettingsDialog(Config())
     qtbot.addWidget(dialog)
     scrolls = dialog._page_scrolls  # noqa: SLF001
-    assert len(scrolls) == 6
+    assert len(scrolls) == len(naming.KINDS) + 1
 
     named = [
         "claude_signin_btn",

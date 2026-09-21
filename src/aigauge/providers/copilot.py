@@ -427,7 +427,6 @@ def _log_snapshot_decision(
 
 class CopilotProvider(Provider):
     name = "copilot"
-    display_name = "Copilot"
     # Declared rather than taking app.py's flat _REST_REFRESH_BUDGET_SECONDS:
     # three bounded calls do not fit 60 s, and the watchdog must not fire
     # inside a refresh that is still inside its own bound.

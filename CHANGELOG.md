@@ -6,6 +6,171 @@
 > earlier `0.6.4` entry predates that convention and **is not** upstream's
 > `v0.6.4`, which is different code.
 
+## 1.4.1+cfa.9 - 2026-09-18
+
+Presentation, plus two small bounds and two catalog fixes. Every provider
+surface now names the company behind the product, from one table instead of
+nine copies. Patch rather than minor: nothing here is a new capability.
+
+### Changed
+
+- **Every tile, dialog title and Settings label reads `Company · Surface`.**
+  The scheme is company first, separated by U+00B7 with a space either side -
+  matching `Microsoft · Azure`, which was the only label that already named a
+  company:
+
+  | id (unchanged) | before | now | short form |
+  | --- | --- | --- | --- |
+  | `claude` | Claude | **Anthropic · Claude** | `Claude` / `Cl` |
+  | `codex` | Codex | **OpenAI · ChatGPT + Codex** | `Codex` / `Cx` |
+  | `opencode_go` | OpenCode | **OpenCode** | `OpenCode` / `Go` |
+  | `azure` | Microsoft · Azure | **Microsoft · Azure** | `Azure` / `Az` |
+  | `copilot` | Copilot | **GitHub · Copilot** | `Copilot` / `Cp` |
+  | `openrouter` | OpenRouter | **OpenRouter** | `OpenRouter` / `OR` |
+
+  A named account keeps the company and puts your own name last:
+  `Anthropic · Claude (Work)`. Where there is no room for a company - the
+  collapsed summary chips, the tray tooltip, the macOS menu bar - the product
+  name alone is used, because a chip that wraps costs the collapsed panel a
+  whole row and the tooltip prints a line per metric per provider. The
+  two-letter menu-bar codes are unchanged.
+
+  **Copilot's company is GitHub, not Microsoft.** The credential is a GitHub
+  fine-grained PAT and the host is `api.github.com`. Microsoft owns GitHub,
+  which is why Settings used to file Copilot under a Microsoft tab; the tile
+  names the vendor whose page the number came from.
+
+  Nothing stored changes. Every `UsageSnapshot.provider`, config key, profile
+  directory, keyring entry and log line is an id and stays one, and
+  `history.py` keys an in-flight period on `id::metric-label`, so no history
+  is orphaned and no period restarts. The **Foundry row** inside the Azure
+  tile still reads `Foundry` for exactly that reason - it is a metric label,
+  not a provider label. Its Settings *group box* says `Microsoft · Foundry`.
+
+- **Settings has one tab per vendor, in the order the tiles are stacked:**
+  General, Anthropic, OpenAI, OpenCode, Microsoft, GitHub, OpenRouter.
+  **Copilot moved out of the Microsoft tab into a GitHub tab of its own** and
+  is its own group in the panel rather than the second half of a "Microsoft
+  pair", so the tiles stack Anthropic, OpenAI, OpenCode, Microsoft, GitHub,
+  OpenRouter. The Microsoft tab is Azure and Foundry: one subscription, one
+  set of credentials, and Foundry only means anything beside the Azure block
+  it configures.
+
+  The dialog opens wide enough for the bar those seven tabs make. Its default
+  width was the widest page plus the chrome around it, and the tab bar was in
+  neither term - the pane measurement the pages are sized through answers for
+  the pages, not for the bar above them - so the seventh tab sat behind Qt's
+  tab-bar scroll arrows at the size the window opened at, and further behind
+  them on a platform whose fonts run wide. The bar is now a term of its own.
+
+- **The tray tooltip and the macOS menu bar count the providers off in the
+  same order as everything else.** Both read them in the order this function
+  happened to build the list in, which paired Copilot with Azure and put
+  OpenCode last, while the panel and Settings now read Anthropic, OpenAI,
+  OpenCode, Microsoft, GitHub, OpenRouter. Which provider is refreshed first
+  is a separate rule and is unchanged: the cheap REST providers still go
+  before the browser-driven ones.
+
+- **A tile header too long for the panel elides instead of widening it.**
+  Measured offscreen at the 260 px floor, with a ratio chip and the status tag
+  on the same row: `Microsoft · Azure` needs a 197 px tile and fits,
+  `Anthropic · Claude` needs 207 and fits, `OpenAI · ChatGPT + Codex` needs 261
+  and does not, and `OpenAI · ChatGPT + Codex (Work)` needs 311 - which put a
+  horizontal scroll bar under the tiles and pushed the header controls off the
+  right. The header is the one element on that row that can lose characters
+  without losing a control, so it is elided from the right and the whole name
+  is in its tooltip. The window minimum is untouched.
+
+- **Each Azure component row shows its amount on the row.** `Foundry`,
+  `Azure OpenAI`, `Container Apps` and the rest carried a share of the month's
+  spend and put the money in the tooltip only. The amount is now in the row's
+  right-hand column, right-aligned and in the same currency formatting the
+  `Spend this month` row uses - a share says which component is the big one,
+  it does not say what it cost. The tooltip keeps it too.
+
+### Fixed
+
+- **The meter-label length bound was two numbers.** Both page-side discovery
+  walks allowed 60 characters while the adoption guard refused anything past
+  40, so a 41-to-60-character row travelled all the way back from the page to
+  be thrown away at the last step. One constant now, injected into the
+  extractor the way the catalog already is.
+
+- **A per-model row renamed to a bare model name is no longer refused.** The
+  collision rule reads `Opus` as `Opus only` under a shorter name, which is
+  right while both are on the page and wrong once the page has relabelled its
+  rows: the alias stops matching *and* adoption refuses the replacement, so
+  the rows vanish with nothing in the log to say why. That one refusal is now
+  skipped when the longer label is not among the labels the scan actually saw.
+  Refusing an exact known label, and refusing a known label with a count glued
+  onto it (`Weekly 42`), are unchanged.
+
+  "The labels the scan saw" are compared in the form the catalog reads them
+  in, not in the form the page sent. A row rendering `Opus only: 42%` hands
+  back `Opus only:` - both discovery walks cut the label at the reset wording
+  or the number and keep whatever punctuation stood before it - so comparing
+  the raw text would have let a page hide the longer label behind a colon or
+  a bullet and get the bare name adopted beside it, which is the duplicate
+  this rule exists to prevent.
+
+  And the longer label counts as seen when it sits *inside* a label the scan
+  saw, not only when the page typed it exactly. Otherwise the shield was one
+  character wide: a semicolon, a bracket, a pipe, an arrow or the ellipsis an
+  elided row ends in all walked past it, and the last of those is what a page
+  produces without trying. What the surrounding row carries makes no
+  difference - extra words shield the label inside them exactly as a
+  decoration does - and a label the page typed exactly still shields its own
+  fragments even when its own edges are punctuation.
+
+- **An account's display name had no length and no shape.** It is the half of
+  every provider label you supply, and it reaches surfaces with no layout to
+  clip it: the tray tooltip is one plain string built by joining lines, and a
+  collapsed chip is sized to its own text, so the width of a chip and the
+  length of that tooltip were both whatever the name was. Worse, a name
+  carrying newlines wrote its own lines into that tooltip, including a
+  convincing second version banner. The name is now collapsed to a single
+  line and clipped to 60 characters where the field is, so the tile header,
+  the tray line, the chip and every window title inherit the one rule, and
+  the Settings field stops at the same number rather than accepting what
+  would be silently shortened. A name that was already longer is shortened
+  on load and written back shortened by the next save - a window move is
+  enough - so the log now says that happened, in lengths rather than in your
+  text, which stays out of the log as every identifier does.
+
+- **The tile header's tooltip is shown as written, and clipped.** `QToolTip`
+  has no text-format setter - Qt reads the first line and decides - so a
+  display name containing markup was laid out as markup on a tooltip that
+  every other one in the panel already routes through the module's escaping
+  wrapper. It now goes the same way.
+
+- **Two unbounded strings, both carried over from 1.4.0+cfa.8's residual
+  list.** The tray tooltip interpolated a provider's metric label into a plain
+  string with no bound - a tile row is clipped by its own geometry, a tooltip
+  is not - so it now goes through `models.bounded_label`. No escaping, and the
+  comment says why: a `QSystemTrayIcon` tooltip is plain text, so markup in a
+  meter name is shown rather than interpreted. And `openrouter.py` built a
+  note from an API-supplied model id with no bound, which is now
+  `bounded_note` like every other page-derived note.
+
+### Notes
+
+- 2 119 tests, from 2 024. `test_naming.py` is new (33), and it carries the
+  rule that keeps the table the only one: no module under `src/` may hold a
+  string literal equal to a display name, or join a vendor to a middle dot.
+  Both halves of that rule are one predicate each now, called by the tests
+  that enforce them *and* by the test that proves they would fire - which is
+  what stops the self-test passing over a rule that has been loosened.
+  Per file: `test_config.py` 165 (from 154), `test_widget.py` 163 (154),
+  `test_azure.py` 244 (242), `test_meter_catalog.py` 164 (148),
+  `test_app.py` 83 (75), `test_settings_dialog.py` 61 (54),
+  `test_meter_discovery_js.py` 47 (44), `test_openrouter.py` 40 (38),
+  `test_docs_consistency.py` 27 (25), `test_menubar.py` 15 (14),
+  `test_models.py` 9 (7).
+- The dead `display_name` class attribute is gone from `providers/base.py` and
+  all six providers. Its only reader anywhere was one test assertion. So are
+  the two sign-in window titles that sat beside the login URLs: the window
+  composes its title from the account's display name and never read them.
+
 ## 1.4.0+cfa.8 - 2026-09-17
 
 A release about the window rather than about the numbers in it. The panel had

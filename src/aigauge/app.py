@@ -25,11 +25,13 @@ from PyQt6.QtWidgets import (
 )
 
 from . import __version__
+from . import naming
 from .config import (
     Config,
     account_kind,
     app_data_dir,
     browser_accounts,
+    compact_name_for_account,
     display_name_for_account,
     qt_scale_factor_env,
 )
@@ -39,7 +41,7 @@ from .history import HistoryStore
 from .logging_setup import setup_logging
 from .gauge import highest_indicator
 from .menubar import render_menubar_pixmap
-from .models import SnapshotStatus, UsageSnapshot
+from .models import SnapshotStatus, UsageSnapshot, bounded_label
 from .platforms import autostart_command, get_platform
 from .providers.base import Provider, ProviderSignals
 from .providers.claude import ClaudeProvider
@@ -59,9 +61,15 @@ from .widget import UsageWidget
 
 log = logging.getLogger("aigauge.app")
 
+# The sign-in page per account kind, and nothing else. Each entry used to
+# carry a window title written out beside the URL; `open_login` composes that
+# title from the account's display name and never read them. They were also
+# the shape the consistency rule is blind to - a literal that *contains* a
+# provider name rather than being one - so they could have drifted out of step
+# with the tiles indefinitely.
 LOGIN_URLS = {
-    "claude": ("https://claude.ai/login", "Sign in to Claude"),
-    "codex": ("https://chatgpt.com/auth/login", "Sign in to ChatGPT"),
+    "claude": "https://claude.ai/login",
+    "codex": "https://chatgpt.com/auth/login",
 }
 
 _ACTIVE_MODE_MINUTES = 30
@@ -256,14 +264,32 @@ def _make_dot_tray_icon(color: str | None = None) -> QIcon:
 
 
 def _enabled_providers(config: Config) -> tuple[str, ...]:
-    # `BrowserAccount.enabled` is deliberately NOT consulted here. See
-    # config.BrowserAccount: nothing in the app ever writes the field, and the
-    # migration can stamp it false permanently, so reading it turned the
-    # Settings provider checkbox into a no-op the user could never undo. The
-    # `providers.<kind>` toggle is the only switch.
+    """Every provider the user has switched on, in the order they are shown.
+
+    That order is ``naming.KINDS`` - the order the panel stacks its tiles in
+    and Settings lists its tabs in - so the tray tooltip and the macOS menu
+    bar read the providers in the same order as everything else. It used to be
+    the order this function happened to append them in, which paired Copilot
+    with Azure and put OpenCode last, and the two surfaces disagreed with the
+    panel about where a provider was.
+
+    **Nothing but display reads this.** The refresh order is
+    ``_refresh_provider_order`` over ``self._providers``, which
+    ``_build_providers`` fills without consulting this function, and
+    ``_REFRESH_FIRST`` is its own tuple; the in-flight gate and the error
+    retry are keyed by name, not by position. The callers are the tray
+    tooltip, the tray dot, the menu-bar pixmap and its status items, and one
+    comma-joined field in the lifecycle log line.
+
+    ``BrowserAccount.enabled`` is deliberately NOT consulted. See
+    config.BrowserAccount: nothing in the app ever writes the field, and the
+    migration can stamp it false permanently, so reading it turned the
+    Settings provider checkbox into a no-op the user could never undo. The
+    ``providers.<kind>`` toggle is the only switch.
+    """
     accounts = browser_accounts(config)
-    out: list[str] = [
-        account.id
+    entries: list[tuple[str, str]] = [
+        (account.kind, account.id)
         for account in accounts
         if getattr(config.providers, account.kind, False)
     ]
@@ -272,18 +298,29 @@ def _enabled_providers(config: Config) -> tuple[str, ...]:
     if not accounts:
         providers = getattr(config, "providers", None)
         if getattr(providers, "claude", False):
-            out.append("claude")
+            entries.append(("claude", "claude"))
         if getattr(providers, "codex", False):
-            out.append("codex")
+            entries.append(("codex", "codex"))
     if config.providers.copilot:
-        out.append("copilot")
+        entries.append(("copilot", "copilot"))
     if getattr(config.providers, "azure", False):
-        out.append("azure")
+        entries.append(("azure", "azure"))
     if config.providers.openrouter:
-        out.append("openrouter")
+        entries.append(("openrouter", "openrouter"))
     if getattr(config.providers, "opencode_go", False):
-        out.append("opencode_go")
-    return tuple(out)
+        entries.append(("opencode_go", "opencode_go"))
+
+    def rank(kind: str) -> int:
+        # A kind the table has never heard of sorts last rather than raising:
+        # `kind` is config text, and this runs inside a tray update.
+        try:
+            return naming.KINDS.index(kind)
+        except ValueError:
+            return len(naming.KINDS)
+
+    # A stable sort, so several accounts of one kind keep the order the config
+    # lists them in - which is the order the panel stacks them in too.
+    return tuple(name for _kind, name in sorted(entries, key=lambda e: rank(e[0])))
 
 
 # Cheap REST providers, refreshed before the browser-driven ones so their tiles
@@ -1013,25 +1050,33 @@ class App(QObject):
                 "copilot", CopilotProvider
             ) or CopilotProvider(self._config)
             desired_tiles.add("copilot")
-            self._widget.ensure_tile("copilot", "Copilot")
+            self._widget.ensure_tile(
+                "copilot", display_name_for_account(self._config, "copilot")
+            )
         if getattr(self._config.providers, "azure", False):
             self._providers["azure"] = _kept("azure", AzureProvider) or AzureProvider(
                 self._config
             )
             desired_tiles.add("azure")
-            self._widget.ensure_tile("azure", "Microsoft · Azure")
+            self._widget.ensure_tile(
+                "azure", display_name_for_account(self._config, "azure")
+            )
         if self._config.providers.openrouter:
             self._providers["openrouter"] = _kept(
                 "openrouter", OpenRouterProvider
             ) or OpenRouterProvider(self._config)
             desired_tiles.add("openrouter")
-            self._widget.ensure_tile("openrouter", "OpenRouter")
+            self._widget.ensure_tile(
+                "openrouter", display_name_for_account(self._config, "openrouter")
+            )
         if self._config.providers.opencode_go:
             self._providers["opencode_go"] = _kept(
                 "opencode_go", OpenCodeGoProvider
             ) or OpenCodeGoProvider(self._config, parent=self)
             desired_tiles.add("opencode_go")
-            self._widget.ensure_tile("opencode_go", "OpenCode")
+            self._widget.ensure_tile(
+                "opencode_go", display_name_for_account(self._config, "opencode_go")
+            )
         for tile_id in list(self._widget._tiles):  # noqa: SLF001
             if tile_id not in desired_tiles:
                 self._widget.remove_tile(tile_id)
@@ -1271,13 +1316,14 @@ class App(QObject):
     # ----- Refresh -----
 
     def _display_names(self, names: list[str]) -> dict[str, str]:
+        """Tile id -> header text, for ``mark_loading``.
+
+        One call per name and no table of its own: this used to carry a third
+        copy of the provider names, which is how a rename could reach the tile
+        and miss the loading state it is replaced by.
+        """
         return {
-            name: {
-                "copilot": "Copilot",
-                "openrouter": "OpenRouter",
-                "azure": "Microsoft · Azure",
-            }.get(name, display_name_for_account(self._config, name))
-            for name in names
+            name: display_name_for_account(self._config, name) for name in names
         }
 
     def _begin_cycle(
@@ -2444,7 +2490,10 @@ class App(QObject):
             snap = self._snapshots.get(name)
             if not snap:
                 continue
-            display_name = display_name_for_account(self._config, name)
+            # The compact name here, not the full one: this tooltip carries a
+            # line per metric per provider, so the company would be repeated on
+            # every one of them.
+            display_name = compact_name_for_account(self._config, name)
             if snap.status == SnapshotStatus.AUTH_REQUIRED:
                 lines.append(f"{display_name}: setup needed")
                 continue
@@ -2456,7 +2505,16 @@ class App(QObject):
                     continue
                 if m.tag:
                     continue
-                lines.append(f"{display_name} {m.label}: {m.percent_used:.0f}%")
+                # The label is the provider's, and this string has no layout
+                # to clip it the way a tile row does - so it is bounded here,
+                # the same rule the tiles' notes go through. No escaping: a
+                # QSystemTrayIcon tooltip is plain text on every platform the
+                # app ships to, so markup in a meter name is shown, not
+                # interpreted. (The rich-text surfaces escape; this is not one.)
+                lines.append(
+                    f"{display_name} {bounded_label(m.label)}: "
+                    f"{m.percent_used:.0f}%"
+                )
         tooltip = (
             f"AI Gauge {__version__}\n" + "\n".join(lines)
             if lines
@@ -2506,7 +2564,7 @@ class App(QObject):
         if kind == "opencode_go":
             url = opencode_go_usage_url(self._config)
         elif kind in LOGIN_URLS:
-            url, _title = LOGIN_URLS[kind]
+            url = LOGIN_URLS[kind]
         else:
             return
         display_name = display_name_for_account(self._config, provider)

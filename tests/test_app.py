@@ -11,8 +11,20 @@ from aigauge.app import (
     _raw_summary,
     _snapshot_signature,
 )
-from aigauge.config import BrowserAccount, Config
-from aigauge.models import SnapshotStatus, UsageMetric, UsageSnapshot
+from aigauge import naming
+from aigauge.config import (
+    ACCOUNT_NAME_MAX_CHARS,
+    BrowserAccount,
+    Config,
+    compact_name_for_account,
+    display_name_for_account,
+)
+from aigauge.models import (
+    MAX_DISPLAY_LABEL_CHARS,
+    SnapshotStatus,
+    UsageMetric,
+    UsageSnapshot,
+)
 
 
 class _Timer:
@@ -193,7 +205,7 @@ def test_manual_refresh_marks_tiles_loading():
     app.refresh_now(manual=True)
 
     assert app._widget.loading_calls == [  # noqa: SLF001
-        {"claude": "Claude", "codex": "Codex"}
+        {"claude": naming.full("claude"), "codex": naming.full("codex")}
     ]
     assert app._refresh_queue == ["claude", "codex"]  # noqa: SLF001
     assert app._unchanged_cycles == 0  # noqa: SLF001
@@ -209,7 +221,7 @@ def test_scheduled_refresh_marks_its_tiles_more_quietly():
     app.refresh_now(manual=False)
 
     assert app._widget.loading_calls == [  # noqa: SLF001
-        {"claude": "Claude", "codex": "Codex"}
+        {"claude": naming.full("claude"), "codex": naming.full("codex")}
     ]
     assert app._widget.loading_kwargs == [{"subtle": True}]  # noqa: SLF001
     assert app._refresh_queue == ["claude", "codex"]  # noqa: SLF001
@@ -360,6 +372,61 @@ def test_enabled_providers_includes_enabled_browser_accounts():
     )
 
 
+
+
+def test_the_tray_and_the_menu_bar_read_the_providers_in_the_panels_order(qtbot):
+    """One order, everywhere the user counts providers off.
+
+    The panel stacks its tiles in `naming.KINDS` and Settings lists its tabs
+    in it; the tray tooltip and the macOS menu bar used to read a different
+    one, left over from the order `_enabled_providers` happened to append in.
+    Nothing but display depends on it - the refresh order is
+    `_refresh_provider_order` over the providers `_build_providers` made, and
+    that is asserted separately - so the two surfaces follow the panel.
+    """
+    from aigauge.menubar import status_items
+    from aigauge.widget import UsageWidget
+
+    config = Config()
+    config.providers.openrouter = True
+    config.providers.azure = True
+    config.providers.opencode_go = True
+    config.browser_accounts.append(
+        BrowserAccount(id="claude-3f9a12cd", kind="claude", name="Work")
+    )
+    config.browser_accounts.append(
+        BrowserAccount(id="codex-work", kind="codex", name="Work")
+    )
+    enabled = _enabled_providers(config)
+    assert len(enabled) == 8, enabled
+
+    panel = UsageWidget(config)
+    qtbot.addWidget(panel)
+    for provider in enabled:
+        panel.ensure_tile(provider, display_name_for_account(config, provider))
+    tile_order = sorted(panel._tiles, key=panel._tile_sort_key)  # noqa: SLF001
+    assert list(enabled) == tile_order
+
+    fetched = datetime(2026, 4, 27, 12, 0)
+    snapshots = {
+        provider: UsageSnapshot(
+            provider=provider,
+            status=SnapshotStatus.OK,
+            metrics=[UsageMetric("Session", 10.0, fetched)],
+            fetched_at=fetched,
+        )
+        for provider in enabled
+    }
+    app = _tray_app(config, snapshots)
+    app._update_tray()  # noqa: SLF001
+
+    assert app._tray.tooltip.splitlines()[1:] == [  # noqa: SLF001
+        f"{compact_name_for_account(config, provider)} Session: 10%"
+        for provider in tile_order
+    ]
+    assert [label for label, _value, _color in status_items(snapshots, enabled)] == [
+        naming.abbrev(provider) for provider in tile_order
+    ]
 
 
 def test_enabled_providers_includes_opencode_go_when_enabled():
@@ -1481,6 +1548,37 @@ def _provider_app(config: Config) -> App:
     return app
 
 
+def test_every_tile_header_is_its_providers_full_name():
+    """The header is the surface this scheme exists for, so it is pinned
+    where it is composed.
+
+    `_display_names`/`mark_loading` was already covered, which left the
+    loading state guarded and the state that replaces it unguarded - the
+    inverse of the arrangement anyone would choose. One dict, every provider
+    plus a named extra account, read from `naming` rather than retyped: the
+    table itself is pinned literally in `test_naming.py`, and this says the
+    five `ensure_tile` calls use it.
+    """
+    config = Config()
+    config.providers.openrouter = True
+    config.providers.azure = True
+    config.providers.opencode_go = True
+    config.browser_accounts.append(
+        BrowserAccount(id="claude-3f9a12cd", kind="claude", name="Work")
+    )
+    app = _provider_app(config)
+
+    assert app._widget._tiles == {  # noqa: SLF001
+        "claude": naming.full("claude"),
+        "codex": naming.full("codex"),
+        "claude-3f9a12cd": naming.account_label("claude", "Work"),
+        "copilot": naming.full("copilot"),
+        "azure": naming.full("azure"),
+        "openrouter": naming.full("openrouter"),
+        "opencode_go": naming.full("opencode_go"),
+    }
+
+
 def test_a_settings_save_keeps_the_provider_objects_it_did_not_change():
     """`_build_providers` runs on every settings save, colour-only included.
 
@@ -1987,4 +2085,199 @@ def test_the_log_summariser_cannot_raise():
     # this function exists to prevent.
     assert _raw_summary(_ItemsRaises(a="z" * 5_000_000)) == (
         "<unsummarisable _ItemsRaises>"
+    )
+
+
+class _TrayStub:
+    """Just enough QSystemTrayIcon for _update_tray."""
+
+    def __init__(self):
+        self.tooltip = None
+
+    def setIcon(self, icon):  # noqa: N802
+        pass
+
+    def setToolTip(self, text):  # noqa: N802
+        self.tooltip = text
+
+
+def _tray_app(config, snapshots):
+    app = App.__new__(App)
+    app._config = config  # noqa: SLF001
+    app._snapshots = snapshots  # noqa: SLF001
+    app._native_status = None  # noqa: SLF001
+    app._tray = _TrayStub()  # noqa: SLF001
+    app._ui_mode = "tray"  # noqa: SLF001
+    app._render_tray_icon = lambda: None  # noqa: SLF001
+    return app
+
+
+def test_the_tray_tooltip_uses_compact_names(qapp):
+    """One line per metric per provider, so the company would be repeated on
+    every one of them. The tiles carry "Anthropic · Claude"; this carries
+    "Claude", and a named account keeps the name the user gave it."""
+    config = Config()
+    config.browser_accounts.append(
+        BrowserAccount(id="codex-work", kind="codex", name="Work")
+    )
+    fetched = datetime(2026, 4, 27, 12, 0)
+    snapshots = {
+        "claude": UsageSnapshot(
+            provider="claude",
+            status=SnapshotStatus.OK,
+            metrics=[UsageMetric("Session", 50.0, fetched)],
+            fetched_at=fetched,
+        ),
+        "codex-work": UsageSnapshot(
+            provider="codex-work",
+            status=SnapshotStatus.OK,
+            metrics=[UsageMetric("Weekly", 21.0, fetched)],
+            fetched_at=fetched,
+        ),
+    }
+    app = _tray_app(config, snapshots)
+
+    app._update_tray()  # noqa: SLF001
+
+    lines = app._tray.tooltip.splitlines()  # noqa: SLF001
+    assert f"{naming.compact('claude')} Session: 50%" in lines
+    assert f"{naming.compact('codex')} (Work) Weekly: 21%" in lines
+    for company in (c for c in naming.COMPANY.values() if c):
+        assert company not in app._tray.tooltip  # noqa: SLF001
+
+
+def test_the_tray_tooltip_bounds_a_providers_metric_label(qapp):
+    """A tile row clips a long label by geometry; this string has no layout at
+    all, so a meter name lifted off a page - or typed into an app-data override
+    file, which nothing validates on the way in - would travel into the tooltip
+    whole and take the tooltip with it."""
+    fetched = datetime(2026, 4, 27, 12, 0)
+    snapshots = {
+        "claude": UsageSnapshot(
+            provider="claude",
+            status=SnapshotStatus.OK,
+            metrics=[UsageMetric("R" * 200_000, 50.0, fetched)],
+            fetched_at=fetched,
+        )
+    }
+    app = _tray_app(Config(), snapshots)
+
+    app._update_tray()  # noqa: SLF001
+
+    line = next(
+        line for line in app._tray.tooltip.splitlines() if line.startswith("Claude ")  # noqa: SLF001
+    )
+    assert line == f"Claude {'R' * MAX_DISPLAY_LABEL_CHARS}: 50%"
+    assert len(line) < 100
+
+
+def test_the_tray_tooltip_shows_markup_rather_than_interpreting_it(qapp):
+    """A QSystemTrayIcon tooltip is plain text, so a meter name shaped like
+    markup is shown as written. The bound is the whole defence here; nothing is
+    escaped, and nothing should be."""
+    fetched = datetime(2026, 4, 27, 12, 0)
+    label = "<b>Session</b>"
+    snapshots = {
+        "claude": UsageSnapshot(
+            provider="claude",
+            status=SnapshotStatus.OK,
+            metrics=[UsageMetric(label, 50.0, fetched)],
+            fetched_at=fetched,
+        )
+    }
+    app = _tray_app(Config(), snapshots)
+
+    app._update_tray()  # noqa: SLF001
+
+    assert f"Claude {label}: 50%" in app._tray.tooltip  # noqa: SLF001
+    assert "&lt;" not in app._tray.tooltip  # noqa: SLF001
+
+
+def test_the_tray_tooltip_bounds_the_half_of_a_line_the_user_wrote(qapp):
+    """Both halves, or neither. The provider's label is clipped as it is
+    interpolated; the account's name is clipped at the field it comes from -
+    and until it was, one 10 kB name made a 10 022-character line and a
+    30 084-character tooltip out of a surface with no layout at all.
+
+    The ceiling is the two bounds plus room for everything the app writes
+    around them, not a count taken from this machine.
+    """
+    config = Config()
+    config.browser_accounts.append(
+        BrowserAccount(id="claude-3f9a12cd", kind="claude", name="N" * 10_000)
+    )
+    fetched = datetime(2026, 4, 27, 12, 0)
+    snapshots = {
+        "claude-3f9a12cd": UsageSnapshot(
+            provider="claude-3f9a12cd",
+            status=SnapshotStatus.OK,
+            metrics=[
+                UsageMetric("R" * 200_000, 50.0, fetched),
+                UsageMetric("Weekly", 21.0, fetched),
+            ],
+            fetched_at=fetched,
+        ),
+        "codex": UsageSnapshot(
+            provider="codex",
+            status=SnapshotStatus.ERROR,
+            metrics=[],
+            error="boom",
+            fetched_at=fetched,
+        ),
+    }
+    app = _tray_app(config, snapshots)
+
+    app._update_tray()  # noqa: SLF001
+
+    ceiling = ACCOUNT_NAME_MAX_CHARS + MAX_DISPLAY_LABEL_CHARS + 80
+    lines = app._tray.tooltip.splitlines()  # noqa: SLF001
+    assert len(lines) >= 4, lines
+    assert all(len(line) <= ceiling for line in lines), max(lines, key=len)
+
+
+def test_open_login_opens_the_sign_in_page_documented_for_each_kind(monkeypatch):
+    """`LOGIN_URLS` maps an account kind to one URL and nothing else.
+
+    It used to carry a window title beside each URL, which `open_login` never
+    read - the title is composed from the account's display name - so the
+    pair went. Nothing had ever read the URL half in a test either: restore
+    the tuple and `open_login` hands `LoginWindow` a tuple where a URL
+    belongs, which fails at the moment a user signs in and nowhere sooner.
+    The URLs are written out here rather than read back out of the table, so
+    that this says where sign-in goes rather than that it goes wherever the
+    table points.
+    """
+    import aigauge.app as app_module
+
+    opened: list[tuple[str, object, str]] = []
+
+    class _Login:
+        def __init__(self, kind, url, title, *, account_id=None, verify_url=None):
+            opened.append((kind, url, title))
+
+        def exec(self):
+            return 0  # the user closed it; nothing refreshes
+
+    monkeypatch.setattr(app_module, "LoginWindow", _Login)
+    config = Config()
+    config.browser_accounts.append(
+        BrowserAccount(id="claude-3f9a12cd", kind="claude", name="Work")
+    )
+    app = App.__new__(App)
+    app._config = config  # noqa: SLF001
+    app._widget = SimpleNamespace(  # noqa: SLF001
+        suspend_always_on_top=lambda: None,
+        restore_always_on_top=lambda: None,
+    )
+
+    for account_id in ("claude", "codex", "claude-3f9a12cd", "nothing-of-ours"):
+        app.open_login(account_id)
+
+    assert [(kind, url) for kind, url, _ in opened] == [
+        ("claude", "https://claude.ai/login"),
+        ("codex", "https://chatgpt.com/auth/login"),
+        ("claude", "https://claude.ai/login"),
+    ], "an unknown id opens nothing, and each kind opens its own page"
+    assert opened[-1][2] == "Sign in to " + display_name_for_account(
+        config, "claude-3f9a12cd"
     )

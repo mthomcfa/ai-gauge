@@ -39,7 +39,9 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from . import naming
 from .config import (
+    ACCOUNT_NAME_MAX_CHARS,
     BrowserAccount,
     ColorThresholds,
     Config,
@@ -586,6 +588,11 @@ class _BrowserAccountRow(QWidget):
         self.colors = account.colors.model_copy(deep=True)
 
         self.name_edit = QLineEdit()
+        # The model clips a name to this, so the field that writes one stops
+        # there too: Qt's own default is 32 767 characters, and a dialog that
+        # accepts what the config will silently shorten is a dialog that lies
+        # about what it saved.
+        self.name_edit.setMaxLength(ACCOUNT_NAME_MAX_CHARS)
         self.name_edit.setText(account.name or "")
         self.name_edit.setPlaceholderText(
             "Default account" if account.id in ("claude", "codex") else "Account name"
@@ -824,40 +831,40 @@ class SettingsDialog(QDialog):
         )
         providers_layout.addWidget(providers_hint)
 
-        self.claude_cb = QCheckBox("Claude")
+        self.claude_cb = QCheckBox(naming.full("claude"))
         self.claude_cb.setToolTip("Show Claude accounts in the panel.")
         self.claude_cb.setChecked(config.providers.claude)
         providers_layout.addWidget(self.claude_cb)
 
-        self.codex_cb = QCheckBox("Codex")
+        self.codex_cb = QCheckBox(naming.full("codex"))
         self.codex_cb.setToolTip("Show Codex accounts in the panel.")
         self.codex_cb.setChecked(config.providers.codex)
         providers_layout.addWidget(self.codex_cb)
 
-        self.opencode_go_cb = QCheckBox("OpenCode")
+        self.opencode_go_cb = QCheckBox(naming.full("opencode_go"))
         self.opencode_go_cb.setToolTip("Show the OpenCode usage tile in the panel.")
         self.opencode_go_cb.setChecked(config.providers.opencode_go)
         providers_layout.addWidget(self.opencode_go_cb)
 
-        self.copilot_cb = QCheckBox("GitHub Copilot")
+        self.copilot_cb = QCheckBox(naming.full("copilot"))
         self.copilot_cb.setToolTip("Show the GitHub Copilot usage tile in the panel.")
         self.copilot_cb.setChecked(config.providers.copilot)
         providers_layout.addWidget(self.copilot_cb)
 
-        self.azure_cb = QCheckBox("Microsoft Azure")
+        self.azure_cb = QCheckBox(naming.full("azure"))
         self.azure_cb.setToolTip(
             "Show the Azure month-to-date spend tile in the panel."
         )
         self.azure_cb.setChecked(getattr(config.providers, "azure", False))
         providers_layout.addWidget(self.azure_cb)
 
-        self.openrouter_cb = QCheckBox("OpenRouter")
+        self.openrouter_cb = QCheckBox(naming.full("openrouter"))
         self.openrouter_cb.setToolTip("Show the OpenRouter usage tile in the panel.")
         self.openrouter_cb.setChecked(config.providers.openrouter)
         providers_layout.addWidget(self.openrouter_cb)
 
         # ----- Claude accounts -----
-        claude_accounts = QGroupBox("Claude Accounts")
+        claude_accounts = QGroupBox(f'{naming.full("claude")} accounts')
         claude_accounts_layout = QVBoxLayout(claude_accounts)
         claude_accounts_layout.setSpacing(8)
         claude_accounts_layout.addWidget(
@@ -883,7 +890,7 @@ class SettingsDialog(QDialog):
         claude_accounts_layout.addLayout(self._claude_accounts_layout)
 
         # ----- Codex accounts -----
-        codex_accounts = QGroupBox("Codex Accounts")
+        codex_accounts = QGroupBox(f'{naming.full("codex")} accounts')
         codex_accounts_layout = QVBoxLayout(codex_accounts)
         codex_accounts_layout.setSpacing(8)
         codex_accounts_layout.addWidget(
@@ -910,7 +917,7 @@ class SettingsDialog(QDialog):
         self._rebuild_browser_account_rows()
 
         # ----- Microsoft → Azure -----
-        azure = QGroupBox("Azure")
+        azure = QGroupBox(naming.full("azure"))
         azure_form = QFormLayout(azure)
         azure_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         azure_form.setHorizontalSpacing(12)
@@ -1051,7 +1058,7 @@ class SettingsDialog(QDialog):
             self.azure_resource_group.setText(config.azure.resource_group)
         azure_form.addRow("Resource group:", self.azure_resource_group)
 
-        azure_form.addRow("", self._gauge_colors_button("azure", "Azure"))
+        azure_form.addRow("", self._gauge_colors_button("azure", naming.full("azure")))
 
         azure_form.addRow(
             "",
@@ -1064,7 +1071,11 @@ class SettingsDialog(QDialog):
         )
 
         # ----- Microsoft → Foundry -----
-        foundry = QGroupBox("Foundry")
+        # The group box may carry the company; the Foundry *row* inside the
+        # Azure tile may not - that string is a metric label and a history key
+        # (history._state_key), so renaming it would orphan every in-flight
+        # period. See azure.FOUNDRY_BUCKET.
+        foundry = QGroupBox(f'{naming.COMPANY["azure"]}{naming.SEPARATOR}Foundry')
         foundry_form = QFormLayout(foundry)
         foundry_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         foundry_form.setHorizontalSpacing(12)
@@ -1108,7 +1119,7 @@ class SettingsDialog(QDialog):
         )
 
         # ----- Microsoft → Copilot -----
-        copilot = QGroupBox("Copilot")
+        copilot = QGroupBox(naming.full("copilot"))
         copilot_form = QFormLayout(copilot)
         copilot_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         copilot_form.setHorizontalSpacing(12)
@@ -1177,7 +1188,9 @@ class SettingsDialog(QDialog):
         copilot_form.addRow(self.gh_quota_label, self.gh_quota)
         self._set_quota_selection(config.copilot.monthly_quota)
 
-        copilot_form.addRow("", self._gauge_colors_button("copilot", "Copilot"))
+        copilot_form.addRow(
+            "", self._gauge_colors_button("copilot", naming.full("copilot"))
+        )
 
         quota_hint = _hint_label(
             "GitHub reports usage, not a reliable personal-plan allowance through "
@@ -1187,7 +1200,7 @@ class SettingsDialog(QDialog):
         copilot_form.addRow("", quota_hint)
 
         # ----- OpenRouter details -----
-        openrouter = QGroupBox("OpenRouter")
+        openrouter = QGroupBox(naming.full("openrouter"))
         openrouter_form = QFormLayout(openrouter)
         openrouter_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         openrouter_form.setHorizontalSpacing(12)
@@ -1265,7 +1278,7 @@ class SettingsDialog(QDialog):
         openrouter_form.addRow("Daily budget:", self.or_daily_budget)
 
         openrouter_form.addRow(
-            "", self._gauge_colors_button("openrouter", "OpenRouter")
+            "", self._gauge_colors_button("openrouter", naming.full("openrouter"))
         )
 
         budget_hint = _hint_label(
@@ -1275,7 +1288,7 @@ class SettingsDialog(QDialog):
         openrouter_form.addRow("", budget_hint)
 
         # ----- OpenCode details -----
-        opencode_go = QGroupBox("OpenCode")
+        opencode_go = QGroupBox(naming.full("opencode_go"))
         opencode_go_form = QFormLayout(opencode_go)
         opencode_go_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         opencode_go_form.setHorizontalSpacing(12)
@@ -1318,7 +1331,7 @@ class SettingsDialog(QDialog):
         opencode_go_form.addRow("", opencode_go_usage_btn)
 
         opencode_go_form.addRow(
-            "", self._gauge_colors_button("opencode_go", "OpenCode")
+            "", self._gauge_colors_button("opencode_go", naming.full("opencode_go"))
         )
 
         opencode_go_help = _hint_label(
@@ -1351,18 +1364,27 @@ class SettingsDialog(QDialog):
         codex_tab_layout.addWidget(codex_accounts)
         codex_tab_layout.addStretch(1)
 
-        # One Microsoft tab holding the three sub-headings. Azure and Copilot
-        # are separate providers with separate credentials, but they are one
-        # vendor relationship to the person configuring them, and Foundry only
-        # makes sense next to the Azure block it configures.
+        # The Microsoft tab is Azure and Foundry: one subscription, one set of
+        # credentials, and Foundry only makes sense next to the Azure block it
+        # configures. Copilot used to sit here too, on the argument that
+        # Microsoft is the billing relationship - but the credential is a
+        # GitHub PAT, the host is api.github.com and the tile reads
+        # "GitHub · Copilot", so filing it under Microsoft made the tab and the
+        # tile disagree about whose product it is.
         microsoft_tab = QWidget()
         microsoft_tab_layout = QVBoxLayout(microsoft_tab)
         microsoft_tab_layout.setContentsMargins(10, 10, 10, 10)
         microsoft_tab_layout.setSpacing(10)
         microsoft_tab_layout.addWidget(azure)
         microsoft_tab_layout.addWidget(foundry)
-        microsoft_tab_layout.addWidget(copilot)
         microsoft_tab_layout.addStretch(1)
+
+        github_tab = QWidget()
+        github_tab_layout = QVBoxLayout(github_tab)
+        github_tab_layout.setContentsMargins(10, 10, 10, 10)
+        github_tab_layout.setSpacing(10)
+        github_tab_layout.addWidget(copilot)
+        github_tab_layout.addStretch(1)
 
         openrouter_tab = QWidget()
         openrouter_tab_layout = QVBoxLayout(openrouter_tab)
@@ -1380,12 +1402,16 @@ class SettingsDialog(QDialog):
 
         tabs = QTabWidget()
         self._tabs = tabs
+        # Vendor names, in the order the tiles are stacked. A tab is a
+        # relationship - one company, one set of credentials - so it carries the
+        # company alone where the tile carries "Company · Surface".
         self._add_tab(tabs, general_tab, "General")
-        self._add_tab(tabs, claude_tab, "Claude")
-        self._add_tab(tabs, codex_tab, "Codex")
-        self._add_tab(tabs, opencode_go_tab, "OpenCode")
-        self._add_tab(tabs, microsoft_tab, "Microsoft")
-        self._add_tab(tabs, openrouter_tab, "OpenRouter")
+        self._add_tab(tabs, claude_tab, naming.COMPANY["claude"])
+        self._add_tab(tabs, codex_tab, naming.COMPANY["codex"])
+        self._add_tab(tabs, opencode_go_tab, naming.SURFACE["opencode_go"])
+        self._add_tab(tabs, microsoft_tab, naming.COMPANY["azure"])
+        self._add_tab(tabs, github_tab, naming.COMPANY["copilot"])
+        self._add_tab(tabs, openrouter_tab, naming.SURFACE["openrouter"])
         tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         # ----- Buttons -----
@@ -1487,6 +1513,17 @@ class SettingsDialog(QDialog):
         runner lays General out 612 px wide, 18 px more than the viewport
         620 leaves it. Both are bounded by the screen's work area.
 
+        The **tab bar** is a third term, and it has to be its own: the pane
+        width the pages are measured through is ``QTabWidget.sizeHint()``,
+        which answers for the pages and not for the bar above them (495 px
+        here against the bar's own 606). Leave it out and the bar is the one
+        part of the dialog nothing sizes: with seven tabs and the company
+        names it opened 596 px wide for a 606-px bar, Qt turned on the
+        tab-bar scroll arrows, and ``OpenRouter`` sat behind them at the
+        default size - unreachable until the user found the arrows or
+        dragged the window wider. Wider fonts only make the gap bigger, so
+        this is measured from the bar rather than added to the constant.
+
         Every layout is activated first, deepest up - see
         ``_activate_layouts`` for why the top-level ``activate()`` alone left
         a nested row 10 px stale, and General scrolling by 6-7 px on the
@@ -1526,8 +1563,20 @@ class SettingsDialog(QDialog):
         pages_min_w = max(
             scroll.widget().minimumSizeHint().width() for scroll in self._page_scrolls
         )
+        # `pane_extra_w` and not the whole `horizontal_chrome`: the vertical
+        # scroll bar in that sum is a page's, and the bar never has one. The
+        # pane extra is kept because the style that draws a frame around a
+        # page is the style that may inset the bar inside it - 4 px here, and
+        # a term that can only ever make the dialog wider.
+        tab_bar_w = (
+            tabs.tabBar().sizeHint().width()
+            + margins.left()
+            + margins.right()
+            + pane_extra_w
+        )
         width = min(
-            max(_DIALOG_DEFAULT_W, pages_min_w + horizontal_chrome), available.width()
+            max(_DIALOG_DEFAULT_W, pages_min_w + horizontal_chrome, tab_bar_w),
+            available.width(),
         )
         page_width = width - horizontal_chrome
         content = _page_height(general_page, page_width)
@@ -1834,7 +1883,9 @@ class SettingsDialog(QDialog):
                 row.remove_clicked.connect(self._remove_browser_account)
                 self._browser_account_rows.append(row)
                 layout.addWidget(row)
-            add_btn = QPushButton(f"Add another {provider_base_name(kind)}")
+            # The compact name: the button is 150 px wide and "Add another
+            # OpenAI · ChatGPT + Codex" would be elided down to nothing useful.
+            add_btn = QPushButton(f"Add another {naming.compact(kind)}")
             add_btn.clicked.connect(
                 lambda _checked=False, k=kind: self._add_browser_account(k)
             )

@@ -8,7 +8,7 @@ from typing import Callable
 import requests
 
 from ..config import Config, get_openrouter_key, get_openrouter_mgmt_key
-from ..models import SnapshotStatus, UsageMetric, UsageSnapshot
+from ..models import SnapshotStatus, UsageMetric, UsageSnapshot, bounded_note
 from ._http import bounded_request, request_worst_case_seconds
 from .base import Provider
 
@@ -319,7 +319,12 @@ def _build_model_metrics(
             UsageMetric(
                 label=display,
                 percent_used=percent,
-                note=note,
+                # `model` is an id /activity supplied and nothing bounds it on
+                # the way in: the row's *label* is clipped to
+                # MODEL_DISPLAY_MAX_LEN, but the full id goes in the note, so
+                # without this a 200 kB id is carried for the life of the tile
+                # and re-clipped by each of the six tooltips that show it.
+                note=bounded_note(note),
                 tag=MODEL_BREAKDOWN_TAG,
             )
         )
@@ -400,7 +405,6 @@ def _build_snapshot(
 
 class OpenRouterProvider(Provider):
     name = "openrouter"
-    display_name = "OpenRouter"
     refresh_budget_seconds = REFRESH_WORST_CASE_SECONDS
 
     def __init__(self, config: Config, pool=None):

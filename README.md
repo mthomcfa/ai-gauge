@@ -14,14 +14,14 @@
 
 If you pay for multiple AI subscriptions and frequently check your usage, AI Gauge might help. It shows session and weekly usage, reset times, account balances, and spend in a compact always-visible view, so you can get the most out of what you're paying for.
 
-Compact monitor for **Claude.ai**, **ChatGPT Codex**, **Microsoft** (Azure spend + Copilot), **OpenRouter**, and **OpenCode** usage. Manual + auto refresh, with a platform-native UI on each OS:
+Compact monitor for **Anthropic · Claude**, **OpenAI · ChatGPT + Codex**, **Microsoft · Azure** spend, **GitHub · Copilot**, **OpenRouter**, and **OpenCode** usage. Every tile, dialog and Settings tab names the company behind the product. Manual + auto refresh, with a platform-native UI on each OS:
 
 - **Windows / Linux** — always-on-top draggable frameless widget plus a system-tray icon.
 - **macOS** — Stats-style menu-bar item (`● 42% ● 78% ● 15%`); the panel opens as a popover when you click it.
 
 > **Requires Python 3.11+.** Secrets live in the OS-native credential store (Windows Credential Manager / DPAPI, macOS Keychain, Linux Secret Service). Auto-start uses the platform's standard mechanism (Windows Task Scheduler / LaunchAgent / `~/.config/autostart`).
 
-Current version: **1.4.0+cfa.8** — a fork version, see [Versioning](#versioning). Release notes in [CHANGELOG.md](CHANGELOG.md).
+Current version: **1.4.1+cfa.9** — a fork version, see [Versioning](#versioning). Release notes in [CHANGELOG.md](CHANGELOG.md).
 
 AI Gauge is an independent open-source project and unofficial local desktop
 utility. It is not affiliated with Anthropic, OpenAI, GitHub, Microsoft,
@@ -46,7 +46,7 @@ notice.
   <img src="docs/screenshots/mac-popover.png" alt="AI Gauge macOS popover panel with Claude, Codex, and Copilot tiles" width="320" />
 </p>
 
-The window in these shots is at its first-run 340 px width. Since 1.4.0+cfa.8 it is resizable by its edges and remembers whatever size you give it, so yours may be wider.
+The window in these shots is at its first-run 340 px width. Since 1.4.0+cfa.8 it is resizable by its edges and remembers whatever size you give it, so yours may be wider. The shots also predate 1.4.1+cfa.9, so the tiles in them read `Claude` and `Copilot` where the app now says `Anthropic · Claude` and `GitHub · Copilot`.
 
 <details>
 <summary>Settings dialog</summary>
@@ -67,7 +67,7 @@ Binaries are published on **[this fork's Releases page](https://github.com/mthom
 | macOS   | `ai-gauge-<file-version>-macos.tar.gz`      | **Apple Silicon only.** Extract, drag `ai-gauge.app` to Applications |
 | Linux   | `ai-gauge-<file-version>-linux.tar.gz`      | extract, run `./ai-gauge/ai-gauge`           |
 
-`<file-version>` is the version with `+` replaced by `-`, so `1.4.0+cfa.8` ships as `ai-gauge-1.4.0-cfa.8-windows.zip`. Print it with `python tools/check_versions.py`.
+`<file-version>` is the version with `+` replaced by `-`, so `1.4.1+cfa.9` ships as `ai-gauge-1.4.1-cfa.9-windows.zip`. Print it with `python tools/check_versions.py`.
 
 **Intel Macs are not covered by the prebuilt archive.** PyInstaller builds for the host architecture and this fork's CI runs on Apple Silicon, so the `.app` is arm64-only. Intel users should [run from source](#run-from-source); the menu-bar UI works identically.
 
@@ -136,24 +136,32 @@ python3 -m venv .venv
 ./.venv/bin/python -m aigauge
 ```
 
+Settings has one tab per vendor, in the order the tiles are stacked:
+**General**, **Anthropic**, **OpenAI**, **OpenCode**, **Microsoft**,
+**GitHub**, **OpenRouter**.
+
 On first launch the widget appears with enabled provider tiles. Claude and Codex use a **Sign in** flow; GitHub Copilot and OpenRouter are configured from Settings with API credentials. Open Settings to disable providers you don't use or to add more Claude/Codex accounts.
+
+Tiles, dialog titles and Settings read `Company · Surface` — `Anthropic · Claude`, `OpenAI · ChatGPT + Codex`, `Microsoft · Azure`, `GitHub · Copilot`, `OpenRouter`, `OpenCode` — and a named account keeps the company with your own name last: `Anthropic · Claude (Work)`. Where there is no room for a company (the collapsed chips, the tray tooltip, the macOS menu bar) the product name alone is used: `Claude`, `Codex`, `Azure`, `Copilot`.
 
 ## First-time setup per provider
 
 | Provider           | Setup                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Claude.ai**      | **Sign in (recommended):** opens an embedded browser. <b>Don't click "Continue with Google"</b> — Google refuses to authenticate inside embedded browsers. If your account is Google-linked, just type that same email into the **Enter your email** box and use the **magic link** sent to your inbox. **Paste cookie:** fallback if magic-link is unavailable; see below. Add extra Claude subscriptions from **Settings → Claude**. |
-| **ChatGPT Codex**  | Same as Claude — use email + magic link in the embedded browser, or paste cookie as a fallback. If your OpenAI account routes through Google or a passkey, use **Paste cookie**; embedded browsers often cannot complete those flows. Add extra Codex subscriptions from **Settings → Codex**.                                                                                                                                                 |
-| **Microsoft — Copilot** | Create a **fine-grained PAT** at <https://github.com/settings/personal-access-tokens/new>. For personal plans, add **Account permissions → Plan → Read**. Paste into **Settings → Microsoft → Copilot**; set your monthly AI credit allowance (Pro=1,500, Pro+=7,000, Max=20,000). If Copilot is billed through an organization, enter the billing org and use a token/account with org billing access and **Organization permissions → Administration → Read**. |
-| **Microsoft — Azure**   | Needs an Entra ID app registration; see [Azure month-to-date spend](#azure-month-to-date-spend) below. |
+| **Anthropic · Claude** | **Sign in (recommended):** opens an embedded browser. <b>Don't click "Continue with Google"</b> — Google refuses to authenticate inside embedded browsers. If your account is Google-linked, just type that same email into the **Enter your email** box and use the **magic link** sent to your inbox. **Paste cookie:** fallback if magic-link is unavailable; see below. Add extra Claude subscriptions from **Settings → Anthropic**. |
+| **OpenAI · ChatGPT + Codex** | Same as Claude — use email + magic link in the embedded browser, or paste cookie as a fallback. If your OpenAI account routes through Google or a passkey, use **Paste cookie**; embedded browsers often cannot complete those flows. Add extra Codex subscriptions from **Settings → OpenAI**.                                                                                                                                                 |
+| **GitHub · Copilot** | Create a **fine-grained PAT** at <https://github.com/settings/personal-access-tokens/new>. For personal plans, add **Account permissions → Plan → Read**. Paste into **Settings → GitHub**; set your monthly AI credit allowance (Pro=1,500, Pro+=7,000, Max=20,000). If Copilot is billed through an organization, enter the billing org and use a token/account with org billing access and **Organization permissions → Administration → Read**. |
+| **Microsoft · Azure**   | Needs an Entra ID app registration; see [Azure month-to-date spend](#azure-month-to-date-spend) below. |
 | **OpenRouter**     | Create an inference API key at <https://openrouter.ai/keys> and paste it into Settings. To show account balance and model activity, also create a management key at <https://openrouter.ai/settings/provisioning-keys>. Management keys cannot be used for inference; AI Gauge stores it separately and only uses it for OpenRouter management endpoints. Daily spend budget is optional.                                                    |
 
 ### Azure month-to-date spend
 
-The **Microsoft** tab in Settings holds three sub-headings: **Azure**,
-**Foundry**, and **Copilot**. Azure and Copilot are separate providers with
-separate credentials; they share a tab because they are one vendor
-relationship to the person configuring them.
+The **Microsoft** tab in Settings holds two sub-headings: **Microsoft ·
+Azure** and **Microsoft · Foundry**. One subscription, one set of
+credentials, and Foundry only means anything beside the Azure block it
+configures. Copilot has its own **GitHub** tab: the credential is a GitHub
+PAT and the host is `api.github.com`, so filing it under Microsoft made the
+tab and the tile disagree about whose product it is.
 
 The Azure tile shows month-to-date spend against a monthly allowance, broken
 into component rows by Azure service:
@@ -162,18 +170,21 @@ into component rows by Azure service:
 Microsoft · Azure
 Spend this month         CAD 36.10 of 150.00 · resets 1 Oct
 [■■■■■■■░░░░░░░░░░░░░░░░░░░░░░]
-  Foundry                    12.40   34%
-  Azure OpenAI                8.05   22%
-  Container Apps              6.90   19%
-  Marketplace models          4.10   11%
-  Storage                     1.20    3%
-  Other (3 services)          3.45   10%
-  Forecast end of month      ~71.00  47%
+  Foundry             34%   CAD 12.40
+  Azure OpenAI        22%    CAD 8.05
+  Container Apps      19%    CAD 6.90
+  Marketplace models  11%    CAD 4.10
+  Storage              3%    CAD 1.20
+  Other (3 services)  10%    CAD 3.45
+  Forecast end of month     47%
 ```
 
 The label is fixed and the amounts sit in the right-hand column: history keys
 an in-flight period on the label, so a label that moved with the money would
-open a new period on every fetch.
+open a new period on every fetch. Since 1.4.1+cfa.9 each **component** row
+carries its amount there too, in the same currency formatting — the share
+says which component is the big one, and the amount says what it cost. Both
+are still in the row's tooltip.
 
 Only the top row counts toward the tray/menu-bar colour. The component rows
 are shares of spend, not usage against a limit, so a single service at 96% of
@@ -208,11 +219,11 @@ one either, and the amounts are still shown.
    charges normally. Without that check no gauge is honest, so none is shown.
    You also lose the Foundry roll-up and have to pin Foundry resource IDs by
    hand.
-4. **Fill in Settings → Microsoft → Azure.** Directory (tenant) ID,
+4. **Fill in Settings → Microsoft → Microsoft · Azure.** Directory (tenant) ID,
    Application (client) ID, the client secret, and the Subscription ID — all
    three IDs are GUIDs, and anything else is refused. Set a monthly allowance
    and the day of the month it resets.
-5. **Enable the tile** on the **General** tab (Microsoft Azure).
+5. **Enable the tile** on the **General** tab (Microsoft · Azure).
 
 #### Allowance and reset semantics
 
@@ -260,7 +271,7 @@ Foundry resources are found by resource **kind** (`AIServices`). That matters:
 Azure OpenAI, Speech, Vision, Language and Foundry all share the
 `Microsoft.CognitiveServices/accounts` resource type, so filtering by type
 would fold all of them into the Foundry row. If the app registration cannot
-list resources, pin the resource IDs under **Settings → Microsoft → Foundry**,
+list resources, pin the resource IDs under **Settings → Microsoft → Microsoft · Foundry**,
 one per line.
 
 #### Refresh rate and lag
@@ -295,7 +306,7 @@ budget, and the forecast — with all IDs and resource names stripped.
 
 ### Multiple Claude / Codex accounts
 
-Claude and Codex can track more than one subscription at a time. Open **Settings → Claude** or **Settings → Codex**, click **Add another**, give the account a short name, then use **Sign in** or **Paste cookie** for that specific row. The default account displays as `Claude` or `Codex`; named accounts display as `Claude (Work)`, `Codex (Account 2)`, etc.
+Claude and Codex can track more than one subscription at a time. Open **Settings → Anthropic** or **Settings → OpenAI**, click **Add another**, give the account a short name, then use **Sign in** or **Paste cookie** for that specific row. The default account displays as `Anthropic · Claude` or `OpenAI · ChatGPT + Codex`; named accounts keep the company and put your own name last — `Anthropic · Claude (Work)`, `OpenAI · ChatGPT + Codex (Account 2)`. A tile header that runs out of room elides from the right and keeps the whole name in its tooltip, rather than pushing the window wider than the 260 px floor.
 
 The **General** tab controls provider groups. If Claude is checked, all configured Claude accounts appear; if Codex is checked, all configured Codex accounts appear. Secondary accounts can be removed from their provider tab. Each Claude/Codex account uses separate cookie storage, browser profile data, widget tile state, and history records.
 
@@ -323,7 +334,7 @@ If the embedded-browser sign-in doesn't work for you (e.g. your account requires
 3. For Claude, press **F12** → **Network**, reload `https://claude.ai/settings/usage`,
    click a `claude.ai` request, and copy the full **Request Headers → Cookie:**
    value. It must include `sessionKey`.
-4. In the app: Settings → Claude or Settings → Codex → click **Paste cookie** next to the account, paste, Save.
+4. In the app: Settings → Anthropic or Settings → OpenAI → click **Paste cookie** next to the account, paste, Save.
 
 ## Daily use
 
@@ -333,7 +344,7 @@ If the embedded-browser sign-in doesn't work for you (e.g. your account requires
 - **Collapse / expand:** click the **−** button in the widget header to shrink to the compact pill view. Enabled provider/account chips wrap onto additional rows when needed, with named secondary Claude/Codex accounts using just the account name to save space.
 - **Resize it:** drag any edge or corner. The window remembers the size you gave it, in both dimensions, and keeps it across restarts — a drag that your window manager finishes is written back a second after its events stop - and again a second after each pause in it, whether you pause before it starts moving or half-way through, so nothing is lost if you stop to think and carry on - and so are a hide and a quit; it will not grow past the work area of the monitor it is on, and a window restored onto a smaller screen is shrunk to fit and moved back on-screen. The floor is 260 x 80. Until you resize it for the first time the window still fits itself to its content, as it always did; once you have, your size wins and the tile area scrolls. Upgrading from 1.3.x keeps the auto-fitting — only a drag that actually changes the size ends it, not a click near an edge.
 - **Scroll bars** appear on the tile area only when something is hidden — vertically when there are more tiles than fit, horizontally when a row is wider than the window (an Azure row carrying a spend and an allowance is the one that gets there). A wheel notch moves three lines vertically; the horizontal bar is dragged, or moved from the keyboard.
-- **Hide unused providers:** uncheck Claude / Codex / Copilot / Microsoft Azure / OpenRouter in Settings to remove their group from the widget — useful if you only use one or two of them.
+- **Hide unused providers:** uncheck Anthropic · Claude / OpenAI · ChatGPT + Codex / OpenCode / Microsoft · Azure / GitHub · Copilot / OpenRouter in Settings to remove their group from the widget — useful if you only use one or two of them.
 - Auto-refresh is adaptive: manual refresh or changed usage enters the active
   cadence, then unchanged results back off toward the configured max interval.
   Defaults are 5 min active and 60 min idle max.
@@ -489,7 +500,7 @@ That also means **upstream cannot support this build**, and bugs here may not ex
 Fork releases use a [PEP 440](https://peps.python.org/pep-0440/) local version segment:
 
 ```
-1.4.0+cfa.8
+1.4.1+cfa.9
 └─┬─┘ └─┬─┘
   │     └── fork build counter — identifies this as a fork build
   └──────── this fork's own release counter, NOT an upstream release number

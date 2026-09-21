@@ -18,6 +18,7 @@ from pydantic import (
     model_validator,
 )
 
+from . import naming
 from .atomic_write import atomic_write
 from .platforms import APP_NAME, get_platform
 
@@ -98,6 +99,23 @@ def app_data_dir() -> Path:
 # can never turn an id into a path-traversal payload.
 _PROFILE_ID_MAX_LEN = 64
 _PROFILE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,%d}" % _PROFILE_ID_MAX_LEN)
+
+# How long an account's display name may be. The id is bounded by the rule
+# above; the name was bounded nowhere, and it is the half of every provider
+# label the user supplies - `naming.account_label` brackets it onto a full
+# name, `compact_name_for_account` onto a compact one, and both of those go on
+# to surfaces with no layout to clip them: the tray tooltip is a joined plain
+# string, and the collapsed chip is `setFixedWidth(fm.horizontalAdvance(text))`,
+# so its width was the name's own length, with nothing between a name pasted
+# out of a document and a chip far wider than the panel's 260 px minimum.
+#
+# Sixty, the same number as ``models.MAX_DISPLAY_LABEL_CHARS`` and for the same
+# reason - a name shares a line with a provider name and a percentage. The
+# bound lives here, on the field, so that every one of those surfaces inherits
+# the one rule and no composer has to re-decide it. The Settings line edit
+# carries the same number as its ``maxLength`` so the dialog cannot produce
+# what this would clip.
+ACCOUNT_NAME_MAX_CHARS = 60
 
 # The provider keys ``App._build_providers`` creates that are NOT browser
 # accounts. A ``BrowserAccount`` carrying one of these collides with it in
@@ -490,6 +508,51 @@ class BrowserAccount(BaseModel):
         if not _is_valid_account_id(value):
             raise ValueError(f"unsafe browser account id: {value!r}")
         return value
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _coerce_name(cls, value: object) -> str | None:
+        """Collapse the name to one bounded line, before anything composes it.
+
+        ``mode="before"`` because this runs on whatever JSON the file holds,
+        and it must not raise: a name that cannot be used costs this field,
+        not the whole ``browser_accounts`` key.
+
+        Interior whitespace goes the same way as the length. The tray tooltip
+        is a newline-joined plain string, so a name carrying a newline writes
+        its own lines into it - ``"Work\\nAI Gauge 9.9.9"`` produced a line
+        indistinguishable from the app's own version banner, and a second one
+        shaped like a real meter reading. Collapsing to single spaces leaves
+        the app the only author of that surface's structure.
+        """
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            # Same answer as the other coercions in this file: log it, drop
+            # the field, keep the account. Nothing sensible reads a list or a
+            # number as a display name, and refusing outright would take the
+            # user's other accounts down with it through `_salvage`.
+            log.warning(
+                "config: unusable browser account name (%s); ignoring",
+                _safe_repr(value),
+            )
+            return None
+        text = re.sub(r"\s+", " ", value).strip()
+        if not text:
+            return None
+        if len(text) > ACCOUNT_NAME_MAX_CHARS:
+            # A name written before this bound existed is shortened here and
+            # written back shortened by the next `Config.save()`, which a
+            # window move is enough to trigger - so the one chance to say the
+            # tail is going is now. The two lengths and nothing else: a
+            # display name is the user's own text, and this file's rule is
+            # that it never reaches the log or Copy-diagnostics.
+            log.warning(
+                "config: browser account name shortened from %d to %d characters",
+                len(text),
+                ACCOUNT_NAME_MAX_CHARS,
+            )
+        return text[:ACCOUNT_NAME_MAX_CHARS]
 
 
 class CopilotConfig(BaseModel):
@@ -1067,13 +1130,17 @@ def qt_scale_factor_env(config: Config) -> str | None:
 
 
 def provider_base_name(kind: str) -> str:
-    return {"claude": "Claude", "codex": "Codex"}.get(kind, kind.title())
+    """The full display name for a kind - ``naming`` decides, not this module.
+
+    Kept as a name the UI already imports rather than folded away, because the
+    two are not the same question: this one is asked about a *browser account's*
+    kind, and the table it used to carry was a third copy of the six names.
+    """
+    return naming.full(kind)
 
 
 def account_display_name(account: BrowserAccount) -> str:
-    base = provider_base_name(account.kind)
-    label = (account.name or "").strip()
-    return f"{base} ({label})" if label else base
+    return naming.account_label(account.kind, account.name)
 
 
 def browser_accounts(
@@ -1117,17 +1184,35 @@ def account_kind(config: Config, account_id: str) -> str | None:
 
 
 def display_name_for_account(config: Config, account_id: str) -> str:
+    """What the panel, the dialogs and Settings call this tile.
+
+    A named account wins - it is the only part of the string the user wrote -
+    and everything else comes from ``naming``. The six-entry dict this used to
+    end with was the de-facto source of truth while three other copies of it
+    disagreed; there is now one table and this reads it.
+    """
     account = browser_account(config, account_id)
     if account is not None:
         return account_display_name(account)
-    return {
-        "claude": "Claude",
-        "codex": "Codex",
-        "copilot": "Copilot",
-        "openrouter": "OpenRouter",
-        "opencode_go": "OpenCode",
-        "azure": "Microsoft · Azure",
-    }.get(account_id, account_id)
+    return naming.full(account_id)
+
+
+def compact_name_for_account(config: Config, account_id: str) -> str:
+    """The short name, for a surface with no room for the company.
+
+    The tray tooltip prints one line per metric per provider, so the company
+    would be repeated on every one of them ("Anthropic · Claude Session: 50%",
+    "Anthropic · Claude Weekly: 21%", ...); the collapsed chips are sized to
+    their own text and wrap into another row when they overflow. Both want the
+    product alone. A named account keeps its name - that is the only part of
+    the string the user wrote, and it is what tells two accounts apart.
+    """
+    account = browser_account(config, account_id)
+    if account is not None:
+        name = (account.name or "").strip()
+        base = naming.compact(account.kind)
+        return f"{base} ({name})" if name else base
+    return naming.compact(account_id)
 
 
 def generate_browser_account_id(config: Config, kind: str) -> str:
