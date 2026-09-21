@@ -539,6 +539,18 @@ class BrowserAccount(BaseModel):
         text = re.sub(r"\s+", " ", value).strip()
         if not text:
             return None
+        if len(text) > ACCOUNT_NAME_MAX_CHARS:
+            # A name written before this bound existed is shortened here and
+            # written back shortened by the next `Config.save()`, which a
+            # window move is enough to trigger - so the one chance to say the
+            # tail is going is now. The two lengths and nothing else: a
+            # display name is the user's own text, and this file's rule is
+            # that it never reaches the log or Copy-diagnostics.
+            log.warning(
+                "config: browser account name shortened from %d to %d characters",
+                len(text),
+                ACCOUNT_NAME_MAX_CHARS,
+            )
         return text[:ACCOUNT_NAME_MAX_CHARS]
 
 

@@ -466,6 +466,34 @@ def test_an_account_name_is_bounded_where_the_field_is():
     assert account.name == "A" * ACCOUNT_NAME_MAX_CHARS
 
 
+def test_a_name_the_bound_shortens_says_so_without_saying_what_it_was(caplog):
+    """A name written before the bound existed loses its tail here, and the
+    next `Config.save()` - a window move is enough - writes the short one
+    back. That is the only coercion in this file that used to happen in
+    silence, so it says the lengths. It does not say the name: an account's
+    display name is the user's own text and stays out of the log, like every
+    other identifier this app writes records about.
+    """
+    with caplog.at_level(logging.WARNING, logger="aigauge.config"):
+        clipped = BrowserAccount(
+            id="claude-work", kind="claude", name="Marketing " + "z" * 200
+        )
+        BrowserAccount(id="claude-home", kind="claude", name="Home")
+
+    shortened = [
+        record.getMessage()
+        for record in caplog.records
+        if "shortened" in record.getMessage()
+    ]
+
+    assert len(clipped.name) == ACCOUNT_NAME_MAX_CHARS
+    assert len(shortened) == 1, "one over-long name, one warning"
+    assert str(ACCOUNT_NAME_MAX_CHARS) in shortened[0]
+    assert "210" in shortened[0], "the length it arrived with"
+    assert "Marketing" not in shortened[0] and "zzz" not in shortened[0]
+    assert len(shortened[0]) < 120
+
+
 def test_an_account_name_is_one_line():
     """The tray tooltip is newline-joined, so an interior newline writes its
     own lines into a surface the app is supposed to be the only author of -

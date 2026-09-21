@@ -130,7 +130,10 @@ nine copies. Patch rather than minor: nothing here is a new capability.
   line and clipped to 60 characters where the field is, so the tile header,
   the tray line, the chip and every window title inherit the one rule, and
   the Settings field stops at the same number rather than accepting what
-  would be silently shortened.
+  would be silently shortened. A name that was already longer is shortened
+  on load and written back shortened by the next save - a window move is
+  enough - so the log now says that happened, in lengths rather than in your
+  text, which stays out of the log as every identifier does.
 
 - **The tile header's tooltip is shown as written, and clipped.** `QToolTip`
   has no text-format setter - Qt reads the first line and decides - so a
