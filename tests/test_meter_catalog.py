@@ -914,7 +914,7 @@ def test_the_page_cannot_hide_a_label_from_the_shield_with_punctuation(
 def test_a_decoration_clean_label_keeps_does_not_hide_a_label_either(
     rendered, tmp_path
 ):
-    """The shield covers every decoration, not the eight characters one
+    """The shield covers every decoration, not the nine characters one
     helper happens to strip.
 
     ``clean_label`` trims ``" \\t·•:,-–—"``, and every other
@@ -931,6 +931,39 @@ def test_a_decoration_clean_label_keeps_does_not_hide_a_label_either(
     assert clean_label(rendered) == rendered != "Opus only"
 
     assert [spec.label for spec in adopt_rows("claude", rows, base_dir=tmp_path)] == []
+
+
+@pytest.mark.parametrize(
+    "discovered",
+    [
+        "Team pool (beta)",
+        "Team pool.",
+        "Team pool+",
+        "Team pool/",
+        "Team pool'",
+        "Team pool&",
+    ],
+    ids=["brackets", "full-stop", "plus", "slash", "apostrophe", "ampersand"],
+)
+def test_a_label_whose_own_edges_are_punctuation_shields_its_own_fragment(
+    discovered, tmp_path
+):
+    """Asking whether a label sits inside another does not answer itself.
+
+    A whole-word search for ``team pool.`` inside ``team pool.`` fails: the
+    trailing full stop is not a word character, so there is no word boundary
+    after it. Every label here is adoptable and survives ``clean_label``
+    intact, so each one becomes a meter and is then the known label its own
+    bare form is a fragment of - and it must still turn that fragment away,
+    or the shield holds for labels the page decorates and drops for the ones
+    the app itself just filed.
+    """
+    rows = [_row(discovered, percent=44.0), _row("Team pool", percent=44.0)]
+    assert clean_label(discovered) == discovered
+
+    adopted = adopt_rows("claude", rows, base_dir=tmp_path)
+
+    assert [spec.label for spec in adopted] == [discovered]
 
 
 def test_a_new_meter_is_adopted_beside_a_decorated_row_it_is_no_fragment_of(

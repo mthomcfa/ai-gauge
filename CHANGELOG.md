@@ -117,8 +117,10 @@ nine copies. Patch rather than minor: nothing here is a new capability.
   saw, not only when the page typed it exactly. Otherwise the shield was one
   character wide: a semicolon, a bracket, a pipe, an arrow or the ellipsis an
   elided row ends in all walked past it, and the last of those is what a page
-  produces without trying. A rendered label with a word of its own is a
-  different label and still shields nothing.
+  produces without trying. What the surrounding row carries makes no
+  difference - extra words shield the label inside them exactly as a
+  decoration does - and a label the page typed exactly still shields its own
+  fragments even when its own edges are punctuation.
 
 - **An account's display name had no length and no shape.** It is the half of
   every provider label you supply, and it reaches surfaces with no layout to

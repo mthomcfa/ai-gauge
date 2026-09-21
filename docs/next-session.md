@@ -44,13 +44,16 @@ State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#1
 >   as seen when it sits inside a label the scan saw, as whole words, so
 >   `Opus only:`, `Opus only;`, `(Opus only)`, `Opus only |`, a trailing
 >   zero-width space and the `Opus only…` an elided row ends in are all still
->   shielded. Omitting the longer label entirely is the one route left, and it
->   is the route this relaxation exists to allow. Two shapes it does not
->   cover, both pre-existing: a page that renders `Opus only.` gets that
->   adopted as a meter in its own right, duplicating the bundled one, because
->   the full stop misses equality against `known_labels()` by one character
->   (`primary=False`, one of the 24 slots); and a label carrying a word of its
->   own is a different label, which is the rule, not a hole.
+>   shielded - and so is a row that carries words of its own around the
+>   label, which shields it exactly as a decoration does. Omitting the longer
+>   label entirely is the one route left, and it is the route this relaxation
+>   exists to allow. One shape it does not cover, pre-existing: a page that
+>   renders `Opus only.` gets that adopted as a meter in its own right,
+>   duplicating the bundled one, because the full stop misses equality against
+>   `known_labels()` by one character (`primary=False`, one of the 24 slots).
+>   A label whose own edges are punctuation is not a whole-word match for
+>   itself, so the rule tests exact membership beside the containment to keep
+>   such a label shielding its own fragments.
 > * **A named extra account's collapsed chip shows the bare name.** A Claude
 >   account the user called "Microsoft · Azure" gets a chip reading exactly
 >   `Microsoft · Azure`, while the tile header, the tray line and the tooltip
