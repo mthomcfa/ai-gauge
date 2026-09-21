@@ -100,6 +100,22 @@ def app_data_dir() -> Path:
 _PROFILE_ID_MAX_LEN = 64
 _PROFILE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,%d}" % _PROFILE_ID_MAX_LEN)
 
+# How long an account's display name may be. The id is bounded by the rule
+# above; the name was bounded nowhere, and it is the half of every provider
+# label the user supplies - `naming.account_label` brackets it onto a full
+# name, `compact_name_for_account` onto a compact one, and both of those go on
+# to surfaces with no layout to clip them: the tray tooltip is a joined plain
+# string, and the collapsed chip is `setFixedWidth(fm.horizontalAdvance(text))`,
+# which a 10 kB name asked 92 049 px for.
+#
+# Sixty, the same number as ``models.MAX_DISPLAY_LABEL_CHARS`` and for the same
+# reason - a name shares a line with a provider name and a percentage. The
+# bound lives here, on the field, so that every one of those surfaces inherits
+# the one rule and no composer has to re-decide it. The Settings line edit
+# carries the same number as its ``maxLength`` so the dialog cannot produce
+# what this would clip.
+ACCOUNT_NAME_MAX_CHARS = 60
+
 # The provider keys ``App._build_providers`` creates that are NOT browser
 # accounts. A ``BrowserAccount`` carrying one of these collides with it in
 # ``_providers``, ``_snapshots`` and the tile map - one account's numbers
@@ -491,6 +507,39 @@ class BrowserAccount(BaseModel):
         if not _is_valid_account_id(value):
             raise ValueError(f"unsafe browser account id: {value!r}")
         return value
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _coerce_name(cls, value: object) -> str | None:
+        """Collapse the name to one bounded line, before anything composes it.
+
+        ``mode="before"`` because this runs on whatever JSON the file holds,
+        and it must not raise: a name that cannot be used costs this field,
+        not the whole ``browser_accounts`` key.
+
+        Interior whitespace goes the same way as the length. The tray tooltip
+        is a newline-joined plain string, so a name carrying a newline writes
+        its own lines into it - ``"Work\\nAI Gauge 9.9.9"`` produced a line
+        indistinguishable from the app's own version banner, and a second one
+        shaped like a real meter reading. Collapsing to single spaces leaves
+        the app the only author of that surface's structure.
+        """
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            # Same answer as the other coercions in this file: log it, drop
+            # the field, keep the account. Nothing sensible reads a list or a
+            # number as a display name, and refusing outright would take the
+            # user's other accounts down with it through `_salvage`.
+            log.warning(
+                "config: unusable browser account name (%s); ignoring",
+                _safe_repr(value),
+            )
+            return None
+        text = re.sub(r"\s+", " ", value).strip()
+        if not text:
+            return None
+        return text[:ACCOUNT_NAME_MAX_CHARS]
 
 
 class CopilotConfig(BaseModel):

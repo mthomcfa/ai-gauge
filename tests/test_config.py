@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from aigauge import naming
 from aigauge.config import (
+    ACCOUNT_NAME_MAX_CHARS,
     DEFAULT_OPENCODE_USAGE_URL,
     WINDOW_MAX_DIMENSION,
     WINDOW_MIN_WIDTH,
@@ -452,6 +453,44 @@ def test_browser_account_display_names():
 
     assert account_display_name(account) == naming.full("codex") + " (Work)"
     assert account_display_name(account) == "OpenAI \u00b7 ChatGPT + Codex (Work)"
+
+
+def test_an_account_name_is_bounded_where_the_field_is():
+    """The name is half of every label the app composes, and the surfaces it
+    reaches have no layout to clip it: the tray tooltip is a joined plain
+    string and the collapsed chip is sized to its text. Bounding it once here
+    is what makes the other end of `account_label` a pure composer."""
+    account = BrowserAccount(id="claude-work", kind="claude", name="A" * 10_000)
+
+    assert len(account.name) <= ACCOUNT_NAME_MAX_CHARS
+    assert account.name == "A" * ACCOUNT_NAME_MAX_CHARS
+
+
+def test_an_account_name_is_one_line():
+    """The tray tooltip is newline-joined, so an interior newline writes its
+    own lines into a surface the app is supposed to be the only author of -
+    including a convincing second version banner."""
+    assert BrowserAccount(id="claude-work", kind="claude", name="a\nb").name == "a b"
+    forged = BrowserAccount(
+        id="claude-work", kind="claude", name="Work\nAI Gauge 9.9.9\nSession: 0%"
+    )
+    assert "\n" not in forged.name
+    assert forged.name == "Work AI Gauge 9.9.9 Session: 0%"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [12345, [1, 2], {"a": 1}, True, 1.5, "", "   ", "\n\t "],
+    ids=["int", "list", "dict", "bool", "float", "empty", "spaces", "whitespace"],
+)
+def test_an_unusable_account_name_costs_the_name_and_nothing_else(value):
+    """The validator runs `mode="before"` on whatever the file holds, so it
+    must never raise: a name it cannot use falls back to no name, and the
+    account - and every other account in the list - survives."""
+    account = BrowserAccount(id="claude-work", kind="claude", name=value)
+
+    assert account.name is None
+    assert account.id == "claude-work"
 
 
 def test_display_name_for_configured_account():

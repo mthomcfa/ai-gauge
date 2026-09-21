@@ -1116,6 +1116,26 @@ def test_compact_metrics_receive_account_colors(qtbot):
     assert "#654321" in compact[0].bar.styleSheet()
 
 
+def test_a_chip_is_no_wider_for_a_ten_kilobyte_name_than_for_a_long_one(qtbot):
+    """The chip is `setFixedWidth(fm.horizontalAdvance(text) + 18)`, so its
+    width is the name's length in pixels - 92 049 of them for a 10 kB name,
+    against a panel whose minimum is 260. Nothing is clamped here: the name
+    arrives already bounded, which is the whole point of bounding it once at
+    the field instead of at each surface that renders one."""
+
+    def chip_width(name: str) -> int:
+        config = Config()
+        config.browser_accounts.append(
+            BrowserAccount(id="claude-3f9a12cd", kind="claude", name=name)
+        )
+        widget = UsageWidget(config)
+        qtbot.addWidget(widget)
+        chip = widget._summary_chip("claude-3f9a12cd")  # noqa: SLF001
+        return chip.maximumWidth()
+
+    assert chip_width("A" * 10_000) <= chip_width("A" * 200)
+
+
 def test_summary_chip_receives_account_colors(qtbot):
     """Guards the mutation where _summary_chip stops passing thresholds."""
     from aigauge.models import SnapshotStatus, UsageMetric, UsageSnapshot
@@ -3299,6 +3319,40 @@ def test_the_eliding_label_drops_its_tail_at_any_width(qtbot):
     resized(advance + 8)
     assert label.elided_text() == full, "the label did not recover its full text"
     assert label.toolTip() == ""
+
+
+def test_an_elided_headers_tooltip_shows_a_name_literally_and_briefly(qtbot):
+    """The header tooltip carries config text, so it goes through the same
+    gate every other tooltip in the module does.
+
+    `QToolTip` has no text-format setter - Qt reads the first line and decides
+    - so a display name containing markup would be laid out as markup, and a
+    name has no length of its own to lean on. `_safe_tooltip` answers both:
+    escaped and wrapped so it is shown as written, clipped so a hover costs
+    the same whatever is in the config file.
+    """
+    from aigauge.widget import _ElidingLabel
+
+    name = naming.account_label("claude", "<b>" + "A" * (_TOOLTIP_ERROR_CHARS * 4))
+    label = _ElidingLabel(name)
+    qtbot.addWidget(label)
+    with qtbot.waitExposed(label):
+        label.show()
+    # Derived from the label's own measurement of its own text, so this is a
+    # quarter of whatever the runner's font makes of it and never a pixel
+    # count of this machine's.
+    width = max(_ElidingLabel.MIN_WIDTH, label.fontMetrics().horizontalAdvance(name) // 4)
+    label.resize(width, label.sizeHint().height())
+    qtbot.waitUntil(lambda: label.width() == width)
+    qtbot.wait(0)
+
+    assert label.elided_text() != name, "nothing was dropped, so nothing to hover"
+    tooltip = label.toolTip()
+    assert "&lt;b&gt;" in tooltip and "<b>" not in tooltip
+    assert len(tooltip) < len(name)
+    # What the user reads is still the name, with the escaping undone by the
+    # renderer that draws it.
+    assert _tooltip_text(tooltip).startswith(f"{naming.full('claude')} (<b>A")
 
 
 def _azure_rows_snapshot():
