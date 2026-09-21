@@ -727,6 +727,14 @@ def _collides_with_known(
     shorter name is a rename and is adopted. Equality and the trailing-junk
     rule are unconditional; and a label adopted earlier in the same scan is in
     ``present`` by construction, so it still shields its own fragments.
+
+    "Among the labels this scan saw" is whole-word containment, not equality:
+    the longer label counts as rendered when it sits *inside* something the
+    page sent. Otherwise the page decides whether the shield applies by typing
+    a character — ``Opus only:`` closes it, ``Opus only;`` does not, and an
+    elided ``Opus only…`` is what a real page produces without trying. Only
+    the decoration a row carries changes; a rendered label with a word of its
+    own is a different label and shields nothing.
     """
     normalized = normalize_label(label)
     if not normalized:
@@ -735,7 +743,9 @@ def _collides_with_known(
     for other in known:
         if normalized == other:
             return True
-        if _overlaps(normalized, other) and (rendered is None or other in rendered):
+        if _overlaps(normalized, other) and (
+            rendered is None or any(_overlaps(other, r) for r in rendered)
+        ):
             return True
         if normalized.startswith(f"{other} ") and not _ALPHA_WORD_RE.search(
             normalized[len(other) :]
@@ -888,6 +898,11 @@ def adopt_rows(
     # was before it), the colon `clean_label` strips keeps "opus only" out of
     # this set, and "Opus" is adopted beside the very label it is a fragment
     # of. A leading bullet does the same.
+    #
+    # `clean_label` tidies eight characters and no more, which is why
+    # `_collides_with_known` asks whether a known label sits *inside* one of
+    # these rather than whether it equals one: a semicolon, a bracket or the
+    # ellipsis an elided row ends in would otherwise walk straight past it.
     present = {
         normalize_label(clean_label(row.get("label")))
         for row in rows

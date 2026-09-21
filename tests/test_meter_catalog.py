@@ -887,6 +887,9 @@ def test_the_page_cannot_hide_a_label_from_the_shield_with_punctuation(
     the raw text and the page decides whether the shield applies: the longer
     label is on the page, the bare name is a second reading of its number,
     and nothing stops it being adopted beside it.
+
+    These are the three ``clean_label`` tidies away. The decorations it keeps
+    are the sibling test's, and they are the larger half of the class.
     """
     rows = [_row(rendered, percent=91.0), _row("Opus", percent=91.0)]
     # The decoration is the whole point: what the page sent is not what the
@@ -894,6 +897,62 @@ def test_the_page_cannot_hide_a_label_from_the_shield_with_punctuation(
     assert clean_label(rendered) == "Opus only" != rendered
 
     assert [spec.label for spec in adopt_rows("claude", rows, base_dir=tmp_path)] == []
+
+
+@pytest.mark.parametrize(
+    "rendered",
+    [
+        "Opus only\u2026",
+        "Opus only;",
+        "(Opus only)",
+        "Opus only |",
+        "Opus only\u200b",
+        "\u2192 Opus only",
+    ],
+    ids=["ellipsis", "semicolon", "brackets", "pipe", "zero-width-space", "arrow"],
+)
+def test_a_decoration_clean_label_keeps_does_not_hide_a_label_either(
+    rendered, tmp_path
+):
+    """The shield covers every decoration, not the eight characters one
+    helper happens to strip.
+
+    ``clean_label`` trims ``" \\t\u00b7\u2022:,-\u2013\u2014"``. Every other character a page can
+    put beside a label - a semicolon, a bracket, a pipe, a zero-width space,
+    an arrow, or the ellipsis Claude's own elided rows end in - survives into
+    the set of labels the scan saw, so comparing that set by equality hands
+    the page the shield back. The comparison asks whether the known label
+    sits inside something the page rendered instead, which no decoration
+    changes.
+    """
+    rows = [_row(rendered, percent=91.0), _row("Opus", percent=91.0)]
+    # The half of the class the cleaning does not reach: what the catalog
+    # reads here is still decorated.
+    assert clean_label(rendered) == rendered != "Opus only"
+
+    assert [spec.label for spec in adopt_rows("claude", rows, base_dir=tmp_path)] == []
+
+
+def test_a_new_meter_is_adopted_beside_a_decorated_row_it_is_no_fragment_of(
+    tmp_path,
+):
+    """The shield refuses a second reading, not a new meter.
+
+    Widening what counts as "the longer label is on the page" has to leave
+    every genuine adoption alone: a page that decorates its rows still gets a
+    name the catalog has never seen filed, and only the fragment beside it is
+    turned away. A shield that refuses a new meter is a worse failure than the
+    duplicate it prevents - the number stops being reported at all.
+    """
+    rows = [
+        _row("Opus only\u2026", percent=91.0),
+        _row("Opus", percent=91.0),
+        _row("Fable 5.1", percent=12.0),
+    ]
+
+    adopted = adopt_rows("claude", rows, base_dir=tmp_path)
+
+    assert [spec.label for spec in adopted] == ["Fable 5.1"]
 
 
 @pytest.mark.parametrize(

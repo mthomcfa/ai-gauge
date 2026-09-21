@@ -39,6 +39,18 @@ State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#1
 >   A meter row labelled `Claude` can therefore appear inside a tile headed
 >   `Anthropic · Claude`. Bounded by `MAX_ADOPTED_METERS` (24) and by
 >   `primary=False`, so an adopted row can never take the tray colour.
+>
+>   What the shield *does* cover is every decoration: the longer label counts
+>   as seen when it sits inside a label the scan saw, as whole words, so
+>   `Opus only:`, `Opus only;`, `(Opus only)`, `Opus only |`, a trailing
+>   zero-width space and the `Opus only…` an elided row ends in are all still
+>   shielded. Omitting the longer label entirely is the one route left, and it
+>   is the route this relaxation exists to allow. Two shapes it does not
+>   cover, both pre-existing: a page that renders `Opus only.` gets that
+>   adopted as a meter in its own right, duplicating the bundled one, because
+>   the full stop misses equality against `known_labels()` by one character
+>   (`primary=False`, one of the 24 slots); and a label carrying a word of its
+>   own is a different label, which is the rule, not a hole.
 > * **A named extra account's collapsed chip shows the bare name.** A Claude
 >   account the user called "Microsoft · Azure" gets a chip reading exactly
 >   `Microsoft · Azure`, while the tile header, the tray line and the tooltip
