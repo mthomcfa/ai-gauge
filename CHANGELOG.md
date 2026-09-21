@@ -56,6 +56,21 @@ nine copies. Patch rather than minor: nothing here is a new capability.
   set of credentials, and Foundry only means anything beside the Azure block
   it configures.
 
+  The dialog opens wide enough for the bar those seven tabs make. Its default
+  width was the widest page plus the chrome around it, and the tab bar was in
+  neither term - the pane measurement the pages are sized through answers for
+  the pages, not for the bar above them - so the seventh tab sat behind Qt's
+  tab-bar scroll arrows at the size the window opened at, and further behind
+  them on a platform whose fonts run wide. The bar is now a term of its own.
+
+- **The tray tooltip and the macOS menu bar count the providers off in the
+  same order as everything else.** Both read them in the order this function
+  happened to build the list in, which paired Copilot with Azure and put
+  OpenCode last, while the panel and Settings now read Anthropic, OpenAI,
+  OpenCode, Microsoft, GitHub, OpenRouter. Which provider is refreshed first
+  is a separate rule and is unchanged: the cheap REST providers still go
+  before the browser-driven ones.
+
 - **A tile header too long for the panel elides instead of widening it.**
   Measured offscreen at the 260 px floor, with a ratio chip and the status tag
   on the same row: `Microsoft · Azure` needs a 197 px tile and fits,
@@ -90,6 +105,31 @@ nine copies. Patch rather than minor: nothing here is a new capability.
   Refusing an exact known label, and refusing a known label with a count glued
   onto it (`Weekly 42`), are unchanged.
 
+  "The labels the scan saw" are compared in the form the catalog reads them
+  in, not in the form the page sent. A row rendering `Opus only: 42%` hands
+  back `Opus only:` - both discovery walks cut the label at the reset wording
+  or the number and keep whatever punctuation stood before it - so comparing
+  the raw text would have let a page hide the longer label behind a colon or
+  a bullet and get the bare name adopted beside it, which is the duplicate
+  this rule exists to prevent.
+
+- **An account's display name had no length and no shape.** It is the half of
+  every provider label you supply, and it reaches surfaces with no layout to
+  clip it: the tray tooltip is one plain string built by joining lines, and a
+  collapsed chip is sized to its own text, so a 10 kB name asked for a chip
+  92 049 px wide and a 30 kB tooltip. Worse, a name carrying newlines wrote
+  its own lines into that tooltip, including a convincing second version
+  banner. The name is now collapsed to a single line and clipped to 60
+  characters where the field is, so the tile header, the tray line, the chip
+  and every window title inherit the one rule, and the Settings field stops
+  at the same number rather than accepting what would be silently shortened.
+
+- **The tile header's tooltip is shown as written, and clipped.** `QToolTip`
+  has no text-format setter - Qt reads the first line and decides - so a
+  display name containing markup was laid out as markup on a tooltip that
+  every other one in the panel already routes through the module's escaping
+  wrapper. It now goes the same way.
+
 - **Two unbounded strings, both carried over from 1.4.0+cfa.8's residual
   list.** The tray tooltip interpolated a provider's metric label into a plain
   string with no bound - a tile row is clipped by its own geometry, a tooltip
@@ -101,16 +141,22 @@ nine copies. Patch rather than minor: nothing here is a new capability.
 
 ### Notes
 
-- 2 085 tests, from 2 024. `test_naming.py` is new (32), and it carries the
+- 2 109 tests, from 2 024. `test_naming.py` is new (33), and it carries the
   rule that keeps the table the only one: no module under `src/` may hold a
   string literal equal to a display name, or join a vendor to a middle dot.
-  Per file: `test_widget.py` 161 (from 154), `test_azure.py` 244 (242),
-  `test_meter_catalog.py` 154 (148), `test_app.py` 79 (75),
-  `test_settings_dialog.py` 56 (54), `test_meter_discovery_js.py` 47 (44),
-  `test_openrouter.py` 40 (38), `test_docs_consistency.py` 27 (25),
-  `test_models.py` 9 (7), `test_config.py` 154 (unchanged).
+  Both halves of that rule are one predicate each now, called by the tests
+  that enforce them *and* by the test that proves they would fire - which is
+  what stops the self-test passing over a rule that has been loosened.
+  Per file: `test_config.py` 164 (from 154), `test_widget.py` 163 (154),
+  `test_azure.py` 244 (242), `test_meter_catalog.py` 157 (148),
+  `test_app.py` 82 (75), `test_settings_dialog.py` 60 (54),
+  `test_meter_discovery_js.py` 47 (44), `test_openrouter.py` 40 (38),
+  `test_docs_consistency.py` 27 (25), `test_menubar.py` 15 (14),
+  `test_models.py` 9 (7).
 - The dead `display_name` class attribute is gone from `providers/base.py` and
-  all six providers. Its only reader anywhere was one test assertion.
+  all six providers. Its only reader anywhere was one test assertion. So are
+  the two sign-in window titles that sat beside the login URLs: the window
+  composes its title from the account's display name and never read them.
 
 ## 1.4.0+cfa.8 - 2026-09-17
 

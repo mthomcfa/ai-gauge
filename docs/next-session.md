@@ -3,7 +3,7 @@
 State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#16,
 610 tests passing, all five providers reading.
 
-> **Updated 2026-09-18** by the naming release (`1.4.1+cfa.9`, 2 085 tests):
+> **Updated 2026-09-18** by the naming release (`1.4.1+cfa.9`, 2 109 tests):
 > every provider surface now names the company behind the product, from one
 > table (`src/aigauge/naming.py`) instead of the nine copies that had drifted
 > apart - `Anthropic · Claude`, `OpenAI · ChatGPT + Codex`, `Microsoft · Azure`,
@@ -28,6 +28,38 @@ State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#1
 > adopt a bare model name beside a longer one that simply had not painted yet.
 > The cost is one extra informational meter against the 24-meter ratchet, which
 > is the failure this direction was chosen for.
+>
+> **And four things it looked at and left as they are:**
+>
+> * **The relaxation is wider than "a renamed model row", and it is the page
+>   that decides.** The shield only holds while the longer label is among the
+>   labels the scan saw, so a page that simply omits it defeats the shield -
+>   and against the bundled Claude catalog that makes `Design`, `Claude` and
+>   `Daily` adoptable as well, each being a whole word inside a bundled label.
+>   A meter row labelled `Claude` can therefore appear inside a tile headed
+>   `Anthropic · Claude`. Bounded by `MAX_ADOPTED_METERS` (24) and by
+>   `primary=False`, so an adopted row can never take the tray colour.
+> * **A named extra account's collapsed chip shows the bare name.** A Claude
+>   account the user called "Microsoft · Azure" gets a chip reading exactly
+>   `Microsoft · Azure`, while the tile header, the tray line and the tooltip
+>   all keep the qualifier. Deliberate since 1.4.0: it is what stops a chip
+>   from wrapping and costing the collapsed panel a whole row. Composing
+>   `compact (name)` for every id instead would widen every chip, and the
+>   chip-row width rule is unchanged from 1.4.0, so it stays as it is until
+>   something else moves that rule.
+> * **Two named Codex accounts are indistinguishable on the panel at its
+>   260 px minimum.** `OpenAI · ChatGPT + Codex` and
+>   `OpenAI · ChatGPT + Codex (Work)` both paint as `OpenAI · ChatGPT + Co…`
+>   in the room the header gets; the tooltip and the collapsed chip tell them
+>   apart. `ElideRight` is what the header was specified with.
+>   `Qt.TextElideMode.ElideMiddle` would keep the bracketed identifier - the
+>   part the user chose - at the cost of the company prefix, which is the part
+>   this release added. An open question for the next release, not a change to
+>   make inside it.
+> * **`widget._session_summary_for` is dead code.** No caller anywhere in
+>   `src/` or `tests/`. Pre-existing, correct (it reads from
+>   `display_name_for_account`), and left alone to keep this diff to the
+>   release's subject.
 >
 > **Updated 2026-09-17** by the UI release (`1.4.0+cfa.8`, 2 024 tests): the
 > panel is resizable and remembers its size, every Settings tab scrolls, the
