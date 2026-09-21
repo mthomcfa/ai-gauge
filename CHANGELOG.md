@@ -152,15 +152,15 @@ nine copies. Patch rather than minor: nothing here is a new capability.
 
 ### Notes
 
-- 2 109 tests, from 2 024. `test_naming.py` is new (33), and it carries the
+- 2 119 tests, from 2 024. `test_naming.py` is new (33), and it carries the
   rule that keeps the table the only one: no module under `src/` may hold a
   string literal equal to a display name, or join a vendor to a middle dot.
   Both halves of that rule are one predicate each now, called by the tests
   that enforce them *and* by the test that proves they would fire - which is
   what stops the self-test passing over a rule that has been loosened.
-  Per file: `test_config.py` 164 (from 154), `test_widget.py` 163 (154),
-  `test_azure.py` 244 (242), `test_meter_catalog.py` 157 (148),
-  `test_app.py` 82 (75), `test_settings_dialog.py` 60 (54),
+  Per file: `test_config.py` 165 (from 154), `test_widget.py` 163 (154),
+  `test_azure.py` 244 (242), `test_meter_catalog.py` 164 (148),
+  `test_app.py` 83 (75), `test_settings_dialog.py` 61 (54),
   `test_meter_discovery_js.py` 47 (44), `test_openrouter.py` 40 (38),
   `test_docs_consistency.py` 27 (25), `test_menubar.py` 15 (14),
   `test_models.py` 9 (7).

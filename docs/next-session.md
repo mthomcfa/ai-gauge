@@ -3,7 +3,7 @@
 State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#16,
 610 tests passing, all five providers reading.
 
-> **Updated 2026-09-18** by the naming release (`1.4.1+cfa.9`, 2 109 tests):
+> **Updated 2026-09-18** by the naming release (`1.4.1+cfa.9`, 2 119 tests):
 > every provider surface now names the company behind the product, from one
 > table (`src/aigauge/naming.py`) instead of the nine copies that had drifted
 > apart - `Anthropic · Claude`, `OpenAI · ChatGPT + Codex`, `Microsoft · Azure`,
@@ -29,7 +29,7 @@ State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#1
 > The cost is one extra informational meter against the 24-meter ratchet, which
 > is the failure this direction was chosen for.
 >
-> **And four things it looked at and left as they are:**
+> **And seven things it looked at and left as they are:**
 >
 > * **The relaxation is wider than "a renamed model row", and it is the page
 >   that decides.** The shield only holds while the longer label is among the
@@ -72,6 +72,32 @@ State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#1
 >   `src/` or `tests/`. Pre-existing, correct (it reads from
 >   `display_name_for_account`), and left alone to keep this diff to the
 >   release's subject.
+> * **The 60-character bound can collide two display names, and Settings then
+>   refuses every save.** Two names for accounts of one kind that differ only
+>   past character 60 are the same name after the clip, and
+>   `_validate_browser_accounts` keys its uniqueness check on the display
+>   name - so `_accept` returns early and *nothing* in Settings can be saved,
+>   the refresh interval included, until one of the two is renamed. Narrow, and
+>   recoverable in the dialog that reports it; the accounts stay addressable
+>   throughout, because `_providers`, the tiles, the history keys and the
+>   profiles are all keyed on the id. The shortening now says so in the log,
+>   which is what it did not do before. Comparing the names before the clip, or
+>   keying the check on the id, is a change to the uniqueness rule and belongs
+>   in a release that is about that rule.
+> * **`BrowserAccount` has no `validate_assignment`.** The name bound is a
+>   `mode="before"` validator, so it runs on construction and on
+>   `Config.load()` but not on `account.name = "B" * 10_000` afterwards. No
+>   production path assigns the field - the Settings dialog builds a new
+>   account - so this is a hardening line (`model_config` with
+>   `validate_assignment=True`, plus a test) rather than a hole, and it was
+>   left out of a release that had no reason to touch the model's config.
+> * **`highest_indicator` breaks an exact tie on the order it is handed.**
+>   `gauge.py` compares `(rank, percent)` with a strict `>`, so the first
+>   provider in the list wins an exact tie, and this release reordered that
+>   list to the panel's order. Only `indicator.color` is read from the winner
+>   and an exact tie is by definition the same severity band, so the tray dot
+>   is the same colour either way - but which provider it came from can differ
+>   from 1.4.0's answer.
 >
 > **Updated 2026-09-17** by the UI release (`1.4.0+cfa.8`, 2 024 tests): the
 > panel is resizable and remembers its size, every Settings tab scrolls, the
