@@ -117,12 +117,13 @@ nine copies. Patch rather than minor: nothing here is a new capability.
   every provider label you supply, and it reaches surfaces with no layout to
   clip it: the tray tooltip is one plain string built by joining lines, and a
   collapsed chip is sized to its own text, so a 10 kB name asked for a chip
-  92 049 px wide and a 30 kB tooltip. Worse, a name carrying newlines wrote
-  its own lines into that tooltip, including a convincing second version
-  banner. The name is now collapsed to a single line and clipped to 60
-  characters where the field is, so the tile header, the tray line, the chip
-  and every window title inherit the one rule, and the Settings field stops
-  at the same number rather than accepting what would be silently shortened.
+  74 238 px wide and a tray tooltip of 20 131 characters. Worse, a name
+  carrying newlines wrote its own lines into that tooltip, including a
+  convincing second version banner. The name is now collapsed to a single
+  line and clipped to 60 characters where the field is, so the tile header,
+  the tray line, the chip and every window title inherit the one rule, and
+  the Settings field stops at the same number rather than accepting what
+  would be silently shortened.
 
 - **The tile header's tooltip is shown as written, and clipped.** `QToolTip`
   has no text-format setter - Qt reads the first line and decides - so a

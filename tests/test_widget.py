@@ -1118,7 +1118,7 @@ def test_compact_metrics_receive_account_colors(qtbot):
 
 def test_a_chip_is_no_wider_for_a_ten_kilobyte_name_than_for_a_long_one(qtbot):
     """The chip is `setFixedWidth(fm.horizontalAdvance(text) + 18)`, so its
-    width is the name's length in pixels - 92 049 of them for a 10 kB name,
+    width is the name's length in pixels - 74 238 of them for a 10 kB name,
     against a panel whose minimum is 260. Nothing is clamped here: the name
     arrives already bounded, which is the whole point of bounding it once at
     the field instead of at each surface that renders one."""

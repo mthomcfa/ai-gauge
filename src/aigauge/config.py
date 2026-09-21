@@ -106,7 +106,7 @@ _PROFILE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,%d}" % _PROFILE_ID_MAX_LEN)
 # name, `compact_name_for_account` onto a compact one, and both of those go on
 # to surfaces with no layout to clip them: the tray tooltip is a joined plain
 # string, and the collapsed chip is `setFixedWidth(fm.horizontalAdvance(text))`,
-# which a 10 kB name asked 92 049 px for.
+# which a 10 kB name asked 74 238 px for.
 #
 # Sixty, the same number as ``models.MAX_DISPLAY_LABEL_CHARS`` and for the same
 # reason - a name shares a line with a provider name and a percentage. The
