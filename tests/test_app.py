@@ -12,7 +12,13 @@ from aigauge.app import (
     _snapshot_signature,
 )
 from aigauge import naming
-from aigauge.config import BrowserAccount, Config
+from aigauge.config import (
+    ACCOUNT_NAME_MAX_CHARS,
+    BrowserAccount,
+    Config,
+    compact_name_for_account,
+    display_name_for_account,
+)
 from aigauge.models import (
     MAX_DISPLAY_LABEL_CHARS,
     SnapshotStatus,
@@ -366,6 +372,61 @@ def test_enabled_providers_includes_enabled_browser_accounts():
     )
 
 
+
+
+def test_the_tray_and_the_menu_bar_read_the_providers_in_the_panels_order(qtbot):
+    """One order, everywhere the user counts providers off.
+
+    The panel stacks its tiles in `naming.KINDS` and Settings lists its tabs
+    in it; the tray tooltip and the macOS menu bar used to read a different
+    one, left over from the order `_enabled_providers` happened to append in.
+    Nothing but display depends on it - the refresh order is
+    `_refresh_provider_order` over the providers `_build_providers` made, and
+    that is asserted separately - so the two surfaces follow the panel.
+    """
+    from aigauge.menubar import status_items
+    from aigauge.widget import UsageWidget
+
+    config = Config()
+    config.providers.openrouter = True
+    config.providers.azure = True
+    config.providers.opencode_go = True
+    config.browser_accounts.append(
+        BrowserAccount(id="claude-3f9a12cd", kind="claude", name="Work")
+    )
+    config.browser_accounts.append(
+        BrowserAccount(id="codex-work", kind="codex", name="Work")
+    )
+    enabled = _enabled_providers(config)
+    assert len(enabled) == 8, enabled
+
+    panel = UsageWidget(config)
+    qtbot.addWidget(panel)
+    for provider in enabled:
+        panel.ensure_tile(provider, display_name_for_account(config, provider))
+    tile_order = sorted(panel._tiles, key=panel._tile_sort_key)  # noqa: SLF001
+    assert list(enabled) == tile_order
+
+    fetched = datetime(2026, 4, 27, 12, 0)
+    snapshots = {
+        provider: UsageSnapshot(
+            provider=provider,
+            status=SnapshotStatus.OK,
+            metrics=[UsageMetric("Session", 10.0, fetched)],
+            fetched_at=fetched,
+        )
+        for provider in enabled
+    }
+    app = _tray_app(config, snapshots)
+    app._update_tray()  # noqa: SLF001
+
+    assert app._tray.tooltip.splitlines()[1:] == [  # noqa: SLF001
+        f"{compact_name_for_account(config, provider)} Session: 10%"
+        for provider in tile_order
+    ]
+    assert [label for label, _value, _color in status_items(snapshots, enabled)] == [
+        naming.abbrev(provider) for provider in tile_order
+    ]
 
 
 def test_enabled_providers_includes_opencode_go_when_enabled():
@@ -1487,6 +1548,37 @@ def _provider_app(config: Config) -> App:
     return app
 
 
+def test_every_tile_header_is_its_providers_full_name():
+    """The header is the surface this scheme exists for, so it is pinned
+    where it is composed.
+
+    `_display_names`/`mark_loading` was already covered, which left the
+    loading state guarded and the state that replaces it unguarded - the
+    inverse of the arrangement anyone would choose. One dict, every provider
+    plus a named extra account, read from `naming` rather than retyped: the
+    table itself is pinned literally in `test_naming.py`, and this says the
+    five `ensure_tile` calls use it.
+    """
+    config = Config()
+    config.providers.openrouter = True
+    config.providers.azure = True
+    config.providers.opencode_go = True
+    config.browser_accounts.append(
+        BrowserAccount(id="claude-3f9a12cd", kind="claude", name="Work")
+    )
+    app = _provider_app(config)
+
+    assert app._widget._tiles == {  # noqa: SLF001
+        "claude": naming.full("claude"),
+        "codex": naming.full("codex"),
+        "claude-3f9a12cd": naming.account_label("claude", "Work"),
+        "copilot": naming.full("copilot"),
+        "azure": naming.full("azure"),
+        "openrouter": naming.full("openrouter"),
+        "opencode_go": naming.full("opencode_go"),
+    }
+
+
 def test_a_settings_save_keeps_the_provider_objects_it_did_not_change():
     """`_build_providers` runs on every settings save, colour-only included.
 
@@ -2099,3 +2191,45 @@ def test_the_tray_tooltip_shows_markup_rather_than_interpreting_it(qapp):
 
     assert f"Claude {label}: 50%" in app._tray.tooltip  # noqa: SLF001
     assert "&lt;" not in app._tray.tooltip  # noqa: SLF001
+
+
+def test_the_tray_tooltip_bounds_the_half_of_a_line_the_user_wrote(qapp):
+    """Both halves, or neither. The provider's label is clipped as it is
+    interpolated; the account's name is clipped at the field it comes from -
+    and until it was, one 10 kB name made a 10 022-character line and a
+    30 084-character tooltip out of a surface with no layout at all.
+
+    The ceiling is the two bounds plus room for everything the app writes
+    around them, not a count taken from this machine.
+    """
+    config = Config()
+    config.browser_accounts.append(
+        BrowserAccount(id="claude-3f9a12cd", kind="claude", name="N" * 10_000)
+    )
+    fetched = datetime(2026, 4, 27, 12, 0)
+    snapshots = {
+        "claude-3f9a12cd": UsageSnapshot(
+            provider="claude-3f9a12cd",
+            status=SnapshotStatus.OK,
+            metrics=[
+                UsageMetric("R" * 200_000, 50.0, fetched),
+                UsageMetric("Weekly", 21.0, fetched),
+            ],
+            fetched_at=fetched,
+        ),
+        "codex": UsageSnapshot(
+            provider="codex",
+            status=SnapshotStatus.ERROR,
+            metrics=[],
+            error="boom",
+            fetched_at=fetched,
+        ),
+    }
+    app = _tray_app(config, snapshots)
+
+    app._update_tray()  # noqa: SLF001
+
+    ceiling = ACCOUNT_NAME_MAX_CHARS + MAX_DISPLAY_LABEL_CHARS + 80
+    lines = app._tray.tooltip.splitlines()  # noqa: SLF001
+    assert len(lines) >= 4, lines
+    assert all(len(line) <= ceiling for line in lines), max(lines, key=len)
