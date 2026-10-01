@@ -741,7 +741,7 @@ class _SummaryChip(QWidget):
 
 
 class _ElidingLabel(QLabel):
-    """A label that gives up its tail rather than the window's width.
+    """A label that gives up its middle rather than the window's width.
 
     ``QLabel.minimumSizeHint`` is the width of the whole text, so a tile header
     is a floor on how narrow the panel's content can be. Measured offscreen at
@@ -753,9 +753,18 @@ class _ElidingLabel(QLabel):
 
     Widening ``WINDOW_MIN_WIDTH`` would spend the user's screen on a name. The
     header is the one element on that row that can lose characters without
-    losing a control - the four buttons are ``setFixedSize`` - so it elides from
-    the right and the full name moves into the tooltip. ``text()`` still answers
-    with the full name; only what is painted is shortened.
+    losing a control - the four buttons are ``setFixedSize`` - so it elides and
+    the full name moves into the tooltip. ``text()`` still answers with the full
+    name; only what is painted is shortened.
+
+    From the middle, because both ends carry something the reader needs. The
+    start is the company and product; the end is the bracketed name of a second
+    account. Eliding from the right dropped the end first, so "OpenAI · ChatGPT +
+    Codex" and "OpenAI · ChatGPT + Codex (Work)" both painted as "OpenAI ·
+    ChatGPT + Co…" at the panel's minimum width and two accounts were the same
+    tile until hovered. One rule for every header, named or not: a special case
+    keyed on a bracket would be a second behaviour to explain for a saving of a
+    few characters on headers that already fit at the default width.
     """
 
     # Enough for a short name and an ellipsis at the header's 12 px bold. Below
@@ -804,7 +813,7 @@ class _ElidingLabel(QLabel):
         try:
             width = max(0, self.width())
             elided = self.fontMetrics().elidedText(
-                self._full_text, Qt.TextElideMode.ElideRight, width
+                self._full_text, Qt.TextElideMode.ElideMiddle, width
             )
             QLabel.setText(self, elided)
             # Only when something was actually dropped: a tooltip repeating a
