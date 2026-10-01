@@ -8,6 +8,17 @@ import pytest
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
+# Headless unless told otherwise, before anything below can create a
+# QApplication. The suite is written against Qt's offscreen platform, which is
+# what CI runs: one 800 x 800 screen, no window manager, a fixed font, and a
+# QWindow.startSystemResize() that declines so the drag arithmetic is the path
+# under test. On a real desktop several of those stop holding - Windows takes
+# the resize itself, a 2560 px monitor is wider than a test that relies on the
+# small screen expects, real fonts fit labels the tests need to overflow - and a
+# plain `pytest` failed seven tests that pass in CI, none of them a defect in
+# the app. setdefault, so a run that names a platform still gets it.
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 # Imported at collection time, on purpose: the scrape runner pulls in
 # QtWebEngineWidgets, which Qt requires to be imported before the first
 # QCoreApplication exists. A full run satisfies that by accident (test_app.py
