@@ -43,7 +43,9 @@ one was a test that assumed the machine runs in UTC.
   the bar counts to that local instant. One test built the row without naming a
   zone and asserted `resets 1 Oct`, so it passed in CI and east of it and failed
   everywhere in the Americas. It now names UTC, as its two neighbours already
-  name theirs.
+  name theirs. The full suite then passes unchanged in UTC, UTC+14, UTC-11,
+  UTC+5:30, St John's (UTC-2:30) and Toronto: no other test depends on the
+  zone.
 - **CI now runs one leg outside UTC.** Every runner is in UTC, which is how that
   test passed for a month. Ubuntu / Python 3.11 now runs in
   `America/St_Johns` - west of UTC and off the hour - and the other five legs
