@@ -2985,8 +2985,17 @@ def test_the_summary_label_is_stable_as_spend_changes():
 
 def test_the_amounts_stay_visible_on_the_row():
     """Moving the money out of the label must not move it out of the tile:
-    reset_label is what the row renders inline, next to the bar."""
-    snapshot = az.build_snapshot(_aggregate(), AzureConfig(monthly_allowance=150.0))
+    reset_label is what the row renders inline, next to the bar.
+
+    In UTC, named rather than inherited. The printed day is the period boundary
+    in the machine's local time, which is the point of the two tests above -
+    so without a zone this asserted "1 Oct" and passed only where the boundary
+    falls on the 1st: in CI and east of it, and nowhere in the Americas, where
+    the same instant is the evening of the 30th.
+    """
+    snapshot = az.build_snapshot(
+        _aggregate(), AzureConfig(monthly_allowance=150.0), local_tz=timezone.utc
+    )
     summary = snapshot.metrics[0]
     assert summary.reset_label == "CAD 36.10 of 150.00 · resets 1 Oct"
 
