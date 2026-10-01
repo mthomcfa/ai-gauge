@@ -3,7 +3,7 @@
 State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#16,
 610 tests passing, all five providers reading.
 
-> **Updated 2026-09-18** by the naming release (`1.4.1+cfa.9`, 2 119 tests):
+> **Updated 2026-09-18** by the naming release (`1.4.1+cfa.9`, 2 125 tests):
 > every provider surface now names the company behind the product, from one
 > table (`src/aigauge/naming.py`) instead of the nine copies that had drifted
 > apart - `Anthropic · Claude`, `OpenAI · ChatGPT + Codex`, `Microsoft · Azure`,
@@ -62,15 +62,13 @@ State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#1
 >   `compact (name)` for every id instead would widen every chip, and the
 >   chip-row width rule is unchanged from 1.4.0, so it stays as it is until
 >   something else moves that rule.
-> * **Two named Codex accounts are indistinguishable on the panel at its
->   260 px minimum.** `OpenAI · ChatGPT + Codex` and
->   `OpenAI · ChatGPT + Codex (Work)` both paint as `OpenAI · ChatGPT + Co…`
->   in the room the header gets; the tooltip and the collapsed chip tell them
->   apart. `ElideRight` is what the header was specified with.
->   `Qt.TextElideMode.ElideMiddle` would keep the bracketed identifier - the
->   part the user chose - at the cost of the company prefix, which is the part
->   this release added. An open question for the next release, not a change to
->   make inside it.
+> * **Two named Codex accounts were indistinguishable on the panel at its
+>   260 px minimum** - *closed in 1.4.2+cfa.10.* `OpenAI · ChatGPT + Codex` and
+>   `OpenAI · ChatGPT + Codex (Work)` both painted as `OpenAI · ChatGPT + Co…`
+>   because the header elided from the right, which drops the bracketed name
+>   first. Headers now elide from the middle, every one of them: decided by
+>   the user over a variant that would have applied it only to named accounts,
+>   on the grounds that one rule is easier to live with than two.
 > * **`widget._session_summary_for` is dead code.** No caller anywhere in
 >   `src/` or `tests/`. Pre-existing, correct (it reads from
 >   `display_name_for_account`), and left alone to keep this diff to the

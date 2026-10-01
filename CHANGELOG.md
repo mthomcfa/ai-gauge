@@ -6,6 +6,52 @@
 > earlier `0.6.4` entry predates that convention and **is not** upstream's
 > `v0.6.4`, which is different code.
 
+## 1.4.2+cfa.10 - 2026-10-01
+
+A patch release that came out of the first install of 1.4.1 on a real desktop.
+The suite failed seven tests there that pass in CI, and none of them was a
+defect in the app: six were a suite that assumes the platform CI gives it, and
+one was a test that assumed the machine runs in UTC.
+
+### Changed
+
+- **Tile headers elide from the middle.** A header too long for its tile used
+  to lose its end, and the end is where a second account's name is:
+  `OpenAI · ChatGPT + Codex` and `OpenAI · ChatGPT + Codex (Work)` both painted
+  as `OpenAI · ChatGPT + Co…` at the panel's minimum width, so two accounts were
+  the same tile until hovered. Now both ends survive -
+  `OpenAI · Ch…dex (Work)` - and so does the company. It applies to every
+  header, named or not; a rule keyed on the bracket would have been a second
+  behaviour to explain, for a few characters saved on headers that already fit
+  at the default width. The full name is still in the tooltip.
+
+### Fixed
+
+- **`pytest` on a desktop behaves as it does in CI.** CI sets
+  `QT_QPA_PLATFORM=offscreen`; nothing else did, and the README's test command
+  did not mention it. On a desktop the suite therefore ran on the real
+  platform, where several things it is written against stop being true: the
+  screen is a monitor rather than 800 x 800, the window manager takes a resize
+  drag itself instead of letting the app compute it, and real fonts fit labels
+  the tests need to overflow. `conftest.py` now defaults the platform to
+  `offscreen` before anything can create a `QApplication`; a run that names a
+  platform still gets it. With the variable unset on a machine with no display,
+  the suite used to abort inside Qt and now passes.
+- **A test assumed it ran in UTC.** The Azure tile prints the day its period
+  resets in local time, which is deliberate: the boundary is midnight UTC on
+  the 1st, which is the evening of the 30th in Toronto, and the countdown beside
+  the bar counts to that local instant. One test built the row without naming a
+  zone and asserted `resets 1 Oct`, so it passed in CI and east of it and failed
+  everywhere in the Americas. It now names UTC, as its two neighbours already
+  name theirs.
+- **CI now runs one leg outside UTC.** Every runner is in UTC, which is how that
+  test passed for a month. Ubuntu / Python 3.11 now runs in
+  `America/St_Johns` - west of UTC and off the hour - and the other five legs
+  are unchanged.
+- **1.4.1's notes counted 2 119 tests**; the release shipped 2 125, and
+  `test_meter_catalog.py` 170. The count was written before the last fix in that
+  release added six cases.
+
 ## 1.4.1+cfa.9 - 2026-09-18
 
 Presentation, plus two small bounds and two catalog fixes. Every provider
@@ -154,14 +200,14 @@ nine copies. Patch rather than minor: nothing here is a new capability.
 
 ### Notes
 
-- 2 119 tests, from 2 024. `test_naming.py` is new (33), and it carries the
+- 2 125 tests, from 2 024. `test_naming.py` is new (33), and it carries the
   rule that keeps the table the only one: no module under `src/` may hold a
   string literal equal to a display name, or join a vendor to a middle dot.
   Both halves of that rule are one predicate each now, called by the tests
   that enforce them *and* by the test that proves they would fire - which is
   what stops the self-test passing over a rule that has been loosened.
   Per file: `test_config.py` 165 (from 154), `test_widget.py` 163 (154),
-  `test_azure.py` 244 (242), `test_meter_catalog.py` 164 (148),
+  `test_azure.py` 244 (242), `test_meter_catalog.py` 170 (148),
   `test_app.py` 83 (75), `test_settings_dialog.py` 61 (54),
   `test_meter_discovery_js.py` 47 (44), `test_openrouter.py` 40 (38),
   `test_docs_consistency.py` 27 (25), `test_menubar.py` 15 (14),

@@ -21,7 +21,7 @@ Compact monitor for **Anthropic · Claude**, **OpenAI · ChatGPT + Codex**, **Mi
 
 > **Requires Python 3.11+.** Secrets live in the OS-native credential store (Windows Credential Manager / DPAPI, macOS Keychain, Linux Secret Service). Auto-start uses the platform's standard mechanism (Windows Task Scheduler / LaunchAgent / `~/.config/autostart`).
 
-Current version: **1.4.1+cfa.9** — a fork version, see [Versioning](#versioning). Release notes in [CHANGELOG.md](CHANGELOG.md).
+Current version: **1.4.2+cfa.10** — a fork version, see [Versioning](#versioning). Release notes in [CHANGELOG.md](CHANGELOG.md).
 
 AI Gauge is an independent open-source project and unofficial local desktop
 utility. It is not affiliated with Anthropic, OpenAI, GitHub, Microsoft,
@@ -67,7 +67,7 @@ Binaries are published on **[this fork's Releases page](https://github.com/mthom
 | macOS   | `ai-gauge-<file-version>-macos.tar.gz`      | **Apple Silicon only.** Extract, drag `ai-gauge.app` to Applications |
 | Linux   | `ai-gauge-<file-version>-linux.tar.gz`      | extract, run `./ai-gauge/ai-gauge`           |
 
-`<file-version>` is the version with `+` replaced by `-`, so `1.4.1+cfa.9` ships as `ai-gauge-1.4.1-cfa.9-windows.zip`. Print it with `python tools/check_versions.py`.
+`<file-version>` is the version with `+` replaced by `-`, so `1.4.2+cfa.10` ships as `ai-gauge-1.4.2-cfa.10-windows.zip`. Print it with `python tools/check_versions.py`.
 
 **Intel Macs are not covered by the prebuilt archive.** PyInstaller builds for the host architecture and this fork's CI runs on Apple Silicon, so the `.app` is arm64-only. Intel users should [run from source](#run-from-source); the menu-bar UI works identically.
 
@@ -471,6 +471,8 @@ Known open items, deliberate non-fixes and the reasoning behind past decisions a
 ./.venv/bin/python -m pytest            # macOS / Linux
 ```
 
+The suite runs headless - on Qt's `offscreen` platform, the same one CI uses - unless `QT_QPA_PLATFORM` says otherwise, so a run on a desktop does not open windows and gets the answers CI gets. It is written against that platform: a fixed 800 x 800 screen, no window manager, and window drags the app computes itself rather than handing to the OS. Name a real platform (`$env:QT_QPA_PLATFORM = "windows"`) and a handful of tests that depend on those facts will fail without anything being wrong with the app.
+
 Tests cover: config round-trip, Copilot and OpenRouter REST helpers (with mocked HTTP), widget behavior, and snapshot models. Provider scrapers (Claude/Codex) require a live browser session and are validated manually.
 
 ## Relationship to upstream
@@ -500,10 +502,10 @@ That also means **upstream cannot support this build**, and bugs here may not ex
 Fork releases use a [PEP 440](https://peps.python.org/pep-0440/) local version segment:
 
 ```
-1.4.1+cfa.9
-└─┬─┘ └─┬─┘
-  │     └── fork build counter — identifies this as a fork build
-  └──────── this fork's own release counter, NOT an upstream release number
+1.4.2+cfa.10
+└─┬─┘ └──┬─┘
+  │      └── fork build counter — identifies this as a fork build
+  └───────── this fork's own release counter, NOT an upstream release number
 ```
 
 **The number before `+` does not mean "equivalent to upstream X."** This fork's `0.6.4` was built from upstream v0.6.3, while upstream separately shipped its own, unrelated `v0.6.4`; upstream also has a `v0.6.5`. The `+cfa.N` segment is what makes a fork build unambiguous, so always quote the full string in a bug report. The exact upstream commit this tree descends from is recorded in `pyproject.toml` under `[tool.ai-gauge-audit]`, and the app shows the full version in its panel header, its tray tooltip, and the `app_version` field of **Copy diagnostics**.
