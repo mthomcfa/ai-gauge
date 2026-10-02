@@ -2533,6 +2533,40 @@ def test_the_forecast_note_states_the_projection_not_the_bar():
     assert "100% of allowance" not in (forecast.note or "")
 
 
+def test_a_component_billed_in_two_currencies_prints_no_figure():
+    """A bucket is a service, not a service and a currency, so a service
+    billed in both added yen to dollars: JPY 4,980 and CAD 8.05 printed as
+    4,988.05, on the row and in its tooltip."""
+    snapshot = az.build_snapshot(
+        _aggregate(
+            total=4988.05 + 13.60,
+            currency="",
+            mixed_currency=True,
+            currency_totals=[("CAD", 21.65), ("JPY", 4980.0)],
+            buckets=[("Azure OpenAI", 4988.05), ("Storage", 13.60)],
+        ),
+        AzureConfig(monthly_allowance=150.0),
+    )
+    breakdown = [m for m in snapshot.metrics if m.tag == az.BREAKDOWN_TAG]
+    assert breakdown
+    for row in breakdown:
+        assert row.reset_label == "mixed currencies"
+        assert "4,988.05" not in (row.note or "")
+        assert "currenc" in (row.note or "").lower()
+
+
+def test_a_component_on_a_truncated_read_says_its_amount_is_so_far():
+    """The summary row says "incomplete"; a component printed as a plain
+    amount one row down said the opposite."""
+    snapshot = az.build_snapshot(
+        _aggregate(partial=True), AzureConfig(monthly_allowance=150.0)
+    )
+    breakdown = [m for m in snapshot.metrics if m.tag == az.BREAKDOWN_TAG]
+    assert breakdown
+    for row in breakdown:
+        assert (row.reset_label or "").endswith(" so far")
+        assert (row.reset_label or "").startswith("CAD ")
+
 
 def test_more_than_three_currencies_are_summarised_not_listed():
     snapshot = az.build_snapshot(

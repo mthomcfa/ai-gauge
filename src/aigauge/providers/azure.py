@@ -894,9 +894,22 @@ def build_snapshot(
             if gaugeable and total > 0
             else None
         )
+        # What the row may say about this component's money. A bucket is keyed
+        # by service, not by service and currency, so in a period billed in
+        # more than one currency its cost is every currency's charges for that
+        # service added together - JPY 4,980 and CAD 8.05 printed as
+        # "4,988.05" - and no figure for it is honest. A truncated read is the
+        # other case: the summary says "incomplete", and a component printed
+        # as a plain amount said the opposite one row down.
+        if aggregate.mixed_currency:
+            amount_text = "mixed currencies"
+        elif aggregate.partial:
+            amount_text = f"{_money(cost, currency)} so far"
+        else:
+            amount_text = _money(cost, currency)
         if name == FOUNDRY_BUCKET:
             note = (
-                f"{_money(cost, currency)} across "
+                f"{amount_text} across "
                 f"{aggregate.foundry_resource_count} Foundry resource"
                 f"{'' if aggregate.foundry_resource_count == 1 else 's'}. "
                 "Foundry bills per token to this subscription, so this is part "
@@ -904,11 +917,11 @@ def build_snapshot(
             )
         elif name == MARKETPLACE_BUCKET:
             note = (
-                f"{_money(cost, currency)}. Marketplace model charges bill "
+                f"{amount_text}. Marketplace model charges bill "
                 "outside the Foundry resource, at resource-group level."
             )
         else:
-            note = _money(cost, currency)
+            note = amount_text
             if len(name) > LABEL_MAX_LEN:
                 note = f"{name}\n{note}"
         if aggregate.mixed_currency:
@@ -934,7 +947,7 @@ def build_snapshot(
                 # billing currency code, which _fetch clips to CURRENCY_MAX_LEN.
                 # No provider string is interpolated into it; the service name
                 # stays in `label`, where _truncate bounds it.
-                reset_label=_money(cost, currency),
+                reset_label=amount_text,
                 note=note,
                 tag=BREAKDOWN_TAG,
             )
