@@ -11,9 +11,21 @@
 A patch release that came out of the first install of 1.4.1 on a real desktop.
 The suite failed seven tests there that pass in CI, and none of them was a
 defect in the app: six were a suite that assumes the platform CI gives it, and
-one was a test that assumed the machine runs in UTC.
+one was a test that assumed the machine runs in UTC. Using the app turned up
+one more thing - the Azure forecast row had a percentage and no amount - and
+looking at that row turned up three more.
 
 ### Changed
+
+- **Azure's forecast row shows the projected amount, in its bar's colour.** The
+  row said where the month would end as a share of the allowance - 47% - and
+  nothing about what that costs, while the spend row above it carries both.
+  It now carries `~CAD 71.00` in the right-hand column, and that figure is the
+  one on the tile painted in its bar's own colour, so it reads as the amount the
+  bar is measuring: green, yellow, orange or red, by the account's own gauge
+  bands. The bar and the figure take the same colour string, so they cannot
+  disagree. A new `UsageMetric.reset_label_tinted` flag carries the request;
+  nothing else sets it.
 
 - **Tile headers elide from the middle.** A header too long for its tile used
   to lose its end, and the end is where a second account's name is:
@@ -46,6 +58,20 @@ one was a test that assumed the machine runs in UTC.
   name theirs. The full suite then passes unchanged in UTC, UTC+14, UTC-11,
   UTC+5:30, St John's (UTC-2:30) and Toronto: no other test depends on the
   zone.
+- **The forecast's tooltip printed the bar, not the projection.** The bar stops
+  at 100%; the note used the same clamped figure, so a forecast of 260.00
+  against an allowance of 150.00 read "(100% of allowance)" - in the tooltip of
+  a row that now prints `~CAD 260.00`. It says 173%.
+- **An Azure component billed in two currencies printed their sum.** Cost
+  Management's rows are grouped by service, not by service and currency, so in
+  a period billed in more than one currency a service charged in both had its
+  yen and its dollars added: JPY 4,980 and CAD 8.05 printed as `4,988.05`, on
+  the row and in its tooltip. The tile already refused to gauge such a period;
+  the component rows now say `mixed currencies` instead of a figure.
+- **A truncated read printed component amounts as totals.** When Cost
+  Management's paging could not be finished the spend row says `incomplete`,
+  and the rows under it printed plain amounts one line down. They now end in
+  `so far`.
 - **CI now runs one leg outside UTC.** Every runner is in UTC, which is how that
   test passed for a month. Ubuntu / Python 3.11 now runs in
   `America/St_Johns` - west of UTC and off the hour - and the other five legs
