@@ -961,6 +961,8 @@ class _MetricRow(QWidget):
         reset_label: str | None = None,
         note: str | None = None,
         window: timedelta | None = None,
+        *,
+        tint_reset: bool = False,
     ) -> None:
         # Reset to flexible width; group alignment in _set_rows may pin it after.
         self.label.setMinimumWidth(70)
@@ -1006,6 +1008,11 @@ class _MetricRow(QWidget):
             f"QProgressBar {{ background:#374151; border:none; border-radius:3px; }}"
             f"QProgressBar::chunk {{ background:{color}; border-radius:3px; }}"
         )
+        if tint_reset and percent is not None and not split_note:
+            # The same colour string the chunk was just given, so the amount
+            # and the bar cannot drift apart - including under a user's own
+            # gauge colours, which is what _colors carries.
+            self.reset.setStyleSheet(f"color: {color}; font-size: 10px;")
         if split_note:
             self.reset.setText(right)
             self.reset.setVisible(True)
@@ -1472,6 +1479,7 @@ class _ProviderTile(QFrame):
                         m.note,
                         m.window,
                         m.tag,
+                        m.reset_label_tinted,
                     )
                     for m in visible
                 ]
@@ -1514,6 +1522,7 @@ class _ProviderTile(QFrame):
                     m.note,
                     m.window,
                     m.tag,
+                    m.reset_label_tinted,
                 )
                 for m in visible
             ]
@@ -1612,6 +1621,7 @@ class _ProviderTile(QFrame):
                 str | None,
                 timedelta | None,
                 str | None,
+                bool,
             ]
         ],
     ) -> None:
@@ -1627,12 +1637,14 @@ class _ProviderTile(QFrame):
             r.setParent(None)
             r.deleteLater()
         grouped: dict[str, list[QLabel]] = {}
-        for row, (label, pct, reset, reset_label, note, window, tag) in zip(
+        for row, (label, pct, reset, reset_label, note, window, tag, tinted) in zip(
             self._rows,
             rows,
         ):
             row._colors = self._colors  # noqa: SLF001 - same-module collaborator
-            row.set_metric(label, pct, reset, reset_label, note, window)
+            row.set_metric(
+                label, pct, reset, reset_label, note, window, tint_reset=tinted
+            )
             if tag and pct is not None:
                 grouped.setdefault(tag, []).append(row.label)
         for labels in grouped.values():

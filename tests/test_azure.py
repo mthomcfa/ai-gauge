@@ -2501,6 +2501,39 @@ def test_mixed_currencies_are_shown_as_subtotals_not_as_a_sum():
     assert "Forecast end of month" not in [m.label for m in snapshot.metrics]
 
 
+
+def test_the_forecast_row_carries_its_projected_amount_in_the_bars_colour():
+    """The projected spend sits in the row's right-hand column, as the spend
+    row's own amount does, and it is the one row whose figure is painted like
+    its bar - the amount is what the bar is a share of the allowance of."""
+    snapshot = az.build_snapshot(
+        _aggregate(forecast_total=71.0), AzureConfig(monthly_allowance=150.0)
+    )
+    rows = {m.label: m for m in snapshot.metrics}
+    forecast = rows["Forecast end of month"]
+    assert forecast.reset_label == "~CAD 71.00"
+    assert forecast.reset_label_tinted is True
+    assert [m.label for m in snapshot.metrics if m.reset_label_tinted] == [
+        "Forecast end of month"
+    ]
+
+
+def test_the_forecast_note_states_the_projection_not_the_bar():
+    """The bar stops at 100; what the month is heading for does not. The
+    note printed the clamped figure, so 260.00 against 150.00 read "(100% of
+    allowance)" beside an amount that said otherwise."""
+    snapshot = az.build_snapshot(
+        _aggregate(total=180.0, forecast_total=260.0),
+        AzureConfig(monthly_allowance=150.0),
+    )
+    forecast = {m.label: m for m in snapshot.metrics}["Forecast end of month"]
+    assert forecast.percent_used == 100.0
+    assert forecast.reset_label == "~CAD 260.00"
+    assert "(173% of allowance)" in (forecast.note or "")
+    assert "100% of allowance" not in (forecast.note or "")
+
+
+
 def test_more_than_three_currencies_are_summarised_not_listed():
     snapshot = az.build_snapshot(
         _aggregate(

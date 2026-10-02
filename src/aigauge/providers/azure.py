@@ -955,15 +955,27 @@ def build_snapshot(
         # rows in currencies that cannot be added, is not a projection of
         # anything the row above it shows. (The number stays in the
         # diagnostics payload, which is where a bug report needs it.)
-        forecast_share = max(0.0, min(100.0, forecast_total / allowance * 100.0))
+        # The bar is clamped for display, like every other row; the note says
+        # what the projection actually is. It printed the clamped figure, so a
+        # forecast of 260.00 against 150.00 read "(100% of allowance)" in the
+        # tooltip of a row whose amount says otherwise.
+        forecast_percent = forecast_total / allowance * 100.0
+        forecast_projected = f"~{_money(forecast_total, currency)}"
         metrics.append(
             UsageMetric(
                 label="Forecast end of month",
-                percent_used=forecast_share,
+                percent_used=max(0.0, min(100.0, forecast_percent)),
+                # The projected amount on the row, as the spend row carries
+                # its own: a percentage of the allowance says how close the
+                # month will run, the amount says what it will cost. Painted in
+                # the bar's colour, so the figure reads as the thing the bar
+                # measures. Composed here from a float and the billing
+                # currency code, which _fetch clips to CURRENCY_MAX_LEN.
+                reset_label=forecast_projected,
+                reset_label_tinted=True,
                 note=(
-                    f"~{_money(forecast_total, currency)} projected by "
-                    "Cost Management for the full period"
-                    + (f" ({forecast_share:.0f}% of allowance)." if forecast_share is not None else ".")
+                    f"{forecast_projected} projected by Cost Management for "
+                    f"the full period ({forecast_percent:.0f}% of allowance)."
                 ),
                 tag=BREAKDOWN_TAG,
             )
