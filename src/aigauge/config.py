@@ -52,6 +52,14 @@ WINDOW_MIN_HEIGHT = 80
 # instead and leaves the rest to the clamp at show time.
 WINDOW_AUTOFIT_MAX_HEIGHT = 420
 WINDOW_MAX_DIMENSION = 4096
+# The sanity bound on a saved position, either sign: left of or above the
+# primary monitor is negative. A desktop is a few thousand pixels per monitor,
+# so this is far outside any real one and far inside the C int that QPoint
+# takes - past that, PyQt raises OverflowError while the panel is being built -
+# with room left for the size, since Qt works out a right edge as
+# x + width - 1.
+# Anything inside it that is off every screen is pulled back on at show time.
+WINDOW_MAX_POSITION = 32767
 WINDOW_COLLAPSED_HEIGHT = 58
 
 # Per-provider session cookie names (HttpOnly cookies you can't read via JS).
@@ -224,10 +232,19 @@ class WindowState(BaseModel):
     420. Both are now whatever the user dragged the window to, and
     ``user_sized`` is what says whether they have.
 
-    Bounded, never trusted: these reach ``QWidget.resize`` and a config file is
-    hand-editable. The bound here is a sanity bound rather than the real one -
-    the loader cannot know which monitor the window will open on, so it caps at
-    4096 and the widget clamps to that screen's work area at show time.
+    Bounded, never trusted: these reach ``QWidget.resize`` and ``move`` and a
+    config file is hand-editable. The bound here is a sanity bound rather than
+    the real one - the loader cannot know which monitor the window will open on,
+    so it caps a size at 4096 and a position at +/-32767, and the widget clamps
+    to that screen's work area at show time.
+
+    ``x`` and ``y`` were the two left unbounded until 1.4.3+cfa.11. A position
+    past the C int that ``QPoint`` takes raised ``OverflowError`` inside
+    ``App()``, so the app failed at every start until the file was edited; a
+    fractional or non-numeric one raised in here instead, and the salvage in
+    ``Config.load()`` discarded the whole window block with it. So did an
+    unreadable ``collapsed``, ``always_on_top`` or ``fade_when_inactive``:
+    every field here now coerces, so one bad value costs only that value.
     """
 
     x: int | None = None
@@ -258,6 +275,27 @@ class WindowState(BaseModel):
         # Anything but a real bool is a file this app did not write; the safe
         # reading of it is "no", which leaves auto-fit on.
         return value if isinstance(value, bool) else False
+
+    @field_validator("collapsed", "always_on_top", "fade_when_inactive", mode="before")
+    @classmethod
+    def _coerce_flag(cls, value: object, info) -> bool:
+        # A raise in here costs the whole window block - position, size,
+        # opacity - for one unreadable flag. Anything but a real bool is a file
+        # this app did not write, and reads as the flag's default.
+        if isinstance(value, bool):
+            return value
+        return cls.model_fields[info.field_name].default
+
+    @field_validator("x", "y", mode="before")
+    @classmethod
+    def _coerce_position(cls, value: object, info) -> int | None:
+        # None is "never placed" and the OS chooses; an unusable value reads
+        # the same way. Either half missing leaves the window unplaced.
+        return _coerce_bounded_number(
+            value, default=None, minimum=-float(WINDOW_MAX_POSITION),
+            maximum=float(WINDOW_MAX_POSITION), field=info.field_name,
+            integer=True, allow_none=True,
+        )
 
     @field_validator("width", "height", "opacity", "ui_scale", mode="before")
     @classmethod
