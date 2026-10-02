@@ -78,6 +78,12 @@ class UsageMetric:
     note: str | None = None
     window: timedelta | None = None
     tag: str | None = None
+    # Paint reset_label in the bar's own colour rather than the column's grey.
+    # For a row whose right-hand text is the amount the bar measures, so the
+    # two read as one reading - Azure's forecast, whose projected spend is what
+    # the bar is a share of the allowance of. Only where there is a bar: a row
+    # with no percentage has no colour to borrow.
+    reset_label_tinted: bool = False
 
 
 @dataclass

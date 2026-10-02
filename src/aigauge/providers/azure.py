@@ -635,6 +635,17 @@ def _money(amount: float, currency: str) -> str:
     return f"{currency} {amount:,.2f}" if currency else f"{amount:,.2f}"
 
 
+def _projected_percent(percent: float) -> str:
+    """The forecast's share of the allowance, as the note prints it.
+
+    Unclamped on purpose - the note says what the bar cannot - but not
+    unbounded: an allowance that is a sliver of a cent (a hand-typed 1e-300, a
+    Budget of 5e-324, both of which load) makes the ratio inf or a 300-digit
+    number.
+    """
+    return f"{percent:.0f}%" if percent < 1000 else "over 999%"
+
+
 MAX_CURRENCY_ROWS = 3
 
 
@@ -894,21 +905,34 @@ def build_snapshot(
             if gaugeable and total > 0
             else None
         )
+        # What the row may say about this component's money. A bucket is keyed
+        # by service, not by service and currency, so in a period billed in
+        # more than one currency its cost is every currency's charges for that
+        # service added together - JPY 4,980 and CAD 8.05 printed as
+        # "4,988.05" - and no figure for it is honest. A truncated read is the
+        # other case: the summary says "incomplete", and a component printed
+        # as a plain amount said the opposite one row down.
+        if aggregate.mixed_currency:
+            amount_text = "mixed currencies"
+        elif aggregate.partial:
+            amount_text = f"{_money(cost, currency)} so far"
+        else:
+            amount_text = _money(cost, currency)
         if name == FOUNDRY_BUCKET:
             note = (
-                f"{_money(cost, currency)} across "
-                f"{aggregate.foundry_resource_count} Foundry resource"
+                ("Across " if aggregate.mixed_currency else f"{amount_text} across ")
+                + f"{aggregate.foundry_resource_count} Foundry resource"
                 f"{'' if aggregate.foundry_resource_count == 1 else 's'}. "
                 "Foundry bills per token to this subscription, so this is part "
                 "of the total above, not a separate credit."
             )
         elif name == MARKETPLACE_BUCKET:
             note = (
-                f"{_money(cost, currency)}. Marketplace model charges bill "
+                f"{amount_text}. Marketplace model charges bill "
                 "outside the Foundry resource, at resource-group level."
             )
         else:
-            note = _money(cost, currency)
+            note = amount_text
             if len(name) > LABEL_MAX_LEN:
                 note = f"{name}\n{note}"
         if aggregate.mixed_currency:
@@ -931,10 +955,11 @@ def build_snapshot(
                 # tooltip.
                 #
                 # Bound: this string is composed here from a float and the
-                # billing currency code, which _fetch clips to CURRENCY_MAX_LEN.
+                # billing currency code, which parse_query_response clips to
+                # CURRENCY_MAX_LEN - a clip, not a check that it is a code.
                 # No provider string is interpolated into it; the service name
                 # stays in `label`, where _truncate bounds it.
-                reset_label=_money(cost, currency),
+                reset_label=amount_text,
                 note=note,
                 tag=BREAKDOWN_TAG,
             )
@@ -942,7 +967,9 @@ def build_snapshot(
 
     forecast_total = aggregate.forecast_total
     if forecast_total is not None and (
-        forecast_total <= 0 or forecast_total < aggregate.total
+        not math.isfinite(forecast_total)
+        or forecast_total <= 0
+        or forecast_total < aggregate.total
     ):
         # A full-period projection at or below what has already been spent is
         # not a projection - it contradicts the row above it. The row is built
@@ -955,15 +982,28 @@ def build_snapshot(
         # rows in currencies that cannot be added, is not a projection of
         # anything the row above it shows. (The number stays in the
         # diagnostics payload, which is where a bug report needs it.)
-        forecast_share = max(0.0, min(100.0, forecast_total / allowance * 100.0))
+        # The bar is clamped for display, like every other row; the note says
+        # what the projection actually is. It printed the clamped figure, so a
+        # forecast of 260.00 against 150.00 read "(100% of allowance)" in the
+        # tooltip of a row whose amount says otherwise.
+        forecast_percent = forecast_total / allowance * 100.0
+        forecast_projected = f"~{_money(forecast_total, currency)}"
         metrics.append(
             UsageMetric(
                 label="Forecast end of month",
-                percent_used=forecast_share,
+                percent_used=max(0.0, min(100.0, forecast_percent)),
+                # The projected amount on the row, as the spend row carries
+                # its own: a percentage of the allowance says how close the
+                # month will run, the amount says what it will cost. Painted in
+                # the bar's colour, so the figure reads as the thing the bar
+                # measures. Composed here from a float and the billing
+                # currency code, which parse_query_response clips to
+                # CURRENCY_MAX_LEN.
+                reset_label=forecast_projected,
+                reset_label_tinted=True,
                 note=(
-                    f"~{_money(forecast_total, currency)} projected by "
-                    "Cost Management for the full period"
-                    + (f" ({forecast_share:.0f}% of allowance)." if forecast_share is not None else ".")
+                    f"{forecast_projected} projected by Cost Management for "
+                    f"the full period ({_projected_percent(forecast_percent)} of allowance)."
                 ),
                 tag=BREAKDOWN_TAG,
             )

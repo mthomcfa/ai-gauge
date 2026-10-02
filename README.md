@@ -21,7 +21,7 @@ Compact monitor for **Anthropic · Claude**, **OpenAI · ChatGPT + Codex**, **Mi
 
 > **Requires Python 3.11+.** Secrets live in the OS-native credential store (Windows Credential Manager / DPAPI, macOS Keychain, Linux Secret Service). Auto-start uses the platform's standard mechanism (Windows Task Scheduler / LaunchAgent / `~/.config/autostart`).
 
-Current version: **1.4.1+cfa.9** — a fork version, see [Versioning](#versioning). Release notes in [CHANGELOG.md](CHANGELOG.md).
+Current version: **1.4.2+cfa.10** — a fork version, see [Versioning](#versioning). Release notes in [CHANGELOG.md](CHANGELOG.md).
 
 AI Gauge is an independent open-source project and unofficial local desktop
 utility. It is not affiliated with Anthropic, OpenAI, GitHub, Microsoft,
@@ -67,7 +67,7 @@ Binaries are published on **[this fork's Releases page](https://github.com/mthom
 | macOS   | `ai-gauge-<file-version>-macos.tar.gz`      | **Apple Silicon only.** Extract, drag `ai-gauge.app` to Applications |
 | Linux   | `ai-gauge-<file-version>-linux.tar.gz`      | extract, run `./ai-gauge/ai-gauge`           |
 
-`<file-version>` is the version with `+` replaced by `-`, so `1.4.1+cfa.9` ships as `ai-gauge-1.4.1-cfa.9-windows.zip`. Print it with `python tools/check_versions.py`.
+`<file-version>` is the version with `+` replaced by `-`, so `1.4.2+cfa.10` ships as `ai-gauge-1.4.2-cfa.10-windows.zip`. Print it with `python tools/check_versions.py`.
 
 **Intel Macs are not covered by the prebuilt archive.** PyInstaller builds for the host architecture and this fork's CI runs on Apple Silicon, so the `.app` is arm64-only. Intel users should [run from source](#run-from-source); the menu-bar UI works identically.
 
@@ -176,7 +176,7 @@ Spend this month         CAD 36.10 of 150.00 · resets 1 Oct
   Marketplace models  11%    CAD 4.10
   Storage              3%    CAD 1.20
   Other (3 services)  10%    CAD 3.45
-  Forecast end of month     47%
+  Forecast end of month 47% ~CAD 71.00
 ```
 
 The label is fixed and the amounts sit in the right-hand column: history keys
@@ -184,7 +184,10 @@ an in-flight period on the label, so a label that moved with the money would
 open a new period on every fetch. Since 1.4.1+cfa.9 each **component** row
 carries its amount there too, in the same currency formatting — the share
 says which component is the big one, and the amount says what it cost. Both
-are still in the row's tooltip.
+are still in the row's tooltip. The forecast row carries the month's projected
+spend the same way, and that figure is painted in the forecast bar's own colour
+— green, yellow, orange or red, by your gauge bands — so it reads as the amount
+the bar is measuring.
 
 Only the top row counts toward the tray/menu-bar colour. The component rows
 are shares of spend, not usage against a limit, so a single service at 96% of
@@ -193,7 +196,12 @@ the top row, the shares and the forecast — appears together or not at all: if
 the total cannot honestly carry a gauge (a truncated read, more than one
 billing currency, an unreadable offer type, a Sponsorship offer, or settings
 changed since the figures were read) then none of the rows below it carries
-one either, and the amounts are still shown.
+one either, and the amounts are still shown. Two of those cases change what an
+amount can honestly say: on a truncated read each component's figure ends in
+"so far", and in a period billed in more than one currency a component row says
+"mixed currencies" instead of a figure, because Cost Management groups a
+service's charges by service, not by currency, and the sum of yen and dollars
+is not an amount of anything.
 
 #### Setting it up
 
@@ -306,7 +314,7 @@ budget, and the forecast — with all IDs and resource names stripped.
 
 ### Multiple Claude / Codex accounts
 
-Claude and Codex can track more than one subscription at a time. Open **Settings → Anthropic** or **Settings → OpenAI**, click **Add another**, give the account a short name, then use **Sign in** or **Paste cookie** for that specific row. The default account displays as `Anthropic · Claude` or `OpenAI · ChatGPT + Codex`; named accounts keep the company and put your own name last — `Anthropic · Claude (Work)`, `OpenAI · ChatGPT + Codex (Account 2)`. A tile header that runs out of room elides from the right and keeps the whole name in its tooltip, rather than pushing the window wider than the 260 px floor.
+Claude and Codex can track more than one subscription at a time. Open **Settings → Anthropic** or **Settings → OpenAI**, click **Add another**, give the account a short name, then use **Sign in** or **Paste cookie** for that specific row. The default account displays as `Anthropic · Claude` or `OpenAI · ChatGPT + Codex`; named accounts keep the company and put your own name last — `Anthropic · Claude (Work)`, `OpenAI · ChatGPT + Codex (Account 2)`. A tile header that runs out of room elides from the middle — `OpenAI · Ch…dex (Work)` — so the company and your name for the account both stay in view, and the whole name is in its tooltip, rather than pushing the window wider than the 260 px floor.
 
 The **General** tab controls provider groups. If Claude is checked, all configured Claude accounts appear; if Codex is checked, all configured Codex accounts appear. Secondary accounts can be removed from their provider tab. Each Claude/Codex account uses separate cookie storage, browser profile data, widget tile state, and history records.
 
@@ -471,6 +479,8 @@ Known open items, deliberate non-fixes and the reasoning behind past decisions a
 ./.venv/bin/python -m pytest            # macOS / Linux
 ```
 
+The suite runs headless - on Qt's `offscreen` platform, the same one CI uses - unless `QT_QPA_PLATFORM` says otherwise, so a run on a desktop does not open windows and gets the answers CI gets. It is written against that platform: a fixed 800 x 800 screen, no window manager, and window drags the app computes itself rather than handing to the OS. Name a real platform (`$env:QT_QPA_PLATFORM = "windows"`) and a handful of tests that depend on those facts will fail without anything being wrong with the app.
+
 Tests cover: config round-trip, Copilot and OpenRouter REST helpers (with mocked HTTP), widget behavior, and snapshot models. Provider scrapers (Claude/Codex) require a live browser session and are validated manually.
 
 ## Relationship to upstream
@@ -500,10 +510,10 @@ That also means **upstream cannot support this build**, and bugs here may not ex
 Fork releases use a [PEP 440](https://peps.python.org/pep-0440/) local version segment:
 
 ```
-1.4.1+cfa.9
-└─┬─┘ └─┬─┘
-  │     └── fork build counter — identifies this as a fork build
-  └──────── this fork's own release counter, NOT an upstream release number
+1.4.2+cfa.10
+└─┬─┘ └──┬─┘
+  │      └── fork build counter — identifies this as a fork build
+  └───────── this fork's own release counter, NOT an upstream release number
 ```
 
 **The number before `+` does not mean "equivalent to upstream X."** This fork's `0.6.4` was built from upstream v0.6.3, while upstream separately shipped its own, unrelated `v0.6.4`; upstream also has a `v0.6.5`. The `+cfa.N` segment is what makes a fork build unambiguous, so always quote the full string in a bug report. The exact upstream commit this tree descends from is recorded in `pyproject.toml` under `[tool.ai-gauge-audit]`, and the app shows the full version in its panel header, its tray tooltip, and the `app_version` field of **Copy diagnostics**.

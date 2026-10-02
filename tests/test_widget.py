@@ -3275,8 +3275,12 @@ def test_a_header_too_long_to_fit_elides_and_keeps_the_name_in_its_tooltip(qtbot
         <= tile.header.width() + 1
     )
     if painted != name:
-        assert painted.endswith("…")
-        assert name.startswith(painted.rstrip("…"))
+        # Elided from the middle: both ends of what is painted are ends of the
+        # name, so the company and the account's own bracketed name survive.
+        assert painted.count("…") == 1
+        head, tail = painted.split("…")
+        assert name.startswith(head)
+        assert name.endswith(tail)
         assert _tooltip_text(tile.header.toolTip()) == name
 
 
@@ -3288,7 +3292,7 @@ def test_a_header_that_fits_carries_no_tooltip(qtbot):
     assert tile.header.toolTip() == ""
 
 
-def test_the_eliding_label_drops_its_tail_at_any_width(qtbot):
+def test_the_eliding_label_drops_its_middle_at_any_width(qtbot):
     """Deterministic on every platform: the label is given less room than its
     own text measures, whatever that measurement happens to be here."""
     from aigauge.widget import _ElidingLabel
@@ -3312,14 +3316,173 @@ def test_the_eliding_label_drops_its_tail_at_any_width(qtbot):
     assert label.toolTip() == ""
 
     resized(max(_ElidingLabel.MIN_WIDTH, advance // 2))
-    assert label.elided_text() != full
+    painted = label.elided_text()
+    assert painted != full
+    head, tail = painted.split("…")
+    assert head and full.startswith(head)
+    assert tail and full.endswith(tail)
     assert _tooltip_text(label.toolTip()) == full
-    # A label that has lost its tail must not also cost the panel its width.
+    # A label that has lost its middle must not also cost the panel its width.
     assert label.minimumSizeHint().width() <= _ElidingLabel.MIN_WIDTH
 
     resized(advance + 8)
     assert label.elided_text() == full, "the label did not recover its full text"
     assert label.toolTip() == ""
+
+
+
+def _chunk_colour(row) -> str:
+    style = row.bar._bar.styleSheet()  # noqa: SLF001 - the painted bar
+    return style.split("::chunk")[1].split("background:")[1].split(";")[0].strip()
+
+
+def _text_colour(label) -> str:
+    return label.styleSheet().split("color:")[1].split(";")[0].strip()
+
+
+def test_a_tinted_amount_takes_its_bars_colour_in_every_band(qtbot):
+    """One colour string for the chunk and the figure, so they cannot drift
+    apart - green, yellow, orange and red alike, and above 100 where the bar is
+    clamped. A row drawn untinted afterwards goes back to the column's grey:
+    rows are pooled and reused across refreshes."""
+    from aigauge.widget import _MetricRow
+
+    row = _MetricRow()
+    qtbot.addWidget(row)
+    grey = None
+    for percent in (10.0, 70.0, 90.0, 99.0, 173.0):
+        row.set_metric(
+            "Forecast end of month", percent, None, "~CAD 71.00", tint_reset=True
+        )
+        assert _text_colour(row.reset) == _chunk_colour(row), percent
+        row.set_metric("Storage", percent, None, "CAD 1.20")
+        grey = grey or _text_colour(row.reset)
+        assert _text_colour(row.reset) == grey != _chunk_colour(row), percent
+    # A row with no percentage has no bar to borrow a colour from, so a tint
+    # request on it is declined rather than painted in the empty-bar grey.
+    row.set_metric("Forecast end of month", None, None, "~CAD 71.00", tint_reset=True)
+    assert _text_colour(row.reset) == grey
+
+
+def test_a_stylesheet_colour_is_a_colour_whatever_reaches_it(qtbot):
+    """The second of two layers. ColorThresholds refuses anything but #rrggbb;
+    behind it every band colour is round-tripped through QColor before it is
+    written into a stylesheet - the bar's chunk, and now a tinted amount too.
+    Built with model_construct to reach this layer with validation skipped."""
+    import re
+
+    from aigauge.config import ColorThresholds
+    from aigauge.widget import _color_for_percent
+
+    hostile = "red; } QLabel { background: url(http://203.0.113.9/x.png); }"
+    colors = ColorThresholds.model_construct(
+        green_color=hostile, yellow_color="#12345;}*{", orange_color="palette(window)",
+        red_color="qlineargradient(x1:0)",
+        green_max=59, yellow_max=79, orange_max=94,
+    )
+    for percent in (10.0, 70.0, 90.0, 99.0):
+        assert re.fullmatch(r"#[0-9a-f]{6}", _color_for_percent(percent, colors)), percent
+
+
+def test_qt_runs_on_the_platform_the_environment_names(qapp):
+    """conftest.py sets QT_QPA_PLATFORM only when the run did not, and it has
+    to do that before the first QApplication exists - Qt reads the variable
+    once, at construction. Too late and the suite runs on the desktop's own
+    platform while the environment says offscreen; this is the one test that
+    notices, on the CI leg that leaves the variable to conftest.py."""
+    import os
+
+    from PyQt6.QtGui import QGuiApplication
+
+    named = os.environ.get("QT_QPA_PLATFORM", "<unset>").split(":", 1)[0]
+    assert QGuiApplication.platformName() == named
+
+
+def test_a_tinted_amount_follows_the_accounts_own_gauge_colours(qtbot):
+    from aigauge.config import ColorThresholds
+    from aigauge.widget import _MetricRow
+
+    row = _MetricRow()
+    qtbot.addWidget(row)
+    row._colors = ColorThresholds(green_color="#123456")  # noqa: SLF001
+    row.set_metric("Forecast end of month", 10.0, None, "~CAD 7.00", tint_reset=True)
+    assert _text_colour(row.reset) == _chunk_colour(row) == "#123456"
+
+
+def test_azures_forecast_amount_is_painted_like_its_bar_on_the_tile(qtbot):
+    """Through the real snapshot and the real tile: the forecast's figure in
+    its bar's colour, and every other row's figure left in the column grey."""
+    from datetime import date
+
+    from aigauge.config import AzureConfig
+    from aigauge.providers import azure as az
+    from aigauge.widget import _MetricRow
+
+    aggregate = az.AzureAggregate(
+        total=80.0,
+        currency="CAD",
+        period_start=date(2026, 9, 1),
+        period_end=date(2026, 10, 1),
+        data_as_of=date(2026, 9, 20),
+        buckets=[("Foundry", 50.0), ("Azure OpenAI", 30.0)],
+        foundry_cost=50.0,
+        foundry_resource_count=1,
+        forecast_total=128.0,
+    )
+    snapshot = az.build_snapshot(aggregate, AzureConfig(monthly_allowance=150.0))
+    widget = UsageWidget(Config())
+    qtbot.addWidget(widget)
+    widget.update_snapshot(snapshot, naming.full("azure"))
+    tile = widget._tiles["azure"]  # noqa: SLF001
+    tile.expand_btn.click()
+    with qtbot.waitExposed(widget):
+        widget.show()
+    rows = {r.label.text(): r for r in tile.findChildren(_MetricRow) if r.isVisible()}
+    forecast = rows.pop("Forecast end of month")
+    assert forecast.reset.text() == "~CAD 128.00"
+    assert _text_colour(forecast.reset) == _chunk_colour(forecast)
+    # The note opens with the amount, so the tooltip says it once, not twice.
+    assert _tooltip_text(forecast.reset.toolTip()).count("~CAD 128.00") == 1
+    others = {label: _text_colour(r.reset) for label, r in rows.items() if r.reset.text()}
+    assert others and len(set(others.values())) == 1, others
+    assert _chunk_colour(forecast) not in others.values()
+
+
+def test_two_named_accounts_stay_apart_when_their_headers_elide(qtbot):
+    """The reason the header elides from the middle rather than the right.
+
+    Two accounts of one provider differ only in the bracketed name at the end
+    of their header. Eliding from the right drops exactly that first, so at the
+    panel's minimum width both read "OpenAI · ChatGPT + Co…" and the only way to
+    tell the tiles apart was to hover them. The room is taken from the longer
+    name's own measurement, so this holds on any platform's fonts.
+    """
+    from aigauge.widget import _ElidingLabel
+
+    work = _ElidingLabel(naming.account_label("codex", "Work"))
+    home = _ElidingLabel(naming.account_label("codex", "Home"))
+    for label in (work, home):
+        qtbot.addWidget(label)
+        with qtbot.waitExposed(label):
+            label.show()
+    width = max(
+        _ElidingLabel.MIN_WIDTH,
+        max(
+            label.fontMetrics().horizontalAdvance(label.text())
+            for label in (work, home)
+        )
+        // 2,
+    )
+    for label in (work, home):
+        label.resize(width, label.sizeHint().height())
+    qtbot.waitUntil(lambda: work.width() == width and home.width() == width)
+    qtbot.wait(0)
+
+    assert work.elided_text() != work.text(), "nothing was elided"
+    assert home.elided_text() != home.text(), "nothing was elided"
+    assert work.elided_text() != home.elided_text()
+    assert work.elided_text().endswith(")")
+    assert home.elided_text().endswith(")")
 
 
 def test_an_elided_headers_tooltip_shows_a_name_literally_and_briefly(qtbot):

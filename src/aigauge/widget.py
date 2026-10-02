@@ -741,7 +741,7 @@ class _SummaryChip(QWidget):
 
 
 class _ElidingLabel(QLabel):
-    """A label that gives up its tail rather than the window's width.
+    """A label that gives up its middle rather than the window's width.
 
     ``QLabel.minimumSizeHint`` is the width of the whole text, so a tile header
     is a floor on how narrow the panel's content can be. Measured offscreen at
@@ -753,9 +753,18 @@ class _ElidingLabel(QLabel):
 
     Widening ``WINDOW_MIN_WIDTH`` would spend the user's screen on a name. The
     header is the one element on that row that can lose characters without
-    losing a control - the four buttons are ``setFixedSize`` - so it elides from
-    the right and the full name moves into the tooltip. ``text()`` still answers
-    with the full name; only what is painted is shortened.
+    losing a control - the four buttons are ``setFixedSize`` - so it elides and
+    the full name moves into the tooltip. ``text()`` still answers with the full
+    name; only what is painted is shortened.
+
+    From the middle, because both ends carry something the reader needs. The
+    start is the company and product; the end is the bracketed name of a second
+    account. Eliding from the right dropped the end first, so "OpenAI · ChatGPT +
+    Codex" and "OpenAI · ChatGPT + Codex (Work)" both painted as "OpenAI ·
+    ChatGPT + Co…" at the panel's minimum width and two accounts were the same
+    tile until hovered. One rule for every header, named or not: a special case
+    keyed on a bracket would be a second behaviour to explain for a saving of a
+    few characters on headers that already fit at the default width.
     """
 
     # Enough for a short name and an ellipsis at the header's 12 px bold. Below
@@ -804,7 +813,7 @@ class _ElidingLabel(QLabel):
         try:
             width = max(0, self.width())
             elided = self.fontMetrics().elidedText(
-                self._full_text, Qt.TextElideMode.ElideRight, width
+                self._full_text, Qt.TextElideMode.ElideMiddle, width
             )
             QLabel.setText(self, elided)
             # Only when something was actually dropped: a tooltip repeating a
@@ -952,6 +961,8 @@ class _MetricRow(QWidget):
         reset_label: str | None = None,
         note: str | None = None,
         window: timedelta | None = None,
+        *,
+        tint_reset: bool = False,
     ) -> None:
         # Reset to flexible width; group alignment in _set_rows may pin it after.
         self.label.setMinimumWidth(70)
@@ -997,6 +1008,11 @@ class _MetricRow(QWidget):
             f"QProgressBar {{ background:#374151; border:none; border-radius:3px; }}"
             f"QProgressBar::chunk {{ background:{color}; border-radius:3px; }}"
         )
+        if tint_reset and percent is not None and not split_note:
+            # The same colour string the chunk was just given, so the amount
+            # and the bar cannot drift apart - including under a user's own
+            # gauge colours, which is what _colors carries.
+            self.reset.setStyleSheet(f"color: {color}; font-size: 10px;")
         if split_note:
             self.reset.setText(right)
             self.reset.setVisible(True)
@@ -1028,11 +1044,17 @@ class _MetricRow(QWidget):
         if reset_label:
             # The full phrase, then the note: whatever the column elided is
             # still reachable here, and the amounts are in the note as well.
-            # Not twice, though - an Azure component row carries its amount in
-            # both, so the two parts are identical and one of them is dropped.
+            # Not twice, though. An Azure component row carries its amount in
+            # both, and the forecast's note opens with its projected amount, so
+            # where the note already begins with the column's text the column's
+            # copy is the one dropped: nothing the column elided is lost, because
+            # the note starts with all of it. Comparing for equality instead
+            # printed "~CAD 260.00" twice, and on a Foundry row in a mixed-
+            # currency period the repeat pushed the end of the note past the
+            # tooltip's clip.
             parts = [part for part in (rel, note) if part]
-            if len(parts) == 2 and parts[0] == parts[1]:
-                parts.pop()
+            if len(parts) == 2 and parts[1].startswith(parts[0]):
+                parts.pop(0)
             self.reset.setToolTip(_safe_tooltip("\n\n".join(parts)))
         elif resets_at:
             self.reset.setToolTip(resets_at.strftime("%Y-%m-%d %H:%M"))
@@ -1463,6 +1485,7 @@ class _ProviderTile(QFrame):
                         m.note,
                         m.window,
                         m.tag,
+                        m.reset_label_tinted,
                     )
                     for m in visible
                 ]
@@ -1505,6 +1528,7 @@ class _ProviderTile(QFrame):
                     m.note,
                     m.window,
                     m.tag,
+                    m.reset_label_tinted,
                 )
                 for m in visible
             ]
@@ -1603,6 +1627,7 @@ class _ProviderTile(QFrame):
                 str | None,
                 timedelta | None,
                 str | None,
+                bool,
             ]
         ],
     ) -> None:
@@ -1618,12 +1643,14 @@ class _ProviderTile(QFrame):
             r.setParent(None)
             r.deleteLater()
         grouped: dict[str, list[QLabel]] = {}
-        for row, (label, pct, reset, reset_label, note, window, tag) in zip(
+        for row, (label, pct, reset, reset_label, note, window, tag, tinted) in zip(
             self._rows,
             rows,
         ):
             row._colors = self._colors  # noqa: SLF001 - same-module collaborator
-            row.set_metric(label, pct, reset, reset_label, note, window)
+            row.set_metric(
+                label, pct, reset, reset_label, note, window, tint_reset=tinted
+            )
             if tag and pct is not None:
                 grouped.setdefault(tag, []).append(row.label)
         for labels in grouped.values():

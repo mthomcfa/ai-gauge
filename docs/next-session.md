@@ -3,7 +3,53 @@
 State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#16,
 610 tests passing, all five providers reading.
 
-> **Updated 2026-09-18** by the naming release (`1.4.1+cfa.9`, 2 119 tests):
+> **Updated 2026-10-02** by `1.4.2+cfa.10`. The Azure tile's percentages were
+> put to two independent design reviews - one from first principles, one told
+> to break every option - which disagreed about the component rows, and the user
+> kept them as they are: a component's percentage is its share of the month's
+> spend, under a top row that is a share of the allowance. Recorded so the
+> next reader does not reopen it as new:
+>
+> * **The spend row has no visible bar at the default 340 px width.** Its
+>   right-hand text, `CAD 36.10 of 150.00 · resets 1 Oct`, takes the room the
+>   bar would have. The track then grows a pixel for every pixel of panel past
+>   about 344 - 16 px at 360, 56 px at 400 - so a modest widening brings it
+>   back, and the user widens the panel rather than give up the reset date on
+>   the row.
+> * **Bar tracks are different lengths on different rows.** The right-hand
+>   column is 58 px for eight characters or fewer and at least 92 px past that,
+>   and the bar takes what is left, so bar lengths are not comparable between
+>   rows - at 340 px Foundry at 34% paints a shorter fill than Azure OpenAI at
+>   22%. One right-hand width per tile, aligned the way the label column already
+>   is, would fix it; nobody asked for it.
+> * **A component's share bar uses the usage colour bands.** A service at 96% of
+>   the month's spend draws a red bar under a top row that may read 5% of the
+>   allowance. It cannot reach the tray colour - only the top row can - but it
+>   looks like an alarm.
+> * **A cost total past float range reaches the spend row as `CAD inf`.** Each
+>   wire row is bounded on parse (`_to_float`); their sum is not, so two rows near
+>   1e308 make `parse_query_response`'s total infinite, and the spend row prints
+>   `CAD inf of 150.00` at 100%. Needs a hostile or broken ARM response. 1.4.2
+>   keeps an infinite projection off the forecast row; the total itself wants
+>   treating as a failed read at its source, which is a change to how the read
+>   is judged rather than to how it is drawn.
+> * **The billing currency code is clipped, not checked.** `parse_query_response`
+>   keeps the first `CURRENCY_MAX_LEN` (8) characters of whatever the Currency
+>   column says. Every amount label is `PlainText` and every tooltip escaped, so
+>   markup is drawn literally and nothing is fetched; but newlines survive the
+>   clip: eight characters hold six of them, so a code of `A`, six newlines and
+>   `B` makes every Azure row that prints an amount seven lines tall, and a
+>   right-to-left override reorders how the amount is painted. Accepting the code
+>   only when it is three letters A-Z, and treating anything else as unknown,
+>   closes it - and touches every Azure row and the mixed-currency detection, so
+>   it is its own change. Since 1.4.1; the forecast row adds one more row it
+>   reaches.
+> * **An Azure Budget becomes the allowance when Settings has none, and the
+>   smallest budget wins** (the one that alerts first). A forgotten small alert
+>   budget is then the base of the top row and the forecast. The allowance in
+>   Settings overrides it, and the top row prints the base it used.
+>
+> **Updated 2026-09-18** by the naming release (`1.4.1+cfa.9`, 2 125 tests):
 > every provider surface now names the company behind the product, from one
 > table (`src/aigauge/naming.py`) instead of the nine copies that had drifted
 > apart - `Anthropic · Claude`, `OpenAI · ChatGPT + Codex`, `Microsoft · Azure`,
@@ -62,15 +108,13 @@ State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#1
 >   `compact (name)` for every id instead would widen every chip, and the
 >   chip-row width rule is unchanged from 1.4.0, so it stays as it is until
 >   something else moves that rule.
-> * **Two named Codex accounts are indistinguishable on the panel at its
->   260 px minimum.** `OpenAI · ChatGPT + Codex` and
->   `OpenAI · ChatGPT + Codex (Work)` both paint as `OpenAI · ChatGPT + Co…`
->   in the room the header gets; the tooltip and the collapsed chip tell them
->   apart. `ElideRight` is what the header was specified with.
->   `Qt.TextElideMode.ElideMiddle` would keep the bracketed identifier - the
->   part the user chose - at the cost of the company prefix, which is the part
->   this release added. An open question for the next release, not a change to
->   make inside it.
+> * **Two named Codex accounts were indistinguishable on the panel at its
+>   260 px minimum** - *closed in 1.4.2+cfa.10.* `OpenAI · ChatGPT + Codex` and
+>   `OpenAI · ChatGPT + Codex (Work)` both painted as `OpenAI · ChatGPT + Co…`
+>   because the header elided from the right, which drops the bracketed name
+>   first. Headers now elide from the middle, every one of them: decided by
+>   the user over a variant that would have applied it only to named accounts,
+>   on the grounds that one rule is easier to live with than two.
 > * **`widget._session_summary_for` is dead code.** No caller anywhere in
 >   `src/` or `tests/`. Pre-existing, correct (it reads from
 >   `display_name_for_account`), and left alone to keep this diff to the

@@ -2501,6 +2501,117 @@ def test_mixed_currencies_are_shown_as_subtotals_not_as_a_sum():
     assert "Forecast end of month" not in [m.label for m in snapshot.metrics]
 
 
+
+def test_the_forecast_row_carries_its_projected_amount_in_the_bars_colour():
+    """The projected spend sits in the row's right-hand column, as the spend
+    row's own amount does, and it is the one row whose figure is painted like
+    its bar - the amount is what the bar is a share of the allowance of."""
+    snapshot = az.build_snapshot(
+        _aggregate(forecast_total=71.0), AzureConfig(monthly_allowance=150.0)
+    )
+    rows = {m.label: m for m in snapshot.metrics}
+    forecast = rows["Forecast end of month"]
+    assert forecast.reset_label == "~CAD 71.00"
+    assert forecast.reset_label_tinted is True
+    assert [m.label for m in snapshot.metrics if m.reset_label_tinted] == [
+        "Forecast end of month"
+    ]
+
+
+def test_the_forecast_note_states_the_projection_not_the_bar():
+    """The bar stops at 100; what the month is heading for does not. The
+    note printed the clamped figure, so 260.00 against 150.00 read "(100% of
+    allowance)" beside an amount that said otherwise."""
+    snapshot = az.build_snapshot(
+        _aggregate(total=180.0, forecast_total=260.0),
+        AzureConfig(monthly_allowance=150.0),
+    )
+    forecast = {m.label: m for m in snapshot.metrics}["Forecast end of month"]
+    assert forecast.percent_used == 100.0
+    assert forecast.reset_label == "~CAD 260.00"
+    assert "(173% of allowance)" in (forecast.note or "")
+    assert "100% of allowance" not in (forecast.note or "")
+
+
+def test_a_forecast_past_float_range_is_not_a_forecast():
+    """Each wire row is bounded on parse, their sum is not: two 1e308 rows
+    add to inf, and a projection of inf printed "~CAD inf" on the row."""
+    total = az.parse_query_response(
+        {"properties": {"columns": [{"name": "Cost"}], "rows": [[1e308], [1e308]]}}
+    ).total
+    assert total == float("inf")
+    snapshot = az.build_snapshot(
+        _aggregate(forecast_total=total), AzureConfig(monthly_allowance=150.0)
+    )
+    assert "Forecast end of month" not in [m.label for m in snapshot.metrics]
+
+
+@pytest.mark.parametrize("allowance", [5e-324, 1e-300])
+def test_the_forecast_note_never_prints_an_unbounded_percentage(allowance):
+    """An allowance that is a sliver of a cent loads - typed by hand, or a
+    Budget's amount - and the unclamped ratio is then inf or 300 digits long."""
+    snapshot = az.build_snapshot(
+        _aggregate(forecast_total=71.0), AzureConfig(monthly_allowance=allowance)
+    )
+    note = {m.label: m for m in snapshot.metrics}["Forecast end of month"].note or ""
+    assert "inf" not in note
+    assert "(over 999% of allowance)" in note
+    assert len(note) < 120, note
+
+
+def test_a_component_billed_in_two_currencies_prints_no_figure():
+    """A bucket is a service, not a service and a currency, so a service
+    billed in both added yen to dollars: JPY 4,980 and CAD 8.05 printed as
+    4,988.05, on the row and in its tooltip."""
+    snapshot = az.build_snapshot(
+        _aggregate(
+            total=4988.05 + 13.60,
+            currency="",
+            mixed_currency=True,
+            currency_totals=[("CAD", 21.65), ("JPY", 4980.0)],
+            buckets=[("Azure OpenAI", 4988.05), ("Storage", 13.60)],
+        ),
+        AzureConfig(monthly_allowance=150.0),
+    )
+    breakdown = [m for m in snapshot.metrics if m.tag == az.BREAKDOWN_TAG]
+    assert breakdown
+    for row in breakdown:
+        assert row.reset_label == "mixed currencies"
+        assert "4,988.05" not in (row.note or "")
+        assert "currenc" in (row.note or "").lower()
+
+
+def test_a_foundry_row_in_a_mixed_currency_period_does_not_lead_with_money():
+    """ "mixed currencies across 1 Foundry resource" read as a sentence about
+    an amount; the row's own column already says the amount is not shown."""
+    snapshot = az.build_snapshot(
+        _aggregate(
+            total=100.0,
+            currency="",
+            mixed_currency=True,
+            currency_totals=[("CAD", 40.0), ("JPY", 60.0)],
+            buckets=[(az.FOUNDRY_BUCKET, 100.0)],
+        ),
+        AzureConfig(monthly_allowance=150.0),
+    )
+    foundry = {m.label: m for m in snapshot.metrics}[az.FOUNDRY_BUCKET]
+    assert foundry.reset_label == "mixed currencies"
+    assert (foundry.note or "").startswith("Across 1 Foundry resource.")
+
+
+def test_a_component_on_a_truncated_read_says_its_amount_is_so_far():
+    """The summary row says "incomplete"; a component printed as a plain
+    amount one row down said the opposite."""
+    snapshot = az.build_snapshot(
+        _aggregate(partial=True), AzureConfig(monthly_allowance=150.0)
+    )
+    breakdown = [m for m in snapshot.metrics if m.tag == az.BREAKDOWN_TAG]
+    assert breakdown
+    for row in breakdown:
+        assert (row.reset_label or "").endswith(" so far")
+        assert (row.reset_label or "").startswith("CAD ")
+
+
 def test_more_than_three_currencies_are_summarised_not_listed():
     snapshot = az.build_snapshot(
         _aggregate(
@@ -2985,8 +3096,17 @@ def test_the_summary_label_is_stable_as_spend_changes():
 
 def test_the_amounts_stay_visible_on_the_row():
     """Moving the money out of the label must not move it out of the tile:
-    reset_label is what the row renders inline, next to the bar."""
-    snapshot = az.build_snapshot(_aggregate(), AzureConfig(monthly_allowance=150.0))
+    reset_label is what the row renders inline, next to the bar.
+
+    In UTC, named rather than inherited. The printed day is the period boundary
+    in the machine's local time, which is the point of the two tests above -
+    so without a zone this asserted "1 Oct" and passed only where the boundary
+    falls on the 1st: in CI and east of it, and nowhere in the Americas, where
+    the same instant is the evening of the 30th.
+    """
+    snapshot = az.build_snapshot(
+        _aggregate(), AzureConfig(monthly_allowance=150.0), local_tz=timezone.utc
+    )
     summary = snapshot.metrics[0]
     assert summary.reset_label == "CAD 36.10 of 150.00 · resets 1 Oct"
 
