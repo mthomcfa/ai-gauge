@@ -2,8 +2,8 @@
 
 Usage: python3 roundtrip.py <patched-tree>
 <patched-tree> is main at 5f09a55 with prototype-widget.diff applied:
-    mkdir proto && git archive 5f09a55 | tar -x -C proto
-    patch -p1 -d proto < docs/research/zoom/prototype-widget.diff
+    P=$(mktemp -d) && git archive 5f09a55 | tar -x -C "$P"
+    patch -p1 -d "$P" < docs/research/zoom/prototype-widget.diff
 Runs offscreen; the config directory is redirected to a temporary folder on every OS.
 """
 import os, sys, json
@@ -13,6 +13,7 @@ import aigauge; assert aigauge.__version__ == "1.4.2+cfa.10" and aigauge.__file_
 # A throwaway config folder per run, outside the repo, so a run never writes next to the script.
 import tempfile; from pathlib import Path; from aigauge.platforms import get_platform
 _sandbox = Path(tempfile.mkdtemp(prefix="aigauge-zoom-")); type(get_platform()).app_data_dir = lambda self: _sandbox
+import atexit, shutil; atexit.register(shutil.rmtree, _sandbox, True)
 from PyQt6.QtWebEngineWidgets import QWebEngineView  # noqa
 from PyQt6.QtWidgets import QApplication
 app = QApplication(sys.argv)

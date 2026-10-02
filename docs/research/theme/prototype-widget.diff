@@ -1,5 +1,5 @@
---- /home/user/ai-gauge/src/aigauge/widget.py	2026-10-02 13:20:12.895058992 +0000
-+++ export/src/aigauge/widget.py	2026-10-02 13:56:55.869712077 +0000
+--- a/src/aigauge/widget.py
++++ b/src/aigauge/widget.py
 @@ -64,6 +64,18 @@
      RatioEstimate,
  )

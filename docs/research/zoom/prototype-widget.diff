@@ -1,5 +1,5 @@
---- base/src/aigauge/widget.py	2026-10-02 13:20:05.000000000 +0000
-+++ proto/src/aigauge/widget.py	2026-10-02 14:05:25.074348436 +0000
+--- a/src/aigauge/widget.py
++++ b/src/aigauge/widget.py
 @@ -18,6 +18,8 @@
      pyqtSignal,
  )

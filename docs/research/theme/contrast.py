@@ -1,3 +1,7 @@
+"""WCAG 2.x contrast ratios for theme-toggle.md §1.3.
+
+Usage: python3 docs/research/theme/contrast.py
+"""
 from PyQt6.QtGui import QColor
 def lum(h):
     c = QColor(h); out = []

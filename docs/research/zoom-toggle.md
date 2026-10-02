@@ -2,13 +2,15 @@
 
 **Status:** research for the 1 November 2026 review. Nothing here is built.
 **Asked for:** "a toggle bottom-right for zoom that increases/decreases font sizes overall"
-(Michael, 2026-10-02).
+(the maintainer, 2026-10-02).
 **Read with:** [`theme-toggle.md`](theme-toggle.md) — the two controls sit together and share
 their first PR — and [`../ui-scale-widget-only-plan.md`](../ui-scale-widget-only-plan.md), the
 unbuilt plan this recommends finishing.
 **Measured against:** `main` at `5f09a55`, 1.4.2+cfa.10. Qt runtime 6.11.2, PyQt6 6.11.0, Python
 3.11. Anything marked **verified** was run offscreen on a `git archive` export with a prototype
-patch.
+patch. Line numbers are as of `5f09a55`. 1.4.3+cfa.11 has since moved `config.py` (by 8 to 38
+lines from line 55 on) and two test files; the `widget.py`, `app.py` and `settings_dialog.py`
+citations are unchanged.
 
 ![Today, then a prototype zoom at 75%, 100%, 125% and 150%](zoom/sheet-steps.png)
 
@@ -36,7 +38,7 @@ prototype changed on purpose.
 **The setting.**
 
 - `WindowState.ui_scale: float = 1.0` (`config.py:253`), coerced to [0.75, 4.0] by
-  `_coerce_bounds` (`config.py:262-283`): a non-number, a bool or a non-finite value becomes 1.0.
+  `_coerce_bounds` (`config.py:262-285`): a non-number, a bool or a non-finite value becomes 1.0.
 - `qt_scale_factor_env` (`config.py:1118-1129`) turns it into a string; `_apply_ui_scale_env`
   (`app.py:2923-2937`, called at `app.py:2952`) writes `QT_SCALE_FACTOR` before `QApplication`
   exists. An explicit environment value wins.
@@ -46,7 +48,8 @@ prototype changed on purpose.
 - `_on_settings_finished` asks "Restart to apply scale" (`app.py:2771-2782`). That prompt is the
   only caller of `App.restart()` (`app.py:2659-2683`), and `restart()` is the only user in `app.py`
   of `subprocess` (`:9`) and `autostart_command` (`:45`).
-- Tests that would change: `test_config.py:24, 337-352, 909-910` and `test_app_logging.py:1933`.
+- Tests that would change: `test_config.py:24, 337-352, 909-910`, `test_app_logging.py:1933`, and
+  the wheel-step assert at `test_widget.py:2549`.
 
 **The plan, checked against today.** Its mechanism is right — the prototype shows that — but every
 citation in it is stale, and it predates 1.4.0:
@@ -57,6 +60,7 @@ citation in it is stale, and it predates 1.4.0:
 | `app.py:1028/1057/801/895` | `:2923/2952/2659/2771` |
 | `settings_dialog.py:421-442, 991-993` | `:774-797, :2190-2192` |
 | `widget.py:60-63` constants | `:68-76` |
+| `config.py:18-21` `WINDOW_*` | `:40-55` |
 | `WINDOW_MAX_HEIGHT` | `WINDOW_AUTOFIT_MAX_HEIGHT` |
 | "Width is no longer constant" is the main risk | Already happened in 1.4.0; `WINDOW_WIDTH` is a first-run size and readers use `self.width()` |
 | "Persist actual px or baseline: decide" | Decided below — baseline, on new evidence |
@@ -68,7 +72,7 @@ stale-`fontMetrics` trap (§5), the non-modal Settings clobber (§7), the positi
 shortcuts.
 
 **Inventory.** `grep -rno "font-size: *[0-9]*px" src/` gives 47 hits; the setter counts come from
-`python3 docs/research/zoom/inventory.py`.
+`python3 docs/research/zoom/inventory.py src/aigauge/widget.py`.
 
 | What | Count | Where |
 |---|---|---|
@@ -101,8 +105,9 @@ shortcuts.
   is the active window — a Ctrl+= typed into a Settings field did not zoom the panel. The frameless
   `Tool` window is active after `show()`. *Unverified:* the Windows layout key mapping for Shift+=,
   and macOS `Ctrl` → ⌘ (Qt's documented swap).
-- **Ctrl+wheel.** Over a `QScrollArea` viewport, Ctrl+wheel **page-scrolls** (148 px against 60 for
-  a plain notch) and accepts the event, so zoom has to intercept it in the panel's existing
+- **Ctrl+wheel.** Over a `QScrollArea` viewport, Ctrl+wheel **page-scrolls** and accepts the event:
+  148 px against 60 for a plain notch on a default scroll area, and 174 px against 126 in the
+  panel's tile area at 340×200, so zoom has to intercept it in the panel's existing
   read-only `eventFilter`, which `_track_hover` already installs on every child. Wheel events go to
   the window under the pointer, so no activation is needed.
 - **min > max.** Qt keeps both, and `resize()` honours the minimum (a 500 min on a 400 max gave
@@ -163,7 +168,7 @@ follow-up.
 
 ## 5. Live application, and the window
 
-**What has to re-run**, found by building it (`zoom/prototype-widget.diff`, +390/−89 including
+**What has to re-run**, found by building it (`zoom/prototype-widget.diff`, +420/−89 including
 duplication a real build would not have):
 
 1. **Static sizes.** The constructor's styling and sizing moves into a per-class `_apply_zoom()` on
@@ -172,7 +177,7 @@ duplication a real build would not have):
 2. **Data-dependent styles.** Each tile re-renders from `_latest_snapshot` via `set_snapshot` —
    status colours, the chunk colour, the 58/92/240 rule, grouped label widths. The ratio label
    re-renders too.
-3. **`ensurePolished()` before every `fontMetrics`-derived width** (`widget.py:1659`, `:1018`,
+3. **`ensurePolished()` before every `fontMetrics`-derived width** (`widget.py:1659`, `:1019`,
    `:1030`). Without it, a label whose stylesheet has just changed measures with the previous font:
    grouped labels sized 81 px for a 116 px "Azure OpenAI" at 150%, shown as "Azure Ope". With it, a
    live zoom and a freshly built panel went from 450–4 327 px different to **0 px different** at
@@ -186,7 +191,8 @@ duplication a real build would not have):
 6. **The window:** minimum size, auto-fit (called synchronously, with the footer's height added),
    screen bounds, `_track_hover` for new rows, the refresh icon pixmap re-rendered at the new size.
 
-A round trip of 100 → 125 → 150 → 200 → 75 → 100% returned to exactly 340×286.
+A round trip of 100 → 125 → 150 → 200 → 75 → 100% returned the auto-fitted panel to exactly its
+starting size.
 
 **Window rules** (verified; `docs/research/zoom/roundtrip.py <patched-tree>`, recipe in its header):
 
@@ -207,7 +213,7 @@ A round trip of 100 → 125 → 150 → 200 → 75 → 100% returned to exactly 
   its top-centre anchor, and `_app_positioned` still stops the anchor being saved.
 - **Floor = `ceil(260 × z)`, capped at the work-area width.** The measured header hard floor (where
   the "just now" label or ✕ starts losing pixels; `docs/research/zoom/floor.py`, one process per
-  step) stays below it at every step, by 8 px at 75% and 17–35 px above that:
+  step) stays below it at every step, by 8 px at 75%, 15 px at 90%, and 17–35 px from 100% up:
 
 | Zoom | 75 | 90 | 100 | 110 | 125 | 150 | 175 | 200 |
 |---|---|---|---|---|---|---|---|---|
@@ -216,26 +222,26 @@ A round trip of 100 → 125 → 150 → 200 → 75 → 100% returned to exactly 
 
 - **Position migration.** For `ui_scale ≠ 1` only: multiply saved x/y by `ui_scale` once, recorded
   by a new bool. Otherwise a panel saved at (400,300) under 1.5 opens somewhere else.
-- **Prerequisite — a pre-existing defect.** `WindowState.x` and `.y` (`config.py:233-234`) are
-  unbounded `int | None`. A `config.json` with `"x": 1e12` loads without complaint, and
-  `QPoint(config.window.x, ...)` at `widget.py:1924` then raises `OverflowError`. The panel is built
-  inside `App()` (`app.py:757`) with nothing catching it, so **the app fails to start, and fails
-  again on every launch** until the file is fixed. Reproduced independently during review of this
-  research. It needs a damaged or hand-edited config — positions come from the OS — but the
-  mandate is that every config value reaching geometry is bounded. The migration above multiplies
-  these values, so they must be bounded first.
+- **Prerequisite — fixed in 1.4.3+cfa.11.** `WindowState.x` and `.y` (`config.py:233-234` at
+  `5f09a55`) were unbounded `int | None`: `"x": 1e12` loaded without complaint, and
+  `QPoint(config.window.x, ...)` at `widget.py:1924` raised `OverflowError` inside `App()`
+  (`app.py:757`), so the app failed at every start until the file was fixed. They are now coerced on
+  load to ±32 767 (`WINDOW_MAX_POSITION` and `WindowState._coerce_position` in `config.py`), and a
+  malformed value reads as "never placed". The migration above multiplies them by `ui_scale`, so it
+  must pass the product back through the same bound: `WindowState` has no `validate_assignment`.
 
 ## 6. The control
 
 ![The footer cluster at 125%, with the 8 px resize band shown in red](zoom/footer-band-z125.png)
 
-*The footer at 125%: the theme toggle (placeholder ◐) and `A− 125% A+`, with the 8 px resize band
-drawn in red. No footer pixel touches it.*
+*The footer at 125%: the theme toggle (a placeholder ◐, drawn for this render only; the committed
+diff does not include it) and `A− 125% A+`, with the 8 px resize band drawn in red. No footer pixel
+touches it.*
 
 **Where it can live.** The 8 px band covers every edge and corner, bottom-right included, and a
 button over it would take the press the corner resize needs. The panel has no footer today.
 
-- **Header — rejected.** The title already clips at 340 ("AI Gauge 1.4.2+cl"); the header's hard
+- **Header — rejected.** The title already clips at 340 ("AI Gauge 1.4.2+c…"); the header's hard
   floor is 240, and two more 20 px buttons would push it past 260.
 - **Hover overlay — rejected.** It covers the last row's reset column.
 - **Inside the collapsed chip rows — rejected.** They are deleted and rebuilt every second, so a
@@ -275,20 +281,22 @@ one atomic write per step and none at a bound.
 - **Embedded sign-in browser and tray:** no longer scaled.
 
 **What the theme feature needs from this** (and see `theme-toggle.md` §6): the footer row and its
-left slot; one **restyle seam** — every inline stylesheet built by a single helper taking zoom and,
-later, palette, so per-class `_apply_zoom()` becomes `_restyle()` and `set_zoom` and `set_theme`
-both end in `_restyle()` plus `tile.set_snapshot(latest)`; colour tokens for the footer buttons; no
-panel-level stylesheet; one shared decision for the collapsed strip. The two refactors rewrite the
-same 31 stylesheet strings in `widget.py`, so sequence them (zoom first, as the mechanical one) or
-do them in one pass.
+left slot; one **restyle seam**, the one `theme-toggle.md` §6 names — `styled()` renders every inline
+stylesheet from colour tokens and zoomed px, and `restyle_all()` re-renders them, calls each panel
+class's `_restyle()` (this document's per-class `_apply_zoom()`), then re-delivers each tile's
+snapshot, so `set_zoom` and `set_theme` both end in `restyle_all()`; colour tokens for the footer
+buttons; no panel-level stylesheet; one shared decision for the collapsed strip. Both refactors
+rewrite the same 34 stylesheet calls in `widget.py`, so they share a first PR: `theme-toggle.md` §9
+PR 1 (the helper, `restyle_all()`, per-class `_restyle()`, dark tokens at zoom 1.0, no visible
+change). The zoom mechanism and the light theme follow in either order.
 
 ## 8. Security mandate
 
 - **New config:** none for the zoom itself. `ui_scale` keeps its coercion and its bound narrows to
   [0.75, 2.0]. The panel clamps again at use, because `WindowState` has no `validate_assignment`.
 - **One new bool** for the one-shot x/y migration, coerced like `user_sized`: anything not a real
-  bool reads as False. A re-conversion is harmless because x/y are bounded first (the prerequisite
-  fix) and clamped on screen.
+  bool reads as False. A re-conversion is harmless because x/y are bounded to ±32 767 on load
+  (1.4.3+cfa.11) and clamped on screen.
 - **Stylesheets:** the helper emits `<int>px` from our own literals times a clamped float. No config
   text reaches a stylesheet.
 - **Fewer moving parts:** the `subprocess.Popen` relaunch and the process-environment write are
@@ -301,7 +309,7 @@ do them in one pass.
 Rules, not Linux pixel counts; they hold on offscreen CI and on the real-platform Windows leg.
 
 1. **Config.** `ui_scale`: −3 → 0.75, 99 → 2.0, NaN or True → 1.0; migration-bool coercion; x/y
-   converted exactly once; x/y bounds.
+   converted exactly once, and a converted value stays within ±32 767.
 2. **Helpers.** Scaling helpers round half-up, never below 1, 0 stays 0, colours untouched.
 3. **Live = built.** At every ladder step, a panel zoomed live equals one constructed at that zoom,
    field by field — each label's `fontInfo().pixelSize()`, every fixed width, size hints, window
@@ -337,7 +345,7 @@ The plan, built on today's code: `ui_scale` becomes a panel-only, live zoom, and
 - **Settings:** the "UI scale" row becomes a live "Text size" combo on the same ladder, written only
   if it was changed.
 
-## 11. Open questions for Michael
+## 11. Open questions for the maintainer
 
 1. **Does the panel grow with the text?** *Default: yes, proportionally* — it stays docked, and the
    old size comes back exactly. The alternative keeps your dragged size, so the tiles scroll and the
@@ -351,9 +359,11 @@ The plan, built on today's code: `ui_scale` becomes a panel-only, live zoom, and
 
 | PR | Contents | Size | Effort |
 |---|---|---|---|
-| **A** (first, small) | Bound `WindowState.x/y` — the prerequisite defect in §5 | ~30 lines, 6 tests | small |
+| **0** (shared, first) | `theme-toggle.md` §9 PR 1: `styled()`, `restyle_all()`, per-class `_restyle()`, dark tokens at zoom 1.0, no visible change | ≈ 600 lines, ~10 tests | 1 session |
 | **B** (mechanism, no new UI) | `widget.py` ≈ +260/−110; `config.py` ≈ +30/−15; `app.py` ≈ +10/−50; `settings_dialog.py` ≈ +10/−8; ~25 new and ~6 edited tests; CHANGELOG; retire the plan doc | 6 files | 1–1.5 sessions |
 | **C** (control) | Footer, cluster, shortcuts, Ctrl+wheel, wheel step | ≈ +130 lines, ~12 tests | 0.5 session; the theme toggle lands in this footer |
+
+The prerequisite x/y bound (§5) shipped separately in 1.4.3+cfa.11.
 
 **Most likely to go wrong:** the commit-seam change ("remember only sizes the user made") touches
 1.4.0's most-tested code; a missed literal (test 3 catches it structurally); stale `fontMetrics`; on

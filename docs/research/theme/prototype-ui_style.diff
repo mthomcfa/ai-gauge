@@ -1,5 +1,5 @@
---- /home/user/ai-gauge/src/aigauge/ui_style.py	2026-10-01 13:01:02.546435761 +0000
-+++ export/src/aigauge/ui_style.py	2026-10-02 13:57:12.012043045 +0000
+--- a/src/aigauge/ui_style.py
++++ b/src/aigauge/ui_style.py
 @@ -46,9 +46,9 @@
  _HANDLE_MARGIN = 2
  _HANDLE_RADIUS = (SCROLLBAR_WIDTH - 2 * _HANDLE_MARGIN) // 2

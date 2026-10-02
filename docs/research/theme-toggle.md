@@ -1,12 +1,14 @@
 # Colour scheme: dark / light / system — research
 
 **Status:** research for the 1 November 2026 review. Nothing here is built.
-**Asked for:** "another toggle for dark/light/system colour schemes" (Michael, 2026-10-02).
+**Asked for:** "another toggle for dark/light/system colour schemes" (the maintainer, 2026-10-02).
 **Read with:** [`zoom-toggle.md`](zoom-toggle.md) — the two controls sit together and share their
 first PR.
 **Measured against:** `main` at `5f09a55`, 1.4.2+cfa.10. Installed: Qt 6.11.2 runtime, PyQt6
 6.11.0, QtWebEngine 6.11.2 (Chromium 140). `pyproject.toml` requires `PyQt6>=6.7`; CI installs the
-latest.
+latest. Line numbers are as of `5f09a55`. 1.4.3+cfa.11 has since moved `config.py` (by 8 to 38
+lines from line 55 on) and two test files; the `widget.py`, `app.py` and `settings_dialog.py`
+citations are unchanged.
 
 ![Today's dark panel, a prototype light theme, and light with pale custom gauge colours](theme/compare-dark-light-custom.png)
 
@@ -31,7 +33,8 @@ tokenizer pass over every string and comment in `src/aigauge/**/*.py`
 - On top of those:
   - **3 RGBA `QColor` tuples** (pace notch, tick and shadow: `widget.py:639, :839, :840`).
   - **1 derived colour**: the chip fill is the band colour `.darker(135)` (`widget.py:296`).
-  - **63 `setStyleSheet` calls**: widget 39, ratio 10, login 5, settings 4, cookie 3, error 2.
+  - **62 `setStyleSheet` calls**: widget 38 (one is the forwarder at `widget.py:895`), ratio 10,
+    login 5, settings 4, cookie 3, error 2.
   - **11 rich-text `style='color:…'` sites** (links and error spans). These are redrawn by
     `setText`, not by a stylesheet.
 
@@ -71,7 +74,7 @@ call site by call site, by role.
   snapshot is re-delivered; `apply_gauge_colors()` (`widget.py:2448`) already does this when gauge
   colours change, so there is a precedent.
 - **Custom painters:** `_SummaryChip` (`:626`), `_PaceTickOverlay` (`:838`), the panel background
-  (`:3014`), the ratio sparkline (`ratio_dialog.py:79`), the hand-drawn refresh icon (`:559`), and
+  (`:3014`), the ratio sparkline (`ratio_dialog.py:76`), the hand-drawn refresh icon (`widget.py:559`), and
   Settings' chevrons — drawn once in `#cbd5e1` and **written to `app_data_dir()/cache`** for
   `image: url()` (`settings_dialog.py:258`).
 - **The app sets no style and no palette.** `app.py:2954` creates the `QApplication` and stops
@@ -109,7 +112,7 @@ are tuned for a dark background:
 - **Pace tick:** `#f3f4f6` at alpha 180 is 1.09:1 on a light track, so it disappears.
 
 **Weak spots already in the dark theme** (noted, not fixed): red against the track 2.74; muted
-`#6b7280` on `#111827` 3.67, on small text; error `#ef4444` on the dark dialog 3.90; chip text
+`#6b7280` on `#111827` 3.67, and 3.04 on the dialog's `#1f2937`, on small text; error `#ef4444` on the dark dialog 3.90; chip text
 `#f9fafb` on the darkened green and yellow fills 3.83 and 3.65.
 
 **Light colours that pass**, against the `#e5e7eb` track:
@@ -186,24 +189,28 @@ without losing distinctions; `palette()` in a stylesheet still needs the same re
 literal still has to be rewritten and painters still need explicit colours; and forcing Fusion
 changes the native look of every message box and menu on Windows and macOS.
 
-**C. Two complete stylesheet sets.** Rejected. Most of the 63 call sites build their stylesheet at
-runtime around a user's band colour, so they cannot be swapped as a set; every later colour change
-becomes two edits; painters are not covered.
+**C. Two complete stylesheet sets.** Rejected. Eight call sites build their stylesheet at runtime
+around a band or status colour (`widget.py:480, :1007, :1015, :1175, :2218, :2219`,
+`settings_dialog.py:559`, `ratio_dialog.py:310`), so the sheets cannot be swapped as a set; every
+later colour change becomes two edits; painters are not covered.
 
 **What the prototype showed** (on a `git archive` export: `theme.py` 128 lines, a scripted rewrite
 of `widget.py`'s 57 sites and 37 `setStyleSheet` calls, and the `ui_style.py` scroll bars):
 
 - Dark render against unmodified `5f09a55`: **0 differing pixels**, panel and chip strip.
 - Built dark then switched live to light, against built light: **0 differing pixels**.
-- A live switch with Settings open (339 widgets, 67 templated) takes 37 ms.
-- The full suite passes on the prototype tree: **2 139 tests**.
+- A live switch with Settings open (about 340 widgets, 67 templated) takes 30–40 ms.
+- The full suite passes on the prototype tree: **2 139 tests**, all of them at `5f09a55`.
+
+The renders and the timing were taken with a driver that is not committed; the prototype tree itself
+is rebuilt with the recipe at the end of this document.
 
 ## 4. What follows the scheme, and what cannot
 
 | Surface | Today | With this design |
 |---|---|---|
 | Panel, chips, macOS popover (the popover *is* the panel) | dark literals | tokens, live |
-| Settings, gauge colours, cookie, error and ratio dialogs | dark literals per dialog | templated and live while open; their 11 rich-text links update on reopen |
+| Settings, gauge colours, cookie, error and ratio dialogs | dark literals per dialog | templated and live while open; their 9 rich-text sites (6 links, 3 spans) update on reopen |
 | Message boxes and `QColorDialog` parented to a dialog | inherit the dialog's stylesheet | follow it |
 | Message boxes on the panel (`app.py:2765, :2772`), tray menu, tooltips, window title bars | OS palette | `setColorScheme` on Qt ≥ 6.8 where the platform honours it; otherwise the OS |
 | Settings chevrons | one PNG pair | one pair per scheme, same cache folder |
@@ -270,21 +277,26 @@ colour emoji on Windows — unverified.) Tooltip: "Colour scheme: Match system (
 
 **Shared with the zoom feature** (see [`zoom-toggle.md`](zoom-toggle.md)):
 
-- **One stylesheet helper.** Both features rewrite the same 63 `setStyleSheet` calls, and
-  `docs/ui-scale-widget-only-plan.md` already proposes a `qss()` wrapper that rewrites px values.
-  Make it **one** helper — `styled(widget, template)` applies the colour tokens *and* the px
-  scaling and remembers the template — and one `restyle_all()` that serves both a theme change and
-  a zoom change. Land it once, as the shared first PR.
+- **One stylesheet helper and one restyle seam.** Both features rewrite the 37 stylesheet calls in
+  `widget.py` (34 of them carry both a colour and a px value); the theme also rewrites the 24 in the
+  dialogs and login window, which zoom leaves at OS size. `docs/ui-scale-widget-only-plan.md`
+  already proposes a `qss()` wrapper that rewrites px values. Make it **one** helper —
+  `styled(widget, template)` renders colour tokens *and* zoomed px and remembers the template — and
+  one `restyle_all()`, which a scheme change and a zoom change both call: it re-renders every
+  remembered template, then calls each panel class's `_restyle()` (zoom-toggle.md §5: fixed sizes,
+  margins, `fontMetrics` widths), then re-delivers each tile's snapshot. Land it with today's dark
+  tokens at zoom 1.0 as the shared first PR (§9, PR 1).
 - **One footer row**, margins of at least `RESIZE_BAND`, counted in `_refit_height`, hidden when
   collapsed.
 - **The theme icon takes a `size`**, so it scales with zoom.
-- **Both config fields in `WindowState`**, beside `ui_scale` and `opacity`, with validators that
-  coerce bad values to a default and never raise.
+- **`color_scheme`, and zoom's one-shot migration bool, in `WindowState`**, beside `ui_scale` and
+  `opacity`, with validators that coerce bad values to a default and never raise.
 
 ## 7. Recommended design
 
 1. **`theme.py`:** the `DARK` table (exactly today's values) and the `LIGHT` table, plus `tok()`,
-   `qss()`, `styled()`, `band_color()` and a `ColorSchemeController(QObject)` with a `changed(str)`
+   `qss()` (token substitution; in the shared helper it also scales px, §6), `styled()`,
+   `band_color()` and a `ColorSchemeController(QObject)` with a `changed(str)`
    signal.
 2. **Resolution:** an explicit Light or Dark setting wins. "System" uses the last scheme Qt
    reported — the initial `colorScheme()`, then each `colorSchemeChanged` argument. Unknown resolves
@@ -327,8 +339,10 @@ scheme.
 2. **Token tables:** both have the same keys, every value is a valid `QColor`, and `DARK` equals
    today's literals — this pins the no-visible-change PR.
 3. **Literal ratchet:** an AST test that no `#rrggbb` literal remains in `src/aigauge` outside
-   `theme.py`, `config.py`'s band defaults and the gauge-neutral constant; and `UsageWidget` itself
-   never gets a stylesheet.
+   `theme.py`, the band defaults (`config.py:303–306`, `menubar.py:31–33`), the four gauge-neutral
+   constants (`gauge.py:21`, `menubar.py:35`, `macos_status_item.py:46`, `app.py:259`) and the setup
+   dot (`menubar.py:36`), ignoring docstrings and comments; and `UsageWidget` itself never gets a
+   stylesheet.
 4. **Contrast rules**, computed from tokens rather than sampled at Linux pixel positions, for each
    scheme: primary and secondary text at least 4.5 on the panel and the dialog; muted text at least
    3 (dark's 3.67 and the dark-dialog error's 3.90 kept as they are); light band defaults at least 3
@@ -352,7 +366,7 @@ scheme.
 ## 9. PRs, effort, risk
 
 1. **Templated stylesheets and dark tokens, no visible change** (shared with zoom). `theme.py`,
-   177 literal edits across 7 files, the 63 `setStyleSheet` calls switched to `styled`, painters
+   177 literal edits across 7 files, the 61 sheet-setting calls switched to `styled`, painters
    reading `tok()`. Tests 2, 3 and 11. About 600 changed lines and 10 tests. Evidence it can be done
    invisibly: the prototype's 0-pixel diff and full passing suite.
 2. **Light theme, resolution and config field.** The `LIGHT` table, the controller, validator and
@@ -370,7 +384,7 @@ test catches it); on macOS, setting `NSApp.appearance` changes the status-item t
 cosmetic only); merge conflicts with zoom if the shared PR does not land first; on a Linux desktop
 Qt cannot read, "System" shows dark, which may surprise.
 
-## 10. Open questions for Michael
+## 10. Open questions for the maintainer
 
 1. **Which scheme by default?** Recommended: new installs follow the system, upgrades keep Dark.
 2. **Should a click open a menu or cycle through the three states?** Recommended: a menu — a cycle
@@ -384,8 +398,17 @@ Qt cannot read, "System" shows dark, which may surprise.
 
 - `compare-dark-light-custom.png` — the image at the top of this document.
 - `inventory.py` — the colour count in §1.1 (`python3 docs/research/theme/inventory.py src/aigauge [-v]`).
-- `contrast.py` — the WCAG ratios in §1.3.
+- `contrast.py` — the WCAG ratios in §1.3 (`python3 docs/research/theme/contrast.py`).
 - `theme_prototype.py` — the prototype token module (`theme.py`), as evidence for §3, not code to
   merge.
 - `prototype-widget.diff`, `prototype-ui_style.diff` — the scripted rewrite the 0-pixel diff was
   measured on, against `5f09a55`.
+
+To rebuild the prototype tree from the repo root:
+
+```sh
+P=$(mktemp -d) && git archive 5f09a55 | tar -x -C "$P"
+patch -p1 -d "$P" < docs/research/theme/prototype-widget.diff
+patch -p1 -d "$P" < docs/research/theme/prototype-ui_style.diff
+cp docs/research/theme/theme_prototype.py "$P/src/aigauge/theme.py"
+```
