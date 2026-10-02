@@ -56,7 +56,8 @@ WINDOW_MAX_DIMENSION = 4096
 # primary monitor is negative. A desktop is a few thousand pixels per monitor,
 # so this is far outside any real one and far inside the C int that QPoint
 # takes - past that, PyQt raises OverflowError while the panel is being built -
-# with room left for the size, since Qt works out a right edge as x + width.
+# with room left for the size, since Qt works out a right edge as
+# x + width - 1.
 # Anything inside it that is off every screen is pulled back on at show time.
 WINDOW_MAX_POSITION = 32767
 WINDOW_COLLAPSED_HEIGHT = 58
@@ -241,7 +242,9 @@ class WindowState(BaseModel):
     past the C int that ``QPoint`` takes raised ``OverflowError`` inside
     ``App()``, so the app failed at every start until the file was edited; a
     fractional or non-numeric one raised in here instead, and the salvage in
-    ``Config.load()`` discarded the whole window block with it.
+    ``Config.load()`` discarded the whole window block with it. So did an
+    unreadable ``collapsed``, ``always_on_top`` or ``fade_when_inactive``:
+    every field here now coerces, so one bad value costs only that value.
     """
 
     x: int | None = None
@@ -272,6 +275,16 @@ class WindowState(BaseModel):
         # Anything but a real bool is a file this app did not write; the safe
         # reading of it is "no", which leaves auto-fit on.
         return value if isinstance(value, bool) else False
+
+    @field_validator("collapsed", "always_on_top", "fade_when_inactive", mode="before")
+    @classmethod
+    def _coerce_flag(cls, value: object, info) -> bool:
+        # A raise in here costs the whole window block - position, size,
+        # opacity - for one unreadable flag. Anything but a real bool is a file
+        # this app did not write, and reads as the flag's default.
+        if isinstance(value, bool):
+            return value
+        return cls.model_fields[info.field_name].default
 
     @field_validator("x", "y", mode="before")
     @classmethod

@@ -658,12 +658,22 @@ def test_window_width_is_coerced_never_rejected(payload, expected):
         (0, 0),
         (WINDOW_MAX_POSITION, WINDOW_MAX_POSITION),
         (-WINDOW_MAX_POSITION, -WINDOW_MAX_POSITION),
+        # Absolute, not relative to the constant: a bound lowered to a few
+        # thousand would still pass every case above, and would move the
+        # panel of anyone with a monitor further out than that.
+        (7680, 7680),
+        (-7680, -7680),
+        (30000, 30000),
+        (32768, 32767),
+        (-32768, -32767),
     ],
     ids=[
         "huge", "huge-negative", "one-past-c-int", "huge-float",
         "too-big-for-float", "fraction", "negative-fraction", "string", "true",
         "false", "nan", "inf", "list", "dict", "null", "monitor-to-the-left",
-        "zero", "at-bound", "at-negative-bound",
+        "zero", "at-bound", "at-negative-bound", "four-4k-monitors-right",
+        "four-4k-monitors-left", "far-out", "one-past-bound",
+        "one-past-negative-bound",
     ],
 )
 def test_window_position_is_coerced_never_rejected(field, raw, expected):
@@ -678,7 +688,7 @@ def test_window_position_is_coerced_never_rejected(field, raw, expected):
 
 def test_the_position_bound_leaves_room_for_the_size_inside_a_c_int():
     """QPoint takes a C int, and Qt works out a window's right and bottom
-    edges as position + size, so the bound has to keep that sum inside one
+    edges as position + size - 1, so the bound has to keep that sum inside one
     too, at either sign. Bounding at the C int itself would pass every
     coercion test above and still overflow there."""
     c_int_max = 2**31 - 1
@@ -700,9 +710,11 @@ def test_the_position_bound_leaves_room_for_the_size_inside_a_c_int():
     ids=["huge", "fraction", "string", "nan", "inf", "list", "bool"],
 )
 def test_a_bad_saved_position_costs_only_the_position(bad_x, expected_x):
-    """Before 1.4.3+cfa.11 a fraction, a string, NaN, an overflowing literal
-    or a list raised inside WindowState, and Config.load()'s salvage threw away
-    the user's size, opacity and user_sized with it, silently."""
+    """Before 1.4.3+cfa.11 a fraction, a non-numeric string, NaN, an
+    overflowing literal or a list raised inside WindowState, and
+    Config.load()'s salvage threw away the user's size, opacity and user_sized
+    with it - logged, and the file kept as config.json.corrupt, but nothing on
+    screen said so."""
     config_path().parent.mkdir(parents=True, exist_ok=True)
     config_path().write_text(
         '{"window": {"x": %s, "y": 120, "width": 500, "height": 400,'
@@ -717,6 +729,57 @@ def test_a_bad_saved_position_costs_only_the_position(bad_x, expected_x):
     assert window.opacity == 0.95
     assert window.y == 120
     assert window.x == expected_x
+
+
+def test_an_unusable_position_is_logged_under_its_own_name(caplog):
+    from aigauge.config import WindowState
+
+    with caplog.at_level(logging.WARNING, logger="aigauge"):
+        WindowState(x=10, y="abc")
+
+    assert "unusable y" in caplog.text
+    assert "unusable x" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "field,default",
+    [("collapsed", False), ("always_on_top", True), ("fade_when_inactive", False)],
+)
+@pytest.mark.parametrize(
+    "raw",
+    [None, "abc", "true", 2, 0, 1, [1], {"a": 1}, float("nan")],
+    ids=["null", "string", "true-string", "two", "zero", "one", "list", "dict", "nan"],
+)
+def test_a_window_flag_that_is_not_a_bool_reads_as_its_default(field, default, raw):
+    """Each raised before, and a raise in WindowState costs the whole window
+    block: one `"collapsed": null` reset the position, size and opacity."""
+    from aigauge.config import WindowState
+
+    assert getattr(WindowState(**{field: raw}), field) is default
+
+
+@pytest.mark.parametrize("field", ["collapsed", "always_on_top", "fade_when_inactive"])
+@pytest.mark.parametrize("value", [True, False])
+def test_a_window_flag_that_is_a_bool_is_kept(field, value):
+    from aigauge.config import WindowState
+
+    assert getattr(WindowState(**{field: value}), field) is value
+
+
+@pytest.mark.parametrize("field", ["collapsed", "always_on_top", "fade_when_inactive"])
+def test_a_bad_window_flag_costs_only_the_flag(field):
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        '{"window": {"x": 400, "y": 120, "width": 500, "height": 400,'
+        ' "user_sized": true, "opacity": 0.95, "%s": null}}' % field,
+        encoding="utf-8",
+    )
+
+    window = Config.load().window
+
+    assert (window.x, window.y, window.width, window.height) == (400, 120, 500, 400)
+    assert window.user_sized is True
+    assert window.opacity == 0.95
 
 
 def test_color_thresholds_reject_stylesheet_injection():

@@ -9,7 +9,8 @@
 ## 1.4.3+cfa.11 - 2026-10-02
 
 A patch release for one defect, found while researching the zoom toggle: a saved
-window position that the loader never bounded.
+window position that the loader never bounded - and, found while testing that,
+three window settings that could still cost the rest of the window block.
 
 ### Fixed
 
@@ -24,13 +25,19 @@ window position that the loader never bounded.
   screen at show time. Nothing the app writes comes near the bound - positions
   come from the OS - so it takes a damaged or hand-edited file.
 - **A malformed position no longer costs the rest of the window block.** A
-  fraction, a string, `NaN`, an overflowing literal or a list in `x` or `y`
-  raised inside the window settings, and the loader's salvage discarded the
-  whole block with it: the panel's saved size, its opacity and whether the user
-  had sized it went back to defaults, silently. A fraction is now truncated,
-  anything else unusable reads as "never placed" and the OS chooses, and the
-  rest of the block is kept. `true` and `false`, which loaded as positions 1
-  and 0, read as "never placed" too.
+  fraction, a non-numeric string, `NaN`, an overflowing literal or a list in
+  `x` or `y` raised inside the window settings, and the loader's salvage
+  discarded the whole block with it: the panel's saved size, its opacity and
+  whether the user had sized it went back to defaults. The log said so and the
+  file was kept as `config.json.corrupt`, but nothing on screen did. A fraction
+  is now truncated, anything else unusable reads as "never placed" and the OS
+  chooses, and the rest of the block is kept. `true` and `false`, which loaded
+  as positions 1 and 0, read as "never placed" too.
+- **So does a malformed on/off setting in the same block.** `collapsed`,
+  `always_on_top` and `fade_when_inactive` had no coercion either, so a
+  `"collapsed": null` reset the position, size and opacity the same way. Each
+  now reads anything but `true` or `false` as its default, as `user_sized`
+  already did.
 
 ## 1.4.2+cfa.10 - 2026-10-01
 
