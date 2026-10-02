@@ -1,0 +1,28 @@
+--- a/src/aigauge/ui_style.py
++++ b/src/aigauge/ui_style.py
+@@ -46,9 +46,9 @@
+ _HANDLE_MARGIN = 2
+ _HANDLE_RADIUS = (SCROLLBAR_WIDTH - 2 * _HANDLE_MARGIN) // 2
+ 
+-HANDLE = "#4b5563"
+-HANDLE_HOVER = "#6b7280"
+-HANDLE_PRESSED = "#9ca3af"
++HANDLE = "$scroll_handle"
++HANDLE_HOVER = "$scroll_handle_hover"
++HANDLE_PRESSED = "$scroll_handle_pressed"
+ 
+ 
+ def wheel_step(widget: QWidget) -> int:
+@@ -124,7 +124,9 @@
+ """
+ 
+ 
+-SCROLLBAR_STYLESHEET = scrollbar_stylesheet(panel=WIDGET_PANEL, track=WIDGET_TRACK)
+-DIALOG_SCROLLBAR_STYLESHEET = scrollbar_stylesheet(
++# PROTOTYPE: the widget's sheet is a template; the dialog's is rendered dark.
++SCROLLBAR_STYLESHEET = scrollbar_stylesheet(panel="$panel", track="$scroll_track")
++from .theme import qss as _qss  # noqa: E402
++DIALOG_SCROLLBAR_STYLESHEET = _qss(scrollbar_stylesheet(
+     panel=DIALOG_PANEL, track=DIALOG_TRACK
+-)
++))

@@ -1,0 +1,494 @@
+--- a/src/aigauge/widget.py
++++ b/src/aigauge/widget.py
+@@ -64,6 +64,18 @@
+     RatioEstimate,
+ )
+ from .ui_style import SCROLLBAR_STYLESHEET, apply_wheel_step
++from .gauge import band_for_percent
++from .theme import band_color, notifier as _theme_notifier, styled, tok
++
++
++def _on_fill(fill) -> str:
++    """White or near-black, whichever reads better on ``fill`` (WCAG luminance)."""
++    def lum(c):
++        ch = [v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
++              for v in (c.redF(), c.greenF(), c.blueF())]
++        return 0.2126 * ch[0] + 0.7152 * ch[1] + 0.0722 * ch[2]
++    lf = lum(QColor(fill))
++    return "#ffffff" if (1.05 / (lf + 0.05)) >= ((lf + 0.05) / (lum(QColor("#111827")) + 0.05)) else "#111827"
+ 
+ ROW_BAR_HEIGHT = 8
+ # How wide the right-hand column may grow for a reset_label that is a phrase
+@@ -285,15 +297,19 @@
+     # literal #rrggbb, whatever the caller passed. config.ColorThresholds
+     # already validates, but these strings are interpolated into QSS and that
+     # safety should not depend on validation having run.
+-    return QColor(color_for_percent(p, colors)).name()
++    colors = colors or ColorThresholds()
++    band = band_for_percent(p, colors)
++    if band is None:
++        return QColor(color_for_percent(p, colors)).name()
++    return QColor(band_color(f"{band}_color", getattr(colors, f"{band}_color"))).name()
+ 
+ 
+ def _chip_fill_for_percent(
+     p: float | None, colors: ColorThresholds | None = None
+ ) -> str:
+     if p is None:
+-        return "#374151"
+-    return QColor(color_for_percent(p, colors)).darker(135).name()
++        return tok().chip_neutral
++    return QColor(_color_for_percent(p, colors)).darker(tok().chip_darker).name()
+ 
+ 
+ def _format_summary_percent(p: float | None) -> str:
+@@ -477,7 +493,7 @@
+     def set_line(self, text: str, *, clickable: bool, color: str) -> None:
+         self._full_text = text or ""
+         self._clickable = clickable and bool(self._full_text)
+-        self.setStyleSheet(
++        styled(self, 
+             f"color:{color}; font-size:10px;"
+             + (" text-decoration: underline;" if self._clickable else "")
+         )
+@@ -631,12 +647,12 @@
+     dark base and the darker-tone fill colors.
+     """
+ 
+-    _BASE = QColor("#1f2937")
+-    _BORDER = QColor("#374151")
+-    _TEXT = QColor("#f9fafb")
+-    _NEUTRAL_FILL = QColor("#374151")
+-    _AUTH_FILL = QColor("#92400e")  # amber-800 — wants action
+-    _PACE = QColor(229, 231, 235, 230)
++    _BASE = property(lambda self: QColor(tok().chip_base))
++    _BORDER = property(lambda self: QColor(tok().chip_border))
++    _TEXT = property(lambda self: QColor(tok().chip_text))
++    _NEUTRAL_FILL = property(lambda self: QColor(tok().chip_neutral))
++    _AUTH_FILL = property(lambda self: QColor(tok().warning_fill))
++    _PACE = property(lambda self: QColor(*tok().chip_notch))
+ 
+     def __init__(self, parent: QWidget | None = None):
+         super().__init__(parent)
+@@ -712,11 +728,18 @@
+ 
+         # Text
+         painter.setPen(self._TEXT)
++        if tok().name == "light" and self._percent:
++            split = rect.x() + rect.width() * max(0.0, min(1.0, self._percent / 100.0))
++            painter.setClipRect(QRectF(split, rect.y(), rect.right() - split, rect.height()))
++            painter.drawText(rect.toRect(), Qt.AlignmentFlag.AlignCenter, self._text)
++            painter.setClipRect(QRectF(rect.x(), rect.y(), split - rect.x(), rect.height()))
++            painter.setPen(QColor(_on_fill(self._fill_color)))
+         painter.drawText(
+             rect.toRect(),
+             Qt.AlignmentFlag.AlignCenter,
+             self._text,
+         )
++        painter.setClipping(False)
+ 
+         # Pace notch — downward-pointing triangle sitting on the top edge.
+         # Drawn last so it isn't clipped by the rounded body or covered by
+@@ -836,8 +859,8 @@
+ 
+ 
+ class _PaceTickOverlay(QWidget):
+-    _PACE = QColor(243, 244, 246, 180)
+-    _PACE_SHADOW = QColor(17, 24, 39, 120)
++    _PACE = property(lambda self: QColor(*tok().pace_tick))
++    _PACE_SHADOW = property(lambda self: QColor(*tok().pace_shadow))
+ 
+     def __init__(self, parent: QWidget | None = None):
+         super().__init__(parent)
+@@ -917,7 +940,7 @@
+         # neighbours - and the default is AutoText, which *interprets* one
+         # shaped like markup. Same rule as the detail line, one row over.
+         self.label.setTextFormat(Qt.TextFormat.PlainText)
+-        self.label.setStyleSheet("color: #d1d5db; font-size: 11px;")
++        styled(self.label, "color: $text_label; font-size: 11px;")
+         self.label.setMinimumWidth(70)
+         self._resets_at: datetime | None = None
+         self._window: timedelta | None = None
+@@ -931,7 +954,7 @@
+ 
+         self.pct = QLabel("--")
+         self.pct.setTextFormat(Qt.TextFormat.PlainText)
+-        self.pct.setStyleSheet("color: #f3f4f6; font-size: 11px; font-weight: 600;")
++        styled(self.pct, "color: $text_strong; font-size: 11px; font-weight: 600;")
+         self.pct.setFixedWidth(34)
+         self.pct.setAlignment(
+             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+@@ -939,7 +962,7 @@
+ 
+         self.reset = QLabel("")
+         self.reset.setTextFormat(Qt.TextFormat.PlainText)
+-        self.reset.setStyleSheet("color: #9ca3af; font-size: 10px;")
++        styled(self.reset, "color: $text_secondary; font-size: 10px;")
+         self.reset.setFixedWidth(58)
+         self.reset.setAlignment(
+             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+@@ -977,10 +1000,10 @@
+         if split_note:
+             left, right = label.split(" · ", 1)
+             self.label.setText(left)
+-            self.reset.setStyleSheet("color: #d1d5db; font-size: 11px;")
++            styled(self.reset, "color: $text_label; font-size: 11px;")
+         else:
+             self.label.setText(label)
+-            self.reset.setStyleSheet("color: #9ca3af; font-size: 10px;")
++            styled(self.reset, "color: $text_secondary; font-size: 10px;")
+         self.setToolTip(_safe_tooltip(note))
+         self._resets_at = resets_at
+         self._window = window
+@@ -1004,15 +1027,15 @@
+             self.pct.setVisible(True)
+             self.bar.setVisible(True)
+         color = _color_for_percent(percent, self._colors)
+-        self.bar.setStyleSheet(
+-            f"QProgressBar {{ background:#374151; border:none; border-radius:3px; }}"
++        styled(self.bar, 
++            f"QProgressBar {{ background:$track; border:none; border-radius:3px; }}"
+             f"QProgressBar::chunk {{ background:{color}; border-radius:3px; }}"
+         )
+         if tint_reset and percent is not None and not split_note:
+             # The same colour string the chunk was just given, so the amount
+             # and the bar cannot drift apart - including under a user's own
+             # gauge colours, which is what _colors carries.
+-            self.reset.setStyleSheet(f"color: {color}; font-size: 10px;")
++            styled(self.reset, f"color: {color}; font-size: 10px;")
+         if split_note:
+             self.reset.setText(right)
+             self.reset.setVisible(True)
+@@ -1098,9 +1121,9 @@
+         self._window = None
+         self.bar.setRange(0, 0)
+         self.bar.set_pace(None)
+-        self.bar.setStyleSheet(
+-            "QProgressBar { background:#1f2937; border:none; border-radius:3px; }"
+-            "QProgressBar::chunk { background:#4b5563; border-radius:3px; }"
++        styled(self.bar, 
++            "QProgressBar { background:$track_skeleton; border:none; border-radius:3px; }"
++            "QProgressBar::chunk { background:$chunk_skeleton; border-radius:3px; }"
+         )
+         self.bar.setVisible(True)
+         self.pct.setVisible(True)
+@@ -1132,7 +1155,7 @@
+         # As on the expanded row: the code is the first letter of a label the
+         # page supplied, and the reset column is a phrase from it.
+         self.code.setTextFormat(Qt.TextFormat.PlainText)
+-        self.code.setStyleSheet("color:#d1d5db; font-size:10px; font-weight:700;")
++        styled(self.code, "color:$text_label; font-size:10px; font-weight:700;")
+         self.code.setFixedWidth(10)
+         self.code.setAlignment(Qt.AlignmentFlag.AlignCenter)
+ 
+@@ -1143,13 +1166,13 @@
+ 
+         self.pct = QLabel("--")
+         self.pct.setTextFormat(Qt.TextFormat.PlainText)
+-        self.pct.setStyleSheet("color:#f3f4f6; font-size:10px; font-weight:600;")
++        styled(self.pct, "color:$text_strong; font-size:10px; font-weight:600;")
+         self.pct.setFixedWidth(28)
+         self.pct.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+ 
+         self.reset = QLabel("")
+         self.reset.setTextFormat(Qt.TextFormat.PlainText)
+-        self.reset.setStyleSheet("color:#9ca3af; font-size:10px;")
++        styled(self.reset, "color:$text_secondary; font-size:10px;")
+         self.reset.setFixedWidth(38)
+         self.reset.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+ 
+@@ -1172,8 +1195,8 @@
+             0 if percent is None else int(round(max(0.0, min(percent, 100.0))))
+         )
+         color = _color_for_percent(percent, self._colors)
+-        self.bar.setStyleSheet(
+-            f"QProgressBar {{ background:#374151; border:none; border-radius:3px; }}"
++        styled(self.bar, 
++            f"QProgressBar {{ background:$track; border:none; border-radius:3px; }}"
+             f"QProgressBar::chunk {{ background:{color}; border-radius:3px; }}"
+         )
+         tooltip = f"{metric.label}: {_format_summary_percent(percent)}"
+@@ -1197,11 +1220,11 @@
+         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+ 
+         self.header = _ElidingLabel(display_name)
+-        self.header.setStyleSheet("color: #e5e7eb; font-size: 12px; font-weight: 700;")
++        styled(self.header, "color: $text; font-size: 12px; font-weight: 700;")
+ 
+         self.status = QLabel("loading…")
+-        self.status.setStyleSheet(
+-            "color: #6b7280; font-size: 10px; font-style: italic;"
++        styled(self.status, 
++            "color: $text_muted; font-size: 10px; font-style: italic;"
+         )
+         self.status.setAlignment(
+             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+@@ -1217,7 +1240,7 @@
+         self.ratio_label = QLabel("")
+         self.ratio_label.setVisible(False)
+         self.ratio_label.setTextFormat(Qt.TextFormat.RichText)
+-        self.ratio_label.setStyleSheet("color: #9ca3af; font-size: 10px;")
++        styled(self.ratio_label, "color: $text_secondary; font-size: 10px;")
+         self.ratio_label.setAlignment(
+             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+         )
+@@ -1228,10 +1251,10 @@
+         self.action_btn = QPushButton("Sign in")
+         self.action_btn.setVisible(False)
+         self.action_btn.setFixedHeight(20)
+-        self.action_btn.setStyleSheet(
+-            "QPushButton { background:#4b5563; color:#f3f4f6; border:none; "
++        styled(self.action_btn, 
++            "QPushButton { background:$button; color:$text_strong; border:none; "
+             "border-radius:3px; padding:0 8px; font-size:10px; }"
+-            "QPushButton:hover { background:#6b7280; }"
++            "QPushButton:hover { background:$button_hover; }"
+         )
+         self.action_btn.clicked.connect(
+             lambda: self.sign_in_requested.emit(self.provider)
+@@ -1240,10 +1263,10 @@
+         self.expand_btn = QPushButton("▸")  # right-pointing chevron
+         self.expand_btn.setVisible(False)
+         self.expand_btn.setFixedSize(16, 16)
+-        self.expand_btn.setStyleSheet(
+-            "QPushButton { background:transparent; color:#9ca3af; border:none; "
++        styled(self.expand_btn, 
++            "QPushButton { background:transparent; color:$text_secondary; border:none; "
+             "font-size:10px; padding:0; }"
+-            "QPushButton:hover { color:#f3f4f6; }"
++            "QPushButton:hover { color:$text_strong; }"
+         )
+         self.expand_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+         self.expand_btn.setToolTip("Show top models")
+@@ -1390,8 +1413,8 @@
+         if snapshot is None:
+             self._set_detail(None)
+             self.status.setText("loading…")
+-            self.status.setStyleSheet(
+-                "color: #6b7280; font-size: 10px; font-style: italic;"
++            styled(self.status, 
++                "color: $text_muted; font-size: 10px; font-style: italic;"
+             )
+             self.status.setToolTip("")
+             self.status.setCursor(Qt.CursorShape.ArrowCursor)
+@@ -1404,8 +1427,8 @@
+ 
+         if snapshot.status == SnapshotStatus.AUTH_REQUIRED:
+             self.status.setText("not signed in")
+-            self.status.setStyleSheet(
+-                "color: #f59e0b; font-size: 10px; font-style: normal;"
++            styled(self.status, 
++                "color: $warning; font-size: 10px; font-style: normal;"
+             )
+             self.status.setToolTip(_safe_tooltip(snapshot.error))
+             self.status.setCursor(Qt.CursorShape.ArrowCursor)
+@@ -1426,7 +1449,7 @@
+             self._set_detail(
+                 None if can_sign_in else snapshot.error,
+                 clickable=False,
+-                color="#f59e0b",
++                color="$warning",
+             )
+             return
+ 
+@@ -1437,10 +1460,10 @@
+                 else _short_error_reason(snapshot.error)
+             )
+             self.status.setText(
+-                f'<a href="details" style="color:#ef4444; text-decoration:none;">{label}</a>'
++                f'<a href="details" style="color:{tok().error}; text-decoration:none;">{label}</a>'
+             )
+-            self.status.setStyleSheet(
+-                "color: #ef4444; font-size: 10px; font-style: normal;"
++            styled(self.status, 
++                "color: $error; font-size: 10px; font-style: normal;"
+             )
+             suffix = "\n\nClick for details."
+             if snapshot.metrics:
+@@ -1465,7 +1488,7 @@
+             self._set_detail(
+                 None if snapshot.metrics else (snapshot.error or "unknown error"),
+                 clickable=True,
+-                color="#ef4444",
++                color="$error",
+             )
+             if compact_metrics and not self._expanded:
+                 self._set_rows([])
+@@ -1495,8 +1518,8 @@
+         # OK
+         self._set_detail(None)
+         self.status.setText("")
+-        self.status.setStyleSheet(
+-            "color: #9ca3af; font-size: 10px; font-style: normal;"
++        styled(self.status, 
++            "color: $text_secondary; font-size: 10px; font-style: normal;"
+         )
+         self.status.setToolTip("")
+         self.status.setCursor(Qt.CursorShape.ArrowCursor)
+@@ -1539,7 +1562,7 @@
+         text: str | None,
+         *,
+         clickable: bool = False,
+-        color: str = "#ef4444",
++        color: str = "$error",
+     ) -> None:
+         self.detail.set_line(text or "", clickable=clickable, color=color)
+ 
+@@ -1578,7 +1601,7 @@
+             and estimate.confident
+             and estimate.source == "history"
+         )
+-        color = "#6b7280" if carry_over else "#9ca3af"
++        color = tok().text_muted if carry_over else tok().text_secondary
+         if carry_over:
+             text = f"{text}°"  # degree marker: last week's value, refining this week
+         self.ratio_label.setText(
+@@ -1780,15 +1803,15 @@
+         # Header bar
+         title = QLabel(f"AI Gauge {__version__}")
+         title.setToolTip(f"ai-gauge {__version__}")
+-        title.setStyleSheet("color:#9ca3af; font-size:10px; font-weight:600;")
++        styled(title, "color:$text_secondary; font-size:10px; font-weight:600;")
+ 
+         self.cadence_label = QLabel("")
+-        self.cadence_label.setStyleSheet("color:#6b7280; font-size:10px;")
++        styled(self.cadence_label, "color:$text_muted; font-size:10px;")
+         self.cadence_label.setToolTip("")
+ 
+         self.refresh_btn = self._mini_button("", "Refresh now")
+         self.refresh_btn.setIcon(
+-            _refresh_icon(normal="#9ca3af", active="#f3f4f6", size=16)
++            _refresh_icon(normal=tok().text_secondary, active=tok().text_strong, size=16)
+         )
+         self.refresh_btn.setIconSize(QSize(16, 16))
+         self.refresh_btn.clicked.connect(self.refresh_requested.emit)
+@@ -1803,7 +1826,7 @@
+         self.close_btn.clicked.connect(self.hide)
+ 
+         self.age_label = QLabel("")
+-        self.age_label.setStyleSheet("color:#6b7280; font-size:10px;")
++        styled(self.age_label, "color:$text_muted; font-size:10px;")
+ 
+         header = QHBoxLayout()
+         header.setContentsMargins(8, 4, 4, 2)
+@@ -1825,8 +1848,8 @@
+         )
+ 
+         self._collapsed_label = QLabel("")
+-        self._collapsed_label.setStyleSheet(
+-            "color:#e5e7eb; font-size:10px; font-weight:600;"
++        styled(self._collapsed_label, 
++            "color:$text; font-size:10px; font-weight:600;"
+         )
+         self._collapsed_label.setAlignment(
+             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+@@ -1848,14 +1871,14 @@
+         collapsed_header.setContentsMargins(0, 0, 0, 0)
+         collapsed_header.setSpacing(4)
+         collapsed_title = QLabel(f"AI Gauge {__version__}")
+-        collapsed_title.setStyleSheet("color:#9ca3af; font-size:10px; font-weight:600;")
++        styled(collapsed_title, "color:$text_secondary; font-size:10px; font-weight:600;")
+         collapsed_header.addWidget(collapsed_title)
+         self._collapsed_cadence_label = QLabel("")
+-        self._collapsed_cadence_label.setStyleSheet("color:#6b7280; font-size:10px;")
++        styled(self._collapsed_cadence_label, "color:$text_muted; font-size:10px;")
+         collapsed_header.addWidget(self._collapsed_cadence_label)
+         collapsed_header.addStretch(1)
+         self._collapsed_age_label = QLabel("")
+-        self._collapsed_age_label.setStyleSheet("color:#6b7280; font-size:10px;")
++        styled(self._collapsed_age_label, "color:$text_muted; font-size:10px;")
+         collapsed_header.addWidget(self._collapsed_age_label)
+         collapsed_header.addWidget(self._expand_btn)
+ 
+@@ -1868,7 +1891,7 @@
+         collapsed_outer.addLayout(self._collapsed_summary_layout)
+ 
+         self._tile_container = QWidget(self)
+-        self._tile_container.setStyleSheet("background:#111827;")
++        styled(self._tile_container, "background:$panel;")
+         self._tile_container.setSizePolicy(
+             QSizePolicy.Policy.Expanding,
+             QSizePolicy.Policy.Fixed,
+@@ -1892,12 +1915,12 @@
+         self._tile_scroll.setVerticalScrollBarPolicy(
+             Qt.ScrollBarPolicy.ScrollBarAsNeeded
+         )
+-        self._tile_scroll.setStyleSheet(
+-            "QScrollArea { background:#111827; border:none; }"
+-            "QScrollArea > QWidget > QWidget { background:#111827; }"
++        styled(self._tile_scroll, 
++            "QScrollArea { background:$panel; border:none; }"
++            "QScrollArea > QWidget > QWidget { background:$panel; }"
+             + SCROLLBAR_STYLESHEET
+         )
+-        self._tile_scroll.viewport().setStyleSheet("background:#111827;")
++        styled(self._tile_scroll.viewport(), "background:$panel;")
+         # Three lines of text per wheel notch, from the one definition the
+         # dialog's pages use as well - see ui_style.WHEEL_STEP_LINES. The page
+         # step is the viewport height, which QScrollArea keeps in step with
+@@ -1936,15 +1959,27 @@
+         self._committed_geometry = self._geometry_state()
+         self._apply_collapsed_state()
+         self._track_hover()
++        _theme_notifier.changed.connect(self._on_theme_changed)
++
++    def _on_theme_changed(self, _name: str) -> None:
++        self.refresh_btn.setIcon(
++            _refresh_icon(normal=tok().text_secondary, active=tok().text_strong, size=16)
++        )
++        for tile in self._tiles.values():
++            if tile._latest_snapshot is not None:  # noqa: SLF001
++                tile.set_snapshot(tile._latest_snapshot)  # noqa: SLF001
++            tile._render_ratio_label()  # noqa: SLF001
++        self._refresh_header_labels()
++        self._refresh_collapsed_summary()
+ 
+     def _mini_button(self, glyph: str, tooltip: str) -> QPushButton:
+         btn = QPushButton(glyph)
+         btn.setToolTip(tooltip)
+         btn.setFixedSize(20, 20)
+-        btn.setStyleSheet(
+-            "QPushButton { background:transparent; color:#9ca3af; border:none; "
++        styled(btn, 
++            "QPushButton { background:transparent; color:$text_secondary; border:none; "
+             "font-size:13px; }"
+-            "QPushButton:hover { color:#f3f4f6; }"
++            "QPushButton:hover { color:$text_strong; }"
+         )
+         btn.setCursor(Qt.CursorShape.PointingHandCursor)
+         return btn
+@@ -2194,9 +2229,9 @@
+             self._collapsed_cadence_label.setText(text)
+             self.cadence_label.setToolTip(tooltip)
+             self._collapsed_cadence_label.setToolTip(tooltip)
+-            self.cadence_label.setStyleSheet("color:#9ca3af; font-size:10px;")
+-            self._collapsed_cadence_label.setStyleSheet(
+-                "color:#9ca3af; font-size:10px;"
++            styled(self.cadence_label, "color:$text_secondary; font-size:10px;")
++            styled(self._collapsed_cadence_label, 
++                "color:$text_secondary; font-size:10px;"
+             )
+             return
+         if self._refresh_mode is None or self._next_refresh_at is None:
+@@ -2214,9 +2249,9 @@
+         )
+         self.cadence_label.setToolTip(tooltip)
+         self._collapsed_cadence_label.setToolTip(tooltip)
+-        color = "#9ca3af" if self._refresh_mode == "active" else "#6b7280"
+-        self.cadence_label.setStyleSheet(f"color:{color}; font-size:10px;")
+-        self._collapsed_cadence_label.setStyleSheet(f"color:{color}; font-size:10px;")
++        color = "$text_secondary" if self._refresh_mode == "active" else "$text_muted"
++        styled(self.cadence_label, f"color:{color}; font-size:10px;")
++        styled(self._collapsed_cadence_label, f"color:{color}; font-size:10px;")
+ 
+     def _session_summary_for(self, provider: str) -> str:
+         display = display_name_for_account(self._config, provider)
+@@ -3014,6 +3049,6 @@
+     def paintEvent(self, event):  # noqa: N802
+         painter = QPainter(self)
+         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+-        painter.setBrush(QColor("#111827"))
+-        painter.setPen(QPen(QColor("#1f2937"), 1))
++        painter.setBrush(QColor(tok().panel))
++        painter.setPen(QPen(QColor(tok().panel_edge), 1))
+         painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 8, 8)

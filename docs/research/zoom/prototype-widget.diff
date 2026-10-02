@@ -1,0 +1,1011 @@
+--- a/src/aigauge/widget.py
++++ b/src/aigauge/widget.py
+@@ -18,6 +18,8 @@
+     pyqtSignal,
+ )
+ from PyQt6.QtGui import (
++    QKeySequence,
++    QShortcut,
+     QColor,
+     QGuiApplication,
+     QIcon,
+@@ -106,9 +108,40 @@
+ _QT_SIZE_MAX = 16777215
+ 
+ 
+-def _autofit_height(value: int) -> int:
++def _autofit_height(value: int, zoom: float = 1.0) -> int:
+     """Bound a height the app chose for itself, not one the user chose."""
+-    return max(WINDOW_MIN_HEIGHT, min(value, WINDOW_AUTOFIT_MAX_HEIGHT))
++    return max(_zpx(WINDOW_MIN_HEIGHT, zoom), min(value, _zpx(WINDOW_AUTOFIT_MAX_HEIGHT, zoom)))
++
++
++# PROTOTYPE zoom ladder and helpers.
++ZOOM_STEPS = (0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0)
++ZOOM_MIN, ZOOM_MAX = ZOOM_STEPS[0], ZOOM_STEPS[-1]
++
++
++def _zpx(n: float, zoom: float) -> int:
++    """``n`` logical px at ``zoom``: half-up (round() is banker's), >= 1 for n > 0."""
++    if n <= 0:
++        return 0
++    return max(1, int(n * zoom + 0.5))
++
++
++_QSS_PX = re.compile(r"(\d+)px")
++
++
++def _zqss(sheet: str, zoom: float) -> str:
++    """Every ``<int>px`` in an inline stylesheet, at ``zoom``."""
++    if zoom == 1.0:
++        return sheet
++    return _QSS_PX.sub(lambda m: f"{_zpx(int(m.group(1)), zoom)}px", sheet)
++
++
++def _zoom_step(current: float, direction: int) -> float:
++    """The next ladder value above (+1) or below (-1) ``current``; 0 resets."""
++    if direction == 0:
++        return 1.0
++    if direction > 0:
++        return next((z for z in ZOOM_STEPS if z > current + 1e-6), ZOOM_MAX)
++    return next((z for z in reversed(ZOOM_STEPS) if z < current - 1e-6), ZOOM_MIN)
+ 
+ 
+ def _connect_once(signal, slot) -> None:
+@@ -463,6 +496,8 @@
+         super().__init__(parent)
+         self._full_text = ""
+         self._clickable = False
++        self._color = "#ef4444"
++        self._zoom = 1.0
+         self._press_at: QPoint | None = None
+         self.setVisible(False)
+         # Plain text, explicitly. The default is AutoText, so an error string
+@@ -477,9 +512,10 @@
+     def set_line(self, text: str, *, clickable: bool, color: str) -> None:
+         self._full_text = text or ""
+         self._clickable = clickable and bool(self._full_text)
+-        self.setStyleSheet(
++        self._color = color
++        self.setStyleSheet(_zqss(
+             f"color:{color}; font-size:10px;"
+-            + (" text-decoration: underline;" if self._clickable else "")
++            + (" text-decoration: underline;" if self._clickable else ""), self._zoom)
+         )
+         self.setToolTip(
+             _safe_tooltip(
+@@ -495,6 +531,10 @@
+         self.setVisible(bool(self._full_text))
+         self._elide()
+ 
++    def set_zoom(self, zoom: float) -> None:
++        self._zoom = zoom
++        self.set_line(self._full_text, clickable=self._clickable, color=self._color)
++
+     def _display_text(self) -> str:
+         """One line of it, bounded, which is what the label is given to elide.
+ 
+@@ -638,17 +678,20 @@
+     _AUTH_FILL = QColor("#92400e")  # amber-800 — wants action
+     _PACE = QColor(229, 231, 235, 230)
+ 
+-    def __init__(self, parent: QWidget | None = None):
++    def __init__(self, parent: QWidget | None = None, zoom: float = 1.0):
+         super().__init__(parent)
++        self._zoom = zoom
++        self._notch_h = _zpx(CHIP_NOTCH_HEIGHT, zoom)
++        self._notch_half = CHIP_NOTCH_HALF_WIDTH * zoom
+         self._text = ""
+         self._percent: float | None = None
+         self._pace_pct: float | None = None
+         self._fill_color = self._NEUTRAL_FILL
+         font = self.font()
+-        font.setPixelSize(11)
++        font.setPixelSize(_zpx(11, zoom))
+         font.setBold(True)
+         self.setFont(font)
+-        self.setFixedHeight(18 + CHIP_NOTCH_HEIGHT)
++        self.setFixedHeight(_zpx(18, zoom) + self._notch_h)
+         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+ 
+     def text(self) -> str:
+@@ -675,7 +718,7 @@
+             self._percent = None
+             self._fill_color = self._NEUTRAL_FILL
+         fm = self.fontMetrics()
+-        self.setFixedWidth(fm.horizontalAdvance(text) + 18)
++        self.setFixedWidth(fm.horizontalAdvance(text) + _zpx(18, self._zoom))
+         self.update()
+ 
+     def paintEvent(self, event):  # noqa: N802
+@@ -683,9 +726,9 @@
+         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+         rect = QRectF(
+             0,
+-            CHIP_NOTCH_HEIGHT,
++            self._notch_h,
+             self.width(),
+-            self.height() - CHIP_NOTCH_HEIGHT,
++            self.height() - self._notch_h,
+         )
+         radius = rect.height() / 2
+ 
+@@ -724,15 +767,13 @@
+         # background, so it reads cleanly over any chip fill color.
+         if self._pace_pct is not None:
+             tip_x = rect.x() + (self._pace_pct / 100.0) * rect.width()
+-            tip_x = max(
+-                rect.x() + CHIP_NOTCH_HALF_WIDTH,
+-                min(rect.right() - CHIP_NOTCH_HALF_WIDTH, tip_x),
+-            )
++            half = self._notch_half
++            tip_x = max(rect.x() + half, min(rect.right() - half, tip_x))
+             notch = QPolygonF(
+                 [
+-                    QPointF(tip_x - CHIP_NOTCH_HALF_WIDTH, 0.0),
+-                    QPointF(tip_x + CHIP_NOTCH_HALF_WIDTH, 0.0),
+-                    QPointF(tip_x, float(CHIP_NOTCH_HEIGHT)),
++                    QPointF(tip_x - half, 0.0),
++                    QPointF(tip_x + half, 0.0),
++                    QPointF(tip_x, float(self._notch_h)),
+                 ]
+             )
+             painter.setPen(Qt.PenStyle.NoPen)
+@@ -776,9 +817,14 @@
+         super().__init__(parent)
+         self._full_text = ""
+         self._eliding = False
++        self._min_width = self.MIN_WIDTH
+         self.setTextFormat(Qt.TextFormat.PlainText)
+         self.setText(text)
+ 
++    def set_zoom(self, zoom: float) -> None:
++        self._min_width = _zpx(self.MIN_WIDTH, zoom)
++        self.updateGeometry()
++
+     def setText(self, text: str) -> None:  # noqa: N802
+         self._full_text = text or ""
+         self._apply_elide()
+@@ -797,7 +843,7 @@
+ 
+     def minimumSizeHint(self):  # noqa: N802
+         hint = super().minimumSizeHint()
+-        hint.setWidth(min(hint.width(), self.MIN_WIDTH))
++        hint.setWidth(min(hint.width(), self._min_width))
+         return hint
+ 
+     def resizeEvent(self, event):  # noqa: N802
+@@ -842,6 +888,7 @@
+     def __init__(self, parent: QWidget | None = None):
+         super().__init__(parent)
+         self._pace_pct: float | None = None
++        self._zoom = 1.0
+         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+ 
+     def set_pace(self, pct: float | None) -> None:
+@@ -855,7 +902,7 @@
+         painter = QPainter(self)
+         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+         x = (self._pace_pct / 100.0) * self.width()
+-        for color, width in ((self._PACE_SHADOW, 4), (self._PACE, 2)):
++        for color, width in ((self._PACE_SHADOW, _zpx(4, self._zoom)), (self._PACE, _zpx(2, self._zoom))):
+             pen = QPen(color)
+             pen.setWidth(width)
+             painter.setPen(pen)
+@@ -871,10 +918,19 @@
+     def __init__(self, parent: QWidget | None = None):
+         super().__init__(parent)
+         self._bar = QProgressBar(self)
++        self._overhang = PACE_TICK_OVERHANG
++        self._bar_h = ROW_BAR_HEIGHT
+         self._bar.setGeometry(0, PACE_TICK_OVERHANG, 0, ROW_BAR_HEIGHT)
+         self._tick = _PaceTickOverlay(self)
+         self._pace_pct: float | None = None
+ 
++    def set_zoom(self, zoom: float) -> None:
++        self._overhang = _zpx(PACE_TICK_OVERHANG, zoom)
++        self._bar_h = _zpx(ROW_BAR_HEIGHT, zoom)
++        self._tick._zoom = zoom  # noqa: SLF001
++        self.setFixedHeight(self._bar_h + self._overhang * 2)
++        self._bar.setGeometry(0, self._overhang, self.width(), self._bar_h)
++
+     def set_pace(self, pct: float | None) -> None:
+         self._pace_pct = max(0.0, min(100.0, pct)) if pct is not None else None
+         self._tick.set_pace(self._pace_pct)
+@@ -895,12 +951,7 @@
+         self._bar.setStyleSheet(style_sheet)
+ 
+     def resizeEvent(self, event):  # noqa: N802
+-        self._bar.setGeometry(
+-            0,
+-            PACE_TICK_OVERHANG,
+-            self.width(),
+-            ROW_BAR_HEIGHT,
+-        )
++        self._bar.setGeometry(0, self._overhang, self.width(), self._bar_h)
+         self._tick.setGeometry(0, 0, self.width(), self.height())
+         self._tick.raise_()
+         super().resizeEvent(event)
+@@ -909,8 +960,9 @@
+ class _MetricRow(QWidget):
+     """A single label / bar / pct / reset row."""
+ 
+-    def __init__(self, parent: QWidget | None = None):
++    def __init__(self, parent: QWidget | None = None, zoom: float = 1.0):
+         super().__init__(parent)
++        self._zoom = zoom
+         self.label = QLabel()
+         # Every label on this row shows a string a provider's usage page
+         # supplied - the meter's name, the reset phrase, the percentage's
+@@ -946,12 +998,34 @@
+         )
+ 
+         layout = QHBoxLayout(self)
++        self._row_layout = layout
+         layout.setContentsMargins(0, 1, 0, 1)
+         layout.setSpacing(6)
+         layout.addWidget(self.label)
+         layout.addWidget(self.bar, 1)
+         layout.addWidget(self.pct)
+         layout.addWidget(self.reset)
++        self._apply_zoom()
++
++    def _z(self, n: float) -> int:
++        return _zpx(n, self._zoom)
++
++    def _apply_zoom(self) -> None:
++        """The sizes set once in __init__; set_metric re-applies the rest."""
++        z = self._zoom
++        self.label.setStyleSheet(_zqss("color: #d1d5db; font-size: 11px;", z))
++        self.label.setMinimumWidth(self._z(70))
++        self.bar.set_zoom(z)
++        self.pct.setStyleSheet(_zqss("color: #f3f4f6; font-size: 11px; font-weight: 600;", z))
++        self.pct.setFixedWidth(self._z(34))
++        self.reset.setStyleSheet(_zqss("color: #9ca3af; font-size: 10px;", z))
++        self.reset.setFixedWidth(self._z(58))
++        self._row_layout.setContentsMargins(0, self._z(1), 0, self._z(1))
++        self._row_layout.setSpacing(self._z(6))
++
++    def set_zoom(self, zoom: float) -> None:
++        self._zoom = zoom
++        self._apply_zoom()
+ 
+     def set_metric(
+         self,
+@@ -965,7 +1039,7 @@
+         tint_reset: bool = False,
+     ) -> None:
+         # Reset to flexible width; group alignment in _set_rows may pin it after.
+-        self.label.setMinimumWidth(70)
++        self.label.setMinimumWidth(self._z(70))
+         self.label.setMaximumWidth(16777215)
+         split_note = (
+             percent is None
+@@ -977,10 +1051,10 @@
+         if split_note:
+             left, right = label.split(" · ", 1)
+             self.label.setText(left)
+-            self.reset.setStyleSheet("color: #d1d5db; font-size: 11px;")
++            self.reset.setStyleSheet(_zqss("color: #d1d5db; font-size: 11px;", self._zoom))
+         else:
+             self.label.setText(label)
+-            self.reset.setStyleSheet("color: #9ca3af; font-size: 10px;")
++            self.reset.setStyleSheet(_zqss("color: #9ca3af; font-size: 10px;", self._zoom))
+         self.setToolTip(_safe_tooltip(note))
+         self._resets_at = resets_at
+         self._window = window
+@@ -1004,20 +1078,21 @@
+             self.pct.setVisible(True)
+             self.bar.setVisible(True)
+         color = _color_for_percent(percent, self._colors)
+-        self.bar.setStyleSheet(
++        self.bar.setStyleSheet(_zqss(
+             f"QProgressBar {{ background:#374151; border:none; border-radius:3px; }}"
+-            f"QProgressBar::chunk {{ background:{color}; border-radius:3px; }}"
++            f"QProgressBar::chunk {{ background:{color}; border-radius:3px; }}", self._zoom)
+         )
+         if tint_reset and percent is not None and not split_note:
+             # The same colour string the chunk was just given, so the amount
+             # and the bar cannot drift apart - including under a user's own
+             # gauge colours, which is what _colors carries.
+-            self.reset.setStyleSheet(f"color: {color}; font-size: 10px;")
++            self.reset.setStyleSheet(_zqss(f"color: {color}; font-size: 10px;", self._zoom))
+         if split_note:
+             self.reset.setText(right)
+             self.reset.setVisible(True)
+-            right_width = self.reset.fontMetrics().horizontalAdvance(right) + 4
+-            self.reset.setFixedWidth(max(92, min(190, right_width)))
++            self.reset.ensurePolished()
++            right_width = self.reset.fontMetrics().horizontalAdvance(right) + self._z(4)
++            self.reset.setFixedWidth(max(self._z(92), min(self._z(190), right_width)))
+             self.reset.setToolTip("")
+         else:
+             self.reset.setText(rel)
+@@ -1027,8 +1102,9 @@
+             # spend and the allowance there so they stay on the row when the
+             # tile is collapsed - and a fixed 58 px would clip it.
+             if len(rel) > 8:
+-                text_width = self.reset.fontMetrics().horizontalAdvance(rel) + 4
+-                width = max(92, min(_RESET_LABEL_MAX_WIDTH, text_width))
++                self.reset.ensurePolished()
++                text_width = self.reset.fontMetrics().horizontalAdvance(rel) + self._z(4)
++                width = max(self._z(92), min(self._z(_RESET_LABEL_MAX_WIDTH), text_width))
+                 self.reset.setFixedWidth(width)
+                 # Elided from the right, not clipped: a currency with no
+                 # two-digit magnitude ran off the end of the column and the
+@@ -1040,7 +1116,7 @@
+                     )
+                 )
+             else:
+-                self.reset.setFixedWidth(58)
++                self.reset.setFixedWidth(self._z(58))
+         if reset_label:
+             # The full phrase, then the note: whatever the column elided is
+             # still reachable here, and the amounts are in the note as well.
+@@ -1098,9 +1174,9 @@
+         self._window = None
+         self.bar.setRange(0, 0)
+         self.bar.set_pace(None)
+-        self.bar.setStyleSheet(
++        self.bar.setStyleSheet(_zqss(
+             "QProgressBar { background:#1f2937; border:none; border-radius:3px; }"
+-            "QProgressBar::chunk { background:#4b5563; border-radius:3px; }"
++            "QProgressBar::chunk { background:#4b5563; border-radius:3px; }", self._zoom)
+         )
+         self.bar.setVisible(True)
+         self.pct.setVisible(True)
+@@ -1125,8 +1201,9 @@
+ class _CompactMetric(QWidget):
+     """Tiny inline metric for a collapsed provider tile."""
+ 
+-    def __init__(self, parent: QWidget | None = None):
++    def __init__(self, parent: QWidget | None = None, zoom: float = 1.0):
+         super().__init__(parent)
++        self._zoom = zoom
+         self._colors: ColorThresholds | None = None
+         self.code = QLabel("")
+         # As on the expanded row: the code is the first letter of a label the
+@@ -1154,12 +1231,25 @@
+         self.reset.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+ 
+         layout = QHBoxLayout(self)
++        self._row_layout = layout
+         layout.setContentsMargins(0, 0, 0, 0)
+         layout.setSpacing(3)
+         layout.addWidget(self.code)
+         layout.addWidget(self.bar)
+         layout.addWidget(self.pct)
+         layout.addWidget(self.reset)
++        self.set_zoom(zoom)
++
++    def set_zoom(self, zoom: float) -> None:
++        self._zoom = z = zoom
++        self.code.setStyleSheet(_zqss("color:#d1d5db; font-size:10px; font-weight:700;", z))
++        self.code.setFixedWidth(_zpx(10, z))
++        self.bar.setFixedSize(_zpx(30, z), _zpx(6, z))
++        self.pct.setStyleSheet(_zqss("color:#f3f4f6; font-size:10px; font-weight:600;", z))
++        self.pct.setFixedWidth(_zpx(28, z))
++        self.reset.setStyleSheet(_zqss("color:#9ca3af; font-size:10px;", z))
++        self.reset.setFixedWidth(_zpx(38, z))
++        self._row_layout.setSpacing(_zpx(3, z))
+ 
+     def set_metric(self, metric, *, show_reset: bool = True) -> None:
+         percent = metric.percent_used
+@@ -1172,9 +1262,9 @@
+             0 if percent is None else int(round(max(0.0, min(percent, 100.0))))
+         )
+         color = _color_for_percent(percent, self._colors)
+-        self.bar.setStyleSheet(
++        self.bar.setStyleSheet(_zqss(
+             f"QProgressBar {{ background:#374151; border:none; border-radius:3px; }}"
+-            f"QProgressBar::chunk {{ background:{color}; border-radius:3px; }}"
++            f"QProgressBar::chunk {{ background:{color}; border-radius:3px; }}", self._zoom)
+         )
+         tooltip = f"{metric.label}: {_format_summary_percent(percent)}"
+         if reset:
+@@ -1190,8 +1280,9 @@
+     ratio_history_requested = pyqtSignal(str)  # provider name (ratio label clicked)
+     expanded_changed = pyqtSignal(str, bool)  # provider name, expanded
+ 
+-    def __init__(self, provider: str, display_name: str, parent: QWidget | None = None):
++    def __init__(self, provider: str, display_name: str, parent: QWidget | None = None, zoom: float = 1.0):
+         super().__init__(parent)
++        self._zoom = zoom
+         self.provider = provider
+         self.setFrameShape(QFrame.Shape.NoFrame)
+         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+@@ -1200,8 +1291,8 @@
+         self.header.setStyleSheet("color: #e5e7eb; font-size: 12px; font-weight: 700;")
+ 
+         self.status = QLabel("loading…")
+-        self.status.setStyleSheet(
+-            "color: #6b7280; font-size: 10px; font-style: italic;"
++        self.status.setStyleSheet(_zqss(
++            "color: #6b7280; font-size: 10px; font-style: italic;", self._zoom)
+         )
+         self.status.setAlignment(
+             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+@@ -1290,6 +1381,7 @@
+         self._layout.setSpacing(2)
+         self._layout.addLayout(header_row)
+         self._layout.addWidget(self.detail)
++        self._apply_zoom()
+ 
+         # Refresh-in-progress dim. Animates between 1.0 and 0.55 so the user
+         # sees a brief breath when refresh starts/completes instead of a snap.
+@@ -1305,6 +1397,43 @@
+         # Show skeleton state immediately so first launch isn't a blank tile.
+         self.set_snapshot(None)
+ 
++    def _apply_zoom(self) -> None:
++        z = self._zoom
++        self.header.setStyleSheet(_zqss("color: #e5e7eb; font-size: 12px; font-weight: 700;", z))
++        self.header.set_zoom(z)
++        self.ratio_label.setStyleSheet(_zqss("color: #9ca3af; font-size: 10px;", z))
++        self.action_btn.setFixedHeight(_zpx(20, z))
++        self.action_btn.setStyleSheet(_zqss(
++            "QPushButton { background:#4b5563; color:#f3f4f6; border:none; "
++            "border-radius:3px; padding:0 8px; font-size:10px; }"
++            "QPushButton:hover { background:#6b7280; }", z))
++        self.expand_btn.setFixedSize(_zpx(16, z), _zpx(16, z))
++        self.expand_btn.setStyleSheet(_zqss(
++            "QPushButton { background:transparent; color:#9ca3af; border:none; "
++            "font-size:10px; padding:0; }"
++            "QPushButton:hover { color:#f3f4f6; }", z))
++        self._compact_layout.setContentsMargins(_zpx(4, z), 0, 0, 0)
++        self._compact_layout.setSpacing(_zpx(6, z))
++        self._layout.setContentsMargins(_zpx(6, z), _zpx(4, z), _zpx(6, z), _zpx(4, z))
++        self._layout.setSpacing(_zpx(2, z))
++        self.detail.set_zoom(z)
++
++    def set_zoom(self, zoom: float) -> None:
++        """Re-apply every size at ``zoom`` and re-render the latest snapshot."""
++        if zoom == self._zoom:
++            return
++        self._zoom = zoom
++        self._apply_zoom()
++        for row in self._rows:
++            row.set_zoom(zoom)
++        for item in self._compact_metrics:
++            item.set_zoom(zoom)
++        # set_snapshot re-runs every stylesheet that depends on the data
++        # (status colour, chunk colour, the reset column's 58/92 rule, the
++        # grouped label widths), which is everything _apply_zoom did not.
++        self.set_snapshot(self._latest_snapshot)
++        self._render_ratio_label()
++
+     def _supports_compact_collapse(self) -> bool:
+         return _provider_family(self.provider) in ("claude", "codex", "opencode_go")
+ 
+@@ -1324,7 +1453,7 @@
+ 
+     def _set_compact_metrics(self, metrics: list, *, show_reset: bool = True) -> None:
+         while len(self._compact_metrics) < len(metrics):
+-            item = _CompactMetric(self._compact_summary)
++            item = _CompactMetric(self._compact_summary, zoom=self._zoom)
+             self._compact_metrics.append(item)
+             self._compact_layout.addWidget(item)
+         while len(self._compact_metrics) > len(metrics):
+@@ -1390,8 +1519,8 @@
+         if snapshot is None:
+             self._set_detail(None)
+             self.status.setText("loading…")
+-            self.status.setStyleSheet(
+-                "color: #6b7280; font-size: 10px; font-style: italic;"
++            self.status.setStyleSheet(_zqss(
++                "color: #6b7280; font-size: 10px; font-style: italic;", self._zoom)
+             )
+             self.status.setToolTip("")
+             self.status.setCursor(Qt.CursorShape.ArrowCursor)
+@@ -1404,8 +1533,8 @@
+ 
+         if snapshot.status == SnapshotStatus.AUTH_REQUIRED:
+             self.status.setText("not signed in")
+-            self.status.setStyleSheet(
+-                "color: #f59e0b; font-size: 10px; font-style: normal;"
++            self.status.setStyleSheet(_zqss(
++                "color: #f59e0b; font-size: 10px; font-style: normal;", self._zoom)
+             )
+             self.status.setToolTip(_safe_tooltip(snapshot.error))
+             self.status.setCursor(Qt.CursorShape.ArrowCursor)
+@@ -1439,8 +1568,8 @@
+             self.status.setText(
+                 f'<a href="details" style="color:#ef4444; text-decoration:none;">{label}</a>'
+             )
+-            self.status.setStyleSheet(
+-                "color: #ef4444; font-size: 10px; font-style: normal;"
++            self.status.setStyleSheet(_zqss(
++                "color: #ef4444; font-size: 10px; font-style: normal;", self._zoom)
+             )
+             suffix = "\n\nClick for details."
+             if snapshot.metrics:
+@@ -1495,8 +1624,8 @@
+         # OK
+         self._set_detail(None)
+         self.status.setText("")
+-        self.status.setStyleSheet(
+-            "color: #9ca3af; font-size: 10px; font-style: normal;"
++        self.status.setStyleSheet(_zqss(
++            "color: #9ca3af; font-size: 10px; font-style: normal;", self._zoom)
+         )
+         self.status.setToolTip("")
+         self.status.setCursor(Qt.CursorShape.ArrowCursor)
+@@ -1633,7 +1762,7 @@
+     ) -> None:
+         # Grow / shrink the row pool to match
+         while len(self._rows) < len(rows):
+-            r = _MetricRow(self)
++            r = _MetricRow(self, zoom=self._zoom)
+             self._rows.append(r)
+             self._layout.addWidget(r)
+         while len(self._rows) > len(rows):
+@@ -1656,18 +1785,23 @@
+         for labels in grouped.values():
+             if len(labels) <= 1:
+                 continue
++            for lbl in labels:
++                # fontMetrics() is the app font until the stylesheet is polished;
++                # at 100% that over-measures (12 px app font vs 11 px row), past
++                # ~110% it under-measures and the grouped labels clip.
++                lbl.ensurePolished()
+             max_w = max(
+                 lbl.fontMetrics().horizontalAdvance(lbl.text()) for lbl in labels
+             )
+             for lbl in labels:
+-                lbl.setFixedWidth(max_w + 4)
++                lbl.setFixedWidth(max_w + _zpx(4, self._zoom))
+         self._layout.invalidate()
+         self.layout().activate()
+         self.updateGeometry()
+ 
+     def _set_skeleton(self, labels: list[str]) -> None:
+         while len(self._rows) < len(labels):
+-            r = _MetricRow(self)
++            r = _MetricRow(self, zoom=self._zoom)
+             self._rows.append(r)
+             self._layout.addWidget(r)
+         while len(self._rows) > len(labels):
+@@ -1756,7 +1890,9 @@
+         # size back until this is True, so moving a fresh window does not
+         # silently end auto-fit.
+         self._user_sized = config.window.user_sized
+-        self.setMinimumSize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
++        # PROTOTYPE: clamp again at use - WindowState has no validate_assignment.
++        self._zoom = max(ZOOM_MIN, min(ZOOM_MAX, float(config.window.ui_scale or 1.0)))
++        self.setMinimumSize(self._z(WINDOW_MIN_WIDTH), self._z(WINDOW_MIN_HEIGHT))
+         self.setMouseTracking(True)
+         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+         # Background is drawn in paintEvent; no widget-level stylesheet — that
+@@ -1780,7 +1916,7 @@
+         # Header bar
+         title = QLabel(f"AI Gauge {__version__}")
+         title.setToolTip(f"ai-gauge {__version__}")
+-        title.setStyleSheet("color:#9ca3af; font-size:10px; font-weight:600;")
++        self._title = title
+ 
+         self.cadence_label = QLabel("")
+         self.cadence_label.setStyleSheet("color:#6b7280; font-size:10px;")
+@@ -1806,6 +1942,7 @@
+         self.age_label.setStyleSheet("color:#6b7280; font-size:10px;")
+ 
+         header = QHBoxLayout()
++        self._header_layout = header
+         header.setContentsMargins(8, 4, 4, 2)
+         header.setSpacing(4)
+         header.addWidget(title)
+@@ -1841,14 +1978,16 @@
+             QSizePolicy.Policy.Fixed,
+         )
+         collapsed_outer = QVBoxLayout(self._collapsed_widget)
++        self._collapsed_outer = collapsed_outer
+         collapsed_outer.setContentsMargins(8, 4, 8, 6)
+         collapsed_outer.setSpacing(4)
+ 
+         collapsed_header = QHBoxLayout()
++        self._collapsed_header = collapsed_header
+         collapsed_header.setContentsMargins(0, 0, 0, 0)
+         collapsed_header.setSpacing(4)
+         collapsed_title = QLabel(f"AI Gauge {__version__}")
+-        collapsed_title.setStyleSheet("color:#9ca3af; font-size:10px; font-weight:600;")
++        self._collapsed_title = collapsed_title
+         collapsed_header.addWidget(collapsed_title)
+         self._collapsed_cadence_label = QLabel("")
+         self._collapsed_cadence_label.setStyleSheet("color:#6b7280; font-size:10px;")
+@@ -1915,11 +2054,19 @@
+         # AlignTop every child got its size hint and the extra height was an
+         # empty strip below the last tile.
+         outer.addWidget(self._tile_scroll, 1)
++        self._build_footer()
++        outer.addWidget(self._footer_widget)
++        self._outer = outer
++        self._apply_zoom_static()
++        self._install_zoom_shortcuts()
+ 
+         # The saved size, bounded by WindowState; the monitor's work area is
+         # applied on top of it at show time, because only then is it known
+         # which monitor that is.
+-        self._app_geometry(self.resize, QSize(config.window.width, config.window.height))
++        # A window the user never sized opens at the first-run width *at this
++        # zoom*; a sized one is persisted in real logical px already.
++        # Stored sizes are at 100%; on screen they are that times the zoom.
++        self._app_geometry(self.resize, QSize(self._z(config.window.width), self._z(config.window.height)))
+         if config.window.x is not None and config.window.y is not None:
+             self._app_geometry(self.move, QPoint(config.window.x, config.window.y))
+         self._clamp_to_visible_screen()
+@@ -1940,18 +2087,169 @@
+     def _mini_button(self, glyph: str, tooltip: str) -> QPushButton:
+         btn = QPushButton(glyph)
+         btn.setToolTip(tooltip)
+-        btn.setFixedSize(20, 20)
+-        btn.setStyleSheet(
++        btn.setCursor(Qt.CursorShape.PointingHandCursor)
++        self.__dict__.setdefault("_mini_buttons", []).append(btn)
++        self._style_mini_button(btn)
++        return btn
++
++    def _style_mini_button(self, btn: QPushButton, size: int = 20, font: int = 13) -> None:
++        z = getattr(self, "_zoom", 1.0)
++        btn.setFixedSize(_zpx(size, z), _zpx(size, z))
++        btn.setStyleSheet(_zqss(
+             "QPushButton { background:transparent; color:#9ca3af; border:none; "
+-            "font-size:13px; }"
++            f"font-size:{font}px; padding:0; }}"
+             "QPushButton:hover { color:#f3f4f6; }"
++            "QPushButton:disabled { color:#374151; }", z))
++
++    # ----- PROTOTYPE zoom ------------------------------------------------------
++
++    def _z(self, n: float) -> int:
++        return _zpx(n, self._zoom)
++
++    def _build_footer(self) -> None:
++        """A footer row whose right end holds the zoom cluster.
++
++        Inset by RESIZE_BAND + 2 on the right and RESIZE_BAND at the bottom,
++        unscaled: the band is a pointer target in logical px, and a button
++        inside it would take the press the corner resize needs.
++        """
++        self._footer_widget = QWidget(self)
++        lay = QHBoxLayout(self._footer_widget)
++        self._footer_layout = lay
++        lay.setSpacing(0)
++        lay.addStretch(1)
++        self.zoom_out_btn = QPushButton("A\u2212")
++        self.zoom_out_btn.setToolTip("Smaller text (Ctrl+\u2212)")
++        self.zoom_label = QPushButton("100%")
++        self.zoom_label.setToolTip("Text size - click to reset (Ctrl+0)")
++        self.zoom_in_btn = QPushButton("A+")
++        self.zoom_in_btn.setToolTip("Larger text (Ctrl+=)")
++        for b in (self.zoom_out_btn, self.zoom_label, self.zoom_in_btn):
++            b.setCursor(Qt.CursorShape.PointingHandCursor)
++            lay.addWidget(b)
++        self.zoom_out_btn.clicked.connect(lambda: self.step_zoom(-1))
++        self.zoom_in_btn.clicked.connect(lambda: self.step_zoom(+1))
++        self.zoom_label.clicked.connect(lambda: self.step_zoom(0))
++
++    def _style_footer(self) -> None:
++        z = self._zoom
++        self._footer_layout.setContentsMargins(self._z(8), 0, RESIZE_BAND + 2, RESIZE_BAND)
++        sheet = _zqss(
++            "QPushButton { background:transparent; color:#9ca3af; border:none; "
++            "font-size:11px; font-weight:600; padding:0 3px; }"
++            "QPushButton:hover { color:#f3f4f6; }"
++            "QPushButton:disabled { color:#374151; }", z)
++        for b in (self.zoom_out_btn, self.zoom_label, self.zoom_in_btn):
++            b.setStyleSheet(sheet)
++            b.setFixedHeight(self._z(16))
++        self.zoom_label.setText(f"{round(z * 100)}%")
++        self.zoom_label.setVisible(abs(z - 1.0) > 1e-6)
++        self.zoom_out_btn.setEnabled(z > ZOOM_MIN + 1e-6)
++        self.zoom_in_btn.setEnabled(z < ZOOM_MAX - 1e-6)
++
++    def _apply_zoom_static(self) -> None:
++        """Everything UsageWidget sizes itself; tiles and chips do their own."""
++        z = self._zoom
++        meta = _zqss("color:#9ca3af; font-size:10px; font-weight:600;", z)
++        self._title.setStyleSheet(meta)
++        self._collapsed_title.setStyleSheet(meta)
++        for lbl in (self.age_label, self._collapsed_age_label):
++            lbl.setStyleSheet(_zqss("color:#6b7280; font-size:10px;", z))
++        self._collapsed_label.setStyleSheet(_zqss("color:#e5e7eb; font-size:10px; font-weight:600;", z))
++        for btn in self._mini_buttons:
++            self._style_mini_button(btn)
++        self.refresh_btn.setIcon(
++            _refresh_icon(normal="#9ca3af", active="#f3f4f6", size=self._z(16))
+         )
+-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+-        return btn
++        self.refresh_btn.setIconSize(QSize(self._z(16), self._z(16)))
++        self._header_layout.setContentsMargins(self._z(8), self._z(4), self._z(4), self._z(2))
++        self._header_layout.setSpacing(self._z(4))
++        self._collapsed_outer.setContentsMargins(self._z(8), self._z(4), self._z(8), self._z(6))
++        self._collapsed_outer.setSpacing(self._z(4))
++        self._collapsed_header.setSpacing(self._z(4))
++        self._collapsed_summary_layout.setSpacing(self._z(3))
++        self._tile_layout.setContentsMargins(self._z(2), 0, self._z(2), 0)
++        self._tile_layout.setSpacing(self._z(2))
++        self._tile_scroll.verticalScrollBar().setSingleStep(3 * self.age_label.fontMetrics().height())
++        self._style_footer()
++
++    def _install_zoom_shortcuts(self) -> None:
++        # Distinct sequences only: the same sequence on two QShortcuts in one
++        # window is ambiguous and fires neither.
++        bindings = {
++            +1: ("Ctrl+=", "Ctrl++", "Ctrl+Shift++", "Ctrl+Shift+="),
++            -1: ("Ctrl+-",),
++            0: ("Ctrl+0",),
++        }
++        self._zoom_shortcuts = []
++        for direction, seqs in bindings.items():
++            for seq in seqs:
++                sc = QShortcut(QKeySequence(seq), self)
++                sc.activated.connect(lambda d=direction: self.step_zoom(d))
++                self._zoom_shortcuts.append(sc)
++        self._wheel_zoom_accum = 0
++
++    def step_zoom(self, direction: int) -> None:
++        self.set_zoom(_zoom_step(self._zoom, direction))
++
++    def set_zoom(self, zoom: float) -> None:
++        """Apply a new zoom live: restyle, resize, refit, persist."""
++        zoom = max(ZOOM_MIN, min(ZOOM_MAX, float(zoom)))
++        if abs(zoom - self._zoom) < 1e-6:
++            return
++        ratio = zoom / self._zoom
++        old = self.geometry()
++        self._remember_size()          # capture a live resize at the old zoom first
++        self._zoom = zoom
++        self._config.window.ui_scale = zoom
++        self._apply_zoom_static()
++        for tile in self._tiles.values():
++            tile.set_zoom(zoom)
++        self._app_geometry(self.setMinimumSize, self._z(WINDOW_MIN_WIDTH),
++                           self._z(COLLAPSED_MIN_HEIGHT) if self._collapsed else self._z(WINDOW_MIN_HEIGHT))
++        width = self._z(self._config.window.width)
++        height = self._z(self._config.window.height) if (self._user_sized and not self._collapsed) else old.height()
++        if self._collapsed:
++            self._expanded_height = int(self._expanded_height * ratio + 0.5)
++        self._app_geometry(self.resize, width, height)
++        self._refresh_header_labels()   # also rebuilds the chip strip at the new zoom
++        for w in (self._tile_container, self._tile_scroll, self._header_widget, self._footer_widget):
++            w.updateGeometry()
++        self.layout().invalidate()
++        self.layout().activate()
++        self._do_refit_height()
++        # Gravity: on each axis keep the edge nearer the work area's edge, so a
++        # panel docked bottom-right (above the Windows tray) stays docked and
++        # its zoom control stays under the pointer; one docked top-left grows
++        # right and down. The macOS popover keeps its top-centre anchor.
++        screen = self._current_screen()
++        if screen is not None:
++            geo = screen.availableGeometry()
++            if self._app_positioned:
++                x = old.center().x() - self.width() // 2
++                y = old.top()
++            else:
++                # Decided once, at the first step after the user last placed
++                # the window, so a run of steps cannot flip it mid-way.
++                anchor = self.__dict__.get("_zoom_anchor")
++                if anchor is None:
++                    right = (old.center().x() - geo.left()) > geo.width() / 2
++                    bottom = (old.center().y() - geo.top()) > geo.height() / 2
++                    anchor = (right, old.right() + 1 if right else old.left(),
++                              bottom, old.bottom() + 1 if bottom else old.top())
++                    self._zoom_anchor = anchor
++                right, ax, bottom, ay = anchor
++                x = ax - self.width() if right else ax
++                y = ay - self.height() if bottom else ay
++            self._app_geometry(self.move, x, y)
++        self._apply_screen_bounds()
++        self._track_hover()
++        self._commit_geometry(remember_size=False)
++
+ 
+     def ensure_tile(self, provider: str, display_name: str) -> _ProviderTile:
+         if provider not in self._tiles:
+-            tile = _ProviderTile(provider, display_name, self)
++            tile = _ProviderTile(provider, display_name, self, zoom=self._zoom)
+             tile.sign_in_requested.connect(self.sign_in_requested.emit)
+             tile.details_requested.connect(self.details_requested.emit)
+             tile.ratio_history_requested.connect(self.ratio_history_requested.emit)
+@@ -2098,9 +2396,9 @@
+         """
+         if self._collapsed:
+             target_height = max(
+-                COLLAPSED_MIN_HEIGHT,
++                self._z(COLLAPSED_MIN_HEIGHT),
+                 min(
+-                    WINDOW_AUTOFIT_MAX_HEIGHT,
++                    self._z(WINDOW_AUTOFIT_MAX_HEIGHT),
+                     self._collapsed_widget.sizeHint().height(),
+                 ),
+             )
+@@ -2121,10 +2419,11 @@
+         self.updateGeometry()
+         self.layout().invalidate()
+         header_height = self._header_widget.sizeHint().height()
++        footer_height = self._footer_widget.sizeHint().height()
+         tile_height = self._tile_container.sizeHint().height()
+-        max_tile_height = max(40, WINDOW_AUTOFIT_MAX_HEIGHT - header_height)
++        max_tile_height = max(self._z(40), self._z(WINDOW_AUTOFIT_MAX_HEIGHT) - header_height - footer_height)
+         self._tile_scroll.setFixedHeight(min(tile_height, max_tile_height))
+-        target_height = _autofit_height(header_height + self._tile_scroll.height())
++        target_height = _autofit_height(header_height + self._tile_scroll.height() + footer_height, self._zoom)
+         if target_height != self.height():
+             self._app_geometry(self.resize, self.width(), target_height)
+ 
+@@ -2194,9 +2493,9 @@
+             self._collapsed_cadence_label.setText(text)
+             self.cadence_label.setToolTip(tooltip)
+             self._collapsed_cadence_label.setToolTip(tooltip)
+-            self.cadence_label.setStyleSheet("color:#9ca3af; font-size:10px;")
++            self.cadence_label.setStyleSheet(_zqss("color:#9ca3af; font-size:10px;", self._zoom))
+             self._collapsed_cadence_label.setStyleSheet(
+-                "color:#9ca3af; font-size:10px;"
++                _zqss("color:#9ca3af; font-size:10px;", self._zoom)
+             )
+             return
+         if self._refresh_mode is None or self._next_refresh_at is None:
+@@ -2215,8 +2514,8 @@
+         self.cadence_label.setToolTip(tooltip)
+         self._collapsed_cadence_label.setToolTip(tooltip)
+         color = "#9ca3af" if self._refresh_mode == "active" else "#6b7280"
+-        self.cadence_label.setStyleSheet(f"color:{color}; font-size:10px;")
+-        self._collapsed_cadence_label.setStyleSheet(f"color:{color}; font-size:10px;")
++        self.cadence_label.setStyleSheet(_zqss(f"color:{color}; font-size:10px;", self._zoom))
++        self._collapsed_cadence_label.setStyleSheet(_zqss(f"color:{color}; font-size:10px;", self._zoom))
+ 
+     def _session_summary_for(self, provider: str) -> str:
+         display = display_name_for_account(self._config, provider)
+@@ -2251,11 +2550,11 @@
+         # The chips wrap into whatever width the window has, not a
+         # constant: the collapsed strip follows the size the user chose
+         # rather than snapping back to 340 and losing it.
+-        available_width = max(WINDOW_MIN_WIDTH, self.width()) - 16
++        available_width = max(self._z(WINDOW_MIN_WIDTH), self.width()) - 2 * self._z(8)
+         row_widget: QWidget | None = None
+         row_layout: QHBoxLayout | None = None
+         row_width = 0
+-        spacing = 5
++        spacing = self._z(5)
+         for provider in providers:
+             chip = self._summary_chip(provider)
+             chip_width = chip.width()
+@@ -2350,7 +2649,7 @@
+                     tooltip = (tooltip + "\n\n" if tooltip else "") + pace_line
+             kind = "ok"
+ 
+-        chip = _SummaryChip()
++        chip = _SummaryChip(zoom=self._zoom)
+         chip.set_state(
+             text, percent, kind, pace, thresholds_for_provider(self._config, provider)
+         )
+@@ -2384,15 +2683,16 @@
+         self._header_widget.setVisible(not self._collapsed)
+         self._tile_scroll.setVisible(not self._collapsed)
+         self._tile_container.setVisible(not self._collapsed)
++        self._footer_widget.setVisible(not self._collapsed)
+         self._refresh_collapsed_summary()
+         if self._collapsed:
+             # A chip strip is one row tall and says so; only its width is the
+             # user's. The vertical maximum is released again on expand.
+-            self._app_geometry(self.setMinimumHeight, COLLAPSED_MIN_HEIGHT)
+-            self._app_geometry(self.setMaximumHeight, WINDOW_AUTOFIT_MAX_HEIGHT)
++            self._app_geometry(self.setMinimumHeight, self._z(COLLAPSED_MIN_HEIGHT))
++            self._app_geometry(self.setMaximumHeight, self._z(WINDOW_AUTOFIT_MAX_HEIGHT))
+             self._do_refit_height()
+         else:
+-            self._app_geometry(self.setMinimumHeight, WINDOW_MIN_HEIGHT)
++            self._app_geometry(self.setMinimumHeight, self._z(WINDOW_MIN_HEIGHT))
+             self._app_geometry(self.setMaximumHeight, _QT_SIZE_MAX)
+             # Back to the height the window had before it became a strip -
+             # after the maximum is released, because the collapsed one is 420.
+@@ -2519,10 +2819,17 @@
+         if screen is None:
+             return
+         geo = screen.availableGeometry()
++        # Qt keeps min > max and resize() honours the minimum, so a zoomed
++        # floor wider than the work area must give way first.
++        self._app_geometry(
++            self.setMinimumSize,
++            min(self._z(WINDOW_MIN_WIDTH), geo.width()),
++            min(self._z(WINDOW_MIN_HEIGHT), geo.height()),
++        )
+         self._app_geometry(
+             self.setMaximumSize,
+-            max(WINDOW_MIN_WIDTH, geo.width()),
+-            max(WINDOW_MIN_HEIGHT, geo.height()),
++            max(min(self._z(WINDOW_MIN_WIDTH), geo.width()), geo.width()),
++            max(min(self._z(WINDOW_MIN_HEIGHT), geo.height()), geo.height()),
+         )
+         self._clamp_to_visible_screen()
+ 
+@@ -2658,6 +2965,19 @@
+ 
+     def eventFilter(self, obj, event):  # noqa: N802
+         if (
++            event.type() == QEvent.Type.Wheel
++            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
++            and isinstance(obj, QWidget)
++            and (obj is self or self.isAncestorOf(obj))
++        ):
++            # Accumulate: a trackpad sends many small deltas, a wheel 120.
++            self._wheel_zoom_accum += event.angleDelta().y()
++            while abs(self._wheel_zoom_accum) >= 120:
++                step = 1 if self._wheel_zoom_accum > 0 else -1
++                self._wheel_zoom_accum -= 120 * step
++                self.step_zoom(step)
++            return True
++        if (
+             event.type() == QEvent.Type.MouseMove
+             and not event.buttons()
+             and isinstance(obj, QWidget)
+@@ -2780,6 +3100,7 @@
+         elif self._resize_edges & Qt.Edge.BottomEdge:
+             height = max(minimum.height(), min(maximum.height(), start.height() + dy))
+         if (width, height) != (start.width(), start.height()):
++            self._size_from_user = True
+             # Here, not on the press: a motionless click 1 px inside the 8 px
+             # band used to end auto-fit for good, and a drag already at the
+             # minimum or the maximum has not resized anything either.
+@@ -2840,12 +3161,14 @@
+         A window still at its first-run size is left recorded as such, so
+         moving it - or closing it - does not quietly switch auto-fit off.
+         """
+-        if not self._user_sized or self._collapsed:
++        if not self._user_sized or self._collapsed or not self.__dict__.get("_size_from_user"):
+             return
+-        self._config.window.width = self.width()
+-        self._config.window.height = self.height()
++        self._size_from_user = False
++        # Stored at 100%, so a zoom step never rewrites the user's size.
++        self._config.window.width = max(WINDOW_MIN_WIDTH, int(self.width() / self._zoom + 0.5))
++        self._config.window.height = max(WINDOW_MIN_HEIGHT, int(self.height() / self._zoom + 0.5))
+ 
+-    def _geometry_state(self) -> tuple[int | None, int | None, int, int, bool, bool]:
++    def _geometry_state(self) -> tuple:
+         window = self._config.window
+         return (
+             window.x,
+@@ -2854,9 +3177,10 @@
+             window.height,
+             window.collapsed,
+             window.user_sized,
++            window.ui_scale,
+         )
+ 
+-    def _commit_geometry(self) -> None:
++    def _commit_geometry(self, remember_size: bool = True) -> None:
+         """The one place the window's geometry reaches the file.
+ 
+         It used to be ``mouseReleaseEvent`` alone, and the code's own comment
+@@ -2874,7 +3198,8 @@
+         that moved nothing writes nothing, and one drag is one atomic write,
+         not one per event.
+         """
+-        self._remember_size()
++        if remember_size:
++            self._remember_size()
+         window = self._config.window
+         if not self._app_positioned:
+             window.x = self.x()
+@@ -2979,6 +3304,7 @@
+         if self._is_user_geometry():
+             # Wherever the window is now, the user put it there.
+             self._app_positioned = False
++            self._zoom_anchor = None
+         self._arm_geometry_commit()
+ 
+     def resizeEvent(self, event):  # noqa: N802
+@@ -2996,6 +3322,11 @@
+             # indistinguishable; and a zero-delta resize has changed no size
+             # for anyone to have chosen.
+             self._mark_user_sized()
++        if self._is_user_geometry() and event.size() != event.oldSize():
++            # Any size the app did not make itself - the same rule the commit
++            # seam already uses. The clamp and auto-fit run behind
++            # _app_geometry, so a work-area clamp after a zoom is not one.
++            self._size_from_user = True
+         self._arm_geometry_commit()
+ 
+     def hideEvent(self, event):  # noqa: N802
