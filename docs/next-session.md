@@ -26,6 +26,24 @@ State at close of the 2026-08-10 session. `main` is `1.0.0+cfa.2` at PRs #6–#1
 >   the month's spend draws a red bar under a top row that may read 5% of the
 >   allowance. It cannot reach the tray colour - only the top row can - but it
 >   looks like an alarm.
+> * **A cost total past float range reaches the spend row as `CAD inf`.** Each
+>   wire row is bounded on parse (`_to_float`); their sum is not, so two rows near
+>   1e308 make `parse_query_response`'s total infinite, and the spend row prints
+>   `CAD inf of 150.00` at 100%. Needs a hostile or broken ARM response. 1.4.2
+>   keeps an infinite projection off the forecast row; the total itself wants
+>   treating as a failed read at its source, which is a change to how the read
+>   is judged rather than to how it is drawn.
+> * **The billing currency code is clipped, not checked.** `parse_query_response`
+>   keeps the first `CURRENCY_MAX_LEN` (8) characters of whatever the Currency
+>   column says. Every amount label is `PlainText` and every tooltip escaped, so
+>   markup is drawn literally and nothing is fetched; but newlines survive the
+>   clip: eight characters hold six of them, so a code of `A`, six newlines and
+>   `B` makes every Azure row that prints an amount seven lines tall, and a
+>   right-to-left override reorders how the amount is painted. Accepting the code
+>   only when it is three letters A-Z, and treating anything else as unknown,
+>   closes it - and touches every Azure row and the mixed-currency detection, so
+>   it is its own change. Since 1.4.1; the forecast row adds one more row it
+>   reaches.
 > * **An Azure Budget becomes the allowance when Settings has none, and the
 >   smallest budget wins** (the one that alerts first). A forgotten small alert
 >   budget is then the base of the top row and the forecast. The allowance in

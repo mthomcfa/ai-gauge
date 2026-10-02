@@ -38,6 +38,14 @@ jobs:
           - os: ubuntu-22.04
             python-version: "3.11"
             tz: America/St_Johns
+          # One leg that does not set QT_QPA_PLATFORM, so conftest.py's default
+          # is what puts the suite on the offscreen platform - the path a plain
+          # `pytest` on a desktop takes, and the one every other leg skips by
+          # setting the variable itself. Windows, because a Windows desktop is
+          # where seven tests failed for want of it.
+          - os: windows-latest
+            python-version: "3.12"
+            platform_from_conftest: true
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
@@ -66,17 +74,23 @@ jobs:
         run: python tools/check_versions.py
 
       - name: Run pytest
-        if: ${{ !matrix.tz }}
+        if: ${{ !matrix.tz && !matrix.platform_from_conftest }}
         env:
           QT_QPA_PLATFORM: offscreen
         run: pytest -q
 
-      # A separate step rather than TZ: '' on the others: an empty TZ is UTC to
-      # the C library on Linux and macOS but is not defined on Windows, and the
-      # point of the other legs is to stay exactly as they were.
-      - name: Run pytest (TZ=${{ matrix.tz }})
+      # Separate steps rather than an empty value on the others. An empty TZ is
+      # UTC to the C library on Linux and macOS but is not defined on Windows,
+      # and an empty QT_QPA_PLATFORM is set, so conftest.py's setdefault would
+      # leave it alone and Qt would pick the desktop platform. The point of the
+      # other legs is to stay exactly as they were.
+      - name: Run pytest away from UTC
         if: ${{ matrix.tz }}
         env:
           QT_QPA_PLATFORM: offscreen
           TZ: ${{ matrix.tz }}
+        run: pytest -q
+
+      - name: Run pytest with the platform left to conftest.py
+        if: ${{ matrix.platform_from_conftest }}
         run: pytest -q

@@ -61,21 +61,32 @@ looking at that row turned up three more.
 - **The forecast's tooltip printed the bar, not the projection.** The bar stops
   at 100%; the note used the same clamped figure, so a forecast of 260.00
   against an allowance of 150.00 read "(100% of allowance)" - in the tooltip of
-  a row that now prints `~CAD 260.00`. It says 173%.
+  a row that now prints `~CAD 260.00`. It says 173%. Unclamped is not
+  unbounded, though: an allowance of a sliver of a cent loads (typed by hand,
+  or a Budget's amount) and made the ratio `inf%` or a 300-digit number, so past
+  999 the note says "over 999%"; and two cost rows near the top of float range
+  sum to infinity on the wire, so a projection that is not a finite number is
+  not shown at all. The row's tooltip says the amount once - the note opens
+  with it, and the column's copy of it is dropped rather than repeated.
 - **An Azure component billed in two currencies printed their sum.** Cost
   Management's rows are grouped by service, not by service and currency, so in
   a period billed in more than one currency a service charged in both had its
   yen and its dollars added: JPY 4,980 and CAD 8.05 printed as `4,988.05`, on
   the row and in its tooltip. The tile already refused to gauge such a period;
-  the component rows now say `mixed currencies` instead of a figure.
+  the component rows now say `mixed currencies` instead of a figure, and the
+  Foundry row's note no longer opens with that phrase as if it were an amount.
 - **A truncated read printed component amounts as totals.** When Cost
   Management's paging could not be finished the spend row says `incomplete`,
   and the rows under it printed plain amounts one line down. They now end in
   `so far`.
 - **CI now runs one leg outside UTC.** Every runner is in UTC, which is how that
   test passed for a month. Ubuntu / Python 3.11 now runs in
-  `America/St_Johns` - west of UTC and off the hour - and the other five legs
-  are unchanged.
+  `America/St_Johns` - west of UTC and off the hour. And every leg set
+  `QT_QPA_PLATFORM` itself, so the default `conftest.py` now supplies was never
+  exercised: Windows / Python 3.12 runs without it, which is the path a plain
+  `pytest` on a Windows desktop takes. A test there checks that Qt runs on the
+  platform the environment names, which is what fails if the default is set
+  after the first `QApplication` exists. The other four legs are unchanged.
 - **1.4.1's notes counted 2 119 tests**; the release shipped 2 125, and
   `test_meter_catalog.py` 170. The count was written before the last fix in that
   release added six cases.
