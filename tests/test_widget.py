@@ -114,6 +114,49 @@ def test_offscreen_saved_position_is_clamped_on_screen(qtbot):
     assert widget.y() + widget.height() <= geo.bottom() + 1
 
 
+@pytest.mark.parametrize(
+    "x,y,edge",
+    [
+        ("1e12", "100", "right"),
+        ("100", "1e12", "bottom"),
+        ("-1e12", "-1e12", "top-left"),
+        ("2147483648", "100", "right"),
+    ],
+    ids=["x-huge", "y-huge", "both-negative-huge", "one-past-c-int"],
+)
+def test_a_position_past_qts_int_still_opens_the_panel_on_screen(qtbot, x, y, edge):
+    """The startup path, end to end: file, Config.load(), UsageWidget.
+
+    Before 1.4.3+cfa.11 these loaded as written and QPoint raised
+    OverflowError inside App(), so the app failed at every start until the file
+    was edited. The bound brings them back inside Qt's range, and the clamp
+    the previous test covers brings the window back onto the screen.
+    """
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        '{"window": {"x": %s, "y": %s}}' % (x, y), encoding="utf-8"
+    )
+    geo = QApplication.primaryScreen().availableGeometry()
+
+    widget = UsageWidget(Config.load())
+    qtbot.addWidget(widget)
+
+    assert widget.x() >= geo.left()
+    assert widget.y() >= geo.top()
+    assert widget.x() + widget.width() <= geo.right() + 1
+    assert widget.y() + widget.height() <= geo.bottom() + 1
+    # And at the edge the saved position points to: on screen is not enough,
+    # a panel that ignored the saved position would be on screen too.
+    if edge == "right":
+        assert widget.x() + widget.width() == geo.right() + 1
+        assert widget.y() == 100
+    elif edge == "bottom":
+        assert widget.y() + widget.height() == geo.bottom() + 1
+        assert widget.x() == 100
+    else:
+        assert (widget.x(), widget.y()) == (geo.left(), geo.top())
+
+
 def test_reenabled_provider_returns_to_canonical_order(qtbot):
     widget = UsageWidget(Config())
     qtbot.addWidget(widget)
