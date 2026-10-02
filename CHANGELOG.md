@@ -6,6 +6,39 @@
 > earlier `0.6.4` entry predates that convention and **is not** upstream's
 > `v0.6.4`, which is different code.
 
+## 1.4.3+cfa.11 - 2026-10-02
+
+A patch release for one defect, found while researching the zoom toggle: a saved
+window position that the loader never bounded - and, found while testing that,
+three window settings that could still cost the rest of the window block.
+
+### Fixed
+
+- **A bad window position in `config.json` no longer stops the app starting.**
+  `window.x` and `window.y` were the only window settings with no bound. A
+  position outside the C int that Qt's `QPoint` takes - `"x": 1e12`, or
+  anything outside -2 147 483 648 to 2 147 483 647 - loaded as written, and
+  PyQt raised `OverflowError` while `App()` built the panel, so the app failed
+  at every start until the file was edited by hand. Positions are now held to
+  +/-32 767, far outside any real desktop and with room for the window's size
+  inside Qt's int, and the existing clamp brings the window onto a visible
+  screen at show time. Nothing the app writes comes near the bound - positions
+  come from the OS - so it takes a damaged or hand-edited file.
+- **A malformed position no longer costs the rest of the window block.** A
+  fraction, a non-numeric string, `NaN`, an overflowing literal or a list in
+  `x` or `y` raised inside the window settings, and the loader's salvage
+  discarded the whole block with it: the panel's saved size, its opacity and
+  whether the user had sized it went back to defaults. The log said so and the
+  file was kept as `config.json.corrupt`, but nothing on screen did. A fraction
+  is now truncated, anything else unusable reads as "never placed" and the OS
+  chooses, and the rest of the block is kept. `true` and `false`, which loaded
+  as positions 1 and 0, read as "never placed" too.
+- **So does a malformed on/off setting in the same block.** `collapsed`,
+  `always_on_top` and `fade_when_inactive` had no coercion either, so a
+  `"collapsed": null` reset the position, size and opacity the same way. Each
+  now reads anything but `true` or `false` as its default, as `user_sized`
+  already did.
+
 ## 1.4.2+cfa.10 - 2026-10-01
 
 A patch release that came out of the first install of 1.4.1 on a real desktop.
