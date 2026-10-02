@@ -454,3 +454,41 @@ def test_the_guard_expires_on_the_budget_the_scrape_really_enforces():
     assert unusable._scrape_budget_seconds() == 240.0, (  # noqa: SLF001
         "an unusable timeout must not make the guard expire immediately"
     )
+
+
+@pytest.mark.parametrize("soft_ready_ms", [None, 13333])
+def test_the_runner_hands_the_early_read_to_every_scraper_it_builds(
+    fake_scraper, soft_ready_ms
+):
+    rn = ScrapeRunner(
+        account_id="x",
+        url="http://example",
+        extractor_js="",
+        build=lambda payload: _err_snapshot(),
+        log=logging.getLogger("test"),
+        build_max_attempts=2,
+        soft_ready_ms=soft_ready_ms,
+    )
+    rn.run(lambda _snapshot: None)
+    fake_scraper.instances[0].done.emit({"any": "payload"}, "")
+
+    assert len(fake_scraper.instances) == 2, "the build retry did not run"
+    assert [s.kwargs["soft_ready_ms"] for s in fake_scraper.instances] == [
+        soft_ready_ms
+    ] * 2
+
+
+def test_only_claude_reads_a_page_before_it_has_loaded():
+    """Off by default, on for Claude alone. Codex's extractor reads once and
+    counts "log in" text without "usage limit" as signed out, so an early read
+    of a slow Codex page could report a false sign-out."""
+    import inspect
+
+    from aigauge.providers import claude, codex, opencode_go
+    from aigauge.webview.scraper import HeadlessScraper
+
+    assert inspect.signature(HeadlessScraper.__init__).parameters["soft_ready_ms"].default is None
+    assert inspect.signature(ScrapeRunner.__init__).parameters["soft_ready_ms"].default is None
+    assert "soft_ready_ms=default_soft_ready_ms(" in inspect.getsource(claude.ClaudeProvider)
+    for module in (codex, opencode_go):
+        assert "soft_ready_ms" not in inspect.getsource(module), module.__name__

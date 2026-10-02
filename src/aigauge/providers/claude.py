@@ -15,6 +15,7 @@ from ._common import (
     page_text,
 )
 from ._scrape_runner import ScrapeRunner, account_is_busy
+from ..webview.scraper import default_soft_ready_ms
 from .catalog import (
     MeterCatalog,
     adopt_rows,
@@ -32,7 +33,11 @@ from .codex import _parse_reset_text  # reuse the same heuristic parser
 from .base import Provider
 from .diagnostics import log_page_diagnosis
 
-CLAUDE_USAGE_URL = "https://claude.ai/settings/usage"
+# Where the usage view lives. It has moved twice: /new#settings/usage stopped
+# opening it in August 2026, so this became /settings/usage; on 2026-10-02
+# Claude moved it back into an in-app view, and /settings/usage now forwards
+# there mid-load. Loading the forward's destination directly skips the hop.
+CLAUDE_USAGE_URL = "https://claude.ai/new#settings/usage"
 _EXPECTED_ROWS = ("session", "weekly_all")
 log = logging.getLogger("aigauge.providers.claude")
 
@@ -450,15 +455,17 @@ EXTRACTOR_TEMPLATE = r"""
       /settings\/usage/i.test(location.hash);
   }
 
-  // One candidate, deliberately. The hash form was kept as a fallback and
-  // turned out to be actively harmful: on a settings page that is merely slow
-  // (body_text "Loading..." while eight other endpoints resolve first), no
-  // usage panel has rendered yet, so the fallback fired and navigated away
-  // from the correct route to one we have direct evidence does not open the
-  // dialog at all - discarding the load that was about to succeed, and with
-  // it the recorded API capture. Being on the right route and unhydrated is a
-  // reason to wait, not to re-route.
-  const ROUTE_CANDIDATES = ['/settings/usage'];
+  // One candidate, deliberately: the route the scraper loads. A second form
+  // kept as a fallback turned out to be actively harmful: on a usage page that
+  // is merely slow (body_text "Loading..." while eight other endpoints resolve
+  // first), no usage panel has rendered yet, so the fallback fired and
+  // navigated away from the correct route - discarding the load that was about
+  // to succeed, and with it the recorded API capture. Being on the right route
+  // and unhydrated is a reason to wait, not to re-route. The candidate is the
+  // in-app view again since 2026-10-02 (see CLAUDE_USAGE_URL); from the
+  // signed-in home screen at /new, going to it is a hash change, which is how
+  // Claude's own forward opens the view.
+  const ROUTE_CANDIDATES = ['/new#settings/usage'];
 
   function routeTries() {
     try { return parseInt(sessionStorage.getItem('__ag_route_tries') || '0', 10) || 0; }
@@ -910,6 +917,13 @@ class ClaudeProvider(Provider):
             wait_ms=3000,
             max_extractor_reruns=20,
             timeout_ms=SCRAPE_TIMEOUT_MS,
+            # Read the page even if Chromium never reports it loaded: on
+            # 2026-10-02 Chromium never reported claude.ai loaded, the usage
+            # was on screen, and every refresh timed out waiting for it. The
+            # extractor polls until its rows are there, which is what makes an
+            # early read useful here. Its "signed out" test (a /login link and
+            # no "Plan usage") is the same one a finished load gets.
+            soft_ready_ms=default_soft_ready_ms(3000, SCRAPE_TIMEOUT_MS),
             transport_max_attempts=SCRAPE_TRANSPORT_ATTEMPTS,
             build_max_attempts=SCRAPE_BUILD_ATTEMPTS,
             # Discovery, not yet load-bearing: the gauge still reads the DOM.

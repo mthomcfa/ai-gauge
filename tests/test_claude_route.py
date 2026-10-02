@@ -9,6 +9,10 @@ The route check was the reason it could not recover. ``onUsageRoute()`` tests
 the URL *shape*, and the app navigates to a usage URL itself, so the check was
 true from the first poll and the recovery path never ran. Route decisions are
 now made on rendered evidence.
+
+The surface then moved back. From 2026-10-02 ``/settings/usage`` forwards to
+``/new#settings/usage`` mid-load, and that hash opens Claude's in-app usage
+view again, so the scraper loads it and it is the one recovery candidate.
 """
 
 from __future__ import annotations
@@ -66,16 +70,18 @@ def _ensure_route(pathname, hash_, body, *, host="claude.ai", tries=0) -> dict:
     return json.loads(out.stdout)
 
 
-def test_the_hash_route_no_longer_opening_the_dialog_is_recovered():
-    """The exact live failure.
+@pytest.mark.parametrize(
+    "pathname,hash_",
+    [("/new", ""), ("/settings/usage", ""), ("/", "")],
+    ids=["home", "old-usage-path", "root"],
+)
+def test_a_page_without_the_usage_view_is_sent_to_it(pathname, hash_):
+    """The signed-in home screen, or the route the view used to live on,
+    with nothing usage-shaped rendered. From /new this is a hash change -
+    the same step Claude's own forward takes to open the view."""
+    r = _ensure_route(pathname, hash_, HOME)
 
-    URL carries #settings/usage, page shows the home screen. The old check saw
-    the hash, declared itself already on the usage route, and returned without
-    acting - so the extractor waited for rows that were never coming.
-    """
-    r = _ensure_route("/new", "#settings/usage", HOME)
-
-    assert r["navigated"] == "/settings/usage", "did not attempt to recover"
+    assert r["navigated"] == "/new#settings/usage", "did not attempt to recover"
     assert r["reason"], "recovery must be reported as a retry reason"
 
 
@@ -93,7 +99,7 @@ def test_being_on_the_right_route_but_unhydrated_is_never_re_routed():
     had not yet re-routed, carried eight endpoints.
     """
     for body in (HOME, "Loading..."):
-        r = _ensure_route("/settings/usage", "", body)
+        r = _ensure_route("/new", "#settings/usage", body)
         assert r["navigated"] is None, f"navigated away while body was {body!r}"
 
 
@@ -110,10 +116,11 @@ def test_a_rendered_usage_panel_is_never_navigated_away_from(pathname, hash_):
     assert r["reason"] is None
 
 
-def test_navigation_is_bounded_so_a_bouncing_route_cannot_spin():
-    r = _ensure_route("/new", "", HOME, tries=2)
+@pytest.mark.parametrize("tries", [1, 2])
+def test_navigation_is_bounded_so_a_bouncing_route_cannot_spin(tries):
+    r = _ensure_route("/new", "", HOME, tries=tries)
 
-    assert r["navigated"] is None, "kept navigating after both candidates were spent"
+    assert r["navigated"] is None, "kept navigating after the candidate was spent"
 
 
 def test_a_foreign_host_is_never_navigated():
@@ -131,14 +138,17 @@ def test_the_scraper_and_the_verifier_target_the_same_url():
     """
     verify_url, _js = VERIFY_TARGETS["claude"]
 
-    assert CLAUDE_USAGE_URL == "https://claude.ai/settings/usage"
+    assert CLAUDE_USAGE_URL == "https://claude.ai/new#settings/usage"
     assert verify_url == CLAUDE_USAGE_URL
 
 
 def test_the_first_route_candidate_is_the_url_the_scraper_loads():
     # Otherwise the very first poll would navigate away from the page the
     # scraper just fetched, wasting a load on every single refresh.
+    from urllib.parse import urlparse
+
     source = _route_source()
     first = source.split("ROUTE_CANDIDATES = [")[1].split("]")[0].split(",")[0]
+    loaded = urlparse(CLAUDE_USAGE_URL)
 
-    assert first.strip().strip("'\"") == "/settings/usage"
+    assert first.strip().strip("'\"") == f"{loaded.path}#{loaded.fragment}"

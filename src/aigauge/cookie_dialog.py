@@ -27,7 +27,7 @@ log = logging.getLogger("aigauge.cookie_dialog")
 # "OpenCode session cookie") were a fourth place a provider had a name.
 INSTRUCTIONS = {
     "claude": f"""\
-1. Open <a style='color:#60a5fa;' href='https://claude.ai/settings/usage'>claude.ai/settings/usage</a>
+1. Open <a style='color:#60a5fa;' href='https://claude.ai/new#settings/usage'>claude.ai/new#settings/usage</a>
    in <b>Chrome / Edge / Firefox</b> (whichever you're already signed into).
 2. Press <b>F12</b> → <b>Network</b>, then reload the page.
 3. Click a <code>claude.ai</code> request.
