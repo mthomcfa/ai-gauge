@@ -25,20 +25,25 @@ two weaknesses in how the app loads a page.
   seconds while the usage was on screen. For Claude, an attempt now reads the
   page a third of the way into its timeout if it has not loaded by then - once
   the page itself reports a parsed document, never a blank one. Claude's reader
-  polls until its rows are there and is strict about "signed out", which is
-  what makes that safe; ChatGPT's and OpenCode's readers are not built that way,
-  so they keep waiting for the page to load.
+  polls until its rows are there, which is what makes an early read useful;
+  ChatGPT's and OpenCode's read once, and an early read there could take a
+  half-drawn page for a signed-out one, so they keep waiting for the page to
+  load.
 - **A retry no longer fails on the attempt it replaced.** The retry stopped the
   load that had timed out, and that load's `net::ERR_ABORTED` arrived during the
   new attempt and failed it as "page failed to load" before it had loaded
-  anything - every Claude retry ended that way. A load that ends
-  `ERR_ABORTED` is one something replaced or stopped, and the attempt now waits
-  for what replaced it. Network failures - a refused connection, a name that
-  does not resolve - still fail at once.
-- **A retry on an address with a `#` reloads.** Loading the address a page is
-  already on, when it has a `#` part, only scrolls; it does not reload. With the
-  usage view at `/new#settings/usage`, a retry would have re-read the very page
-  that had just failed. It reloads instead. Each attempt's reads are also tied
+  anything - every Claude retry ended that way. The retry now expects that one
+  abort, records it the moment Chromium reports it (the new load's start would
+  otherwise overwrite it first), and waits for its own load. Any other abort -
+  a page calling `window.stop()`, say - and every network failure still fail at
+  once.
+- **A retry on an address with a `#` reloads when it has to.** Loading the
+  address a page already shows, `#` part and all, only scrolls; it does not
+  reload. With the usage view at `/new#settings/usage`, a retry would have
+  re-read the very page that had just failed, so it reloads instead - but only
+  when the page has really arrived at that address. A page still being fetched
+  gets the address loaded again, and so does one that dropped the `#`, where
+  loading it is the step that opens the view. Each attempt's reads are also tied
   to that attempt, so a timed-out attempt's pending reads cannot run on into the
   next one.
 

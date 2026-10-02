@@ -918,10 +918,11 @@ class ClaudeProvider(Provider):
             max_extractor_reruns=20,
             timeout_ms=SCRAPE_TIMEOUT_MS,
             # Read the page even if Chromium never reports it loaded: on
-            # 2026-10-02 one request on claude.ai never settled, the usage was
-            # on screen, and every refresh timed out waiting for "loaded". The
-            # extractor polls for its rows and is strict about "signed out",
-            # which is what makes reading early safe here.
+            # 2026-10-02 Chromium never reported claude.ai loaded, the usage
+            # was on screen, and every refresh timed out waiting for it. The
+            # extractor polls until its rows are there, which is what makes an
+            # early read useful here. Its "signed out" test (a /login link and
+            # no "Plan usage") is the same one a finished load gets.
             soft_ready_ms=default_soft_ready_ms(3000, SCRAPE_TIMEOUT_MS),
             transport_max_attempts=SCRAPE_TRANSPORT_ATTEMPTS,
             build_max_attempts=SCRAPE_BUILD_ATTEMPTS,

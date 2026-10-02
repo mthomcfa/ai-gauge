@@ -193,18 +193,25 @@ class HeadlessScraper(QObject):
         self._extractor_reruns = 0
         # Has this attempt's extractor been started, by either route below?
         self._extracting = False
+        # Did the last load that stopped or failed end net::ERR_ABORTED?
+        # Recorded when Chromium reports it, because the deferred check in
+        # _on_load_failed runs after the replacement load's "started" has
+        # already overwritten the fields above.
+        self._last_failure_aborted = False
+        # Set by the retry when it stops a load that is still in progress: the
+        # abort that stop() causes is expected, and is not this attempt's.
+        self._expect_abort = False
         # How long an attempt waits for Chromium's "load finished" before it
         # reads the page anyway. A page counts as loaded only once every
-        # subresource has settled, and one request that never settles - claude.ai
-        # had one on 2026-10-02 - kept that event from ever firing: the usage
-        # was on screen, the scrape sat at 70% until its timeout, and the retry
-        # did the same.
+        # subresource has settled, and on claude.ai on 2026-10-02 that event
+        # never fired: the usage was on screen, the scrape sat at 70% until its
+        # timeout, and the retry did the same.
         #
-        # Opt-in (None is off), because it is only safe for an extractor that
-        # polls until its rows are there and is strict about "signed out":
-        # Claude's is. Codex's reads once, and counts any "log in" text on a
-        # page without "usage limit" as signed out, so reading its page early
-        # could turn a slow load into a false sign-out.
+        # Opt-in (None is off), because it only suits an extractor that polls
+        # until its rows are there: Claude's does. Codex's reads once, and
+        # counts any "log in" text on a page without "usage limit" as signed
+        # out, so reading its page early could turn a slow load into a false
+        # sign-out.
         self._soft_ready_ms = (
             None
             if soft_ready_ms is None
@@ -275,25 +282,28 @@ class HeadlessScraper(QObject):
         if self._soft_ready_ms is not None:
             self._soft_ready.start(self._soft_ready_ms)
         target = QUrl(self._url)
-        drop_fragment = QUrl.UrlFormattingOption.RemoveFragment
-        if (
-            self._attempt > 1
-            and target.hasFragment()
-            and self._page.url().adjusted(drop_fragment) == target.adjusted(drop_fragment)
-        ):
-            # Loading a URL that differs from the current one only in its
-            # fragment - or not at all - is a same-document navigation: it
-            # scrolls, and does not reload. Claude's usage view is
-            # /new#settings/usage, so a retry from that page would have
-            # re-read the very page that just failed. Reload it instead - one
-            # event-loop turn later: straight after the stop() in the retry
-            # path, Chromium does reload but Qt reports none of the new load's
-            # progress or completion, so the attempt would wait out its
-            # timeout on a page it believes never started.
+        if self._attempt > 1 and target.hasFragment() and self._on_committed(target):
+            # Loading the URL a page already shows, fragment and all, is a
+            # same-document navigation: it scrolls, and does not reload.
+            # Claude's usage view is /new#settings/usage, so a retry from that
+            # page would have re-read the very page that just failed. Reload
+            # it instead, one event-loop turn later, once the stop() has
+            # settled. Anywhere else - nothing committed yet, or a page that
+            # dropped the fragment - load() is right: it fetches the document,
+            # or changes the fragment, which is how Claude opens the view.
             attempt = self._attempt
             QTimer.singleShot(0, lambda: self._reload_for(attempt))
         else:
             self._page.load(target)
+
+    def _on_committed(self, target: QUrl) -> bool:
+        """Is ``target`` the page's committed entry, exactly?
+
+        ``page.url()`` is not enough: while a document is still being fetched
+        it is the URL being loaded, and a reload then has no committed entry to
+        reload - the retry sent no request at all."""
+        history = self._page.history()
+        return history.count() > 0 and history.currentItem().url() == target
 
     def _reload_for(self, attempt: int) -> None:
         if self._finished or attempt != self._attempt:
@@ -335,6 +345,12 @@ class HeadlessScraper(QObject):
         self._last_load_error_domain = _enum_name(_call_or_empty(info, "errorDomain"))
         self._last_load_error_string = str(_call_or_empty(info, "errorString") or "")
         self._last_load_is_error_page = _call_or_empty(info, "isErrorPage")
+        status = self._last_load_status.lower()
+        if "stopped" in status or "failed" in status:
+            self._last_failure_aborted = (
+                str(self._last_load_error_code).strip() == "-3"
+                or self._last_load_error_string.strip() == "net::ERR_ABORTED"
+            )
         if "fail" in self._last_load_status.lower() or self._last_load_error_string:
             log.warning(
                 "scrape load event provider=%s status=%s url=%s error_code=%s "
@@ -382,29 +398,26 @@ class HeadlessScraper(QObject):
         self._schedule_extractor(self._wait_ms)
 
     def _load_was_superseded(self) -> bool:
-        """Did the load end because something replaced or stopped it?
+        """Is this the abort of the load the retry itself stopped?
 
-        ``net::ERR_ABORTED`` is not the network failing: it is what a load
-        reports when a newer navigation takes its place, or when it is
-        stopped. The retry below stops the attempt that timed out, and the
-        aborted load's report then arrived during the *new* attempt and failed
-        it before it had loaded anything - every Claude retry on 2026-10-02
-        ended "page failed to load" that way. A page that forwards itself
-        mid-load reports it too. Neither is a reason to give up; the page that
-        replaced it, the early read and the timeout are all still running.
+        The retry stops the attempt that timed out, and that load's
+        ``net::ERR_ABORTED`` arrived during the *new* attempt and failed it
+        before it had loaded anything - every Claude retry on 2026-10-02 ended
+        "page failed to load" that way. That one abort is expected and waited
+        out. Any other - a page calling ``window.stop()``, say - fails at once,
+        as it always has.
         """
-        code = str(self._last_load_error_code).strip()
-        return code == "-3" or self._last_load_error_string.strip() == "net::ERR_ABORTED"
+        return self._expect_abort and self._last_failure_aborted
 
     def _on_load_failed(self) -> None:
         if self._finished:
             return
         if self._load_was_superseded():
+            self._expect_abort = False
             log.info(
-                "scrape load superseded provider=%s url=%s attempt=%s; waiting "
-                "for the page that replaced it",
+                "scrape load superseded provider=%s attempt=%s; the retry "
+                "stopped it, waiting for the retry's own load",
                 self._provider,
-                self._last_load_url,
                 self._attempt,
             )
             return
@@ -424,8 +437,8 @@ class HeadlessScraper(QObject):
         # Not before a real document has been parsed: an extractor run on a
         # blank page reports a page with no usage on it, which reads as a
         # layout change rather than the slow load it is. Asked of the page
-        # rather than taken from Qt's progress figure, which a reload after a
-        # stalled load does not report at all. Check again shortly; the
+        # rather than taken from Qt's progress figure, which does not reliably
+        # report a reload that follows a stalled load. Check again shortly; the
         # timeout still bounds the wait.
         ready = (
             isinstance(result, list)
@@ -577,6 +590,10 @@ class HeadlessScraper(QObject):
                 self._last_load_status,
             )
             try:
+                # Stopping a load that is still in progress aborts it, and
+                # that abort reaches the next attempt. It is expected; one
+                # that this stop did not cause is not.
+                self._expect_abort = "started" in str(self._last_load_status).lower()
                 self._view.stop()
                 self._begin_attempt()
             except Exception:  # noqa: BLE001

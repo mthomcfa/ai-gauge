@@ -80,6 +80,7 @@ class _LoadFailStandIn:
     _finish = HeadlessScraper._finish
     _on_load_failed = HeadlessScraper._on_load_failed
     _load_was_superseded = HeadlessScraper._load_was_superseded
+    _on_loading_changed = HeadlessScraper._on_loading_changed
     _is_resume_artifact = HeadlessScraper._is_resume_artifact
     _cleanup = lambda self: None  # noqa: E731 - no Qt objects to tear down
 
@@ -129,6 +130,34 @@ class _LoadFailStandIn:
         self._timeout = _Timer()
         self._soft_ready = _Timer()
         self._extracting = False
+        self._last_failure_aborted = False
+        self._expect_abort = False
+
+
+class _LoadInfo:
+    """What Qt's loadingChanged hands over, as the handler reads it."""
+
+    def __init__(self, status, code=0, string="", url="https://claude.ai/new"):
+        self._status = type("S", (), {"name": status})()
+        self._code, self._string, self._url = code, string, url
+
+    def status(self):
+        return self._status
+
+    def url(self):
+        return self._url
+
+    def errorCode(self):  # noqa: N802 - Qt's name
+        return self._code
+
+    def errorDomain(self):  # noqa: N802
+        return type("D", (), {"name": "InternalErrorDomain"})()
+
+    def errorString(self):  # noqa: N802
+        return self._string
+
+    def isErrorPage(self):  # noqa: N802
+        return False
 
 
 def test_load_failure_context_carries_the_chromium_error_detail():
@@ -194,28 +223,58 @@ def test_failed_load_actually_delivers_the_context_to_the_caller(monkeypatch):
     [(-3, "net::ERR_ABORTED"), ("-3", ""), (0, "net::ERR_ABORTED")],
     ids=["code-and-string", "code-only", "string-only"],
 )
-def test_a_load_that_was_replaced_or_stopped_is_not_a_failure(
+def test_the_abort_of_the_load_the_retry_stopped_is_waited_out(
     monkeypatch, caplog, code, string
 ):
     """Observed on 2026-10-02, on every Claude retry: the retry stops the
     attempt that timed out, and that load's ERR_ABORTED arrived in the new
     attempt and failed it as "page failed to load" before it had loaded
-    anything. A page that forwards itself mid-load reports the same. The
-    attempt waits for the page that replaced it; its timeout still bounds it.
+    anything. In the order Chromium reports it: the abort, then the new
+    load's start - which overwrites the error fields - then the deferred
+    check. The abort is recorded when it arrives, so the check still sees it.
     """
     stand_in = _LoadFailStandIn()
-    stand_in._last_load_error_code = code
-    stand_in._last_load_error_string = string
+    stand_in._expect_abort = True  # set by the retry that stopped the load
     scheduled = _run_deferred(monkeypatch)
 
     with caplog.at_level(logging.INFO, logger="aigauge"):
+        stand_in._on_loading_changed(_LoadInfo("LoadStoppedStatus", code, string))
         HeadlessScraper._on_load_finished(stand_in, False)
+        stand_in._on_loading_changed(_LoadInfo("LoadStartedStatus"))
         for _ms, callback in scheduled:
             callback()
 
-    assert stand_in.finished_with is None, "a superseded load ended the attempt"
-    assert stand_in._finished is False
+    assert stand_in.finished_with is None, "the retry failed on the load it replaced"
+    assert stand_in._expect_abort is False, "the expected abort was not consumed"
     assert "scrape load superseded" in caplog.text
+
+
+def test_an_abort_the_retry_did_not_cause_fails_at_once(monkeypatch):
+    """A page calling window.stop(), say. Nothing replaces that load, so
+    waiting for one only costs the whole timeout; it fails at once, as it did
+    before the retry learned to expect its own abort."""
+    stand_in = _LoadFailStandIn()
+    scheduled = _run_deferred(monkeypatch)
+    stand_in._on_loading_changed(_LoadInfo("LoadStoppedStatus", -3, "net::ERR_ABORTED"))
+    HeadlessScraper._on_load_finished(stand_in, False)
+    for _ms, callback in scheduled:
+        callback()
+
+    assert stand_in.finished_with is not None
+    assert stand_in.finished_with[1] == "page failed to load"
+
+
+def test_only_one_abort_is_expected(monkeypatch):
+    stand_in = _LoadFailStandIn()
+    stand_in._expect_abort = True
+    scheduled = _run_deferred(monkeypatch)
+    for _ in range(2):
+        stand_in._on_loading_changed(_LoadInfo("LoadStoppedStatus", -3, "net::ERR_ABORTED"))
+        HeadlessScraper._on_load_finished(stand_in, False)
+    for _ms, callback in scheduled:
+        callback()
+
+    assert stand_in.finished_with is not None, "a second abort was waited out too"
 
 
 @pytest.mark.parametrize(
@@ -225,20 +284,44 @@ def test_a_load_that_was_replaced_or_stopped_is_not_a_failure(
     ids=["refused", "dns", "no-detail", "lookalike"],
 )
 def test_a_load_the_network_failed_still_fails_at_once(monkeypatch, code, string):
-    """The tolerance is for ERR_ABORTED alone - code -3 or Chromium's exact
-    string. A refused connection, a name that does not resolve, a failure
-    Chromium gave no detail for, or a string that merely contains the token
-    must still end the attempt immediately rather than wait out the timeout."""
+    """Even while the retry expects its abort: what is waited out is
+    ERR_ABORTED alone - code -3 or Chromium's exact string. A refused
+    connection, a name that does not resolve, a failure Chromium gave no
+    detail for, or a string that merely contains the token ends the attempt
+    immediately rather than waiting out the timeout."""
     stand_in = _LoadFailStandIn()
-    stand_in._last_load_error_code = code
-    stand_in._last_load_error_string = string
+    stand_in._expect_abort = True
     scheduled = _run_deferred(monkeypatch)
+    stand_in._on_loading_changed(_LoadInfo("LoadFailedStatus", code, string))
     HeadlessScraper._on_load_finished(stand_in, False)
     for _ms, callback in scheduled:
         callback()
 
     assert stand_in.finished_with is not None
     assert stand_in.finished_with[1] == "page failed to load"
+
+
+@pytest.mark.parametrize(
+    "status,expected",
+    [("LoadStartedStatus", True), ("LoadSucceededStatus", False),
+     ("LoadFailedStatus", False), ("", False)],
+)
+def test_the_retry_expects_an_abort_only_from_a_load_still_in_progress(status, expected):
+    """Stopping a load that already ended causes no abort; expecting one
+    anyway would let a later real failure be waited out."""
+    stand_in = _LoadFailStandIn()
+    stand_in._RETRYABLE_ERRORS = ("timeout",)
+    stand_in._max_attempts = 2
+    stand_in._last_load_status = status
+    calls: list = []
+    stand_in._view = type("V", (), {"stop": lambda self: calls.append("stop")})()
+    stand_in._begin_attempt = lambda: calls.append("begin")
+
+    HeadlessScraper._finish(stand_in, None, "timeout")
+
+    assert calls == ["stop", "begin"]
+    assert stand_in._expect_abort is expected
+    assert stand_in.finished_with is None
 
 
 def test_the_failure_detail_is_captured_after_chromium_reports_it(monkeypatch):
@@ -626,8 +709,14 @@ class _SoftReadStandIn:
     _schedule_extractor = HeadlessScraper._schedule_extractor
     _begin_attempt = HeadlessScraper._begin_attempt
     _reload_for = HeadlessScraper._reload_for
+    _on_committed = HeadlessScraper._on_committed
 
-    def __init__(self, url="https://claude.ai/new#settings/usage", page_url="about:blank"):
+    def __init__(
+        self,
+        url="https://claude.ai/new#settings/usage",
+        page_url="about:blank",
+        committed=None,
+    ):
         from PyQt6.QtCore import QUrl
         from PyQt6.QtWebEngineCore import QWebEnginePage
 
@@ -656,6 +745,19 @@ class _SoftReadStandIn:
                 page.loaded = []
                 page.actions = []
                 page.current = QUrl(page_url)
+                page.committed = None if committed is None else QUrl(committed)
+
+            def history(page):
+                entry = page.committed
+
+                class _History:
+                    def count(self):
+                        return 0 if entry is None else 1
+
+                    def currentItem(self):  # noqa: N802 - Qt's name
+                        return type("I", (), {"url": lambda self: entry})()
+
+                return _History()
 
             def url(page):
                 return page.current
@@ -763,12 +865,10 @@ def test_a_previous_attempts_reads_do_not_run_in_the_next():
     assert stand_in._extracting is False
 
 
-def test_a_retry_on_a_fragment_url_reloads_rather_than_scrolls(monkeypatch):
-    """claude.ai/new#settings/usage. load() of the URL a page is already on,
-    differing at most in its fragment, is a same-document navigation: it
-    scrolls and does not reload, so the retry re-read the page that had just
-    failed. One event-loop turn later, too: straight after stop(), Qt reports
-    nothing of the reload's progress."""
+def test_a_retry_on_the_page_it_already_shows_reloads_rather_than_scrolls(monkeypatch):
+    """claude.ai/new#settings/usage. load() of the URL a page already shows,
+    fragment and all, is a same-document navigation: it scrolls and does not
+    reload, so the retry re-read the page that had just failed."""
     from PyQt6.QtWebEngineCore import QWebEnginePage
 
     scheduled: list = []
@@ -776,13 +876,34 @@ def test_a_retry_on_a_fragment_url_reloads_rather_than_scrolls(monkeypatch):
         "aigauge.webview.scraper.QTimer.singleShot",
         lambda ms, cb: scheduled.append((ms, cb)),
     )
-    for here in ("https://claude.ai/new#settings/usage", "https://claude.ai/new"):
-        stand_in = _SoftReadStandIn(page_url=here)
-        stand_in._begin_attempt()  # the retry: attempt 2
-        assert stand_in._page.loaded == []
-        assert [ms for ms, _cb in scheduled] == [0]
-        scheduled.pop()[1]()
-        assert stand_in._page.actions == [QWebEnginePage.WebAction.Reload]
+    target = "https://claude.ai/new#settings/usage"
+    stand_in = _SoftReadStandIn(page_url=target, committed=target)
+    stand_in._begin_attempt()  # the retry: attempt 2
+    assert stand_in._page.loaded == []
+    assert [ms for ms, _cb in scheduled] == [0]
+    scheduled.pop()[1]()
+    assert stand_in._page.actions == [QWebEnginePage.WebAction.Reload]
+
+
+@pytest.mark.parametrize(
+    "here,committed",
+    [
+        ("https://claude.ai/new#settings/usage", None),
+        ("https://claude.ai/new", "https://claude.ai/new"),
+    ],
+    ids=["document-never-committed", "page-dropped-the-fragment"],
+)
+def test_a_retry_anywhere_else_loads_the_url(here, committed):
+    """While a document is still being fetched, page.url() is the URL being
+    loaded and nothing is committed: a reload there sends no request at all,
+    so the retry was dead for its whole timeout. And from /new, a page that
+    dropped the fragment, load() is a fragment change - the step that opens
+    Claude's view - where a reload would only reload /new."""
+    target = "https://claude.ai/new#settings/usage"
+    stand_in = _SoftReadStandIn(page_url=here, committed=committed)
+    stand_in._begin_attempt()
+    assert stand_in._page.loaded == [target]
+    assert stand_in._page.actions == []
 
 
 @pytest.mark.parametrize(
@@ -801,6 +922,29 @@ def test_every_other_attempt_loads_the_url(here, url):
     assert stand_in._page.loaded == [url]
     assert stand_in._page.actions == []
     assert stand_in._soft_ready.starts == [stand_in._soft_ready_ms]
+
+
+def test_each_attempt_starts_without_a_reader(monkeypatch):
+    """A retry after an early read must be able to start its own; with the
+    flag carried over, no reader ever started again and every retry was dead."""
+    stand_in = _SoftReadStandIn()
+    stand_in._extracting = True
+    stand_in._begin_attempt()
+    assert stand_in._extracting is False
+
+
+def test_a_rerun_scheduled_in_one_attempt_does_not_run_in_the_next(monkeypatch):
+    scheduled: list = []
+    monkeypatch.setattr(
+        "aigauge.webview.scraper.QTimer.singleShot",
+        lambda ms, cb: scheduled.append((ms, cb)),
+    )
+    stand_in = _SoftReadStandIn()
+    stand_in._schedule_extractor(500)
+    stand_in._attempt = 2  # the retry starts before the rerun fires
+    scheduled.pop()[1]()
+
+    assert stand_in.js_runs == [], "attempt 1's rerun read attempt 2's page"
 
 
 def test_without_the_early_read_an_attempt_waits_for_the_load_event():
