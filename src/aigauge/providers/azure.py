@@ -635,6 +635,17 @@ def _money(amount: float, currency: str) -> str:
     return f"{currency} {amount:,.2f}" if currency else f"{amount:,.2f}"
 
 
+def _projected_percent(percent: float) -> str:
+    """The forecast's share of the allowance, as the note prints it.
+
+    Unclamped on purpose - the note says what the bar cannot - but not
+    unbounded: an allowance that is a sliver of a cent (a hand-typed 1e-300, a
+    Budget of 5e-324, both of which load) makes the ratio inf or a 300-digit
+    number.
+    """
+    return f"{percent:.0f}%" if percent < 1000 else "over 999%"
+
+
 MAX_CURRENCY_ROWS = 3
 
 
@@ -909,8 +920,8 @@ def build_snapshot(
             amount_text = _money(cost, currency)
         if name == FOUNDRY_BUCKET:
             note = (
-                f"{amount_text} across "
-                f"{aggregate.foundry_resource_count} Foundry resource"
+                ("Across " if aggregate.mixed_currency else f"{amount_text} across ")
+                + f"{aggregate.foundry_resource_count} Foundry resource"
                 f"{'' if aggregate.foundry_resource_count == 1 else 's'}. "
                 "Foundry bills per token to this subscription, so this is part "
                 "of the total above, not a separate credit."
@@ -944,7 +955,8 @@ def build_snapshot(
                 # tooltip.
                 #
                 # Bound: this string is composed here from a float and the
-                # billing currency code, which _fetch clips to CURRENCY_MAX_LEN.
+                # billing currency code, which parse_query_response clips to
+                # CURRENCY_MAX_LEN - a clip, not a check that it is a code.
                 # No provider string is interpolated into it; the service name
                 # stays in `label`, where _truncate bounds it.
                 reset_label=amount_text,
@@ -955,7 +967,9 @@ def build_snapshot(
 
     forecast_total = aggregate.forecast_total
     if forecast_total is not None and (
-        forecast_total <= 0 or forecast_total < aggregate.total
+        not math.isfinite(forecast_total)
+        or forecast_total <= 0
+        or forecast_total < aggregate.total
     ):
         # A full-period projection at or below what has already been spent is
         # not a projection - it contradicts the row above it. The row is built
@@ -983,12 +997,13 @@ def build_snapshot(
                 # month will run, the amount says what it will cost. Painted in
                 # the bar's colour, so the figure reads as the thing the bar
                 # measures. Composed here from a float and the billing
-                # currency code, which _fetch clips to CURRENCY_MAX_LEN.
+                # currency code, which parse_query_response clips to
+                # CURRENCY_MAX_LEN.
                 reset_label=forecast_projected,
                 reset_label_tinted=True,
                 note=(
                     f"{forecast_projected} projected by Cost Management for "
-                    f"the full period ({forecast_percent:.0f}% of allowance)."
+                    f"the full period ({_projected_percent(forecast_percent)} of allowance)."
                 ),
                 tag=BREAKDOWN_TAG,
             )

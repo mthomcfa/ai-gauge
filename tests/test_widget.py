@@ -3358,6 +3358,44 @@ def test_a_tinted_amount_takes_its_bars_colour_in_every_band(qtbot):
         row.set_metric("Storage", percent, None, "CAD 1.20")
         grey = grey or _text_colour(row.reset)
         assert _text_colour(row.reset) == grey != _chunk_colour(row), percent
+    # A row with no percentage has no bar to borrow a colour from, so a tint
+    # request on it is declined rather than painted in the empty-bar grey.
+    row.set_metric("Forecast end of month", None, None, "~CAD 71.00", tint_reset=True)
+    assert _text_colour(row.reset) == grey
+
+
+def test_a_stylesheet_colour_is_a_colour_whatever_reaches_it(qtbot):
+    """The second of two layers. ColorThresholds refuses anything but #rrggbb;
+    behind it every band colour is round-tripped through QColor before it is
+    written into a stylesheet - the bar's chunk, and now a tinted amount too.
+    Built with model_construct to reach this layer with validation skipped."""
+    import re
+
+    from aigauge.config import ColorThresholds
+    from aigauge.widget import _color_for_percent
+
+    hostile = "red; } QLabel { background: url(http://203.0.113.9/x.png); }"
+    colors = ColorThresholds.model_construct(
+        green_color=hostile, yellow_color="#12345;}*{", orange_color="palette(window)",
+        red_color="qlineargradient(x1:0)",
+        green_max=59, yellow_max=79, orange_max=94,
+    )
+    for percent in (10.0, 70.0, 90.0, 99.0):
+        assert re.fullmatch(r"#[0-9a-f]{6}", _color_for_percent(percent, colors)), percent
+
+
+def test_qt_runs_on_the_platform_the_environment_names(qapp):
+    """conftest.py sets QT_QPA_PLATFORM only when the run did not, and it has
+    to do that before the first QApplication exists - Qt reads the variable
+    once, at construction. Too late and the suite runs on the desktop's own
+    platform while the environment says offscreen; this is the one test that
+    notices, on the CI leg that leaves the variable to conftest.py."""
+    import os
+
+    from PyQt6.QtGui import QGuiApplication
+
+    named = os.environ.get("QT_QPA_PLATFORM", "<unset>").split(":", 1)[0]
+    assert QGuiApplication.platformName() == named
 
 
 def test_a_tinted_amount_follows_the_accounts_own_gauge_colours(qtbot):
@@ -3403,6 +3441,8 @@ def test_azures_forecast_amount_is_painted_like_its_bar_on_the_tile(qtbot):
     forecast = rows.pop("Forecast end of month")
     assert forecast.reset.text() == "~CAD 128.00"
     assert _text_colour(forecast.reset) == _chunk_colour(forecast)
+    # The note opens with the amount, so the tooltip says it once, not twice.
+    assert _tooltip_text(forecast.reset.toolTip()).count("~CAD 128.00") == 1
     others = {label: _text_colour(r.reset) for label, r in rows.items() if r.reset.text()}
     assert others and len(set(others.values())) == 1, others
     assert _chunk_colour(forecast) not in others.values()

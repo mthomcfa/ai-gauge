@@ -2533,6 +2533,32 @@ def test_the_forecast_note_states_the_projection_not_the_bar():
     assert "100% of allowance" not in (forecast.note or "")
 
 
+def test_a_forecast_past_float_range_is_not_a_forecast():
+    """Each wire row is bounded on parse, their sum is not: two 1e308 rows
+    add to inf, and a projection of inf printed "~CAD inf" on the row."""
+    total = az.parse_query_response(
+        {"properties": {"columns": [{"name": "Cost"}], "rows": [[1e308], [1e308]]}}
+    ).total
+    assert total == float("inf")
+    snapshot = az.build_snapshot(
+        _aggregate(forecast_total=total), AzureConfig(monthly_allowance=150.0)
+    )
+    assert "Forecast end of month" not in [m.label for m in snapshot.metrics]
+
+
+@pytest.mark.parametrize("allowance", [5e-324, 1e-300])
+def test_the_forecast_note_never_prints_an_unbounded_percentage(allowance):
+    """An allowance that is a sliver of a cent loads - typed by hand, or a
+    Budget's amount - and the unclamped ratio is then inf or 300 digits long."""
+    snapshot = az.build_snapshot(
+        _aggregate(forecast_total=71.0), AzureConfig(monthly_allowance=allowance)
+    )
+    note = {m.label: m for m in snapshot.metrics}["Forecast end of month"].note or ""
+    assert "inf" not in note
+    assert "(over 999% of allowance)" in note
+    assert len(note) < 120, note
+
+
 def test_a_component_billed_in_two_currencies_prints_no_figure():
     """A bucket is a service, not a service and a currency, so a service
     billed in both added yen to dollars: JPY 4,980 and CAD 8.05 printed as
@@ -2553,6 +2579,24 @@ def test_a_component_billed_in_two_currencies_prints_no_figure():
         assert row.reset_label == "mixed currencies"
         assert "4,988.05" not in (row.note or "")
         assert "currenc" in (row.note or "").lower()
+
+
+def test_a_foundry_row_in_a_mixed_currency_period_does_not_lead_with_money():
+    """ "mixed currencies across 1 Foundry resource" read as a sentence about
+    an amount; the row's own column already says the amount is not shown."""
+    snapshot = az.build_snapshot(
+        _aggregate(
+            total=100.0,
+            currency="",
+            mixed_currency=True,
+            currency_totals=[("CAD", 40.0), ("JPY", 60.0)],
+            buckets=[(az.FOUNDRY_BUCKET, 100.0)],
+        ),
+        AzureConfig(monthly_allowance=150.0),
+    )
+    foundry = {m.label: m for m in snapshot.metrics}[az.FOUNDRY_BUCKET]
+    assert foundry.reset_label == "mixed currencies"
+    assert (foundry.note or "").startswith("Across 1 Foundry resource.")
 
 
 def test_a_component_on_a_truncated_read_says_its_amount_is_so_far():

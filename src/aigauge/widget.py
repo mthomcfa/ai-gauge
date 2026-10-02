@@ -1044,11 +1044,17 @@ class _MetricRow(QWidget):
         if reset_label:
             # The full phrase, then the note: whatever the column elided is
             # still reachable here, and the amounts are in the note as well.
-            # Not twice, though - an Azure component row carries its amount in
-            # both, so the two parts are identical and one of them is dropped.
+            # Not twice, though. An Azure component row carries its amount in
+            # both, and the forecast's note opens with its projected amount, so
+            # where the note already begins with the column's text the column's
+            # copy is the one dropped: nothing the column elided is lost, because
+            # the note starts with all of it. Comparing for equality instead
+            # printed "~CAD 260.00" twice, and on a Foundry row in a mixed-
+            # currency period the repeat pushed the end of the note past the
+            # tooltip's clip.
             parts = [part for part in (rel, note) if part]
-            if len(parts) == 2 and parts[0] == parts[1]:
-                parts.pop()
+            if len(parts) == 2 and parts[1].startswith(parts[0]):
+                parts.pop(0)
             self.reset.setToolTip(_safe_tooltip("\n\n".join(parts)))
         elif resets_at:
             self.reset.setToolTip(resets_at.strftime("%Y-%m-%d %H:%M"))
