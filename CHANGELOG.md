@@ -6,6 +6,42 @@
 > earlier `0.6.4` entry predates that convention and **is not** upstream's
 > `v0.6.4`, which is different code.
 
+## 1.4.4+cfa.12 - 2026-10-02
+
+A patch release for the Claude tile, which showed `error · stale` from 2 October.
+claude.ai moved its usage view back into the app that day, and the move exposed
+two weaknesses in how the app loads a page.
+
+### Fixed
+
+- **The Claude tile reads its usage again.** `claude.ai/settings/usage` now
+  forwards to `claude.ai/new#settings/usage`, the in-app usage view, part-way
+  through loading. The app loads that address directly, and it is the one place
+  the page's route recovery sends a home screen that has not opened the view.
+  The sign-in check, the cookie instructions and the README point there too.
+- **A page that never finishes loading is still read.** On the new page Chromium
+  never reported the load finished - the log shows it holding at 70% - and the
+  app waited for that before reading anything, so every refresh sat out its 40
+  seconds while the usage was on screen. For Claude, an attempt now reads the
+  page a third of the way into its timeout if it has not loaded by then - once
+  the page itself reports a parsed document, never a blank one. Claude's reader
+  polls until its rows are there and is strict about "signed out", which is
+  what makes that safe; ChatGPT's and OpenCode's readers are not built that way,
+  so they keep waiting for the page to load.
+- **A retry no longer fails on the attempt it replaced.** The retry stopped the
+  load that had timed out, and that load's `net::ERR_ABORTED` arrived during the
+  new attempt and failed it as "page failed to load" before it had loaded
+  anything - every Claude retry ended that way. A load that ends
+  `ERR_ABORTED` is one something replaced or stopped, and the attempt now waits
+  for what replaced it. Network failures - a refused connection, a name that
+  does not resolve - still fail at once.
+- **A retry on an address with a `#` reloads.** Loading the address a page is
+  already on, when it has a `#` part, only scrolls; it does not reload. With the
+  usage view at `/new#settings/usage`, a retry would have re-read the very page
+  that had just failed. It reloads instead. Each attempt's reads are also tied
+  to that attempt, so a timed-out attempt's pending reads cannot run on into the
+  next one.
+
 ## 1.4.3+cfa.11 - 2026-10-02
 
 A patch release for one defect, found while researching the zoom toggle: a saved
