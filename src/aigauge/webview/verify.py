@@ -13,7 +13,9 @@ from .profile import get_profile
 # either redirects to /login or shows an interstitial.
 VERIFY_TARGETS = {
     "claude": (
-        "https://claude.ai/settings/usage",
+        # The same URL the scraper loads (providers/claude.py), pinned by
+        # tests/test_claude_route.py.
+        "https://claude.ai/new#settings/usage",
         r"""(() => {
           const text = ((document.body && (document.body.innerText || document.body.textContent)) || '')
             .replace(/\s+/g, ' ').trim();

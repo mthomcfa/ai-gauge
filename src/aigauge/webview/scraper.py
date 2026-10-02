@@ -120,6 +120,24 @@ def _result_keys_for_log(result: Any) -> str:
 RESUME_ARTIFACT_FACTOR = 3.0
 
 
+def default_soft_ready_ms(wait_ms: int, timeout_ms: int) -> int:
+    """When an attempt reads a page whose load has not finished.
+
+    A third of the timeout, which leaves two thirds for the extractor to poll
+    for its rows; never sooner than the ordinary post-load wait, and never past
+    the timeout itself.
+    """
+    return max(0, min(max(wait_ms, timeout_ms // 3), timeout_ms))
+
+
+# Is a real page's DOM there yet? Two strings and nothing else, so nothing a
+# page controls reaches Python beyond whether its URL is http(s).
+_READY_PROBE_JS = (
+    "(() => { try { return [String(document.readyState), "
+    "String(location.protocol) + '//']; } catch (e) { return null; } })()"
+)
+
+
 class HeadlessScraper(QObject):
     """Load a page in an offscreen QWebEngineView, then evaluate JS to extract data.
 
@@ -147,6 +165,7 @@ class HeadlessScraper(QObject):
         capture_api: bool = False,
         max_extractor_reruns: int = 5,
         max_attempts: int = 1,
+        soft_ready_ms: int | None = None,
         parent: QObject | None = None,
     ):
         super().__init__(parent)
@@ -172,6 +191,25 @@ class HeadlessScraper(QObject):
         self._max_progress = 0
         self._render_terminated = False
         self._extractor_reruns = 0
+        # Has this attempt's extractor been started, by either route below?
+        self._extracting = False
+        # How long an attempt waits for Chromium's "load finished" before it
+        # reads the page anyway. A page counts as loaded only once every
+        # subresource has settled, and one request that never settles - claude.ai
+        # had one on 2026-10-02 - kept that event from ever firing: the usage
+        # was on screen, the scrape sat at 70% until its timeout, and the retry
+        # did the same.
+        #
+        # Opt-in (None is off), because it is only safe for an extractor that
+        # polls until its rows are there and is strict about "signed out":
+        # Claude's is. Codex's reads once, and counts any "log in" text on a
+        # page without "usage limit" as signed out, so reading its page early
+        # could turn a slow load into a false sign-out.
+        self._soft_ready_ms = (
+            None
+            if soft_ready_ms is None
+            else max(0, min(int(soft_ready_ms), timeout_ms))
+        )
 
         profile = get_profile(provider)
         self._page = QuietWebEnginePage(profile, self, provider=provider)
@@ -189,6 +227,10 @@ class HeadlessScraper(QObject):
         self._timeout = QTimer(self)
         self._timeout.setSingleShot(True)
         self._timeout.timeout.connect(lambda: self._finish(None, "timeout"))
+
+        self._soft_ready = QTimer(self)
+        self._soft_ready.setSingleShot(True)
+        self._soft_ready.timeout.connect(self._on_soft_ready)
 
         self._page.loadFinished.connect(self._on_load_finished)
         self._page.loadProgress.connect(self._on_load_progress)
@@ -226,9 +268,37 @@ class HeadlessScraper(QObject):
         self._max_progress = 0
         self._render_terminated = False
         self._extractor_reruns = 0
+        self._extracting = False
         self._timeout.stop()
         self._timeout.start(self._timeout_ms)
-        self._page.load(QUrl(self._url))
+        self._soft_ready.stop()
+        if self._soft_ready_ms is not None:
+            self._soft_ready.start(self._soft_ready_ms)
+        target = QUrl(self._url)
+        drop_fragment = QUrl.UrlFormattingOption.RemoveFragment
+        if (
+            self._attempt > 1
+            and target.hasFragment()
+            and self._page.url().adjusted(drop_fragment) == target.adjusted(drop_fragment)
+        ):
+            # Loading a URL that differs from the current one only in its
+            # fragment - or not at all - is a same-document navigation: it
+            # scrolls, and does not reload. Claude's usage view is
+            # /new#settings/usage, so a retry from that page would have
+            # re-read the very page that just failed. Reload it instead - one
+            # event-loop turn later: straight after the stop() in the retry
+            # path, Chromium does reload but Qt reports none of the new load's
+            # progress or completion, so the attempt would wait out its
+            # timeout on a page it believes never started.
+            attempt = self._attempt
+            QTimer.singleShot(0, lambda: self._reload_for(attempt))
+        else:
+            self._page.load(target)
+
+    def _reload_for(self, attempt: int) -> None:
+        if self._finished or attempt != self._attempt:
+            return
+        self._page.triggerAction(self._page.WebAction.Reload)
 
     def _on_load_progress(self, progress: int) -> None:
         self._max_progress = max(self._max_progress, progress)
@@ -301,15 +371,96 @@ class HeadlessScraper(QObject):
             # NoErrorDomain and an empty error string - precisely the fields
             # this context exists to supply, and precisely when they matter.
             # Yield one event-loop turn so the detail lands first.
-            QTimer.singleShot(0, lambda: self._finish(None, "page failed to load"))
+            QTimer.singleShot(0, self._on_load_failed)
             return
+        if self._extracting:
+            # The early read below already started; a second chain would
+            # only spend the rerun budget twice as fast.
+            return
+        self._extracting = True
         # Page DOM may render asynchronously — give React a moment, then evaluate.
-        QTimer.singleShot(self._wait_ms, self._run_extractor)
+        self._schedule_extractor(self._wait_ms)
 
-    def _run_extractor(self) -> None:
+    def _load_was_superseded(self) -> bool:
+        """Did the load end because something replaced or stopped it?
+
+        ``net::ERR_ABORTED`` is not the network failing: it is what a load
+        reports when a newer navigation takes its place, or when it is
+        stopped. The retry below stops the attempt that timed out, and the
+        aborted load's report then arrived during the *new* attempt and failed
+        it before it had loaded anything - every Claude retry on 2026-10-02
+        ended "page failed to load" that way. A page that forwards itself
+        mid-load reports it too. Neither is a reason to give up; the page that
+        replaced it, the early read and the timeout are all still running.
+        """
+        code = str(self._last_load_error_code).strip()
+        return code == "-3" or self._last_load_error_string.strip() == "net::ERR_ABORTED"
+
+    def _on_load_failed(self) -> None:
         if self._finished:
             return
-        self._page.runJavaScript(self._extractor_js, self._on_js_result)
+        if self._load_was_superseded():
+            log.info(
+                "scrape load superseded provider=%s url=%s attempt=%s; waiting "
+                "for the page that replaced it",
+                self._provider,
+                self._last_load_url,
+                self._attempt,
+            )
+            return
+        self._finish(None, "page failed to load")
+
+    def _on_soft_ready(self) -> None:
+        if self._finished or self._extracting:
+            return
+        attempt = self._attempt
+        self._page.runJavaScript(
+            _READY_PROBE_JS, lambda result: self._on_ready_probe(result, attempt)
+        )
+
+    def _on_ready_probe(self, result: Any, attempt: int) -> None:
+        if self._finished or self._extracting or attempt != self._attempt:
+            return
+        # Not before a real document has been parsed: an extractor run on a
+        # blank page reports a page with no usage on it, which reads as a
+        # layout change rather than the slow load it is. Asked of the page
+        # rather than taken from Qt's progress figure, which a reload after a
+        # stalled load does not report at all. Check again shortly; the
+        # timeout still bounds the wait.
+        ready = (
+            isinstance(result, list)
+            and len(result) == 2
+            and result[0] in ("interactive", "complete")
+            and str(result[1]).startswith(("https://", "http://"))
+        )
+        if not ready:
+            self._soft_ready.start(1000)
+            return
+        self._extracting = True
+        log.info(
+            "scrape reading before load finished provider=%s attempt=%s "
+            "progress=%s load_status=%s url=%s",
+            self._provider,
+            self._attempt,
+            self._max_progress,
+            self._last_load_status,
+            _safe_url(self._page.url()),
+        )
+        self._run_extractor(attempt)
+
+    def _schedule_extractor(self, delay_ms: int) -> None:
+        attempt = self._attempt
+        QTimer.singleShot(delay_ms, lambda: self._run_extractor(attempt))
+
+    def _run_extractor(self, attempt: int | None = None) -> None:
+        # ``attempt`` pins a run to the attempt that scheduled it. A retry
+        # starts a fresh chain, and the previous attempt's pending reruns
+        # would otherwise go on reading the new page alongside it.
+        if self._finished or (attempt is not None and attempt != self._attempt):
+            return
+        self._page.runJavaScript(
+            self._extractor_js, lambda result: self._on_js_result(result, attempt)
+        )
 
     def _load_failure_context(
         self, *, error: str = "", elapsed_s: float | None = None
@@ -340,8 +491,8 @@ class HeadlessScraper(QObject):
             context["elapsed_s"] = round(elapsed_s, 1)
         return context
 
-    def _on_js_result(self, result: Any) -> None:
-        if self._finished:
+    def _on_js_result(self, result: Any, attempt: int | None = None) -> None:
+        if self._finished or (attempt is not None and attempt != self._attempt):
             return
         if result is None:
             self._finish(None, "extractor returned null")
@@ -369,7 +520,7 @@ class HeadlessScraper(QObject):
                 delay_ms,
                 result.get("__retry_reason", ""),
             )
-            QTimer.singleShot(delay_ms, self._run_extractor)
+            self._schedule_extractor(delay_ms)
             return
         self._finish(result, "")
 
@@ -445,6 +596,7 @@ class HeadlessScraper(QObject):
         # RuntimeError from reading it used to take `done` with it.
         try:
             self._timeout.stop()
+            self._soft_ready.stop()
             if error:
                 log.warning(
                     "scrape fail provider=%s url=%s page_url=%s elapsed=%.1fs "

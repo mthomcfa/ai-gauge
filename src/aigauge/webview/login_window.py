@@ -350,9 +350,9 @@ class LoginWindow(QDialog):
         # does NOT fire for a same-document (fragment-only) navigation. That
         # bit us when the verify URL was .../new#settings/usage and the view
         # was already on https://claude.ai/new: the hash-only change emitted no
-        # load event and verification hung until the 20s timeout. The URL is a
-        # real page now, so the event does fire — but the timer stays, because
-        # the next time this surface moves it may well move back to a fragment.
+        # load event and verification hung until the 20s timeout. The surface
+        # did move back to that fragment on 2026-10-02, which is what the timer
+        # is for.
         # loadFinished, when it fires, only fast-fails genuine load errors.
         QTimer.singleShot(1500, self._begin_verify_polling)
 

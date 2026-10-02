@@ -78,6 +78,8 @@ class _LoadFailStandIn:
 
     _load_failure_context = HeadlessScraper._load_failure_context
     _finish = HeadlessScraper._finish
+    _on_load_failed = HeadlessScraper._on_load_failed
+    _load_was_superseded = HeadlessScraper._load_was_superseded
     _is_resume_artifact = HeadlessScraper._is_resume_artifact
     _cleanup = lambda self: None  # noqa: E731 - no Qt objects to tear down
 
@@ -125,6 +127,8 @@ class _LoadFailStandIn:
                 pass
 
         self._timeout = _Timer()
+        self._soft_ready = _Timer()
+        self._extracting = False
 
 
 def test_load_failure_context_carries_the_chromium_error_detail():
@@ -167,6 +171,12 @@ def test_failed_load_actually_delivers_the_context_to_the_caller(monkeypatch):
     _on_load_finished still hands back None - which is exactly the bug.
     """
     stand_in = _LoadFailStandIn()
+    # A load the network failed. ERR_ABORTED, the stand-in's default, is a
+    # load something replaced, and that one is waited out - see below.
+    stand_in._last_load_status = "LoadFailedStatus"
+    stand_in._last_load_error_code = -101
+    stand_in._last_load_error_domain = "ConnectionErrorDomain"
+    stand_in._last_load_error_string = "net::ERR_CONNECTION_RESET"
     scheduled = _run_deferred(monkeypatch)
     HeadlessScraper._on_load_finished(stand_in, False)
     for _ms, callback in scheduled:
@@ -176,7 +186,59 @@ def test_failed_load_actually_delivers_the_context_to_the_caller(monkeypatch):
     result, error = stand_in.finished_with
     assert error == "page failed to load"
     assert isinstance(result, dict), "the load-failure detail must reach the snapshot"
-    assert result["load_error_string"] == "net::ERR_ABORTED"
+    assert result["load_error_string"] == "net::ERR_CONNECTION_RESET"
+
+
+@pytest.mark.parametrize(
+    "code,string",
+    [(-3, "net::ERR_ABORTED"), ("-3", ""), (0, "net::ERR_ABORTED")],
+    ids=["code-and-string", "code-only", "string-only"],
+)
+def test_a_load_that_was_replaced_or_stopped_is_not_a_failure(
+    monkeypatch, caplog, code, string
+):
+    """Observed on 2026-10-02, on every Claude retry: the retry stops the
+    attempt that timed out, and that load's ERR_ABORTED arrived in the new
+    attempt and failed it as "page failed to load" before it had loaded
+    anything. A page that forwards itself mid-load reports the same. The
+    attempt waits for the page that replaced it; its timeout still bounds it.
+    """
+    stand_in = _LoadFailStandIn()
+    stand_in._last_load_error_code = code
+    stand_in._last_load_error_string = string
+    scheduled = _run_deferred(monkeypatch)
+
+    with caplog.at_level(logging.INFO, logger="aigauge"):
+        HeadlessScraper._on_load_finished(stand_in, False)
+        for _ms, callback in scheduled:
+            callback()
+
+    assert stand_in.finished_with is None, "a superseded load ended the attempt"
+    assert stand_in._finished is False
+    assert "scrape load superseded" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "code,string",
+    [(-102, "net::ERR_CONNECTION_REFUSED"), (-105, "net::ERR_NAME_NOT_RESOLVED"),
+     ("", ""), (-30, "net::ERR_ABORTED_ELSEWHERE")],
+    ids=["refused", "dns", "no-detail", "lookalike"],
+)
+def test_a_load_the_network_failed_still_fails_at_once(monkeypatch, code, string):
+    """The tolerance is for ERR_ABORTED alone - code -3 or Chromium's exact
+    string. A refused connection, a name that does not resolve, a failure
+    Chromium gave no detail for, or a string that merely contains the token
+    must still end the attempt immediately rather than wait out the timeout."""
+    stand_in = _LoadFailStandIn()
+    stand_in._last_load_error_code = code
+    stand_in._last_load_error_string = string
+    scheduled = _run_deferred(monkeypatch)
+    HeadlessScraper._on_load_finished(stand_in, False)
+    for _ms, callback in scheduled:
+        callback()
+
+    assert stand_in.finished_with is not None
+    assert stand_in.finished_with[1] == "page failed to load"
 
 
 def test_the_failure_detail_is_captured_after_chromium_reports_it(monkeypatch):
@@ -547,3 +609,223 @@ def test_the_scrapers_url_field_is_bounded_too():
 
     assert len(_safe_url("https://claude.ai/" + "p" * 100_000)) <= 300
     assert len(_safe_url("not a url at all " + "q" * 100_000)) <= 300
+
+
+class _SoftReadStandIn:
+    """Carries what the early read, the load event and a retry touch.
+
+    The methods are the production ones, so these tests exercise the real
+    state machine; only Qt (page, timers) is replaced.
+    """
+
+    _on_soft_ready = HeadlessScraper._on_soft_ready
+    _on_ready_probe = HeadlessScraper._on_ready_probe
+    _run_extractor = HeadlessScraper._run_extractor
+    _on_js_result = HeadlessScraper._on_js_result
+    _on_load_finished = HeadlessScraper._on_load_finished
+    _schedule_extractor = HeadlessScraper._schedule_extractor
+    _begin_attempt = HeadlessScraper._begin_attempt
+    _reload_for = HeadlessScraper._reload_for
+
+    def __init__(self, url="https://claude.ai/new#settings/usage", page_url="about:blank"):
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtWebEngineCore import QWebEnginePage
+
+        self._finished = False
+        self._extracting = False
+        self._attempt = 1
+        self._provider = "claude"
+        self._max_progress = 80
+        self._last_load_status = "LoadStartedStatus"
+        self._last_load_is_error_page = False
+        self._extractor_js = "EXTRACT"
+        self._wait_ms = 3000
+        self._url = url
+        self._timeout_ms = 40000
+        self._soft_ready_ms = 13333
+        self._extractor_reruns = 0
+        self._max_extractor_reruns = 5
+        self.js_runs: list = []
+        self.finished_with = None
+        outer = self
+
+        class _Page:
+            WebAction = QWebEnginePage.WebAction
+
+            def __init__(page):
+                page.loaded = []
+                page.actions = []
+                page.current = QUrl(page_url)
+
+            def url(page):
+                return page.current
+
+            def title(page):
+                return "Claude"
+
+            def runJavaScript(page, js, callback):
+                outer.js_runs.append((js, callback))
+
+            def load(page, target):
+                page.loaded.append(target.toString())
+
+            def triggerAction(page, action):
+                page.actions.append(action)
+
+        class _Timer:
+            def __init__(timer):
+                timer.starts = []
+
+            def stop(timer):
+                pass
+
+            def start(timer, ms):
+                timer.starts.append(ms)
+
+        self._page = _Page()
+        self._timeout = _Timer()
+        self._soft_ready = _Timer()
+
+    def _finish(self, result, error):
+        self.finished_with = (result, error)
+        self._finished = True
+
+
+def test_a_page_still_loading_is_read_once_its_document_is_there(monkeypatch):
+    """The 2026-10-02 failure: claude.ai rendered the usage and one request on
+    the page never settled, so Chromium's load-finished never fired and the
+    extractor never ran. The early read asks the page whether its document
+    is parsed, and reads it."""
+    from aigauge.webview.scraper import _READY_PROBE_JS
+
+    stand_in = _SoftReadStandIn()
+    stand_in._on_soft_ready()
+
+    assert [js for js, _cb in stand_in.js_runs] == [_READY_PROBE_JS]
+    stand_in.js_runs[0][1](["interactive", "https://"])
+
+    assert stand_in._extracting is True
+    assert [js for js, _cb in stand_in.js_runs][1] == "EXTRACT"
+    stand_in.js_runs[1][1]({"session": {"percent": 8}})
+    assert stand_in.finished_with == ({"session": {"percent": 8}}, "")
+
+
+@pytest.mark.parametrize(
+    "probe",
+    [["loading", "https://"], ["complete", "about://"], ["interactive", "data://"],
+     None, "interactive", ["interactive"], [1, 2], {"0": "complete"}],
+    ids=["still-parsing", "about-blank", "data-url", "null", "string", "short",
+         "wrong-types", "dict"],
+)
+def test_the_early_read_waits_for_a_real_document(probe):
+    """An extractor run on a blank page finds no usage on it, and that reads as
+    a layout change rather than the slow load it is. So it waits, and asks
+    again a second later; the timeout still bounds the wait."""
+    stand_in = _SoftReadStandIn()
+    stand_in._on_soft_ready()
+    stand_in.js_runs[0][1](probe)
+
+    assert stand_in._extracting is False
+    assert len(stand_in.js_runs) == 1, "the extractor ran on a page with no document"
+    assert stand_in._soft_ready.starts == [1000]
+
+
+def test_the_load_event_and_the_early_read_start_one_reader_between_them(monkeypatch):
+    scheduled: list = []
+    monkeypatch.setattr(
+        "aigauge.webview.scraper.QTimer.singleShot",
+        lambda ms, cb: scheduled.append((ms, cb)),
+    )
+    early = _SoftReadStandIn()
+    early._on_soft_ready()
+    early.js_runs[0][1](["interactive", "https://"])
+    early._on_load_finished(True)
+    assert scheduled == [], "the load event started a second reader"
+
+    late = _SoftReadStandIn()
+    late._on_load_finished(True)
+    assert len(scheduled) == 1 and scheduled[0][0] == late._wait_ms
+    late._on_soft_ready()
+    assert late.js_runs == [], "the early read started a second reader"
+
+
+def test_a_previous_attempts_reads_do_not_run_in_the_next():
+    """A retry starts its own reader. The timed-out attempt's pending reruns,
+    probes and results belong to the page it gave up on."""
+    stand_in = _SoftReadStandIn()
+    stand_in._attempt = 2
+
+    stand_in._run_extractor(1)
+    assert stand_in.js_runs == []
+    stand_in._on_js_result({"session": {"percent": 8}}, 1)
+    assert stand_in.finished_with is None
+    stand_in._on_ready_probe(["interactive", "https://"], 1)
+    assert stand_in._extracting is False
+
+
+def test_a_retry_on_a_fragment_url_reloads_rather_than_scrolls(monkeypatch):
+    """claude.ai/new#settings/usage. load() of the URL a page is already on,
+    differing at most in its fragment, is a same-document navigation: it
+    scrolls and does not reload, so the retry re-read the page that had just
+    failed. One event-loop turn later, too: straight after stop(), Qt reports
+    nothing of the reload's progress."""
+    from PyQt6.QtWebEngineCore import QWebEnginePage
+
+    scheduled: list = []
+    monkeypatch.setattr(
+        "aigauge.webview.scraper.QTimer.singleShot",
+        lambda ms, cb: scheduled.append((ms, cb)),
+    )
+    for here in ("https://claude.ai/new#settings/usage", "https://claude.ai/new"):
+        stand_in = _SoftReadStandIn(page_url=here)
+        stand_in._begin_attempt()  # the retry: attempt 2
+        assert stand_in._page.loaded == []
+        assert [ms for ms, _cb in scheduled] == [0]
+        scheduled.pop()[1]()
+        assert stand_in._page.actions == [QWebEnginePage.WebAction.Reload]
+
+
+@pytest.mark.parametrize(
+    "here,url",
+    [
+        ("about:blank", "https://claude.ai/new#settings/usage"),
+        ("https://claude.ai/login", "https://claude.ai/new#settings/usage"),
+        ("https://chatgpt.com/codex", "https://chatgpt.com/codex/cloud/settings/analytics#personal-usage"),
+        ("https://claude.ai/settings/usage", "https://claude.ai/settings/usage"),
+    ],
+    ids=["first-load", "another-page", "another-path", "no-fragment"],
+)
+def test_every_other_attempt_loads_the_url(here, url):
+    stand_in = _SoftReadStandIn(url=url, page_url=here)
+    stand_in._begin_attempt()
+    assert stand_in._page.loaded == [url]
+    assert stand_in._page.actions == []
+    assert stand_in._soft_ready.starts == [stand_in._soft_ready_ms]
+
+
+def test_without_the_early_read_an_attempt_waits_for_the_load_event():
+    stand_in = _SoftReadStandIn()
+    stand_in._soft_ready_ms = None
+    stand_in._begin_attempt()
+
+    assert stand_in._soft_ready.starts == []
+    assert stand_in._page.loaded == [stand_in._url]
+
+
+def test_the_early_read_leaves_claude_room_to_poll_inside_its_timeout():
+    from aigauge.providers.claude import SCRAPE_TIMEOUT_MS
+    from aigauge.webview.scraper import default_soft_ready_ms
+
+    # Claude polls 20 times at up to 1.2 s (providers/claude.py).
+    assert default_soft_ready_ms(3000, SCRAPE_TIMEOUT_MS) + 20 * 1200 <= SCRAPE_TIMEOUT_MS
+
+
+@pytest.mark.parametrize(
+    "wait_ms,timeout_ms,expected",
+    [(3000, 40000, 13333), (7000, 25000, 8333), (4000, 25000, 8333),
+     (20000, 25000, 20000), (60000, 25000, 25000), (0, 0, 0)],
+)
+def test_the_early_read_default(wait_ms, timeout_ms, expected):
+    from aigauge.webview.scraper import default_soft_ready_ms
+
+    assert default_soft_ready_ms(wait_ms, timeout_ms) == expected

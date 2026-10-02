@@ -117,6 +117,7 @@ class ScrapeRunner:
         capture_api: bool = False,
         max_extractor_reruns: int = 5,
         timeout_ms: int = 25000,
+        soft_ready_ms: int | None = None,
         parent: QObject | None = None,
     ):
         self._account_id = account_id
@@ -130,6 +131,7 @@ class ScrapeRunner:
         self._capture_api = capture_api
         self._max_extractor_reruns = max_extractor_reruns
         self._timeout_ms = timeout_ms
+        self._soft_ready_ms = soft_ready_ms
         self._parent = parent
         self._scraper: HeadlessScraper | None = None
 
@@ -244,6 +246,7 @@ class ScrapeRunner:
                 capture_api=self._capture_api,
                 max_extractor_reruns=self._max_extractor_reruns,
                 timeout_ms=self._timeout_ms,
+                soft_ready_ms=self._soft_ready_ms,
                 parent=self._parent,
             )
             self._scraper.done.connect(_handle)
