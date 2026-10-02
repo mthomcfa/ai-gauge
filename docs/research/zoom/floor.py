@@ -12,7 +12,7 @@ import os, sys
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 tree = os.path.abspath(sys.argv[1]); sys.path.insert(0, os.path.join(tree, "src")); sys.dont_write_bytecode = True
 import aigauge; assert aigauge.__version__ == "1.4.2+cfa.10" and aigauge.__file__.startswith(tree)
-# Never the real config: app_data_dir() ignores APPDATA/XDG on macOS, so patch the platform class.
+# A throwaway config folder per run, outside the repo, so a run never writes next to the script.
 import tempfile; from pathlib import Path; from aigauge.platforms import get_platform
 _sandbox = Path(tempfile.mkdtemp(prefix="aigauge-zoom-")); type(get_platform()).app_data_dir = lambda self: _sandbox
 from PyQt6.QtWebEngineWidgets import QWebEngineView  # noqa
