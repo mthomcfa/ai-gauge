@@ -10,6 +10,7 @@ from aigauge.config import (
     ACCOUNT_NAME_MAX_CHARS,
     DEFAULT_OPENCODE_USAGE_URL,
     WINDOW_MAX_DIMENSION,
+    WINDOW_MAX_POSITION,
     WINDOW_MIN_WIDTH,
     WINDOW_MIN_HEIGHT,
     BrowserAccount,
@@ -632,6 +633,90 @@ def test_window_width_is_coerced_never_rejected(payload, expected):
     from aigauge.config import WindowState
 
     assert WindowState(**payload).width == expected
+
+
+@pytest.mark.parametrize("field", ["x", "y"])
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (10**12, WINDOW_MAX_POSITION),
+        (-(10**12), -WINDOW_MAX_POSITION),
+        (2**31, WINDOW_MAX_POSITION),
+        (1e12, WINDOW_MAX_POSITION),
+        (10**5000, None),
+        (1.5, 1),
+        (-1.5, -1),
+        ("abc", None),
+        (True, None),
+        (False, None),
+        (float("nan"), None),
+        (float("inf"), None),
+        ([1], None),
+        ({"a": 1}, None),
+        (None, None),
+        (-1200, -1200),
+        (0, 0),
+        (WINDOW_MAX_POSITION, WINDOW_MAX_POSITION),
+        (-WINDOW_MAX_POSITION, -WINDOW_MAX_POSITION),
+    ],
+    ids=[
+        "huge", "huge-negative", "one-past-c-int", "huge-float",
+        "too-big-for-float", "fraction", "negative-fraction", "string", "true",
+        "false", "nan", "inf", "list", "dict", "null", "monitor-to-the-left",
+        "zero", "at-bound", "at-negative-bound",
+    ],
+)
+def test_window_position_is_coerced_never_rejected(field, raw, expected):
+    """x/y reach QPoint, which takes a C int: past it PyQt raises
+    OverflowError while App() builds the panel. And like every WindowState
+    field, a raise in here costs the whole window block, so nothing is
+    rejected - an unusable value reads as "never placed"."""
+    from aigauge.config import WindowState
+
+    assert getattr(WindowState(**{field: raw}), field) == expected
+
+
+def test_the_position_bound_leaves_room_for_the_size_inside_a_c_int():
+    """QPoint takes a C int, and Qt works out a window's right and bottom
+    edges as position + size, so the bound has to keep that sum inside one
+    too, at either sign. Bounding at the C int itself would pass every
+    coercion test above and still overflow there."""
+    c_int_max = 2**31 - 1
+    assert WINDOW_MAX_POSITION + WINDOW_MAX_DIMENSION <= c_int_max
+    assert -WINDOW_MAX_POSITION - WINDOW_MAX_DIMENSION >= -c_int_max - 1
+
+
+@pytest.mark.parametrize(
+    "bad_x,expected_x",
+    [
+        ("1e12", WINDOW_MAX_POSITION),
+        ("1.5", 1),
+        ('"abc"', None),
+        ("NaN", None),
+        ("1e400", None),
+        ("[1]", None),
+        ("true", None),
+    ],
+    ids=["huge", "fraction", "string", "nan", "inf", "list", "bool"],
+)
+def test_a_bad_saved_position_costs_only_the_position(bad_x, expected_x):
+    """Before 1.4.3+cfa.11 a fraction, a string, NaN, an overflowing literal
+    or a list raised inside WindowState, and Config.load()'s salvage threw away
+    the user's size, opacity and user_sized with it, silently."""
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        '{"window": {"x": %s, "y": 120, "width": 500, "height": 400,'
+        ' "user_sized": true, "opacity": 0.95}}' % bad_x,
+        encoding="utf-8",
+    )
+
+    window = Config.load().window
+
+    assert (window.width, window.height) == (500, 400)
+    assert window.user_sized is True
+    assert window.opacity == 0.95
+    assert window.y == 120
+    assert window.x == expected_x
 
 
 def test_color_thresholds_reject_stylesheet_injection():
