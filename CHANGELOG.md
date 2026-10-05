@@ -22,18 +22,27 @@ then as "layout changed".
   limit; its "Plan limits - Shared across Codex, Work, ..." wording now counts as
   the weekly-only layout the app already knew from the old page, so a lone
   weekly limit is a full reading, not a half-loaded one, and an untouched one
-  reads 0% rather than retrying. The sign-in check and the cookie instructions
-  point at the new page.
+  reads 0% rather than retrying. A card is read from its own name onward, so a
+  card drawn beside another without a box of its own cannot take its
+  neighbour's number. The sign-in check and the cookie instructions point at
+  the new page, and the sign-in check now wants the same readable weekly card
+  the tile does.
 - **The reader waits for the plan limits.** Settings > Usage draws a shell
   ("Loading settings...") and fills in the limits later, and it counts as loaded
   before they are there. ChatGPT's reader read the page once and came back
-  empty; it now checks every second until the weekly card is there with its
-  used/left wording, and a signed-out page is still reported as signed out at
-  once. With that in place it also reads a page Chromium never reports loaded,
-  as Claude's does since 1.4.4, and its timeout is 40 seconds rather than 25:
-  on 2 October the old page took 23 seconds to report loaded.
+  empty; it now checks every second, for up to 30 seconds from when the page
+  started loading, until the weekly card is there with its used/left wording.
+  If it never is, the reader says what it found - a card with no used/left
+  wording, or no card at all - and the refresh tries once more. A sign-in page
+  or a Cloudflare check is reported at once; a signed-out page left at Settings
+  > Usage is reported as signed out when the wait ends, since a page still
+  loading can show "Log in" too. With the wait in place the reader also reads a
+  page Chromium never reports loaded, as Claude's does since 1.4.4, and its
+  timeout is 40 seconds rather than 25: on 2 October the old page took 23
+  seconds to report loaded.
 - **Reset times written in days are read.** "Resets in 4d 7h" came back as no
-  reset at all; days now count, alongside hours and minutes.
+  reset at all; days now count, alongside hours and minutes, written as "4d7h"
+  or "4 days, 7 hours" too.
 
 ### Known
 
@@ -44,6 +53,11 @@ then as "layout changed".
   page's "Daily usage" percentages or the credits' "Up to 40% off" either way -
   none of them says used or left - but a meter OpenAI adds to this page needs a
   catalog entry rather than being picked up by itself.
+- **A five-hour limit on this page would not be read.** The page mentions one
+  ("restore your 5-hour limit, weekly limit, or both") but did not show one, so
+  there is no card to learn its name from - and that sentence would match the
+  name it would most likely carry, so the guess is not made. Weekly reads its
+  own card either way; the tile would just show no Session gauge.
 
 ## 1.4.4+cfa.12 - 2026-10-02
 

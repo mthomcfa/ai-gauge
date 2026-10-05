@@ -15,7 +15,7 @@
       "key": "weekly",
       "label": "Weekly",
       "aliases": ["Weekly usage limit", "Weekly limit"],
-      "boundaries": ["Personal usage", "Team usage"],
+      "boundaries": ["Personal usage", "Team usage", "Daily usage"],
       "window_seconds": 604800,
       "primary": true,
       "source": "bundled"

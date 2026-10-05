@@ -11,6 +11,7 @@ from aigauge.gauge import provider_max_percent
 from aigauge.models import SnapshotStatus
 from aigauge.providers.catalog import adopt_rows, load_catalog
 from aigauge.providers.codex import (
+    CODEX_ANALYTICS_URL,
     CODEX_USAGE_URL,
     EXTRACTOR_JS,
     _build_snapshot,
@@ -18,6 +19,11 @@ from aigauge.providers.codex import (
     _parse_reset_text,
     _weekly_only_layout_evidence,
 )
+
+
+# The page these empty-page tests were written against, and the only one the
+# empty-page rule applies to; Settings > Usage waits for its limits itself.
+OLD_ANALYTICS_URL = f"{CODEX_ANALYTICS_URL}#personal-usage"
 
 
 def test_parse_reset_text_handles_weekday_time():
@@ -67,7 +73,7 @@ def test_codex_empty_shell_with_login_task_titles_is_transient_error():
             "session": None,
             "weekly": None,
             "title": "Codex",
-            "url": CODEX_USAGE_URL,
+            "url": OLD_ANALYTICS_URL,
             "body_text": "Codex cloud tasks Sign in flow debugging",
         }
     )
@@ -170,7 +176,7 @@ def test_codex_signed_in_empty_usage_payload_is_transient_error():
             "session": None,
             "weekly": None,
             "title": "Codex",
-            "url": CODEX_USAGE_URL,
+            "url": OLD_ANALYTICS_URL,
             "body_text": "Codex cloud tasks",
         }
     )

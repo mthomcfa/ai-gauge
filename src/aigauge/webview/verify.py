@@ -57,9 +57,16 @@ VERIFY_TARGETS = {
           // weekly card here while the extractor demanded the markers let
           // sign-in report success and then error forever on every refresh.
           // "Weekly usage limit" on the old analytics page, "Weekly limit" on
-          // Settings > Usage.
-          const hasWeekly = /Weekly (?:usage )?limit/i.test(text) &&
-            /\d+(?:\.\d+)?\s*%/.test(text);
+          // Settings > Usage - followed by its own percentage and used/left
+          // wording, as the extractor requires. Settings > Usage also says
+          // "weekly limit" in prose ("restore your 5-hour limit, weekly
+          // limit, or both") and has percentages that are not limits ("Up to
+          // 40% off", Daily usage), and the two together are not a card. No
+          // \b around the words: inline elements run into each other in
+          // innerText ("Weekly limitResets in 4d 7h58% leftCredits").
+          const hasWeekly =
+            /Weekly (?:usage )?limit[^%]{0,80}?\d+(?:\.\d+)?\s*%\s*(?:used|left|remaining)/i
+              .test(text);
           const hasSession = /5 hour usage limit/i.test(text);
           // Must stay in step with providers/codex.py's markers: accepting a
           // layout here that the extractor then rejects is what made sign-in
