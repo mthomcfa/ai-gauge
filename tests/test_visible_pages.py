@@ -88,13 +88,14 @@ def test_a_page_kept_visible_counts_itself_visible_at_once():
 
 
 def test_visibility_comes_back_on_every_load_signal():
-    """Qt puts the page back in its never-shown view's hidden state when a
-    load starts, so setting it once before loading did nothing."""
+    """Set before the page's first load, Qt loses the flag - the page's
+    contents are created hidden, like the view - so setting it once did
+    nothing. It is re-asserted on every load signal."""
     page = _Page()
     page.keep_visible()
 
     for name in SIGNALS:
-        page.visible = False  # what Qt does as a load begins
+        page.visible = False  # what Qt does to a flag set before the first load
         getattr(page, name).emit(*(() if name == "loadStarted" else (None,)))
         assert page.visible is True, name
 
@@ -174,11 +175,20 @@ def test_the_sign_in_check_keeps_its_page_visible(qtbot, monkeypatch):
 
 
 def _scraper_stand_in(page):
-    view = type("View", (), {
-        "stop": lambda self: None,
-        "setPage": lambda self, _page: None,
-        "deleteLater": lambda self: None,
-    })()
+    class _View:
+        # As Qt does: stopping a load reports it finished, and detaching the
+        # view hides the page.
+        def stop(self):
+            page.loadFinished.emit(False)
+
+        def setPage(self, new_page):  # noqa: N802 - Qt's name
+            if new_page is None:
+                page.setVisible(False)
+
+        def deleteLater(self):  # noqa: N802 - Qt's name
+            pass
+
+    view = _View()
     stand_in = type("Scraper", (), {"deleteLater": lambda self: None})()
     stand_in._page = page
     stand_in._view = view
@@ -198,6 +208,11 @@ def test_the_scrapers_cleanup_hides_its_page_so_it_can_be_discarded():
 
     assert page.state == "Discarded"
     assert ("discard refused", "Discarded") not in page.events
+    # Released, so nothing that arrives late - the stop's own "load
+    # finished" included - makes it visible again.
+    assert page._keep_visible is False
+    page.loadFinished.emit(True)
+    assert page.visible is False
 
 
 def test_the_sign_in_checks_cleanup_hides_its_page_so_it_can_be_discarded():

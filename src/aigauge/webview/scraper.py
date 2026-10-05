@@ -691,11 +691,17 @@ class HeadlessScraper(QObject):
                 loading_changed.disconnect(self._on_loading_changed)
             except (TypeError, RuntimeError):
                 pass
+        try:
+            # Released before the load is stopped: stopping reports the load
+            # finished, which would make the page visible again, and Qt will
+            # not discard a visible page. Detaching the view below hides it
+            # too, but the discard does not depend on that.
+            self._page.release_visible()
+        except RuntimeError:
+            pass
         self._view.stop()
         self._view.setPage(None)
         try:
-            # Hidden first: Qt will not discard a visible page.
-            self._page.release_visible()
             self._page.setLifecycleState(self._page.LifecycleState.Discarded)
         except RuntimeError:
             pass

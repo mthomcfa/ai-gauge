@@ -25,7 +25,10 @@ refresh from the morning of 5 October.
   against a page that starts up the way such an app does, the Claude and
   ChatGPT readers and the sign-in check went from failing after 38 to 61
   seconds to reading in about 3. Each page is hidden again just before it is
-  discarded, because the browser will not discard a visible page.
+  discarded, because the browser will not discard a visible page. The same
+  goes for the OpenCode Go tile and for the sign-in checks behind Sign in and
+  Paste cookie. A page being read now uses a little CPU while it is open -
+  it draws - and each one is closed as soon as its read ends.
 
 ## 1.4.5+cfa.13 - 2026-10-05
 

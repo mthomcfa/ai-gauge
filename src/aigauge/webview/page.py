@@ -77,8 +77,14 @@ class QuietWebEnginePage(QWebEnginePage):
         text after a minute, on a connection that delivered the page in
         0.1 s. Visible, the same page draws.
 
-        Qt resets the page to the view's hidden state when a load starts, so
-        this is re-asserted on every load signal rather than set once.
+        Set before the page's first load, the flag is lost: the page's
+        contents are created hidden, like the view, when that load starts. So
+        it is re-asserted on every load signal rather than set once, which
+        also covers any later reset.
+
+        The cost: a page counted visible draws, so it uses some CPU for as
+        long as it is open - about 7% of a core for an animated page, measured
+        - and the app closes each one as soon as its read ends.
         """
         if not hasattr(self, "setVisible"):
             return
