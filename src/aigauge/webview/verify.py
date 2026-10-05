@@ -45,7 +45,9 @@ VERIFY_TARGETS = {
         })()""",
     ),
     "codex": (
-        "https://chatgpt.com/codex/cloud/settings/analytics#personal-usage",
+        # The same page the scraper loads (providers/codex.py). The old Codex
+        # analytics address forwards here since October 2026.
+        "https://chatgpt.com/settings/usage?tab=overview",
         r"""(() => {
           const visibleText = el => ((el && (el.innerText || el.textContent)) || '').replace(/\s+/g, ' ').trim();
           const text = visibleText(document.body);
@@ -54,7 +56,9 @@ VERIFY_TARGETS = {
           // shared-agentic markers (new weekly-only layout). Accepting a bare
           // weekly card here while the extractor demanded the markers let
           // sign-in report success and then error forever on every refresh.
-          const hasWeekly = /Weekly usage limit/i.test(text) &&
+          // "Weekly usage limit" on the old analytics page, "Weekly limit" on
+          // Settings > Usage.
+          const hasWeekly = /Weekly (?:usage )?limit/i.test(text) &&
             /\d+(?:\.\d+)?\s*%/.test(text);
           const hasSession = /5 hour usage limit/i.test(text);
           // Must stay in step with providers/codex.py's markers: accepting a
@@ -62,7 +66,7 @@ VERIFY_TARGETS = {
           // report success and the tile error forever. OpenAI has shipped
           // several phrasings for the shared limit.
           const sharedAgentic =
-            /shared agentic usage limit|shares? the same usage limit|workspace monthly credit limit|credits remaining|usage breakdown/i
+            /shared agentic usage limit|shares? the same usage limit|workspace monthly credit limit|plan limits|shared across codex|credits remaining|usage breakdown/i
               .test(text);
           if (hasWeekly && (hasSession || sharedAgentic)) {
             return true;

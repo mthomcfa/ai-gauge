@@ -69,6 +69,28 @@ def test_codex_verify_accepts_classic_session_plus_weekly_layout():
     )
 
 
+def test_codex_verify_accepts_the_settings_usage_overview():
+    assert _run_check(
+        "codex",
+        body=(
+            "Usage Overview Analytics Plan limits Shared across Codex, Work, "
+            "Workspace Agents, and ChatGPT for Excel. Weekly limit Resets in 4d 7h "
+            "58% left Credits 2,500 of 2,500 monthly credits left"
+        ),
+        host="chatgpt.com",
+        path="/settings/usage",
+    )
+
+
+def test_codex_verify_waits_out_the_settings_shell():
+    assert not _run_check(
+        "codex",
+        body="Skip to content Loading settings…",
+        host="chatgpt.com",
+        path="/settings/usage",
+    )
+
+
 def test_codex_verify_accepts_weekly_only_with_shared_agentic_markers():
     assert _run_check(
         "codex",

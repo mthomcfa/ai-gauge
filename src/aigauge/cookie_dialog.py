@@ -36,8 +36,8 @@ INSTRUCTIONS = {
    <code>{COOKIE_NAMES['claude']}</code>.
 """,
     "codex": """\
-1. Open <a style='color:#60a5fa;' href='https://chatgpt.com/codex/cloud/settings/analytics'>
-   chatgpt.com/codex/cloud/settings/analytics</a> in your normal browser.
+1. Open <a style='color:#60a5fa;' href='https://chatgpt.com/settings/usage'>
+   chatgpt.com/settings/usage</a> in your normal browser.
 2. Press <b>F12</b> → <b>Network</b>, then reload the page.
 3. Click a <code>chatgpt.com</code> request such as <code>analytics</code>,
    <code>backend-api</code>, or <code>accounts/check</code>.

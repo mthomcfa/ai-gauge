@@ -6,6 +6,45 @@
 > earlier `0.6.4` entry predates that convention and **is not** upstream's
 > `v0.6.4`, which is different code.
 
+## 1.4.5+cfa.13 - 2026-10-05
+
+A patch release for the ChatGPT tile. OpenAI moved Codex usage into ChatGPT's
+Settings > Usage, and the tile has shown `error` since: first as a timeout,
+then as "layout changed".
+
+### Fixed
+
+- **The ChatGPT tile reads its usage again.** The Codex analytics page now
+  forwards to `chatgpt.com/settings/usage`. The app loads its Overview tab
+  directly, and reads the "Weekly limit" card under "Plan limits" - the same
+  weekly meter, under a new name, written as "58% left" (shown as 42% used, as
+  before) with a reset like "Resets in 4d 7h". The page shows no five-hour
+  limit; its "Plan limits - Shared across Codex, Work, ..." wording now counts as
+  the weekly-only layout the app already knew from the old page, so a lone
+  weekly limit is a full reading, not a half-loaded one, and an untouched one
+  reads 0% rather than retrying. The sign-in check and the cookie instructions
+  point at the new page.
+- **The reader waits for the plan limits.** Settings > Usage draws a shell
+  ("Loading settings...") and fills in the limits later, and it counts as loaded
+  before they are there. ChatGPT's reader read the page once and came back
+  empty; it now checks every second until the weekly card is there with its
+  used/left wording, and a signed-out page is still reported as signed out at
+  once. With that in place it also reads a page Chromium never reports loaded,
+  as Claude's does since 1.4.4, and its timeout is 40 seconds rather than 25:
+  on 2 October the old page took 23 seconds to report loaded.
+- **Reset times written in days are read.** "Resets in 4d 7h" came back as no
+  reset at all; days now count, alongside hours and minutes.
+
+### Known
+
+- **The weekly meter scan learns nothing on this page.** It finds the usage
+  panel by an element that carries both a meter's name and its percentage, and
+  Settings > Usage puts "Weekly limit" and "58% left" in separate elements, so
+  the scan finds no panel and says so in the log once a day. It cannot adopt the
+  page's "Daily usage" percentages or the credits' "Up to 40% off" either way -
+  none of them says used or left - but a meter OpenAI adds to this page needs a
+  catalog entry rather than being picked up by itself.
+
 ## 1.4.4+cfa.12 - 2026-10-02
 
 A patch release for the Claude tile, which showed `error · stale` from 2 October.

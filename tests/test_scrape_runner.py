@@ -478,10 +478,11 @@ def test_the_runner_hands_the_early_read_to_every_scraper_it_builds(
     ] * 2
 
 
-def test_only_claude_reads_a_page_before_it_has_loaded():
-    """Off by default, on for Claude alone. Codex's extractor reads once and
-    counts "log in" text without "usage limit" as signed out, so an early read
-    of a slow Codex page could report a false sign-out."""
+def test_only_claude_and_codex_read_a_page_before_it_has_loaded():
+    """Off by default. On for Claude, and for Codex since its extractor polls
+    Settings > Usage until the weekly limit is there - before that it read
+    once, and counted "log in" text without "usage limit" as signed out.
+    OpenCode's still reads once."""
     import inspect
 
     from aigauge.providers import claude, codex, opencode_go
@@ -490,5 +491,5 @@ def test_only_claude_reads_a_page_before_it_has_loaded():
     assert inspect.signature(HeadlessScraper.__init__).parameters["soft_ready_ms"].default is None
     assert inspect.signature(ScrapeRunner.__init__).parameters["soft_ready_ms"].default is None
     assert "soft_ready_ms=default_soft_ready_ms(" in inspect.getsource(claude.ClaudeProvider)
-    for module in (codex, opencode_go):
-        assert "soft_ready_ms" not in inspect.getsource(module), module.__name__
+    assert "soft_ready_ms=default_soft_ready_ms(" in inspect.getsource(codex.CodexProvider)
+    assert "soft_ready_ms" not in inspect.getsource(opencode_go)
