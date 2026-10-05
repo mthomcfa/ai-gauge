@@ -228,8 +228,10 @@ class HeadlessScraper(QObject):
         )
         self._view = QWebEngineView()
         self._view.setPage(self._page)
-        # Offscreen — never .show()
+        # Offscreen — never .show(). The page still has to count itself
+        # visible, or Chromium throttles it until heavy apps never draw.
         self._view.resize(1280, 900)
+        self._page.keep_visible()
 
         self._timeout = QTimer(self)
         self._timeout.setSingleShot(True)
@@ -692,6 +694,8 @@ class HeadlessScraper(QObject):
         self._view.stop()
         self._view.setPage(None)
         try:
+            # Hidden first: Qt will not discard a visible page.
+            self._page.release_visible()
             self._page.setLifecycleState(self._page.LifecycleState.Discarded)
         except RuntimeError:
             pass

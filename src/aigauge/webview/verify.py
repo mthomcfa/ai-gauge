@@ -179,6 +179,10 @@ class SessionVerifier(QObject):
         s = self._page.settings()
         s.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
         s.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, True)
+        # It has no view at all, so it is hidden to the page, and a hidden
+        # page is throttled until heavy apps never draw - the check would
+        # then call a good sign-in bad. See QuietWebEnginePage.keep_visible.
+        self._page.keep_visible()
 
         self._timeout = QTimer(self)
         self._timeout.setSingleShot(True)
@@ -228,6 +232,8 @@ class SessionVerifier(QObject):
         except (TypeError, RuntimeError):
             pass
         try:
+            # Hidden first: Qt will not discard a visible page.
+            self._page.release_visible()
             self._page.setLifecycleState(self._page.LifecycleState.Discarded)
         except RuntimeError:
             pass

@@ -6,6 +6,27 @@
 > earlier `0.6.4` entry predates that convention and **is not** upstream's
 > `v0.6.4`, which is different code.
 
+## 1.4.6+cfa.14 - 2026-10-05
+
+A patch release for the Claude and ChatGPT tiles, which timed out on every
+refresh from the morning of 5 October.
+
+### Fixed
+
+- **Pages the app reads no longer count themselves hidden.** The app reads
+  each provider's page in a browser it never shows, and a page that is never
+  shown tells the website it is hidden. Chromium throttles a hidden page hard:
+  in this app's engine a chain of zero-delay timers ran 11 times in 3 seconds
+  instead of about 720, and animation frames stopped after the first. From
+  about 10:00 on 5 October claude.ai's app never finished drawing under that -
+  on a connection that delivered the page in a tenth of a second, it showed no
+  text at all after a minute - and both Claude accounts and ChatGPT timed out.
+  The page now counts itself visible, with no window shown: in a real browser,
+  against a page that starts up the way such an app does, the Claude and
+  ChatGPT readers and the sign-in check went from failing after 38 to 61
+  seconds to reading in about 3. Each page is hidden again just before it is
+  discarded, because the browser will not discard a visible page.
+
 ## 1.4.5+cfa.13 - 2026-10-05
 
 A patch release for the ChatGPT tile. OpenAI moved Codex usage into ChatGPT's
