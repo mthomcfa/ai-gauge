@@ -19,45 +19,50 @@ then as "layout changed".
   directly, and reads the "Weekly limit" card under "Plan limits" - the same
   weekly meter, under a new name, written as "58% left" (shown as 42% used, as
   before) with a reset like "Resets in 4d 7h". The page shows no five-hour
-  limit; its "Plan limits - Shared across Codex, Work, ..." wording now counts as
-  the weekly-only layout the app already knew from the old page, so a lone
-  weekly limit is a full reading, not a half-loaded one, and an untouched one
-  reads 0% rather than retrying. A card is read from its own name onward, so a
-  card drawn beside another without a box of its own cannot take its
-  neighbour's number. The sign-in check and the cookie instructions point at
-  the new page, and the sign-in check now wants the same readable weekly card
-  the tile does.
+  limit; Settings > Usage, and its "Shared across Codex, Work, ..." wording,
+  now count as the weekly-only layout the app already knew from the old page,
+  so a lone weekly limit is a full reading, not a half-loaded one, and an
+  untouched one reads 0% rather than retrying. A card is read from its own
+  name to the next card's, so a card drawn beside another without a box of
+  its own cannot take its neighbour's number, and a sentence naming the card
+  before it does cannot stand in for it. The sign-in check and the cookie
+  instructions point at the new page, and the sign-in check now wants the same
+  readable weekly card the tile does, and waits as long for it.
 - **The reader waits for the plan limits.** Settings > Usage draws a shell
-  ("Loading settings...") and fills in the limits later, and it counts as loaded
-  before they are there. ChatGPT's reader read the page once and came back
-  empty; it now checks every second, for up to 30 seconds from when the page
-  started loading, until the weekly card is there with its used/left wording.
-  If it never is, the reader says what it found - a card with no used/left
-  wording, or no card at all - and the refresh tries once more. A sign-in page
-  or a Cloudflare check is reported at once; a signed-out page left at Settings
-  > Usage is reported as signed out when the wait ends, since a page still
-  loading can show "Log in" too. With the wait in place the reader also reads a
-  page Chromium never reports loaded, as Claude's does since 1.4.4, and its
-  timeout is 40 seconds rather than 25: on 2 October the old page took 23
-  seconds to report loaded.
+  ("Loading settings...") and fills in the limits later, and it counts as
+  loaded before they are there. ChatGPT's reader read the page once and came
+  back empty; it now checks every second, for up to 30 seconds from when the
+  page started loading, until the weekly card is there with its used/left
+  wording. If it never is, the reader says what it found - a card with no
+  used/left wording, or no card at all - and the refresh tries once more. A
+  sign-in page is reported at once, and a Cloudflare check once it has stayed
+  twelve seconds: the automatic kind clears by itself sooner, and has to be
+  left to, because a page torn down mid-check never gets past it. A signed-out
+  page left at Settings > Usage is reported as signed out when the wait ends,
+  since a page still loading can show "Log in" too. With the wait in place the
+  reader also reads a page Chromium never reports loaded, as Claude's does
+  since 1.4.4, and its timeout is 40 seconds rather than 25: on 2 October the
+  old page took 23 seconds to report loaded.
 - **Reset times written in days are read.** "Resets in 4d 7h" came back as no
   reset at all; days now count, alongside hours and minutes, written as "4d7h"
   or "4 days, 7 hours" too.
 
 ### Known
 
-- **The weekly meter scan learns nothing on this page.** It finds the usage
+- **The weekly meter scan may learn nothing on this page.** It finds the usage
   panel by an element that carries both a meter's name and its percentage, and
   Settings > Usage puts "Weekly limit" and "58% left" in separate elements, so
-  the scan finds no panel and says so in the log once a day. It cannot adopt the
-  page's "Daily usage" percentages or the credits' "Up to 40% off" either way -
-  none of them says used or left - but a meter OpenAI adds to this page needs a
-  catalog entry rather than being picked up by itself.
+  depending on how those are marked up the scan may find no panel, and say so
+  in the log once a day. It cannot adopt the page's "Daily usage" percentages
+  or the credits' "Up to 40% off" either way - none of them says used or left -
+  but a meter OpenAI adds to this page may need a catalog entry rather than
+  being picked up by itself.
 - **A five-hour limit on this page would not be read.** The page mentions one
   ("restore your 5-hour limit, weekly limit, or both") but did not show one, so
   there is no card to learn its name from - and that sentence would match the
   name it would most likely carry, so the guess is not made. Weekly reads its
-  own card either way; the tile would just show no Session gauge.
+  own card either way; the tile would show no Session gauge, and at most the
+  scan above adds the five-hour limit as an extra meter.
 
 ## 1.4.4+cfa.12 - 2026-10-02
 

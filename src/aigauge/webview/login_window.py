@@ -11,6 +11,7 @@ from .page import QuietWebEnginePage
 from .profile import get_profile
 from .verify import (
     VERIFY_TARGETS,
+    verify_budget,
     verify_session,
 )  # noqa: F401 - VERIFY_TARGETS re-exported for callers
 
@@ -340,10 +341,11 @@ class LoginWindow(QDialog):
 
         self._verify_attempts = 0
         self._verify_polling = False
+        verify_timeout_ms, self._max_verify_attempts = verify_budget(self._provider)
         self._verify_timeout = QTimer(self)
         self._verify_timeout.setSingleShot(True)
         self._verify_timeout.timeout.connect(self._on_verify_timeout)
-        self._verify_timeout.start(20000)
+        self._verify_timeout.start(verify_timeout_ms)
 
         self._view.load(QUrl(self._verify_url))
         # Drive polling from a timer rather than from loadFinished, which
@@ -396,7 +398,7 @@ class LoginWindow(QDialog):
             self._verify_finish(True, "")
             return
         self._verify_attempts = getattr(self, "_verify_attempts", 0) + 1
-        if self._verify_attempts >= 12:
+        if self._verify_attempts >= getattr(self, "_max_verify_attempts", 12):
             self._verify_finish(False, "")
             return
         QTimer.singleShot(1000, self._run_verify_check)

@@ -4,6 +4,7 @@ import logging
 import re
 from datetime import datetime, timedelta
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from PyQt6.QtCore import QObject
 
@@ -44,6 +45,11 @@ CODEX_ANALYTICS_URL = "https://chatgpt.com/codex/cloud/settings/analytics"
 # SCRAPE_TIMEOUT_MS with room for that last read; pinned by
 # tests/test_codex_settings_usage.py.
 USAGE_PANEL_WAIT_MS = 30000
+# How long a Cloudflare check may show before that wait ends on it. Long
+# enough for the automatic check, which clears in a few seconds by itself -
+# and has to be left to: a page torn down mid-check never gets its clearance
+# cookie, so every later refresh met the same check.
+SECURITY_CHECK_GRACE_MS = 12000
 _EXPECTED_ROWS = ("session", "weekly")
 log = logging.getLogger("aigauge.providers.codex")
 
@@ -179,7 +185,9 @@ EXTRACTOR_TEMPLATE = r"""
     // The FIRST percentage, unlike Claude's readRow: a Codex card renders its
     // own number before any neighbouring text can intrude.
     const pctMatch = text.match(/(\d+(?:\.\d+)?)\s*%/);
-    const resetMatch = text.match(/Resets?\s+(?:(?:at|on|in)\s+)?(.+?)(?=\s*$|\s+(?:Daily|Weekly|All|Current|Personal|Team|5 hour)\b|\s+\d+(?:\.\d+)?\s*%)/i);
+    // The reset ends where the card's percentage starts, with or without a
+    // space: inline elements run together in innerText ("4d 7h58% left").
+    const resetMatch = text.match(/Resets?\s+(?:(?:at|on|in)\s+)?(.+?)(?=\s*$|\s+(?:Daily|Weekly|All|Current|Personal|Team|5 hour)\b|\s*\d+(?:\.\d+)?\s*%)/i);
     return {
       raw: text.slice(0, 400),
       percent: pctMatch ? parseFloat(pctMatch[1]) : null,
@@ -188,26 +196,46 @@ EXTRACTOR_TEMPLATE = r"""
     };
   }
 
-  function readCard(label, nextLabels) {
-    const card = findCardByLabel(label);
-    if (!card) return readCardText(windowTextAfterLabel(label, nextLabels));
-    const text = visibleText(card);
-    // A card opens with its own label. An element holding several
-    // percentages that does not is a wrapper around more than one card, and
-    // its first percentage can be a neighbour's - a "5-hour limit" card
-    // rendered beside "Weekly limit" as flat siblings gave Weekly the 5-hour
-    // number. Read from the label on, up to the next card's label.
+  // The part of an element's text that is `label`'s own card. The element
+  // found for a label can wrap more than one card, and its first percentage
+  // can then be a neighbour's: a "5-hour limit" card rendered beside "Weekly
+  // limit" as flat siblings gave Weekly the 5-hour number. So the read runs
+  // from the label to the next card's label - from the first mention of the
+  // label that has a percentage in that stretch, since prose can name a card
+  // before the card does ("restore your 5-hour limit, weekly limit, or
+  // both"). With none, a percentage written BEFORE the label is still this
+  // card's ("58% left Weekly limit") when it is the only one and no other
+  // card's name sits before it; otherwise there is no number here yet.
+  function cardText(text, label, nextLabels) {
     const lower = text.toLowerCase();
-    const start = lower.indexOf(label.toLowerCase());
-    if (start > 0 && pctCount(text) > 1) {
+    const needle = label.toLowerCase();
+    let first = null;
+    for (let at = lower.indexOf(needle); at >= 0;
+         at = lower.indexOf(needle, at + needle.length)) {
       let end = text.length;
       for (const nextLabel of nextLabels) {
-        const at = lower.indexOf(nextLabel.toLowerCase(), start + label.length);
-        if (at >= 0 && at < end) end = at;
+        const next = lower.indexOf(nextLabel.toLowerCase(), at + needle.length);
+        if (next >= 0 && next < end) end = next;
       }
-      return readCardText(text.slice(start, end).trim());
+      const own = text.slice(at, end).trim();
+      if (pctCount(own) > 0) return own;
+      if (first === null) first = { at: at, end: end };
     }
-    return readCardText(text);
+    if (first === null) return text;
+    const before = lower.slice(0, first.at);
+    const neighbourBefore = nextLabels.some(
+      nextLabel => before.includes(nextLabel.toLowerCase()));
+    if (pctCount(before) === 1 && !neighbourBefore) {
+      return text.slice(0, first.end).trim();
+    }
+    return text.slice(first.at, first.end).trim();
+  }
+
+  function readCard(label, nextLabels) {
+    const card = findCardByLabel(label);
+    return readCardText(card
+      ? cardText(visibleText(card), label, nextLabels)
+      : windowTextAfterLabel(label, nextLabels));
   }
 
   // One field per catalog meter. `seed` carries the two primary cards already
@@ -466,7 +494,7 @@ EXTRACTOR_TEMPLATE = r"""
     document.title.toLowerCase().includes('login') ||
     (/log in|sign in/.test(lowerText) && !/usage limit/i.test(bodyText));
   const session = readCard('5 hour usage limit', ['Weekly usage limit']);
-  const weekly = readCard('Weekly usage limit', ['Personal usage', 'Team usage']);
+  const weekly = readCard('Weekly usage limit', ['Personal usage', 'Team usage', '5 hour usage limit']);
   // The two cards above stay the primary path, unchanged. Everything else
   // the catalog knows about is read alongside them - including the weekly
   // card under its Settings > Usage label, "Weekly limit".
@@ -488,17 +516,40 @@ EXTRACTOR_TEMPLATE = r"""
   // age; then read what is there, which Python classifies. "Signed out" is
   // not a reason to stop early here - a shell can say "Log in" before it
   // hydrates - and a sign-in page that is a sign-in page lives at another
-  // address, which is not polled. A Cloudflare check is: the user has to
-  // click through it, and waiting only ran the clock down. Same markers as
-  // providers/_common.py, pinned by tests/test_codex_settings_usage.py.
+  // address, which is not polled.
   const onSettingsUsage = /^\/settings\/usage(?:\/|$)/.test(location.pathname);
+  // The page's age, counted from the first navigation this tab made, not the
+  // current document's: a page that reloads itself (a Cloudflare check
+  // clearing, an app update) restarted performance.now() and with it the
+  // wait, until the scraper's timeout ended the refresh with no page text.
+  function pageAge() {
+    const own = (typeof performance !== 'undefined' && performance.now)
+      ? performance.now() : 0;
+    try {
+      const key = '__ag_codex_first_navigation';
+      let first = parseInt(sessionStorage.getItem(key) || '', 10);
+      if (!Number.isFinite(first)) {
+        first = Date.now() - own;
+        sessionStorage.setItem(key, String(first));
+      }
+      return Math.max(own, Date.now() - first);
+    } catch (e) {
+      return own;
+    }
+  }
+  const pageAgeMs = pageAge();
+  // A Cloudflare check ends the wait once it has been showing a while: the
+  // user has to click through one that stays, and waiting on it only ran
+  // the clock down. Not at once - the automatic kind ("Verifying you are
+  // human. This may take a few seconds.") clears by itself and reloads into
+  // the page. Same markers as providers/_common.py, pinned by
+  // tests/test_codex_settings_usage.py.
   const securityCheck =
     /verify(?:ing)? you are human|security verification|checking if the site connection is secure|needs to review the security of your connection|enable javascript and cookies to continue|performance & security by cloudflare/i
       .test(bodyText) ||
     (/just a moment/i.test(document.title) && /cloudflare/i.test(bodyText));
-  const pageAgeMs = (typeof performance !== 'undefined' && performance.now)
-    ? performance.now() : 0;
-  if (onSettingsUsage && !weeklyReady && !securityCheck &&
+  const securityCheckStays = securityCheck && pageAgeMs >= __CODEX_SECURITY_GRACE_MS__;
+  if (onSettingsUsage && !weeklyReady && !securityCheckStays &&
       pageAgeMs < __CODEX_PANEL_WAIT_MS__) {
     return {
       __retry_after_ms: 1000,
@@ -533,16 +584,20 @@ EXTRACTOR_TEMPLATE = r"""
     // (older) and "Codex and Work share the same usage limit" / "Workspace
     // monthly credit limit", and on Settings > Usage "Plan limits - Shared
     // across Codex, Work, ...". Matching only the first made a real account
-    // read as a partial render.
+    // read as a partial render. Not "plan limits" alone: the old page could
+    // link to "See plan limits", and Settings > Usage is recognised by its
+    // address (_weekly_only_layout_evidence).
     has_shared_agentic_text:
-      /shared agentic usage limit|shares? the same usage limit|workspace monthly credit limit|plan limits|shared across codex/i
+      /shared agentic usage limit|shares? the same usage limit|workspace monthly credit limit|shared across codex/i
         .test(bodyText),
     has_usage_summary_text:
       /credits remaining|usage breakdown/i.test(bodyText),
     body_text: bodyText.slice(0, 2000),
   };
 })();
-""".replace("__CODEX_PANEL_WAIT_MS__", str(int(USAGE_PANEL_WAIT_MS)))
+""".replace("__CODEX_PANEL_WAIT_MS__", str(int(USAGE_PANEL_WAIT_MS))).replace(
+    "__CODEX_SECURITY_GRACE_MS__", str(int(SECURITY_CHECK_GRACE_MS))
+)
 
 # The module-level constant is the catalog as shipped, with discovery off. The
 # provider rebuilds it per refresh so an override file (and a due scan) take
@@ -584,24 +639,25 @@ def _parse_reset_text(text: str | None) -> datetime | None:
 
     # Relative: "in 2 hr 59 min", "2h 59m", "6 hr 29 min", and Settings >
     # Usage's "4d 7h" ("4d7h", "4 days, 7 hours"). A day unit must not run on
-    # into a letter: "d" alone must not take the "d" of a word that follows a
-    # number ("4daily", "8 de octubre").
+    # into a letter, in any alphabet: "d" alone must not take the "d" of a
+    # word that follows a number ("4daily", "8 de octubre", "12 décembre").
     rel = re.match(
-        r"(?:in\s+)?(?:(\d+)\s*(?:days?|d)(?![a-z]))?[\s,]*"
+        r"(?:in\s+)?(?:(\d+)\s*(?:days?|d)(?![^\W\d_]))?[\s,]*"
         r"(?:(\d+)\s*(?:hr|h|hour)s?)?[\s,]*(?:(\d+)\s*(?:min|m|minute)s?)?",
         text,
         re.IGNORECASE,
     )
     if rel and (rel.group(1) or rel.group(2) or rel.group(3)):
-        days = int(rel.group(1) or 0)
-        hours = int(rel.group(2) or 0)
-        minutes = int(rel.group(3) or 0)
-        if days or hours or minutes:
-            try:
+        try:
+            days = int(rel.group(1) or 0)
+            hours = int(rel.group(2) or 0)
+            minutes = int(rel.group(3) or 0)
+            if days or hours or minutes:
                 return now + timedelta(days=days, hours=hours, minutes=minutes)
-            except OverflowError:
-                # Page text, not a countdown anything could mean.
-                return None
+        except (OverflowError, ValueError):
+            # Page text, not a countdown anything could mean: too many days
+            # for a date, or too many digits for int().
+            return None
 
     # Absolute date+time: "Apr 29, 2026 8:53 AM"
     for fmt in ("%b %d, %Y %I:%M %p", "%b %d %I:%M %p", "%B %d, %Y %I:%M %p"):
@@ -718,7 +774,7 @@ def _parse_body_card(
         return None
 
     reset_match = re.search(
-        r"Resets?\s+(?:(?:at|on|in)\s+)?(.+?)(?=\s*$|\s+(?:Daily|Weekly|All|Current|Personal|Team|5 hour)\b|\s+\d+(?:\.\d+)?\s*%)",
+        r"Resets?\s+(?:(?:at|on|in)\s+)?(.+?)(?=\s*$|\s+(?:Daily|Weekly|All|Current|Personal|Team|5 hour)\b|\s*\d+(?:\.\d+)?\s*%)",
         window,
         re.IGNORECASE,
     )
@@ -776,10 +832,11 @@ _STRONG_WEEKLY_LAYOUT_MARKERS = (
     "workspace monthly credit limit",
     # Settings > Usage (2026-10): "Plan limits - Shared across Codex, Work,
     # Workspace Agents, and ChatGPT for Excel", above a lone Weekly limit.
-    "plan limits",
+    # Not "plan limits" alone, which the old page could say in a link.
     "shared across codex",
 )
 _WEAK_WEEKLY_LAYOUT_MARKERS = ("credits remaining", "usage breakdown")
+_SETTINGS_USAGE_PATH = re.compile(r"/settings/usage(?:/|$)")
 
 
 def _weekly_only_layout_evidence(payload: dict[str, Any]) -> str | None:
@@ -794,6 +851,13 @@ def _weekly_only_layout_evidence(payload: dict[str, Any]) -> str | None:
     otherwise an idle account errors forever, which is exactly what shipped.
     """
     text = re.sub(r"\s+", " ", str(payload.get("body_text") or "")).lower()
+
+    # Settings > Usage shows the plan's limits and has never shown the old
+    # page's five-hour card, and its extractor only answers once the weekly
+    # card is there whole: a lone weekly limit on it is the layout, not half
+    # of one.
+    if _SETTINGS_USAGE_PATH.match(urlparse(str(payload.get("url") or "")).path):
+        return "strong"
 
     if payload.get("has_shared_agentic_text") or any(
         marker in text for marker in _STRONG_WEEKLY_LAYOUT_MARKERS
@@ -824,14 +888,19 @@ def _is_logged_out_payload(payload: dict[str, Any]) -> bool:
 
 
 def _has_read_a_card(payload: dict[str, Any]) -> bool:
-    """A card was read with a percentage - the page is a signed-in one.
+    """A card was read whole - percentage and used/left wording - so the page
+    is a signed-in one.
 
     has_usage_page_signal sees the old page's top-level cards and its
     "weekly usage limit" wording; Settings > Usage's card travels only in
-    ``rows``, so a stray login link beside it read as signed out.
+    ``rows``, so a stray login link beside it read as signed out. The wording
+    is required, as the extractor's weeklyReady requires it: a signed-out page
+    whose copy mentions a weekly limit and a discount reads a percentage with
+    no polarity, and that is not a usage card.
     """
     return any(
-        card.get("percent") is not None for card in _payload_rows(payload).values()
+        card.get("percent") is not None and card.get("kind") in ("used", "remaining")
+        for card in _payload_rows(payload).values()
     )
 
 
@@ -873,7 +942,7 @@ def _build_snapshot(
             error="Not signed in to ChatGPT.",
             raw=payload,
         )
-    if is_security_verification_page(payload):
+    if not _has_read_a_card(payload) and is_security_verification_page(payload):
         log_page_diagnosis(
             log,
             provider=account_id,
@@ -1057,10 +1126,13 @@ SCRAPE_TRANSPORT_ATTEMPTS = 1
 SCRAPE_BUILD_ATTEMPTS = 2
 # The first read comes this long after the page reports loaded.
 SCRAPE_WAIT_MS = 3000
-# The extractor's own wait (USAGE_PANEL_WAIT_MS) is what ends the poll. This
-# cap, a read a second after SCRAPE_WAIT_MS, is the backstop for a page whose
-# clock restarts, and stops short of SCRAPE_TIMEOUT_MS so the last page text
-# still reaches the log.
+# The extractor's own wait (USAGE_PANEL_WAIT_MS of page age) is what ends the
+# poll. This cap is only a backstop, and has to stay above the reruns that
+# wait takes (27 from a first read at SCRAPE_WAIT_MS) or it ends the poll
+# early, as a bare retry limit. When reading starts late - a page Chromium
+# never reports loaded is first read at the early-read mark - the timeout
+# comes first instead, and ends the refresh with Chromium's load details
+# rather than page text.
 SCRAPE_EXTRACTOR_RERUNS = 34
 
 

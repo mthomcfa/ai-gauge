@@ -29,6 +29,7 @@ from aigauge.providers.codex import (
     CODEX_USAGE_PAGE,
     CODEX_USAGE_URL,
     EXTRACTOR_TEMPLATE,
+    SECURITY_CHECK_GRACE_MS,
     USAGE_PANEL_WAIT_MS,
     _build_snapshot,
     _is_codex_analytics_url,
@@ -124,6 +125,7 @@ def _extract(
     page_age_ms: float = 2000,
     title: str = "ChatGPT",
     login_link: bool = False,
+    first_navigation_ms_ago: float | None = None,
 ) -> dict:
     source = extractor_source(EXTRACTOR_TEMPLATE, bundled_catalog("codex"), discover=True)
     href = "https://chatgpt.com" + pathname + "?tab=overview"
@@ -138,6 +140,16 @@ def _extract(
         + (
             "document.querySelector = sel => String(sel).includes('/login') ? {} : null;\n"
             if login_link
+            else ""
+        )
+        # This tab's first navigation, as the extractor stamps it in
+        # sessionStorage; a page that reloaded itself is younger than that.
+        + (
+            "const STORE = {__ag_codex_first_navigation: "
+            f"String(Date.now() - {float(first_navigation_ms_ago)})}};\n"
+            "globalThis.sessionStorage = {getItem: k => STORE[k] ?? null, "
+            "setItem: (k, v) => { STORE[k] = v; }};\n"
+            if first_navigation_ms_ago is not None
             else ""
         )
         + "const RESULT = " + source.strip() + "\n"
@@ -185,7 +197,8 @@ def test_the_page_is_polled_until_the_weekly_limit_is_there(dom):
     result = _extract(dom)
 
     assert result.get("__retry_reason") == "usage panel not ready"
-    assert result["__retry_after_ms"] > 0
+    # Once a second, as the CHANGELOG says and the rerun cap is sized for.
+    assert result["__retry_after_ms"] == 1000
 
 
 SIGNED_OUT_LANDING: Dom = [
@@ -235,15 +248,19 @@ def test_a_shell_saying_log_in_is_waited_out_not_reported_as_signed_out():
     assert result.get("__retry_reason") == "usage panel not ready"
 
 
+# A Cloudflare check that has been showing this long ends the wait.
+CHECK_STAYED_MS = SECURITY_CHECK_GRACE_MS + 1000
+
+
 @needs_node
 @pytest.mark.parametrize("marker", SECURITY_VERIFICATION_STRONG_MARKERS)
-def test_a_security_check_is_reported_at_once_not_polled(marker):
-    """The user has to click through it; polling only ran the clock down and
-    then said "extractor retry limit exceeded". Every marker Python reports
-    must also stop the poll, so the JS list is pinned to it here."""
+def test_a_security_check_that_stays_is_reported_not_polled_out(marker):
+    """The user has to click through it; polling to the end only ran the
+    clock down and then said "extractor retry limit exceeded". Every marker
+    Python reports must also end the wait, so the JS list is pinned to it."""
     dom = [("", 900, None), (marker.capitalize(), 10, 0), ("Ray ID: 8c", 10, 0)]
 
-    result = _extract(dom, title="Just a moment...")
+    result = _extract(dom, title="Just a moment...", page_age_ms=CHECK_STAYED_MS)
 
     assert "__retry_after_ms" not in result
     snapshot = _build_snapshot(result, catalog=bundled_catalog("codex"))
@@ -252,15 +269,70 @@ def test_a_security_check_is_reported_at_once_not_polled(marker):
 
 
 @needs_node
-def test_a_soft_cloudflare_check_is_reported_at_once_not_polled():
+def test_a_soft_cloudflare_check_that_stays_is_reported_not_polled_out():
     dom = [("", 900, None), ("Checking your browser. Cloudflare", 10, 0)]
 
-    result = _extract(dom, title="Just a moment...")
+    result = _extract(dom, title="Just a moment...", page_age_ms=CHECK_STAYED_MS)
 
     assert "__retry_after_ms" not in result
     assert _build_snapshot(result, catalog=bundled_catalog("codex")).status == (
         SnapshotStatus.AUTH_REQUIRED
     )
+
+
+@needs_node
+def test_a_security_check_gets_a_few_seconds_to_clear_by_itself():
+    """Cloudflare's automatic check ("Verifying you are human. This may take
+    a few seconds.") clears and reloads into the page. Ending the wait on
+    the first look at it reported "verification required" for a check 1.4.4
+    read straight past."""
+    dom = [("", 900, None), ("Verifying you are human. This may take a few seconds.", 10, 0)]
+
+    result = _extract(dom, title="Just a moment...", page_age_ms=3000)
+
+    assert result.get("__retry_reason") == "usage panel not ready"
+
+
+@needs_node
+def test_the_wait_is_counted_from_the_tabs_first_navigation():
+    """A page that reloads itself - a check clearing, an app update - starts
+    performance.now() again. Counting from there restarted the wait until the
+    scraper's timeout ended the refresh with no page text."""
+    shell = [("", 900, None), ("Skip to content", 10, 0), ("Loading settings…", 10, 0)]
+
+    reloaded = _extract(shell, page_age_ms=2000, first_navigation_ms_ago=PAST_THE_WAIT_MS)
+    assert "__retry_after_ms" not in reloaded
+
+    fresh = _extract(shell, page_age_ms=2000, first_navigation_ms_ago=2000)
+    assert fresh.get("__retry_reason") == "usage panel not ready"
+
+
+@needs_node
+def test_a_read_weekly_limit_outweighs_security_check_wording():
+    """A fully read page that also says "Verify you are human" (an embedded
+    widget) is a page that was read, not a check standing in front of one."""
+    dom = OVERVIEW + [("Verify you are human", 10, 0)]
+
+    result = _extract(dom)
+
+    snapshot = _build_snapshot(result, catalog=bundled_catalog("codex"))
+    assert snapshot.status == SnapshotStatus.OK, snapshot.error
+
+
+@needs_node
+def test_a_signed_out_page_quoting_a_weekly_limit_and_a_discount_is_signed_out():
+    """Marketing copy reads a percentage with no used/left wording. That is
+    not a usage card, and must not outweigh the signed-out flag."""
+    dom = [
+        ("", 900, None),
+        ("Log in", 10, 0),
+        ("Free accounts have a weekly limit on Codex tasks. Upgrade today and save 20%.", 10, 0),
+    ]
+
+    result = _extract(dom, login_link=True, page_age_ms=PAST_THE_WAIT_MS)
+
+    snapshot = _build_snapshot(result, catalog=bundled_catalog("codex"))
+    assert snapshot.status == SnapshotStatus.AUTH_REQUIRED, snapshot.error
 
 
 @needs_node
@@ -438,15 +510,93 @@ TWO_CARDS_NESTED: Dom = [
 def test_a_second_limit_neither_becomes_session_nor_disturbs_weekly():
     """What the CHANGELOG's Known section says. "5-hour limit" is not a
     Session alias, because the page's own resets prose says "5-hour limit"
-    and would match it; and with each card's name and number in separate
-    elements the scan finds no panel, so a second limit goes unread. Weekly
-    still reads its own card."""
+    and would match it; Weekly still reads its own card. On this stub every
+    element is a div, and with each card's name and number in separate divs
+    the scan finds no panel. With the names in spans, as a real page may
+    mark them, the scan can find the panel and add the second limit as an
+    extra meter - which is why the CHANGELOG says "may"."""
     result = _extract(TWO_CARDS_NESTED)
 
     assert result["session"] is None and "session" not in result["rows"]
     weekly = result["rows"]["weekly"]
     assert (weekly["percent"], weekly["kind"], weekly["reset_text"]) == (58, "remaining", "4d 7h")
     assert result["discovered"] is None
+    snapshot = _build_snapshot(result, catalog=bundled_catalog("codex"))
+    assert [(m.label, m.percent_used) for m in snapshot.metrics] == [("Weekly", 42)]
+
+
+@needs_node
+@pytest.mark.parametrize(
+    "dom",
+    [
+        # Weekly's own percentage not rendered yet, the 5-hour card's is.
+        [
+            ("", 900, None),
+            ("", 400, 0),
+            ("Weekly limit", 20, 1),
+            ("Resets in 4d 7h", 20, 1),
+            ("5-hour limit", 20, 1),
+            ("Resets in 2h 10m", 20, 1),
+            ("12% left", 20, 1),
+        ],
+        # Prose names both limits before the cards, in the same wrapper.
+        [
+            ("", 900, None),
+            ("", 400, 0),
+            ("Plan limits: your weekly limit and 5-hour limit are shared.", 20, 1),
+            ("5-hour limit", 20, 1),
+            ("Resets in 2h 10m", 20, 1),
+            ("12% left", 20, 1),
+            ("Weekly limit", 20, 1),
+            ("Resets in 4d 7h", 20, 1),
+        ],
+    ],
+    ids=["weekly-pending-then-five-hour", "prose-then-five-hour-first"],
+)
+def test_weekly_never_takes_the_five_hour_cards_number(dom):
+    """Either the weekly card's own number or no number - never 88% used,
+    which is the 5-hour card's "12% left"."""
+    result = _extract(dom)
+
+    assert result.get("__retry_reason") == "usage panel not ready"
+    weekly = result["rows"].get("weekly")
+    assert weekly is None or weekly["percent"] is None, weekly
+
+
+@needs_node
+def test_prose_naming_the_card_first_does_not_hide_the_card():
+    dom = [
+        ("", 900, None),
+        ("", 400, 0),
+        ("Plan limits: your weekly limit and 5-hour limit are shared.", 20, 1),
+        ("5-hour limit", 20, 1),
+        ("Resets in 2h 10m", 20, 1),
+        ("12% left", 20, 1),
+        ("Weekly limit", 20, 1),
+        ("Resets in 4d 7h", 20, 1),
+        ("58% left", 20, 1),
+    ]
+
+    result = _extract(dom)
+
+    weekly = result["rows"]["weekly"]
+    assert (weekly["percent"], weekly["kind"], weekly["reset_text"]) == (58, "remaining", "4d 7h")
+
+
+@needs_node
+def test_a_card_that_puts_its_number_first_is_still_read():
+    dom = [
+        ("", 900, None),
+        ("Plan limits Shared across Codex", 20, 0),
+        ("", 60, 0),
+        ("58% left", 20, 2),
+        ("Weekly limit", 20, 2),
+        ("Resets in 4d 7h", 20, 2),
+    ]
+
+    result = _extract(dom)
+
+    assert "__retry_after_ms" not in result, result.get("__retry_reason")
     snapshot = _build_snapshot(result, catalog=bundled_catalog("codex"))
     assert [(m.label, m.percent_used) for m in snapshot.metrics] == [("Weekly", 42)]
 
@@ -492,14 +642,16 @@ def test_relative_resets_with_days_are_parsed(text, delta):
     assert abs((parsed - (datetime.now() + delta)).total_seconds()) < 60
 
 
-@pytest.mark.parametrize("text", ["4daily", "8 de octubre", "3 dec", "1 dy"])
+@pytest.mark.parametrize(
+    "text", ["4daily", "8 de octubre", "3 dec", "1 dy", "12 décembre", "8 días"]
+)
 def test_a_d_that_runs_into_a_word_is_not_days(text):
     parsed = _parse_reset_text(text)
 
     assert parsed is None or parsed - datetime.now() < timedelta(days=1)
 
 
-@pytest.mark.parametrize("text", ["3000000d", "80000000h"])
+@pytest.mark.parametrize("text", ["3000000d", "80000000h", "9" * 5000 + "d"])
 def test_an_impossible_countdown_is_no_reset_rather_than_a_crash(text):
     assert _parse_reset_text(text) is None
 
@@ -515,13 +667,50 @@ def test_a_weekday_reset_is_not_taken_for_days():
     "body",
     [
         "Plan limits Shared across Codex, Work, Workspace Agents, and ChatGPT for Excel.",
-        "PLAN LIMITS Weekly limit 58% left",
         "Shared across Codex and Work",
     ],
 )
 def test_the_settings_usage_wording_is_strong_evidence_of_a_weekly_only_layout(body):
     """Strong, so a weekly limit at 0% used is believed rather than retried."""
     assert _weekly_only_layout_evidence({"body_text": body}) == "strong"
+
+
+def test_settings_usage_is_strong_evidence_by_its_address():
+    """It has only ever shown the weekly limit, whatever its wording says."""
+    payload = {"url": CODEX_USAGE_URL + "&aigauge_ts=1", "body_text": "Weekly limit 58% left"}
+
+    assert _weekly_only_layout_evidence(payload) == "strong"
+
+
+@needs_node
+def test_the_extractor_does_not_take_plan_limits_alone_for_the_shared_layout():
+    """The flag the extractor computes over the full page is the same rule:
+    a half-rendered old page with a "See plan limits" link keeps retrying."""
+    old_page = [
+        ("", 900, None),
+        ("Personal usage", 20, 0),
+        ("Weekly usage limit 40% used Resets Mon 6:00 PM", 40, 0),
+        ("See plan limits", 20, 0),
+    ]
+
+    result = _extract(old_page, pathname="/codex/cloud/settings/analytics")
+
+    assert result["has_shared_agentic_text"] is False
+    result["url"] = CODEX_ANALYTICS_URL + "#personal-usage"
+    snapshot = _build_snapshot(result, catalog=bundled_catalog("codex"))
+    assert snapshot.status == SnapshotStatus.ERROR
+    assert "part of the usage cards" in (snapshot.error or "")
+
+
+def test_plan_limits_alone_on_the_old_page_is_not_evidence():
+    """The old page could link to "See plan limits"; counting that made a
+    half-rendered two-card page a full reading with no Session gauge."""
+    payload = {
+        "url": CODEX_ANALYTICS_URL + "#personal-usage",
+        "body_text": "Personal usage Weekly usage limit 40% used See plan limits",
+    }
+
+    assert _weekly_only_layout_evidence(payload) is None
 
 
 def test_an_untouched_weekly_limit_reads_as_zero_not_as_a_partial_render():
@@ -559,6 +748,15 @@ def test_the_weekly_meter_knows_its_settings_usage_label():
 
     assert "Weekly limit" in weekly.aliases
     assert weekly.aliases[0] == "Weekly usage limit", "the old label is still tried first"
+
+
+def test_the_cookie_instructions_point_at_settings_usage():
+    from aigauge import cookie_dialog
+
+    source = open(cookie_dialog.__file__, encoding="utf-8").read()
+
+    assert f"href='{CODEX_USAGE_PAGE}'" in source
+    assert "codex/cloud/settings/analytics" not in source
 
 
 def test_the_scraper_and_the_verifier_target_the_same_page():
@@ -617,6 +815,42 @@ def test_the_poll_ends_on_the_extractor_wait_inside_the_timeout(monkeypatch):
     assert USAGE_PANEL_WAIT_MS <= timeout - 8000, "no room left for the last read"
     assert kwargs["soft_ready_ms"] == default_soft_ready_ms(wait, timeout)
     assert kwargs["soft_ready_ms"] < USAGE_PANEL_WAIT_MS
+    # Long enough for Cloudflare's automatic check to clear by itself, short
+    # enough that one which stays still ends the wait before it runs out.
+    assert 8000 <= SECURITY_CHECK_GRACE_MS < USAGE_PANEL_WAIT_MS
+
+
+def test_the_sign_in_check_outlasts_the_tiles_wait():
+    """The sign-in check wants the readable weekly card, as the tile does. Its
+    old twelve checks gave up about 13 s after load, so a page that renders the
+    limits at 20 s - which the tile reads - told the user a working cookie
+    "didn't authenticate". The first check comes 2 s after load (1.5 s in the
+    sign-in window), then one a second."""
+    from aigauge.providers.codex import SCRAPE_TIMEOUT_MS
+    from aigauge.webview.verify import verify_budget
+
+    timeout_ms, attempts = verify_budget("codex")
+
+    assert 1500 + attempts * 1000 > USAGE_PANEL_WAIT_MS
+    assert timeout_ms >= SCRAPE_TIMEOUT_MS
+    assert verify_budget("claude") == (20000, 12), "other providers keep theirs"
+
+
+@needs_node
+def test_a_reset_run_together_with_the_percentage_ends_at_it():
+    """innerText puts no space between inline elements; the reset note read
+    "4d 7h58% left"."""
+    # Blanked rather than dropped, so every parent index in the tree holds.
+    run_together = {
+        "Weekly limit": "Weekly limitResets in 4d 7h58% left",
+        "Resets in 4d 7h": "",
+        "58% left": "",
+    }
+    dom = [(run_together.get(t, t), h, p) for t, h, p in OVERVIEW]
+
+    result = _extract(dom)
+
+    assert result["rows"]["weekly"]["reset_text"] == "4d 7h"
 
 
 def test_the_extractor_carries_the_wait():
@@ -624,3 +858,110 @@ def test_the_extractor_carries_the_wait():
 
     assert "__CODEX_PANEL_WAIT_MS__" not in EXTRACTOR_JS
     assert f"pageAgeMs < {USAGE_PANEL_WAIT_MS}" in EXTRACTOR_JS
+
+
+# --- the sign-in checks run the codex budget -------------------------------
+
+
+class _Signal:
+    def connect(self, *_args):
+        pass
+
+    def disconnect(self, *_args):
+        pass
+
+
+class _Timer:
+    """QTimer stand-in: records what was started, fires nothing."""
+
+    started: list[int] = []
+
+    def __init__(self, *_args):
+        self.timeout = _Signal()
+
+    def setSingleShot(self, *_args):  # noqa: N802 - Qt's name
+        pass
+
+    def start(self, ms):
+        _Timer.started.append(ms)
+
+    def stop(self):
+        pass
+
+    @staticmethod
+    def singleShot(*_args):  # noqa: N802 - Qt's name
+        pass
+
+
+def _count_checks_until_given_up(on_result, finished: list) -> int:
+    for check in range(1, 200):
+        on_result(False)
+        if finished:
+            return check
+    raise AssertionError("never gave up")
+
+
+def test_the_cookie_check_waits_out_the_codex_budget(qtbot, monkeypatch):
+    from aigauge.webview import verify
+
+    class _Page:
+        def __init__(self, *_args, **_kwargs):
+            self.loadFinished = _Signal()
+
+        def settings(self):
+            return type("S", (), {"setAttribute": lambda *_a: None})()
+
+        def load(self, _url):
+            pass
+
+    monkeypatch.setattr(verify, "QuietWebEnginePage", _Page)
+    monkeypatch.setattr(verify, "get_profile", lambda _account: None)
+    checker = verify.SessionVerifier("codex")
+    try:
+        assert checker._timeout.interval() == verify.verify_budget("codex")[0]
+        monkeypatch.setattr(verify, "QTimer", _Timer)
+        finished: list = []
+        checker._finish = lambda ok, error: finished.append((ok, error))
+
+        checks = _count_checks_until_given_up(checker._on_js_result, finished)
+    finally:
+        checker._timeout.stop()
+
+    assert checks == verify.verify_budget("codex")[1]
+    assert finished == [(False, "")]
+
+
+def test_the_sign_in_window_waits_out_the_codex_budget(monkeypatch):
+    from aigauge.webview import login_window
+    from aigauge.webview.verify import verify_budget
+
+    monkeypatch.setattr(login_window, "QTimer", _Timer)
+    _Timer.started = []
+    page = type("P", (), {"loadFinished": _Signal()})()
+    window = type(
+        "W",
+        (),
+        {
+            "_provider": "codex",
+            "_verify_url_override": None,
+            "_status": type("L", (), {"setText": lambda *_a: None,
+                                      "setStyleSheet": lambda *_a: None})(),
+            "_page": page,
+            "_view": type("V", (), {"load": lambda *_a: None})(),
+            "_on_verify_load_finished": lambda *_a: None,
+            "_on_verify_timeout": lambda *_a: None,
+            "_begin_verify_polling": lambda *_a: None,
+        },
+    )()
+
+    login_window.LoginWindow._verify(window)
+
+    assert _Timer.started == [verify_budget("codex")[0]]
+    finished: list = []
+    window._verify_finish = lambda ok, error: finished.append((ok, error))
+    window._run_verify_check = lambda: None
+    checks = _count_checks_until_given_up(
+        lambda result: login_window.LoginWindow._on_verify_js_result(window, result),
+        finished,
+    )
+    assert checks == verify_budget("codex")[1]

@@ -118,6 +118,31 @@ def test_codex_verify_reads_text_that_inline_elements_run_together(body, path):
     assert _run_check("codex", body=body, host="chatgpt.com", path=path)
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Plan limits Shared across Codex Weekly limit The weekly allowance shared "
+        "by every Codex surface, counted across all of your workspaces this week. "
+        "Resets in 4d 7h 58% left",
+        "Plan limits Shared across Codex 58% left Weekly limit Resets in 4d 7h",
+    ],
+    ids=["description-inside-the-card", "number-before-the-name"],
+)
+def test_codex_verify_accepts_cards_the_extractor_reads(body):
+    assert _run_check("codex", body=body, host="chatgpt.com", path="/settings/usage")
+
+
+def test_codex_verify_takes_settings_usage_by_its_address():
+    """As providers/codex.py does: a readable weekly card there is the whole
+    reading, whatever the page's wording about shared limits."""
+    body = "Usage Overview Analytics Weekly limit Resets in 4d 7h 58% left"
+
+    assert _run_check("codex", body=body, host="chatgpt.com", path="/settings/usage")
+    assert not _run_check(
+        "codex", body=body, host="chatgpt.com", path="/codex/cloud/settings/analytics"
+    )
+
+
 def test_codex_verify_waits_out_the_settings_shell():
     assert not _run_check(
         "codex",

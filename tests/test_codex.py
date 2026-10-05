@@ -21,8 +21,9 @@ from aigauge.providers.codex import (
 )
 
 
-# The page these empty-page tests were written against, and the only one the
-# empty-page rule applies to; Settings > Usage waits for its limits itself.
+# The page these empty-page and partial-render tests were written against.
+# Settings > Usage waits for its limits itself, and a lone weekly limit there
+# is the layout, so those rules apply to the old page only.
 OLD_ANALYTICS_URL = f"{CODEX_ANALYTICS_URL}#personal-usage"
 
 
@@ -353,7 +354,7 @@ def test_codex_weekly_only_without_shared_layout_markers_still_retries():
             "session": None,
             "weekly": None,
             "title": "Codex",
-            "url": CODEX_USAGE_URL,
+            "url": OLD_ANALYTICS_URL,
             "body_text": "Personal usage Weekly usage limit 40% used",
             "has_usage_text": True,
             "has_percent_text": True,
@@ -396,7 +397,7 @@ def test_codex_weekly_only_idle_zero_percent_is_treated_as_mid_hydration():
             "session": None,
             "weekly": {"percent": 0.0, "kind": "used", "reset_text": None},
             "title": "Codex",
-            "url": CODEX_USAGE_URL,
+            "url": OLD_ANALYTICS_URL,
             "body_text": "Usage breakdown Weekly usage limit 0% used",
             "has_usage_summary_text": True,
             "has_usage_text": True,
