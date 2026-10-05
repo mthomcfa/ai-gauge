@@ -6,7 +6,7 @@
       "key": "session",
       "label": "Session",
       "aliases": ["5 hour usage limit"],
-      "boundaries": ["Weekly usage limit"],
+      "boundaries": ["Weekly usage limit", "Weekly limit"],
       "window_seconds": 18000,
       "primary": true,
       "source": "bundled"
@@ -14,8 +14,10 @@
     {
       "key": "weekly",
       "label": "Weekly",
-      "aliases": ["Weekly usage limit"],
-      "boundaries": ["Personal usage", "Team usage"],
+      "aliases": ["Weekly usage limit", "Weekly limit"],
+      "boundaries": [
+        "Personal usage", "Team usage", "Daily usage", "5-hour limit", "5 hour usage limit"
+      ],
       "window_seconds": 604800,
       "primary": true,
       "source": "bundled"

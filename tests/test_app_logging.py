@@ -756,8 +756,9 @@ def test_the_watchdog_budget_follows_the_providers_own_bound():
 
     # 40 s timeout x 2 transport attempts x 2 build attempts.
     assert _refresh_budget_seconds(ClaudeProvider) == 160
-    # 25 s x 1 x 2.
-    assert _refresh_budget_seconds(CodexProvider) == 50
+    # 40 s x 1 x 2: Codex's timeout rose from 25 s in 1.4.5+cfa.13, when its
+    # extractor began polling Settings > Usage for the plan limits.
+    assert _refresh_budget_seconds(CodexProvider) == 80
     # Azure's REFRESH_DEADLINE_SECONDS bounds its *page loops* only; the
     # fixed handful of calls around them is outside it by design. The
     # watchdog has to allow for the whole refresh, so the provider reports

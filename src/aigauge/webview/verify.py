@@ -45,7 +45,9 @@ VERIFY_TARGETS = {
         })()""",
     ),
     "codex": (
-        "https://chatgpt.com/codex/cloud/settings/analytics#personal-usage",
+        # The same page the scraper loads (providers/codex.py). The old Codex
+        # analytics address forwards here since October 2026.
+        "https://chatgpt.com/settings/usage?tab=overview",
         r"""(() => {
           const visibleText = el => ((el && (el.innerText || el.textContent)) || '').replace(/\s+/g, ' ').trim();
           const text = visibleText(document.body);
@@ -54,16 +56,29 @@ VERIFY_TARGETS = {
           // shared-agentic markers (new weekly-only layout). Accepting a bare
           // weekly card here while the extractor demanded the markers let
           // sign-in report success and then error forever on every refresh.
-          const hasWeekly = /Weekly usage limit/i.test(text) &&
-            /\d+(?:\.\d+)?\s*%/.test(text);
+          // "Weekly usage limit" on the old analytics page, "Weekly limit" on
+          // Settings > Usage, and a percentage with used/left wording, which
+          // the extractor needs to read a card at all. Settings > Usage also
+          // says "weekly limit" in prose ("restore your 5-hour limit, weekly
+          // limit, or both") and has percentages that are not limits ("Up to
+          // 40% off", Daily usage), and the two together are not a card. Not
+          // tied to sit next to each other: a card can put a description
+          // between them, or its number first, and the extractor reads both.
+          // No \b around the words: inline elements run into each other in
+          // innerText ("Weekly limitResets in 4d 7h58% leftCredits").
+          const hasWeekly = /Weekly (?:usage )?limit/i.test(text) &&
+            /\d+(?:\.\d+)?\s*%\s*(?:used|left|remaining)/i.test(text);
           const hasSession = /5 hour usage limit/i.test(text);
           // Must stay in step with providers/codex.py's markers: accepting a
           // layout here that the extractor then rejects is what made sign-in
           // report success and the tile error forever. OpenAI has shipped
           // several phrasings for the shared limit.
+          // Settings > Usage counts by its address, as it does in
+          // providers/codex.py: it has only ever shown the weekly limit.
           const sharedAgentic =
-            /shared agentic usage limit|shares? the same usage limit|workspace monthly credit limit|credits remaining|usage breakdown/i
-              .test(text);
+            /shared agentic usage limit|shares? the same usage limit|workspace monthly credit limit|shared across codex|credits remaining|usage breakdown/i
+              .test(text) ||
+            /^\/settings\/usage(?:\/|$)/.test(location.pathname);
           if (hasWeekly && (hasSession || sharedAgentic)) {
             return true;
           }
@@ -106,6 +121,21 @@ VERIFY_TARGETS = {
     ),
 }
 
+# How long each provider's check may take: (timeout in ms, checks a second
+# apart). Codex's has to outlast the tile's own wait for the plan limits
+# (providers/codex.py USAGE_PANEL_WAIT_MS, 30 s of page age): the check now
+# wants the readable weekly card, as the tile does, and giving up after twelve
+# checks told a user with a working cookie on a slow page that it "didn't
+# authenticate". Pinned against the tile's figures by
+# tests/test_codex_settings_usage.py.
+VERIFY_BUDGETS: dict[str, tuple[int, int]] = {"codex": (45000, 36)}
+_DEFAULT_VERIFY_BUDGET = (20000, 12)
+
+
+def verify_budget(provider: str) -> tuple[int, int]:
+    """(timeout_ms, attempts) for a provider's sign-in check."""
+    return VERIFY_BUDGETS.get(provider, _DEFAULT_VERIFY_BUDGET)
+
 
 class SessionVerifier(QObject):
     """Loads the provider's usage page off-screen and runs a JS check.
@@ -124,7 +154,7 @@ class SessionVerifier(QObject):
         self,
         provider: str,
         account_id: str | None = None,
-        timeout_ms: int = 20000,
+        timeout_ms: int | None = None,
         parent: QObject | None = None,
         verify_url: str | None = None,
     ):
@@ -140,6 +170,9 @@ class SessionVerifier(QObject):
             url = verify_url
         self._check_js = check_js
         self._check_attempts = 0
+        budget_ms, self._max_check_attempts = verify_budget(provider)
+        if timeout_ms is None:
+            timeout_ms = budget_ms
 
         profile = get_profile(account_id or provider)
         self._page = QuietWebEnginePage(profile, self)
@@ -176,7 +209,7 @@ class SessionVerifier(QObject):
             self._finish(True, "")
             return
         self._check_attempts += 1
-        if self._check_attempts >= 12:
+        if self._check_attempts >= self._max_check_attempts:
             self._finish(False, "")
             return
         QTimer.singleShot(1000, self._run_check)

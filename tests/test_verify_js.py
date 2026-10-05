@@ -69,6 +69,89 @@ def test_codex_verify_accepts_classic_session_plus_weekly_layout():
     )
 
 
+def test_codex_verify_accepts_the_settings_usage_overview():
+    assert _run_check(
+        "codex",
+        body=(
+            "Usage Overview Analytics Plan limits Shared across Codex, Work, "
+            "Workspace Agents, and ChatGPT for Excel. Weekly limit Resets in 4d 7h "
+            "58% left Credits 2,500 of 2,500 monthly credits left"
+        ),
+        host="chatgpt.com",
+        path="/settings/usage",
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # The plan limits not rendered yet: "weekly limit" only in the resets
+        # prose, and percentages that are not limits elsewhere on the page.
+        "Usage Overview Analytics Plan limits Shared across Codex, Work. "
+        "Credits Automatic reload Up to 40% off Usage limit resets Use a reset "
+        "to restore your 5-hour limit, weekly limit, or both Daily usage "
+        "Sep 6, 2026 Web 1%",
+        # A card the extractor cannot read: no used/left beside the number.
+        "Plan limits Shared across Codex Weekly limit Resets in 4d 7h 58%",
+    ],
+    ids=["resets-prose", "no-used-or-left"],
+)
+def test_codex_verify_only_accepts_a_weekly_card_the_extractor_can_read(body):
+    assert not _run_check("codex", body=body, host="chatgpt.com", path="/settings/usage")
+
+
+@pytest.mark.parametrize(
+    "body,path",
+    [
+        ("Usage OverviewAnalytics Plan limitsShared across Codex Weekly limitResets "
+         "in 4d 7h58% leftCredits", "/settings/usage"),
+        ("Personal usage 5 hour usage limitResets 4:47 PM88% remaining "
+         "Weekly usage limitResets Mon 6:00 PM80% remaining",
+         "/codex/cloud/settings/analytics"),
+    ],
+    ids=["settings-usage", "old-analytics"],
+)
+def test_codex_verify_reads_text_that_inline_elements_run_together(body, path):
+    """innerText puts no space between inline elements, so the card reads
+    "limitResets ... 58% leftCredits": a word boundary on either side
+    rejected a page the extractor reads."""
+    assert _run_check("codex", body=body, host="chatgpt.com", path=path)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Plan limits Shared across Codex Weekly limit The weekly allowance shared "
+        "by every Codex surface, counted across all of your workspaces this week. "
+        "Resets in 4d 7h 58% left",
+        "Plan limits Shared across Codex 58% left Weekly limit Resets in 4d 7h",
+    ],
+    ids=["description-inside-the-card", "number-before-the-name"],
+)
+def test_codex_verify_accepts_cards_the_extractor_reads(body):
+    assert _run_check("codex", body=body, host="chatgpt.com", path="/settings/usage")
+
+
+def test_codex_verify_takes_settings_usage_by_its_address():
+    """As providers/codex.py does: a readable weekly card there is the whole
+    reading, whatever the page's wording about shared limits."""
+    body = "Usage Overview Analytics Weekly limit Resets in 4d 7h 58% left"
+
+    assert _run_check("codex", body=body, host="chatgpt.com", path="/settings/usage")
+    assert not _run_check(
+        "codex", body=body, host="chatgpt.com", path="/codex/cloud/settings/analytics"
+    )
+
+
+def test_codex_verify_waits_out_the_settings_shell():
+    assert not _run_check(
+        "codex",
+        body="Skip to content Loading settings…",
+        host="chatgpt.com",
+        path="/settings/usage",
+    )
+
+
 def test_codex_verify_accepts_weekly_only_with_shared_agentic_markers():
     assert _run_check(
         "codex",
