@@ -13,22 +13,26 @@ refresh from the morning of 5 October.
 
 ### Fixed
 
-- **Pages the app reads no longer count themselves hidden.** The app reads
-  each provider's page in a browser it never shows, and a page that is never
-  shown tells the website it is hidden. Chromium throttles a hidden page hard:
-  in this app's engine a chain of zero-delay timers ran 11 times in 3 seconds
+- **Pages the app reads are shown, off screen.** The app reads each
+  provider's page in a browser it never shows, and a page that is never shown
+  tells the website it is hidden and is given a window 0 by 0 pixels.
+  Chromium throttles a hidden page hard: in
+  this app's engine a chain of zero-delay timers ran 11 times in 3 seconds
   instead of about 720, and animation frames stopped after the first. From
   about 10:00 on 5 October claude.ai's app never finished drawing under that -
   on a connection that delivered the page in a tenth of a second, it showed no
   text at all after a minute - and both Claude accounts and ChatGPT timed out.
-  The page now counts itself visible, with no window shown: in a real browser,
-  against a page that starts up the way such an app does, the Claude and
-  ChatGPT readers and the sign-in check went from failing after 38 to 61
-  seconds to reading in about 3. Each page is hidden again just before it is
-  discarded, because the browser will not discard a visible page. The same
-  goes for the OpenCode Go tile and for the sign-in checks behind Sign in and
-  Paste cookie. A page being read now uses a little CPU while it is open -
-  it draws - and each one is closed as soon as its read ends.
+  Pages are now shown the way Qt shows a window that is never put on screen:
+  no window appears, no taskbar entry, no focus taken, and the page sees a
+  1280 by 900 window it is visible in. In a real browser, against pages that
+  start up the way such an app does, wait for content to scroll into view, or
+  sit behind a cross-site redirect or claude.ai's headers, the Claude and
+  ChatGPT readers and the sign-in check went from failing after 31 to 61
+  seconds to reading in 2 to 4. The same goes for the OpenCode Go tile and for
+  the sign-in checks behind Sign in and Paste cookie. A page being read now
+  draws, so it uses some CPU while it is open - up to about a third of a core
+  for one that animates continuously - and each is closed as soon as its read
+  ends.
 
 ## 1.4.5+cfa.13 - 2026-10-05
 

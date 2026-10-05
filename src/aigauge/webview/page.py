@@ -2,10 +2,37 @@ from __future__ import annotations
 
 import logging
 
-from PyQt6.QtCore import QUrl
+from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtWebEngineCore import QWebEnginePage
 
 log = logging.getLogger("aigauge.webview.page")
+
+# The viewport a page read off screen is given: a desktop browser window, so
+# a site lays itself out as it would for the user.
+OFFSCREEN_VIEWPORT = (1280, 900)
+
+
+def show_offscreen(view) -> None:
+    """Show a QWebEngineView as far as Qt and its page are concerned, never on screen.
+
+    A view that is only resized and never shown gives its page a 0x0
+    viewport and no frames once the page moves to a new renderer process -
+    which a cross-site redirect does, and so does a site that sends
+    Cross-Origin-Opener-Policy, as claude.ai does. With no viewport nothing
+    ever scrolls into view, so content waiting on an IntersectionObserver
+    never appears. Qt's WA_DontShowOnScreen shows the widget without
+    putting a window on screen: no window, no taskbar entry, no focus. The
+    attribute has to be set before show(), or the show is a real one.
+
+    Shown, the page draws: one that animates continuously cost about a third
+    of a core in the app's process and an eighth in the renderer, measured,
+    for as long as it is open - which is only until its read ends. And the
+    view counts as a window to Qt, so the app must not quit when its last
+    window closes (it does not: app.main).
+    """
+    view.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+    view.resize(*OFFSCREEN_VIEWPORT)
+    view.show()
 
 
 # JS console fragments that are pure third-party telemetry/analytics chatter
@@ -77,14 +104,13 @@ class QuietWebEnginePage(QWebEnginePage):
         text after a minute, on a connection that delivered the page in
         0.1 s. Visible, the same page draws.
 
-        Set before the page's first load, the flag is lost: the page's
-        contents are created hidden, like the view, when that load starts. So
-        it is re-asserted on every load signal rather than set once, which
-        also covers any later reset.
+        Pair it with show_offscreen on the page's view: this alone leaves a
+        viewless or never-shown page with a 0x0 viewport and, after a move
+        to a new renderer process, without frames.
 
-        The cost: a page counted visible draws, so it uses some CPU for as
-        long as it is open - about 7% of a core for an animated page, measured
-        - and the app closes each one as soon as its read ends.
+        Asked for before the page's first load, it is dropped - the page's
+        contents do not exist yet - so it is asked for again on every load
+        signal rather than once, which also covers any later reset.
         """
         if not hasattr(self, "setVisible"):
             return

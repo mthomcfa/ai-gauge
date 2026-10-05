@@ -8,7 +8,7 @@ from urllib.parse import urlparse, urlunparse
 from PyQt6.QtCore import QObject, QTimer, QUrl, pyqtSignal
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 
-from .page import QuietWebEnginePage
+from .page import QuietWebEnginePage, show_offscreen
 from .api_capture import install_api_recorder
 from .profile import get_profile
 
@@ -228,9 +228,10 @@ class HeadlessScraper(QObject):
         )
         self._view = QWebEngineView()
         self._view.setPage(self._page)
-        # Offscreen — never .show(). The page still has to count itself
-        # visible, or Chromium throttles it until heavy apps never draw.
-        self._view.resize(1280, 900)
+        # Never on screen, but shown and visible as far as the page can tell:
+        # a hidden page is throttled until heavy apps never draw, and a
+        # never-shown view gives it a 0x0 viewport.
+        show_offscreen(self._view)
         self._page.keep_visible()
 
         self._timeout = QTimer(self)

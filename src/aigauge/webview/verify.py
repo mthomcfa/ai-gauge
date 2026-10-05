@@ -4,8 +4,9 @@ from typing import Any, Callable
 
 from PyQt6.QtCore import QObject, QTimer, QUrl, pyqtSignal
 from PyQt6.QtWebEngineCore import QWebEngineSettings
+from PyQt6.QtWebEngineWidgets import QWebEngineView
 
-from .page import QuietWebEnginePage
+from .page import QuietWebEnginePage, show_offscreen
 from .profile import get_profile
 
 # Load the provider's actual usage page and check for text that only renders for
@@ -179,9 +180,14 @@ class SessionVerifier(QObject):
         s = self._page.settings()
         s.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
         s.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, True)
-        # It has no view at all, so it is hidden to the page, and a hidden
-        # page is throttled until heavy apps never draw - the check would
-        # then call a good sign-in bad. See QuietWebEnginePage.keep_visible.
+        # Shown off screen and kept visible, as the scraper's page is: hidden,
+        # a heavy app never draws and the check calls a good sign-in bad. A
+        # view is needed even though nothing is ever displayed - without one
+        # the page gets no frames once it moves to a new renderer process,
+        # which claude.ai's Cross-Origin-Opener-Policy makes it do.
+        self._view = QWebEngineView()
+        self._view.setPage(self._page)
+        show_offscreen(self._view)
         self._page.keep_visible()
 
         self._timeout = QTimer(self)
@@ -234,9 +240,11 @@ class SessionVerifier(QObject):
         try:
             # Hidden first: Qt will not discard a visible page.
             self._page.release_visible()
+            self._view.setPage(None)
             self._page.setLifecycleState(self._page.LifecycleState.Discarded)
         except RuntimeError:
             pass
+        self._view.deleteLater()
         self._page.deleteLater()
         self.deleteLater()
 

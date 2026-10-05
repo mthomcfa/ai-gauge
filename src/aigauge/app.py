@@ -2954,7 +2954,9 @@ def main() -> int:
     qt_app = QApplication(sys.argv)
     # Must be set on the live instance: a tray-resident app keeps running with
     # no visible windows, and closing a transient dialog/message box must not
-    # quit it. (Called pre-construction this silently no-ops.)
+    # quit it. Nor may the end of a scrape or a sign-in check: their views are
+    # shown off screen (webview/page.py show_offscreen), which counts as a
+    # window to Qt. (Called pre-construction this silently no-ops.)
     qt_app.setQuitOnLastWindowClosed(False)
     qt_app.setApplicationName("ai-gauge")
     qt_app.setOrganizationName("ai-gauge")
