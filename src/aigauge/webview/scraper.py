@@ -8,7 +8,7 @@ from urllib.parse import urlparse, urlunparse
 from PyQt6.QtCore import QObject, QTimer, QUrl, pyqtSignal
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 
-from .page import QuietWebEnginePage
+from .page import QuietWebEnginePage, show_offscreen
 from .api_capture import install_api_recorder
 from .profile import get_profile
 
@@ -228,8 +228,11 @@ class HeadlessScraper(QObject):
         )
         self._view = QWebEngineView()
         self._view.setPage(self._page)
-        # Offscreen — never .show()
-        self._view.resize(1280, 900)
+        # Never on screen, but shown and visible as far as the page can tell:
+        # a hidden page is throttled until heavy apps never draw, and a
+        # never-shown view gives it a 0x0 viewport.
+        show_offscreen(self._view)
+        self._page.keep_visible()
 
         self._timeout = QTimer(self)
         self._timeout.setSingleShot(True)
@@ -689,6 +692,14 @@ class HeadlessScraper(QObject):
                 loading_changed.disconnect(self._on_loading_changed)
             except (TypeError, RuntimeError):
                 pass
+        try:
+            # Released before the load is stopped: stopping reports the load
+            # finished, which would make the page visible again, and Qt will
+            # not discard a visible page. Detaching the view below hides it
+            # too, but the discard does not depend on that.
+            self._page.release_visible()
+        except RuntimeError:
+            pass
         self._view.stop()
         self._view.setPage(None)
         try:

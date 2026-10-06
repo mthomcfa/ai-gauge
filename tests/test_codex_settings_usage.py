@@ -914,7 +914,15 @@ def test_the_cookie_check_waits_out_the_codex_budget(qtbot, monkeypatch):
         def load(self, _url):
             pass
 
+        def keep_visible(self):
+            pass
+
+    class _View:
+        def __getattr__(self, _name):
+            return lambda *_a, **_k: None
+
     monkeypatch.setattr(verify, "QuietWebEnginePage", _Page)
+    monkeypatch.setattr(verify, "QWebEngineView", _View)
     monkeypatch.setattr(verify, "get_profile", lambda _account: None)
     checker = verify.SessionVerifier("codex")
     try:

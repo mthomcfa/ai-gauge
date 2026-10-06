@@ -6,6 +6,34 @@
 > earlier `0.6.4` entry predates that convention and **is not** upstream's
 > `v0.6.4`, which is different code.
 
+## 1.4.6+cfa.14 - 2026-10-05
+
+A patch release for the Claude and ChatGPT tiles, which timed out on every
+refresh from the morning of 5 October.
+
+### Fixed
+
+- **Pages the app reads are shown, off screen.** The app reads each
+  provider's page in a browser it never shows, and a page that is never shown
+  tells the website it is hidden and is given a window 0 by 0 pixels.
+  Chromium throttles a hidden page hard: in
+  this app's engine a chain of zero-delay timers ran 11 times in 3 seconds
+  instead of about 720, and animation frames stopped after the first. From
+  about 10:00 on 5 October claude.ai's app never finished drawing under that -
+  on a connection that delivered the page in a tenth of a second, it showed no
+  text at all after a minute - and both Claude accounts and ChatGPT timed out.
+  Pages are now shown the way Qt shows a window that is never put on screen:
+  no window appears, no taskbar entry, no focus taken, and the page sees a
+  1280 by 900 window it is visible in. In a real browser, against pages that
+  start up the way such an app does, wait for content to scroll into view, or
+  sit behind a cross-site redirect or claude.ai's headers, the Claude and
+  ChatGPT readers and the sign-in check went from failing after 31 to 61
+  seconds to reading in 2 to 4. The same goes for the OpenCode Go tile and for
+  the sign-in checks behind Sign in and Paste cookie. A page being read now
+  draws, so it uses some CPU while it is open - up to about a third of a core
+  for one that animates continuously - and each is closed as soon as its read
+  ends.
+
 ## 1.4.5+cfa.13 - 2026-10-05
 
 A patch release for the ChatGPT tile. OpenAI moved Codex usage into ChatGPT's
