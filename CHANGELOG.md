@@ -6,6 +6,38 @@
 > earlier `0.6.4` entry predates that convention and **is not** upstream's
 > `v0.6.4`, which is different code.
 
+## 1.4.7+cfa.15 - 2026-10-06
+
+A patch release for the Claude tile, which showed Fable's weekly limit as the
+account's weekly limit.
+
+### Fixed
+
+- **Claude's Weekly gauge read the Fable limit.** From 6 October claude.ai's
+  usage panel labels its seven-day row "This week" and adds a row below it,
+  "Fable this week", described as "Separate weekly limit for Fable". The app
+  looked for the seven-day row as "All models" and then "Weekly". Neither
+  labels a row any more, and the only "weekly" left on the page is in the
+  Fable row's description, so the tile showed Fable's 14% as the weekly
+  figure while the account stood at 73%. It now looks for "This week"
+  before "Weekly".
+  A row is also taken to belong to the meter whose label it starts with, so
+  the Fable row can no longer stand in for another meter, whatever its
+  description says. If the seven-day row is ever missing again, the tile
+  reports that it could not read Weekly instead of showing another meter's
+  number.
+- **Session and Weekly follow the meter catalog.** They were read through a
+  fixed list of labels, so a label added to the catalog was used for the
+  expanded rows but never for the gauge itself. They are now read through
+  the catalog, and a label that reads cleanly wins over one found only in a
+  block holding several meters.
+
+### Added
+
+- **Fable** is read as a meter of its own: its weekly percentage and reset
+  time appear among the informational rows when the Claude tile is expanded.
+  Like Opus only and Sonnet only, it does not drive the tray colour.
+
 ## 1.4.6+cfa.14 - 2026-10-05
 
 A patch release for the Claude and ChatGPT tiles, which timed out on every

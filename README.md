@@ -67,7 +67,7 @@ Binaries are published on **[this fork's Releases page](https://github.com/mthom
 | macOS   | `ai-gauge-<file-version>-macos.tar.gz`      | **Apple Silicon only.** Extract, drag `ai-gauge.app` to Applications |
 | Linux   | `ai-gauge-<file-version>-linux.tar.gz`      | extract, run `./ai-gauge/ai-gauge`           |
 
-`<file-version>` is the version with `+` replaced by `-`, so `1.4.6+cfa.14` ships as `ai-gauge-1.4.6-cfa.14-windows.zip`. Print it with `python tools/check_versions.py`.
+`<file-version>` is the version with `+` replaced by `-`, so `1.4.7+cfa.15` ships as `ai-gauge-1.4.7-cfa.15-windows.zip`. Print it with `python tools/check_versions.py`.
 
 **Intel Macs are not covered by the prebuilt archive.** PyInstaller builds for the host architecture and this fork's CI runs on Apple Silicon, so the `.app` is arm64-only. Intel users should [run from source](#run-from-source); the menu-bar UI works identically.
 
@@ -366,7 +366,7 @@ about**, and each becomes its own row on the tile:
 
 | Provider | Meters read | Drives the tray colour |
 | --- | --- | --- |
-| Claude | Session (5 h), Weekly (7 d), Opus only, Sonnet only, Cowork only, Claude Design, Daily routine runs | Session + Weekly |
+| Claude | Session (5 h), Weekly (7 d), Opus only, Sonnet only, Fable, Cowork only, Claude Design, Daily routine runs | Session + Weekly |
 | Codex | Session (5 h), Weekly (7 d), plus any additional usage card the page shows | Session + Weekly |
 
 Everything else is **informational**: those rows appear when you expand the
@@ -510,7 +510,7 @@ That also means **upstream cannot support this build**, and bugs here may not ex
 Fork releases use a [PEP 440](https://peps.python.org/pep-0440/) local version segment:
 
 ```
-1.4.6+cfa.14
+1.4.7+cfa.15
 └─┬─┘ └──┬─┘
   │      └── fork build counter — identifies this as a fork build
   └───────── this fork's own release counter, NOT an upstream release number

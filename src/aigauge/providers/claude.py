@@ -89,6 +89,29 @@ EXTRACTOR_TEMPLATE = r"""
     return rowCandidateCache;
   }
 
+  // Which catalog meter each alias names. A row led by another alias of the
+  // meter being read (a "Weekly" heading over the "This week" row) is still
+  // that meter's row; one led by a different meter's alias is not.
+  const ALIAS_OWNER = Object.create(null);
+  for (const entry of CATALOG) {
+    for (const alias of entry.aliases) ALIAS_OWNER[alias.toLowerCase()] = entry.key;
+  }
+
+  function ledByAnotherMeter(lower, ownLabel) {
+    // Past any icon or bullet the row text starts with.
+    const lead = lower.replace(/^[^\p{L}\p{N}]+/u, '');
+    const ownKey = ALIAS_OWNER[ownLabel];
+    for (const other of ROW_LABELS) {
+      const otherLower = other.toLowerCase();
+      if (otherLower === ownLabel || ownLabel.startsWith(otherLower)) continue;
+      if (ownKey !== undefined && ALIAS_OWNER[otherLower] === ownKey) continue;
+      if (!lead.startsWith(otherLower)) continue;
+      // A whole word: "This week" does not lead "This weekend".
+      if (!/[\p{L}\p{N}]/u.test(lead.charAt(otherLower.length))) return true;
+    }
+    return false;
+  }
+
   function findRowByLabel(label) {
     const lowerLabel = label.toLowerCase();
     let best = null;
@@ -97,6 +120,14 @@ EXTRACTOR_TEMPLATE = r"""
       const t = candidate.text;
       if (!candidate.lower.includes(lowerLabel)) continue;
       if (!/%/.test(t)) continue;
+      // A row is named by the label it starts with, so a row that starts
+      // with another meter's label is that meter's, whatever its prose says.
+      // claude.ai's "Fable this week · Separate weekly limit for Fable · 14%
+      // used" contains both "this week" and "weekly", and its 14% was shown
+      // as the weekly figure while the real one, "This week", stood at 73%.
+      // One row only: an element holding several meters is left to
+      // readRowText, which refuses it as ambiguous and says so.
+      if (pctCount(t) === 1 && ledByAnotherMeter(candidate.lower, lowerLabel)) continue;
       let score = t.length;
       for (const other of ROW_LABELS) {
         if (other !== label && candidate.lower.includes(other.toLowerCase())) {
@@ -433,13 +464,33 @@ EXTRACTOR_TEMPLATE = r"""
     !!document.querySelector('a[href*="/login"]') &&
     !/Plan usage/i.test(bodyText);
 
-  const session = readRow('Current session');
-  // Claude ships two usage layouts behind a flag. The older one labels the
-  // seven-day meter "All models"; the newer gauge/bar one labels it "Weekly"
-  // (see its es[] meter table: five_hour -> "Current session", seven_day ->
-  // "Weekly", plus Opus only / Sonnet only / Cowork only / Claude Design).
-  // Requiring "All models" made the newer layout permanently unreadable.
-  const weeklyAll = readRow('All models') || readRow('Weekly');
+  // The two primary meters, through their catalog aliases in order, so a
+  // relabel is a data change for them as it is for every other meter: a
+  // hard-coded pair here meant an alias added to the catalog was read into
+  // `rows` but never satisfied the readiness check below. The fallbacks are
+  // the shipped aliases, for a catalog with the meter switched off.
+  //
+  // The seven-day meter has carried three labels: "All models" on the older
+  // layout, "Weekly" on the gauge/bar one (its es[] meter table: five_hour ->
+  // "Current session", seven_day -> "Weekly"), and "This week" since October
+  // 2026, beside "Fable this week".
+  //
+  // An alias found only in an element holding several meters reads as
+  // ambiguous - "this week" is inside "Fable this week" - so a later alias
+  // that reads cleanly wins over it. Kept if nothing reads cleanly: an
+  // ambiguous row is an error the user is shown, not a gap.
+  function readPrimary(key, fallback) {
+    const entry = CATALOG.find(e => e.key === key);
+    let ambiguous = null;
+    for (const alias of (entry ? entry.aliases : fallback)) {
+      const row = readRow(alias);
+      if (row && !row.ambiguous) return row;
+      if (row && !ambiguous) ambiguous = row;
+    }
+    return ambiguous;
+  }
+  const session = readPrimary('session', ['Current session']);
+  const weeklyAll = readPrimary('weekly_all', ['All models', 'This week', 'Weekly']);
 
   // The two rows above stay the primary path, unchanged. Everything else the
   // catalog knows about is read alongside them, and each becomes its own field.

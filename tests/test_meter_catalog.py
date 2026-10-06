@@ -76,6 +76,23 @@ LEGACY_CLAUDE_ROW_LABELS = [
     "Daily included routine runs",
 ]
 
+# The bundled list now: the legacy labels, in their order, plus what claude.ai
+# added in October 2026 - "This week" for the seven-day meter, and "Fable this
+# week" beside it, whose description says "weekly" and was read as the weekly
+# figure until Fable was a meter of its own.
+CLAUDE_ROW_LABELS = [
+    "Current session",
+    "All models",
+    "This week",
+    "Weekly",
+    "Opus only",
+    "Sonnet only",
+    "Fable this week",
+    "Cowork only",
+    "Claude Design",
+    "Daily included routine runs",
+]
+
 
 def _write_override(base_dir: Path, kind: str, meters: list[dict]) -> Path:
     path = base_dir / f"{kind}.json"
@@ -100,7 +117,11 @@ def test_bundled_catalog_loads_and_has_unique_keys(kind):
 
 
 def test_claude_catalog_reproduces_the_labels_the_extractor_used_to_carry():
-    assert list(bundled_catalog("claude").aliases()) == LEGACY_CLAUDE_ROW_LABELS
+    aliases = list(bundled_catalog("claude").aliases())
+
+    assert aliases == CLAUDE_ROW_LABELS
+    # Every label the extractor used to carry is still there, in its order.
+    assert [a for a in aliases if a in LEGACY_CLAUDE_ROW_LABELS] == LEGACY_CLAUDE_ROW_LABELS
 
 
 @pytest.mark.parametrize(
@@ -1293,7 +1314,7 @@ def test_the_rival_label_set_carries_every_meter_the_page_renders(tmp_path):
 
     labels = _row_labels(load_catalog("claude", base_dir=tmp_path))
 
-    assert labels == LEGACY_CLAUDE_ROW_LABELS + ["Cowork sessions"]
+    assert labels == CLAUDE_ROW_LABELS + ["Cowork sessions"]
 
 
 def test_a_hand_added_meter_also_counts_as_a_rival(tmp_path):

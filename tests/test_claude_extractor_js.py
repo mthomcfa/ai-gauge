@@ -16,6 +16,7 @@ import subprocess
 
 import pytest
 
+from aigauge.providers.catalog import bundled_catalog
 from aigauge.providers.claude import EXTRACTOR_JS
 
 pytestmark = pytest.mark.skipif(
@@ -113,10 +114,33 @@ def test_both_claude_usage_layouts_are_recognised_as_the_usage_panel(heading):
     assert out.stdout == "true", f"layout not recognised: {heading!r}"
 
 
-def _weekly_row_expression() -> str:
-    match = re.search(r"const weeklyAll = ([^;]+);", EXTRACTOR_JS)
-    assert match, "weeklyAll assignment not found; did EXTRACTOR_JS change shape?"
-    return match.group(1)
+def _weekly_row_source() -> str:
+    """readPrimary and the two primary reads, anchored on code."""
+    start = EXTRACTOR_JS.index("function readPrimary")
+    end = EXTRACTOR_JS.index("const rows = readCatalogRows")
+    block = EXTRACTOR_JS[start:end]
+    assert "const weeklyAll = readPrimary(" in block, "weeklyAll not read by readPrimary"
+    return block
+
+
+def _weekly_row(available, *, catalog=None, ambiguous=()) -> str | None:
+    """The real read, against a stubbed readRow that finds ``available``."""
+    if catalog is None:
+        catalog = bundled_catalog("claude").to_js()
+    script = f"""
+    const CATALOG = {json.dumps(catalog)};
+    const available = new Set({json.dumps(list(available))});
+    const unclear = new Set({json.dumps(list(ambiguous))});
+    const readRow = label => available.has(label)
+      ? {{ label: label, ambiguous: unclear.has(label) }} : null;
+    {_weekly_row_source()}
+    process.stdout.write(JSON.stringify(weeklyAll && weeklyAll.label));
+    """
+    out = subprocess.run(
+        ["node", "-e", script], capture_output=True, text=True, timeout=30
+    )
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout)
 
 
 @pytest.mark.parametrize(
@@ -124,14 +148,17 @@ def _weekly_row_expression() -> str:
     [
         # Legacy layout: only "All models" exists.
         (["All models"], "All models"),
-        # New layout: only "Weekly" exists - the fallback must fire.
+        # Gauge/bar layout: only "Weekly" exists - the fallback must fire.
         (["Weekly"], "Weekly"),
-        # Both present: legacy label wins, which is the current contract.
+        # October 2026: "This week", with "weekly" in the Fable row's prose.
+        (["This week"], "This week"),
+        (["This week", "Weekly"], "This week"),
+        # Both older labels present: the legacy one wins, as it always has.
         (["All models", "Weekly"], "All models"),
     ],
 )
-def test_weekly_row_resolves_across_both_layouts(available, expected):
-    """Executes the real expression against a stubbed readRow.
+def test_weekly_row_resolves_across_every_layout(available, expected):
+    """Executes the real read against a stubbed readRow.
 
     The previous version of this test asserted the source string
     "readRow('All models') || readRow('Weekly')" appeared in EXTRACTOR_JS.
@@ -139,13 +166,18 @@ def test_weekly_row_resolves_across_both_layouts(available, expected):
     reformatting - it tests the text, not the behaviour. I wrote it in the
     same session in which I flagged that exact pattern five times.
     """
-    script = f"""
-    const available = new Set({json.dumps(available)});
-    const readRow = label => available.has(label) ? label : null;
-    process.stdout.write(String({_weekly_row_expression()}));
-    """
-    out = subprocess.run(
-        ["node", "-e", script], capture_output=True, text=True, timeout=30
-    )
-    assert out.returncode == 0, out.stderr
-    assert out.stdout == expected
+    assert _weekly_row(available) == expected
+
+
+def test_a_clean_read_wins_over_an_ambiguous_one_whatever_the_order():
+    """"this week" sits inside "Fable this week", so an element holding both
+    rows reads ambiguous for it; a later alias that reads cleanly wins."""
+    assert _weekly_row(["This week", "Weekly"], ambiguous=["This week"]) == "Weekly"
+    # Nothing clean: the ambiguous read is kept, so the user is told.
+    assert _weekly_row(["This week"], ambiguous=["This week"]) == "This week"
+
+
+def test_a_switched_off_weekly_meter_still_falls_back_to_the_shipped_labels():
+    catalog = [m for m in bundled_catalog("claude").to_js() if m["key"] != "weekly_all"]
+
+    assert _weekly_row(["This week"], catalog=catalog) == "This week"
