@@ -54,7 +54,7 @@ def _capture(responses: dict, *, ctype: str | None = None) -> dict:
         ),
     )
     out = subprocess.run(
-        ["node", "-e", script], capture_output=True, text=True, timeout=30
+        ["node", "-"], input=script, capture_output=True, encoding="utf-8", timeout=30
     )
     assert out.returncode == 0, out.stderr
     return json.loads(out.stdout)
@@ -178,7 +178,7 @@ def test_the_extractor_hands_the_capture_back_with_every_payload():
     process.stdout.write(JSON.stringify(payload));
     """
     out = subprocess.run(
-        ["node", "-e", script], capture_output=True, text=True, timeout=30
+        ["node", "-"], input=script, capture_output=True, encoding="utf-8", timeout=30
     )
     assert out.returncode == 0, out.stderr
     payload = json.loads(out.stdout)
@@ -234,7 +234,7 @@ def _tamper(attack: str) -> dict:
     process.stdout.write(JSON.stringify({READBACK_JS}));
     """
     out = subprocess.run(
-        ["node", "-e", script], capture_output=True, text=True, timeout=30
+        ["node", "-"], input=script, capture_output=True, encoding="utf-8", timeout=30
     )
     assert out.returncode == 0, out.stderr
     return json.loads(out.stdout)

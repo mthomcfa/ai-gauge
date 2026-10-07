@@ -96,7 +96,7 @@ def _run(js: str, dom: list[tuple[str, int, int | None]], expression: str):
         f"\nprocess.stdout.write(JSON.stringify({expression}));"
     )
     out = subprocess.run(
-        ["node", "-e", script], capture_output=True, text=True, timeout=30
+        ["node", "-"], input=script, capture_output=True, encoding="utf-8", timeout=30
     )
     assert out.returncode == 0, out.stderr
     return json.loads(out.stdout)
@@ -682,7 +682,7 @@ def test_discovery_only_runs_when_the_scan_is_due(discover, expected):
         f"process.stdout.write(JSON.stringify({expression}));"
     )
     out = subprocess.run(
-        ["node", "-e", script], capture_output=True, text=True, timeout=30
+        ["node", "-"], input=script, capture_output=True, encoding="utf-8", timeout=30
     )
     assert out.returncode == 0, out.stderr
     assert json.loads(out.stdout) == expected
