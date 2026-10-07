@@ -128,25 +128,16 @@ EXTRACTOR_TEMPLATE = r"""
     const labels = extra && !KNOWN_LABELS.includes(extra)
       ? KNOWN_LABELS.concat([extra]) : KNOWN_LABELS;
     const own = leadingLabel(lower, labels);
-    if (own || !el) return own;
-    // A row is a few nodes; a wrapper with thousands is not one, and
-    // innerText per element is the expensive part.
-    const LIMIT = 80;
-    if (typeof document.createTreeWalker === 'function') {
-      // 5 = NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT.
-      const walker = document.createTreeWalker(el, 5);
-      for (let i = 0, node = walker.nextNode(); node && i < LIMIT;
-           i++, node = walker.nextNode()) {
-        const text = node.nodeType === 3 ? String(node.nodeValue || '') : norm(node);
-        const found = leadingLabel(text.replace(/\s+/g, ' ').trim().toLowerCase(), labels);
-        if (found) return found;
-      }
-      return null;
-    }
-    if (typeof el.querySelectorAll !== 'function') return null;
-    const inner = el.querySelectorAll('*');
-    for (let i = 0; i < inner.length && i < LIMIT; i++) {
-      const found = leadingLabel(norm(inner[i]).toLowerCase(), labels);
+    // Without a TreeWalker (a test's stub DOM) the row's own text is all.
+    if (own || !el || typeof document.createTreeWalker !== 'function') return own;
+    // 5 = NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT. A row is a few
+    // nodes; a wrapper with thousands is not one, and innerText per element
+    // is the expensive part.
+    const walker = document.createTreeWalker(el, 5);
+    for (let i = 0, node = walker.nextNode(); node && i < 80;
+         i++, node = walker.nextNode()) {
+      const text = node.nodeType === 3 ? String(node.nodeValue || '') : norm(node);
+      const found = leadingLabel(text.replace(/\s+/g, ' ').trim().toLowerCase(), labels);
       if (found) return found;
     }
     return null;

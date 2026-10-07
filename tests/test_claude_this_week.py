@@ -105,11 +105,6 @@ function walk(el, out) {
   return out;
 }
 NODES.forEach(el => { el.innerText = derive(el); el.textContent = el.innerText; });
-// Descendants in page order: every list here gives a parent before its
-// children and siblings in order.
-NODES.forEach(el => {
-  el.querySelectorAll = () => NODES.filter(n => n !== el && el.contains(n));
-});
 globalThis.document = {
   querySelectorAll: () => NODES,
   querySelector: () => null,
@@ -250,6 +245,24 @@ def test_prose_naming_this_week_does_not_turn_a_refusal_into_a_number():
         ("Current session Resets in 2 hr 59 min 64% used", 40, 1),
         ("All models Resets in 6 hr 29 min 30% used Opus only Resets in 6 hr 10% used", 60, 1),
         ("Insight: you've used 40% more this week than last", 40, 1),
+    ]
+
+    snapshot = _build_snapshot(_extract(dom), catalog=bundled_catalog("claude"))
+
+    assert snapshot.status.name == "ERROR"
+    assert "could not read Weekly" in snapshot.error
+
+
+def test_a_clean_read_the_meter_does_not_name_cannot_overrule_a_refusal():
+    """An element with two percentages and no rival label reads as a clean
+    row for "This week", but nothing in it is named "This week": it may not
+    turn the collapsed "All models" refusal into its 40."""
+    dom = [
+        ("", 900, None),
+        ("Plan usage limits", 600, 0),
+        ("Current session Resets in 2 hr 59 min 64% used", 40, 1),
+        ("All models Resets in 6 hr 29 min 30% used Opus only Resets in 6 hr 10% used", 60, 1),
+        ("Tip: this week 10% used, last week 40% used", 40, 1),
     ]
 
     snapshot = _build_snapshot(_extract(dom), catalog=bundled_catalog("claude"))
