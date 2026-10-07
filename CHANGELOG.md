@@ -24,13 +24,20 @@ account's weekly limit.
   the first thing in it that starts with a known label - the row's own
   text, then each element and run of text inside it, in page order.
   Mentioning a label is no longer enough, so the Fable row cannot stand in
-  for Weekly, and neither can a row for a model the app does not know yet,
-  or one that is merely shorter than the real row; a description that
-  starts with another meter's label ("Weekly limit for Fable") cannot
-  rename the row it sits in. Naming by structure keeps a badge, an icon,
-  screen-reader text, a list number, or a percentage or reset line placed
-  first from hiding a label. A page the app cannot attribute shows "could
-  not read Weekly" instead of a number.
+  for Weekly, and neither can a row for a model the app does not know yet
+  (unless something in that row, such as its description, itself starts
+  with a known label), or one that is merely shorter than the real row; a
+  description that starts with another meter's label ("Weekly limit for
+  Fable") cannot rename the row it sits in. Naming by structure keeps a
+  badge, an icon, screen-reader text, a list number, or a percentage or
+  reset line placed first from hiding a label, as long as it is not in the
+  same run of text as the label ("New: Weekly" is refused). A row that
+  says when it resets is preferred to a line of prose that starts with the
+  label, and an element holding several different percentages is no
+  longer read as its last one. A page the app cannot attribute shows an
+  error instead of a number: "could not read Weekly", or, where nothing on
+  the page could be tried at all, "extractor retry limit exceeded" after
+  its retries.
 - **Session and Weekly follow the meter catalog.** They were read through a
   fixed list of labels, so a label added to the catalog was used for the
   expanded rows but never for the gauge itself. They are now read through

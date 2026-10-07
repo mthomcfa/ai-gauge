@@ -113,6 +113,25 @@ EXTRACTOR_TEMPLATE = r"""
     return found;
   }
 
+  // Within one extractor run a row's name does not change with the label
+  // being read, and every label read asks again; element text likewise.
+  // Measured on a 3,000-element page, recomputing both made a half-loaded
+  // page's read six times slower than main's.
+  const ROW_NAMES = new Map();
+  let elementText = null;
+  function textOf(el) {
+    if (!elementText) {
+      elementText = new Map();
+      for (const candidate of rowCandidates()) elementText.set(candidate.el, candidate.text);
+    }
+    let text = elementText.get(el);
+    if (text === undefined) {
+      text = norm(el);
+      elementText.set(el, text);
+    }
+    return text;
+  }
+
   // The label a row is named by: the first thing in it that starts with a
   // known label - the row's own text, then each element and each run of
   // text inside it, in page order. By structure, not by the row's
@@ -122,11 +141,19 @@ EXTRACTOR_TEMPLATE = r"""
   // for Fable · 14% used" is Fable's. Text nodes as well as elements,
   // because a badge often shares the label's element ("<span>New</span>
   // This week"). null when nothing in the row starts with a known label, as
-  // in a row for a model the app does not know yet. `extra` is the label
-  // being read, which a fallback alias may not be among the known ones.
+  // in a row for a model the app does not know yet - unless something else
+  // in that row, such as a description reading "Weekly limit for Mythos",
+  // starts with one. `extra` is the label being read, which a fallback
+  // alias may not be among the known ones.
   function rowName(el, lower, extra) {
-    const labels = extra && !KNOWN_LABELS.includes(extra)
-      ? KNOWN_LABELS.concat([extra]) : KNOWN_LABELS;
+    const known = !extra || KNOWN_LABELS.includes(extra);
+    if (known && el && ROW_NAMES.has(el)) return ROW_NAMES.get(el);
+    const name = nameRow(el, lower, known ? KNOWN_LABELS : KNOWN_LABELS.concat([extra]));
+    if (known && el) ROW_NAMES.set(el, name);
+    return name;
+  }
+
+  function nameRow(el, lower, labels) {
     const own = leadingLabel(lower, labels);
     // Without a TreeWalker (a test's stub DOM) the row's own text is all.
     if (own || !el || typeof document.createTreeWalker !== 'function') return own;
@@ -136,7 +163,7 @@ EXTRACTOR_TEMPLATE = r"""
     const walker = document.createTreeWalker(el, 5);
     for (let i = 0, node = walker.nextNode(); node && i < 80;
          i++, node = walker.nextNode()) {
-      const text = node.nodeType === 3 ? String(node.nodeValue || '') : norm(node);
+      const text = node.nodeType === 3 ? String(node.nodeValue || '') : textOf(node);
       const found = leadingLabel(text.replace(/\s+/g, ' ').trim().toLowerCase(), labels);
       if (found) return found;
     }
@@ -172,6 +199,11 @@ EXTRACTOR_TEMPLATE = r"""
       // readRowText, which refuses it as ambiguous when it can tell.
       if (pctCount(t) === 1 && !namedFor(candidate.el, candidate.lower, lowerLabel)) continue;
       let score = t.length;
+      // Every usage row claude.ai has rendered says when it resets; a line
+      // of prose that starts with the label does not. "This week: 90% used
+      // at this pace by Friday" in the banner slot is shorter than the real
+      // "This week · Resets Saturday 10:00 AM · 73% used" and won on length.
+      if (!/\bresets?\b/.test(candidate.lower)) score += 1000;
       for (const other of ROW_LABELS) {
         if (other !== label && candidate.lower.includes(other.toLowerCase())) {
           score += 10000;
@@ -211,10 +243,16 @@ EXTRACTOR_TEMPLATE = r"""
     // A rival label plus a rival number means the percentage cannot be
     // attributed, so hand back no number at all. The full row text still
     // travels in `raw`, which is what makes the layout fixable in one round.
+    // So do two different numbers with no rival label to name either: a
+    // "This week" heading over per-model rows the catalog does not know yet
+    // ("Opus 60% used Sonnet 30% used") reported the last row's 30 as the
+    // weekly figure, and "this week 10% used, last week 40% used" the 40.
+    // The same number twice - a bar's own label and a caption - is one.
     const rivalLabel = ROW_LABELS.some(other =>
       other.toLowerCase() !== label.toLowerCase() &&
       lower.includes(other.toLowerCase()));
-    const ambiguous = pctMatches.length > 1 && rivalLabel;
+    const differing = new Set(pctMatches.map(match => parseFloat(match[1]))).size > 1;
+    const ambiguous = pctMatches.length > 1 && (rivalLabel || differing);
     const pctMatch = ambiguous ? null : pctMatches[pctMatches.length - 1];
 
     // POLARITY. normalize_percent treats an unknown kind as *used*, so a row

@@ -254,21 +254,70 @@ def test_prose_naming_this_week_does_not_turn_a_refusal_into_a_number():
 
 
 def test_a_clean_read_the_meter_does_not_name_cannot_overrule_a_refusal():
-    """An element with two percentages and no rival label reads as a clean
-    row for "This week", but nothing in it is named "This week": it may not
-    turn the collapsed "All models" refusal into its 40."""
+    """An element holding the same percentage twice and no rival label reads
+    as a clean row for "This week", but nothing in it is named "This week":
+    it may not turn the collapsed "All models" refusal into its 40."""
     dom = [
         ("", 900, None),
         ("Plan usage limits", 600, 0),
         ("Current session Resets in 2 hr 59 min 64% used", 40, 1),
         ("All models Resets in 6 hr 29 min 30% used Opus only Resets in 6 hr 10% used", 60, 1),
-        ("Tip: this week 10% used, last week 40% used", 40, 1),
+        ("Tip: 40% this week, 40% used so far", 40, 1),
     ]
 
     snapshot = _build_snapshot(_extract(dom), catalog=bundled_catalog("claude"))
 
     assert snapshot.status.name == "ERROR"
     assert "could not read Weekly" in snapshot.error
+
+
+@pytest.mark.parametrize("banner", [
+    "This week: 90% used at this pace by Friday",
+    "This week you used 40% more than last week",
+])
+def test_a_banner_starting_with_the_label_does_not_beat_the_real_row(banner):
+    """The banner slot already renders prose about the limits. Starting with
+    "This week" and shorter than the real row, it won on length."""
+    dom = [(banner if text.startswith("Heads up.") else text, h, p) for text, h, p in PANEL]
+
+    snapshot = _build_snapshot(_extract(dom), catalog=bundled_catalog("claude"))
+
+    assert {m.label: m.percent_used for m in snapshot.metrics}["Weekly"] == 73
+
+
+def test_several_different_percentages_with_no_rival_label_are_not_attributed():
+    """A "This week" heading over per-model rows the catalog does not know,
+    with no total, read the last row's 30 as Weekly; so did a tip quoting
+    two weeks. Neither names whose number is whose."""
+    heading_over_unknown_rows = [
+        ("", 900, None),
+        ("Your usage", 600, 0),
+        ("Current session Resets at 11:00 PM 20% used", 40, 1),
+        ("This week Opus Resets Saturday 60% used Sonnet Resets Saturday 30% used", 80, 1),
+    ]
+    tip = [
+        ("", 900, None),
+        ("Your usage", 600, 0),
+        ("Current session Resets at 11:00 PM 20% used", 40, 1),
+        ("7-day limit Resets Saturday 73% used", 40, 1),
+        ("This week 10% used, last week 40% used", 40, 1),
+    ]
+
+    for dom in (heading_over_unknown_rows, tip):
+        snapshot = _build_snapshot(_extract(dom), catalog=bundled_catalog("claude"))
+        assert snapshot.status.name == "ERROR", {m.label: m.percent_used for m in snapshot.metrics}
+        assert "could not read Weekly" in snapshot.error
+
+
+def test_the_same_percentage_twice_in_a_row_is_one_reading():
+    """A bar that labels itself and a caption under it: one number."""
+    dom = [
+        ("", 900, None),
+        ("", 400, 0),
+        ("This week 73% Resets Saturday 10:00 AM 73% used", 40, 1),
+    ]
+
+    assert _read_row("This week", dom)["percent"] == 73
 
 
 def _override_weekly(aliases: tuple[str, ...]) -> str:
