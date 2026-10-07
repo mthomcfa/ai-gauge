@@ -37,7 +37,7 @@
     {
       "key": "fable_weekly",
       "label": "Fable",
-      "aliases": ["Fable this week"],
+      "aliases": ["Fable this week", "Fable"],
       "window_seconds": 604800,
       "primary": false,
       "source": "bundled"

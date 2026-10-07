@@ -97,17 +97,36 @@ EXTRACTOR_TEMPLATE = r"""
     for (const alias of entry.aliases) ALIAS_OWNER[alias.toLowerCase()] = entry.key;
   }
 
-  function ledByAnotherMeter(lower, ownLabel) {
-    // Past any icon or bullet the row text starts with.
+  // Does the row start with `name`, past any icon or bullet, as a whole
+  // word? "This week" does not lead "This weekend".
+  function ledBy(lower, name) {
     const lead = lower.replace(/^[^\p{L}\p{N}]+/u, '');
+    return lead.startsWith(name) && !/[\p{L}\p{N}]/u.test(lead.charAt(name.length));
+  }
+
+  function ledByAnotherMeter(lower, ownLabel) {
     const ownKey = ALIAS_OWNER[ownLabel];
     for (const other of ROW_LABELS) {
       const otherLower = other.toLowerCase();
       if (otherLower === ownLabel || ownLabel.startsWith(otherLower)) continue;
       if (ownKey !== undefined && ALIAS_OWNER[otherLower] === ownKey) continue;
-      if (!lead.startsWith(otherLower)) continue;
-      // A whole word: "This week" does not lead "This weekend".
-      if (!/[\p{L}\p{N}]/u.test(lead.charAt(otherLower.length))) return true;
+      if (!ledBy(lower, otherLower)) continue;
+      // A heading run into this meter's own label is a heading, not the
+      // other meter's row: "Weekly · Opus only 91% used" is Opus only's.
+      const lead = lower.replace(/^[^\p{L}\p{N}]+/u, '');
+      if (ledBy(lead.slice(otherLower.length), ownLabel)) continue;
+      return true;
+    }
+    return false;
+  }
+
+  // Led by this label or another alias of the same meter.
+  function ledByThisMeter(lower, ownLabel) {
+    if (ledBy(lower, ownLabel)) return true;
+    const ownKey = ALIAS_OWNER[ownLabel];
+    if (ownKey === undefined) return false;
+    for (const alias in ALIAS_OWNER) {
+      if (ALIAS_OWNER[alias] === ownKey && ledBy(lower, alias)) return true;
     }
     return false;
   }
@@ -129,6 +148,12 @@ EXTRACTOR_TEMPLATE = r"""
       // readRowText, which refuses it as ambiguous and says so.
       if (pctCount(t) === 1 && ledByAnotherMeter(candidate.lower, lowerLabel)) continue;
       let score = t.length;
+      // And a row this meter names beats one that only mentions it. Length
+      // alone let "Opus this week · Resets in 2 days · 9% used", a row the
+      // catalog does not know, win "This week" over the real row by being
+      // five characters shorter. A preference, not a rule: a label under a
+      // heading of its own is still found.
+      if (!ledByThisMeter(candidate.lower, lowerLabel)) score += 1000;
       for (const other of ROW_LABELS) {
         if (other !== label && candidate.lower.includes(other.toLowerCase())) {
           score += 10000;
@@ -475,19 +500,35 @@ EXTRACTOR_TEMPLATE = r"""
   // "Current session", seven_day -> "Weekly"), and "This week" since October
   // 2026, beside "Fable this week".
   //
-  // An alias found only in an element holding several meters reads as
-  // ambiguous - "this week" is inside "Fable this week" - so a later alias
-  // that reads cleanly wins over it. Kept if nothing reads cleanly: an
-  // ambiguous row is an error the user is shown, not a gap.
+  // The catalog's aliases first, then the shipped ones: an override that
+  // lists labels of its own still has these read after them, as the fixed
+  // pair always was. Replacing them made the README's own override example
+  // miss "This week".
+  //
+  // The first row any alias finds is the answer, as it always was, unless a
+  // later alias finds a row that is plainly this meter's: one percentage,
+  // used/left wording against it, and named by the meter. Only a row like
+  // that may overrule what came first, because "this week" is inside "Fable
+  // this week" and an element holding both reads as ambiguous, and "Save
+  // 20% this week" has no wording - neither may hide the real row. A row
+  // that merely mentions the alias may not overrule an earlier refusal:
+  // "you've used 40% more this week" would turn "could not read Weekly"
+  // into Weekly 40.
   function readPrimary(key, fallback) {
     const entry = CATALOG.find(e => e.key === key);
-    let ambiguous = null;
-    for (const alias of (entry ? entry.aliases : fallback)) {
+    const seen = Object.create(null);
+    let first = null;
+    for (const alias of (entry ? entry.aliases : []).concat(fallback)) {
+      const lower = alias.toLowerCase();
+      if (seen[lower]) continue;
+      seen[lower] = true;
       const row = readRow(alias);
-      if (row && !row.ambiguous) return row;
-      if (row && !ambiguous) ambiguous = row;
+      if (!row) continue;
+      if (!row.ambiguous && row.kind !== 'unknown' &&
+          ledByThisMeter(String(row.raw || '').toLowerCase(), lower)) return row;
+      if (!first) first = row;
     }
-    return ambiguous;
+    return first;
   }
   const session = readPrimary('session', ['Current session']);
   const weeklyAll = readPrimary('weekly_all', ['All models', 'This week', 'Weekly']);

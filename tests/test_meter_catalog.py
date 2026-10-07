@@ -88,6 +88,7 @@ CLAUDE_ROW_LABELS = [
     "Opus only",
     "Sonnet only",
     "Fable this week",
+    "Fable",
     "Cowork only",
     "Claude Design",
     "Daily included routine runs",

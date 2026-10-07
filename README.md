@@ -404,7 +404,7 @@ an override changes only the fields it names:
   "kind": "claude",
   "meters": [
     { "key": "cowork_only", "enabled": false },
-    { "key": "weekly_all", "aliases": ["All models", "Weekly", "Weekly limit"] }
+    { "key": "weekly_all", "aliases": ["All models", "This week", "Weekly", "Weekly limit"] }
   ]
 }
 ```
@@ -413,7 +413,7 @@ an override changes only the fields it names:
 | --- | --- |
 | `key` | Identifies the meter. An unknown key adds a new meter; a known one edits it. An entry for a new key needs `label` and `aliases` as well — one that only names a key it does not recognise is dropped with a warning in the log. |
 | `label` | What the tile shows. Also the history key (`provider::label`), so changing it starts that meter's history over. **Do not rename one meter's `label` to another meter's**: two entries sharing a label share one history key, which merges the two series and reads as a period rollover on every refresh — whichever entry the loader saw last wins, so the tile can show either meter's number under that name. Renaming a bundled meter to something new is fine; it just starts a fresh history. |
-| `aliases` | The wordings the page may use. Add one here when a provider renames a row and the tile stops reading it. |
+| `aliases` | The wordings the page may use. Add one here when a provider renames a row and the tile stops reading it. For Claude's Session and Weekly, the shipped wordings are still tried after yours. |
 | `window_seconds` | The meter's period, or `null` if unknown. Drives the reset countdown and the pace line in the tile's tooltip ("you are 40% through the window"), so a wrong value is worse than none. |
 | `boundaries` | Where this meter's text stops, for Codex's plain-text fallback: the app reads from the meter's alias up to the first of these words. Defaults to every *other* meter's aliases, which is normally right — set it when a page puts something else between the cards. |
 | `primary` | `true` lets the meter drive the tray colour. Only Session and Weekly ship as primary, and a discovered meter is never adopted as primary. |

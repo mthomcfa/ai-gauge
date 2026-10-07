@@ -114,6 +114,13 @@ def test_both_claude_usage_layouts_are_recognised_as_the_usage_panel(heading):
     assert out.stdout == "true", f"layout not recognised: {heading!r}"
 
 
+def _guard_source() -> str:
+    """ALIAS_OWNER, ledBy and the two ledBy* checks, anchored on code."""
+    start = EXTRACTOR_JS.index("const ALIAS_OWNER")
+    end = EXTRACTOR_JS.index("function findRowByLabel")
+    return EXTRACTOR_JS[start:end]
+
+
 def _weekly_row_source() -> str:
     """readPrimary and the two primary reads, anchored on code."""
     start = EXTRACTOR_JS.index("function readPrimary")
@@ -123,16 +130,24 @@ def _weekly_row_source() -> str:
     return block
 
 
-def _weekly_row(available, *, catalog=None, ambiguous=()) -> str | None:
+def _weekly_row(available, *, catalog=None, ambiguous=(), unknown=(), unled=()) -> str | None:
     """The real read, against a stubbed readRow that finds ``available``."""
     if catalog is None:
         catalog = bundled_catalog("claude").to_js()
     script = f"""
     const CATALOG = {json.dumps(catalog)};
+    const ROW_LABELS = CATALOG.flatMap(m => m.aliases);
     const available = new Set({json.dumps(list(available))});
     const unclear = new Set({json.dumps(list(ambiguous))});
+    const unworded = new Set({json.dumps(list(unknown))});
+    const mentioned = new Set({json.dumps(list(unled))});
     const readRow = label => available.has(label)
-      ? {{ label: label, ambiguous: unclear.has(label) }} : null;
+      ? {{ label: label, ambiguous: unclear.has(label),
+           kind: unworded.has(label) ? 'unknown' : 'used',
+           raw: (mentioned.has(label) ? "you've used 40% more " : '') + label + ' 12% used' }}
+      : null;
+    // The guard helpers readPrimary calls, from the same source.
+    {_guard_source()}
     {_weekly_row_source()}
     process.stdout.write(JSON.stringify(weeklyAll && weeklyAll.label));
     """
@@ -175,6 +190,36 @@ def test_a_clean_read_wins_over_an_ambiguous_one_whatever_the_order():
     assert _weekly_row(["This week", "Weekly"], ambiguous=["This week"]) == "Weekly"
     # Nothing clean: the ambiguous read is kept, so the user is told.
     assert _weekly_row(["This week"], ambiguous=["This week"]) == "This week"
+
+
+def test_a_read_with_no_used_or_left_wording_gives_way_to_one_with_it():
+    """"Save 20% this week" carries "this week" and a percentage but no
+    wording, so it cannot be a gauge; a later alias's row can."""
+    assert _weekly_row(["This week", "Weekly"], unknown=["This week"]) == "Weekly"
+    assert _weekly_row(["This week"], unknown=["This week"]) == "This week"
+
+
+def test_a_row_that_only_mentions_the_label_cannot_overrule_an_earlier_refusal():
+    """"you've used 40% more this week" reads cleanly for "This week", but it
+    is prose, not the row: the earlier ambiguous read stands, and the user
+    is told Weekly could not be read instead of being shown 40."""
+    assert _weekly_row(
+        ["All models", "This week"], ambiguous=["All models"], unled=["This week"]
+    ) == "All models"
+    # A row the meter names still overrules it.
+    assert _weekly_row(["All models", "This week"], ambiguous=["All models"]) == "This week"
+
+
+def test_the_shipped_labels_are_still_tried_after_an_overrides_own():
+    """An override's aliases replace the catalog entry's, but the shipped
+    labels were always read for Session and Weekly and still are."""
+    catalog = [
+        dict(m, aliases=["Weekly limit"]) if m["key"] == "weekly_all" else m
+        for m in bundled_catalog("claude").to_js()
+    ]
+
+    assert _weekly_row(["All models"], catalog=catalog) == "All models"
+    assert _weekly_row(["Weekly limit", "All models"], catalog=catalog) == "Weekly limit"
 
 
 def test_a_switched_off_weekly_meter_still_falls_back_to_the_shipped_labels():

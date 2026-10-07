@@ -4,7 +4,8 @@ From 6 October 2026 the panel's rows read, from Michael's screen:
 
     Current session    Resets at 11:00 PM                                  20% used
     This week          Resets Saturday 10:00 AM                            73% used
-    Fable this week    Separate weekly limit for Fable · Resets Sat 10 AM  14% used
+    Fable this week    Separate weekly limit for Fable ·
+                       Resets Saturday 10:00 AM                            14% used
 
 The reader looked for the seven-day meter as "All models", then "Weekly".
 Neither labels a row any more, and the only "weekly" on the page is in the
@@ -178,6 +179,108 @@ def test_the_snapshot_shows_session_and_weekly_with_fable_in_the_breakdown():
     assert by_label["Fable"].resets_at == by_label["Weekly"].resets_at
 
 
+def test_a_row_the_catalog_does_not_know_cannot_take_the_weekly_figure():
+    """Claude names per-model limits "<model> this week" now. One the catalog
+    has not learned yet is no rival, and "Opus this week · Resets in 2 days
+    · 9% used" is shorter than the real row: by length alone it was Weekly."""
+    dom = PANEL + [
+        ("", 70, 6),
+        ("Opus this week", 20, len(PANEL)),
+        ("Resets in 2 days", 20, len(PANEL)),
+        ("9% used", 20, len(PANEL)),
+    ]
+
+    snapshot = _build_snapshot(_extract(dom), catalog=bundled_catalog("claude"))
+
+    assert snapshot.status.name == "OK", snapshot.error
+    assert {m.label: m.percent_used for m in snapshot.metrics}["Weekly"] == 73
+
+
+def test_a_promotion_naming_this_week_leaves_the_gauge_layouts_weekly_row_alone():
+    """"This week" is now tried before "Weekly". On the gauge layout a line
+    like "Save 20% this week" is the only thing it finds: a percentage with no
+    used/left wording, which must not stand in for the real "Weekly" row."""
+    gauge = [
+        ("", 900, None),
+        ("Plan usage", 600, 0),
+        ("Current session 8% used", 40, 1),
+        ("Weekly 12% used", 40, 1),
+        ("Opus only 91% used", 40, 1),
+        ("Save 20% this week", 40, 0),
+    ]
+
+    snapshot = _build_snapshot(_extract(gauge), catalog=bundled_catalog("claude"))
+
+    assert snapshot.status.name == "OK", snapshot.error
+    assert {m.label: m.percent_used for m in snapshot.metrics}["Weekly"] == 12
+
+
+def test_prose_naming_this_week_does_not_turn_a_refusal_into_a_number():
+    """Claude collapses rows into one element at times. Main refused the
+    collapsed old layout's Weekly; a "this week" in an insight line must not
+    turn that refusal into a reading of the insight's 40%."""
+    dom = [
+        ("", 900, None),
+        ("Plan usage limits", 600, 0),
+        ("Current session Resets in 2 hr 59 min 64% used", 40, 1),
+        ("All models Resets in 6 hr 29 min 30% used Opus only Resets in 6 hr 10% used", 60, 1),
+        ("Insight: you've used 40% more this week than last", 40, 1),
+    ]
+
+    snapshot = _build_snapshot(_extract(dom), catalog=bundled_catalog("claude"))
+
+    assert snapshot.status.name == "ERROR"
+    assert "could not read Weekly" in snapshot.error
+
+
+def _override_weekly(aliases: tuple[str, ...]) -> str:
+    catalog = MeterCatalog(
+        kind="claude",
+        specs=tuple(
+            spec if spec.key != "weekly_all"
+            else MeterSpec(key="weekly_all", label="Weekly", aliases=aliases,
+                           window=spec.window, primary=True)
+            for spec in bundled_catalog("claude").specs
+        ),
+    )
+    return extractor_source(EXTRACTOR_TEMPLATE, catalog, discover=False)
+
+
+def test_an_override_listing_its_own_labels_still_gets_the_fix():
+    """The README's override example, as users copied it before "This week"
+    existed, replaces the entry's aliases. The shipped labels are still read
+    after it, so the new panel reads 73 and the old one 30."""
+    readme_example = _override_weekly(("All models", "Weekly", "Weekly limit"))
+    old = [
+        ("", 900, None),
+        ("Plan usage limits", 600, 0),
+        ("Current session Resets in 2 hr 59 min 64% used", 40, 1),
+        ("All models Resets in 6 hr 29 min 30% used", 40, 1),
+    ]
+
+    assert _extract(PANEL, readme_example)["weekly_all"]["percent"] == 73
+    assert _extract(old, _override_weekly(("Weekly limit",)))["weekly_all"]["percent"] == 30
+
+
+def test_a_heading_run_into_a_meters_own_label_is_still_that_meters_row():
+    """"Weekly · Opus only 91% used" starts with another meter's label, but
+    the row's own label follows it straight away: it is Opus only's."""
+    dom = [
+        ("", 900, None),
+        ("", 400, 0),
+        ("Weekly \u00b7 Opus only 91% used", 40, 1),
+    ]
+
+    assert _read_row("Opus only", dom)["percent"] == 91
+
+
+def test_fable_is_still_read_if_the_row_is_shortened_to_its_name():
+    dom = [(t.replace("Fable this week", "Fable"), h, p) for t, h, p in PANEL]
+
+    assert _extract(dom)["rows"]["fable_weekly"]["percent"] == 14
+    assert _extract(dom)["weekly_all"]["percent"] == 73
+
+
 # --- the guard: a row belongs to the meter it starts with -------------------
 
 
@@ -223,10 +326,10 @@ def test_the_leading_label_must_be_a_whole_word():
     dom = [
         ("", 900, None),
         ("", 400, 0),
-        ("Fable this weekend weekly offer 30% used", 40, 1),
+        ("Claude Designer weekly offer 30% used", 40, 1),
     ]
 
-    # "Fable this weekend" is not "Fable this week": the row is not Fable's,
+    # "Claude Designer" is not "Claude Design": the row is not that meter's,
     # so the guard does not take it from the meter being read.
     assert _read_row("Weekly", dom)["percent"] == 30
 
