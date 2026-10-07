@@ -328,6 +328,19 @@ def test_a_row_led_by_another_alias_of_the_same_meter_still_reads():
     assert _read_row("This week", dom)["percent"] == 73
 
 
+def test_a_row_named_by_another_alias_of_the_same_meter_is_that_meters():
+    """A "Weekly limits" heading in the same element as the "All models" row
+    names the row "Weekly" - the same meter - so reading "All models" finds
+    it."""
+    dom = [
+        ("", 900, None),
+        ("", 400, 0),
+        ("Weekly limits All models Resets in 6 hr 29 min 30% used", 40, 1),
+    ]
+
+    assert _read_row("All models", dom)["percent"] == 30
+
+
 def test_the_leading_label_must_be_a_whole_word():
     """"This weekend's pass" is not named "This week"; were it, it would win
     on length over the real row."""
