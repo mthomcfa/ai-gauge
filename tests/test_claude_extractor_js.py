@@ -152,7 +152,8 @@ def _weekly_row(available, *, catalog=None, ambiguous=(), unknown=(), unled=()) 
     process.stdout.write(JSON.stringify(weeklyAll && weeklyAll.label));
     """
     out = subprocess.run(
-        ["node", "-e", script], capture_output=True, text=True, timeout=30
+        # Over stdin, in UTF-8 both ways: see test_claude_this_week._node.
+        ["node", "-"], input=script, capture_output=True, encoding="utf-8", timeout=30
     )
     assert out.returncode == 0, out.stderr
     return json.loads(out.stdout)

@@ -113,8 +113,14 @@ globalThis.location = {
 
 
 def _node(script: str):
+    """Run ``script`` in node and parse what it prints.
+
+    Over stdin and in UTF-8 both ways, not ``-e`` and ``text=True``: those
+    encode the script and decode its output with the locale's encoding,
+    and on Windows that is cp1252, which cannot decode the "●" a row
+    here reads back - the output came back None."""
     out = subprocess.run(
-        ["node", "-e", script], capture_output=True, text=True, timeout=30
+        ["node", "-"], input=script, capture_output=True, encoding="utf-8", timeout=30
     )
     assert out.returncode == 0, out.stderr
     return json.loads(out.stdout)
