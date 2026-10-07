@@ -67,7 +67,7 @@ Binaries are published on **[this fork's Releases page](https://github.com/mthom
 | macOS   | `ai-gauge-<file-version>-macos.tar.gz`      | **Apple Silicon only.** Extract, drag `ai-gauge.app` to Applications |
 | Linux   | `ai-gauge-<file-version>-linux.tar.gz`      | extract, run `./ai-gauge/ai-gauge`           |
 
-`<file-version>` is the version with `+` replaced by `-`, so `1.4.6+cfa.14` ships as `ai-gauge-1.4.6-cfa.14-windows.zip`. Print it with `python tools/check_versions.py`.
+`<file-version>` is the version with `+` replaced by `-`, so `1.4.7+cfa.15` ships as `ai-gauge-1.4.7-cfa.15-windows.zip`. Print it with `python tools/check_versions.py`.
 
 **Intel Macs are not covered by the prebuilt archive.** PyInstaller builds for the host architecture and this fork's CI runs on Apple Silicon, so the `.app` is arm64-only. Intel users should [run from source](#run-from-source); the menu-bar UI works identically.
 
@@ -366,7 +366,7 @@ about**, and each becomes its own row on the tile:
 
 | Provider | Meters read | Drives the tray colour |
 | --- | --- | --- |
-| Claude | Session (5 h), Weekly (7 d), Opus only, Sonnet only, Cowork only, Claude Design, Daily routine runs | Session + Weekly |
+| Claude | Session (5 h), Weekly (7 d), Opus only, Sonnet only, Fable, Cowork only, Claude Design, Daily routine runs | Session + Weekly |
 | Codex | Session (5 h), Weekly (7 d), plus any additional usage card the page shows | Session + Weekly |
 
 Everything else is **informational**: those rows appear when you expand the
@@ -404,7 +404,7 @@ an override changes only the fields it names:
   "kind": "claude",
   "meters": [
     { "key": "cowork_only", "enabled": false },
-    { "key": "weekly_all", "aliases": ["All models", "Weekly", "Weekly limit"] }
+    { "key": "weekly_all", "aliases": ["All models", "This week", "Weekly", "Weekly limit"] }
   ]
 }
 ```
@@ -413,7 +413,7 @@ an override changes only the fields it names:
 | --- | --- |
 | `key` | Identifies the meter. An unknown key adds a new meter; a known one edits it. An entry for a new key needs `label` and `aliases` as well — one that only names a key it does not recognise is dropped with a warning in the log. |
 | `label` | What the tile shows. Also the history key (`provider::label`), so changing it starts that meter's history over. **Do not rename one meter's `label` to another meter's**: two entries sharing a label share one history key, which merges the two series and reads as a period rollover on every refresh — whichever entry the loader saw last wins, so the tile can show either meter's number under that name. Renaming a bundled meter to something new is fine; it just starts a fresh history. |
-| `aliases` | The wordings the page may use. Add one here when a provider renames a row and the tile stops reading it. |
+| `aliases` | The wordings the page may use. Add one here when a provider renames a row and the tile stops reading it. For Claude's Session and Weekly, the shipped wordings are still tried after yours. |
 | `window_seconds` | The meter's period, or `null` if unknown. Drives the reset countdown and the pace line in the tile's tooltip ("you are 40% through the window"), so a wrong value is worse than none. |
 | `boundaries` | Where this meter's text stops, for Codex's plain-text fallback: the app reads from the meter's alias up to the first of these words. Defaults to every *other* meter's aliases, which is normally right — set it when a page puts something else between the cards. |
 | `primary` | `true` lets the meter drive the tray colour. Only Session and Weekly ship as primary, and a discovered meter is never adopted as primary. |
@@ -510,7 +510,7 @@ That also means **upstream cannot support this build**, and bugs here may not ex
 Fork releases use a [PEP 440](https://peps.python.org/pep-0440/) local version segment:
 
 ```
-1.4.6+cfa.14
+1.4.7+cfa.15
 └─┬─┘ └──┬─┘
   │      └── fork build counter — identifies this as a fork build
   └───────── this fork's own release counter, NOT an upstream release number

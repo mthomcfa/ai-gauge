@@ -6,6 +6,54 @@
 > earlier `0.6.4` entry predates that convention and **is not** upstream's
 > `v0.6.4`, which is different code.
 
+## 1.4.7+cfa.15 - 2026-10-07
+
+A patch release for the Claude tile, which showed Fable's weekly limit as the
+account's weekly limit.
+
+### Fixed
+
+- **Claude's Weekly gauge read the Fable limit.** From 6 October claude.ai's
+  usage panel labels its seven-day row "This week" and adds a row below it,
+  "Fable this week", described as "Separate weekly limit for Fable". The app
+  looked for the seven-day row as "All models" and then "Weekly". Neither
+  labels a row any more, and the only "weekly" left on the page is in the
+  Fable row's description, so the tile showed Fable's 14% as the weekly
+  figure while the account stood at 73%. It now looks for "This week"
+  before "Weekly". A row is also read only for the meter it is named by:
+  the first thing in it that starts with a known label - the row's own
+  text, then each element and run of text inside it, in page order.
+  Mentioning a label is no longer enough, so the Fable row cannot stand in
+  for Weekly, and neither can a row for a model the app does not know yet
+  (unless something in that row, such as its description, itself starts
+  with a known label), or one that is merely shorter than the real row; a
+  description that starts with another meter's label ("Weekly limit for
+  Fable") cannot rename the row it sits in. Naming by structure keeps a
+  badge, an icon, screen-reader text, a list number, or a percentage or
+  reset line placed first from hiding a label, as long as it is not in the
+  same run of text as the label ("New: Weekly" is refused). A row that
+  says when it resets is preferred to a line of prose that starts with the
+  label, and an element holding several different percentages is no
+  longer read as its last one. A page the app cannot attribute shows an
+  error instead of a number: "could not read Weekly", or, where nothing on
+  the page could be tried at all, "extractor retry limit exceeded" after
+  its retries.
+- **Session and Weekly follow the meter catalog.** They were read through a
+  fixed list of labels, so a label added to the catalog was used for the
+  expanded rows but never for the gauge itself. They are now read through
+  the catalog's labels and then the shipped ones, so an override that
+  lists its own labels still gets "This week". A later label overrules
+  what an earlier one found only with a row that is plainly the meter's
+  own: one percentage, used/left wording against it, and the meter's name
+  at its start. Prose such as "you've used 40% more this week" cannot.
+
+### Added
+
+- **Fable** is read as a meter of its own, as "Fable this week" or "Fable":
+  its weekly percentage and reset time appear among the informational rows
+  when the Claude tile is expanded. Like Opus only and Sonnet only, it does
+  not drive the tray colour.
+
 ## 1.4.6+cfa.14 - 2026-10-05
 
 A patch release for the Claude and ChatGPT tiles, which timed out on every

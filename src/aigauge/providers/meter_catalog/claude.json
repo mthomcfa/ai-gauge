@@ -13,7 +13,7 @@
     {
       "key": "weekly_all",
       "label": "Weekly",
-      "aliases": ["All models", "Weekly"],
+      "aliases": ["All models", "This week", "Weekly"],
       "window_seconds": 604800,
       "primary": true,
       "source": "bundled"
@@ -30,6 +30,14 @@
       "key": "sonnet_only",
       "label": "Sonnet only",
       "aliases": ["Sonnet only"],
+      "window_seconds": 604800,
+      "primary": false,
+      "source": "bundled"
+    },
+    {
+      "key": "fable_weekly",
+      "label": "Fable",
+      "aliases": ["Fable this week", "Fable"],
       "window_seconds": 604800,
       "primary": false,
       "source": "bundled"

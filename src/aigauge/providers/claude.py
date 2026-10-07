@@ -89,6 +89,96 @@ EXTRACTOR_TEMPLATE = r"""
     return rowCandidateCache;
   }
 
+  // Which catalog meter each alias names, so a row named by any alias of a
+  // meter is that meter's ("All models", "This week" and "Weekly" are one).
+  const ALIAS_OWNER = Object.create(null);
+  for (const entry of CATALOG) {
+    for (const alias of entry.aliases) ALIAS_OWNER[alias.toLowerCase()] = entry.key;
+  }
+  const KNOWN_LABELS = ROW_LABELS.map(label => label.toLowerCase());
+
+  // The longest known label `text` starts with, past any icon, bullet or
+  // list number ("1."), as a whole word: no letter straight after it, so
+  // "This week" does not start "This weekend". A digit may follow -
+  // "Current session20% used" is how an inline label and an inline
+  // percentage run together.
+  function leadingLabel(text, labels) {
+    const rest = text.replace(/^(?:[^\p{L}\p{N}]+|\d+[.)](?=\s))+/u, '');
+    let found = null;
+    for (const label of labels) {
+      if (!rest.startsWith(label)) continue;
+      if (/\p{L}/u.test(rest.charAt(label.length))) continue;
+      if (!found || label.length > found.length) found = label;
+    }
+    return found;
+  }
+
+  // Within one extractor run a row's name does not change with the label
+  // being read, and every label read asks again; element text likewise.
+  // Measured on a 3,000-element page, recomputing both made a half-loaded
+  // page's read six times slower than main's.
+  const ROW_NAMES = new Map();
+  let elementText = null;
+  function textOf(el) {
+    if (!elementText) {
+      elementText = new Map();
+      for (const candidate of rowCandidates()) elementText.set(candidate.el, candidate.text);
+    }
+    let text = elementText.get(el);
+    if (text === undefined) {
+      text = norm(el);
+      elementText.set(el, text);
+    }
+    return text;
+  }
+
+  // The label a row is named by: the first thing in it that starts with a
+  // known label - the row's own text, then each element and each run of
+  // text inside it, in page order. By structure, not by the row's
+  // run-together text, so a badge, a screen-reader prefix, an icon, a
+  // caption or the percentage before the label does not hide it, and a
+  // description after it cannot rename it: "Fable this week · Weekly limit
+  // for Fable · 14% used" is Fable's. Text nodes as well as elements,
+  // because a badge often shares the label's element ("<span>New</span>
+  // This week"). null when nothing in the row starts with a known label, as
+  // in a row for a model the app does not know yet - unless something else
+  // in that row, such as a description reading "Weekly limit for Mythos",
+  // starts with one. `extra` is the label being read, which a fallback
+  // alias may not be among the known ones.
+  function rowName(el, lower, extra) {
+    const known = !extra || KNOWN_LABELS.includes(extra);
+    if (known && el && ROW_NAMES.has(el)) return ROW_NAMES.get(el);
+    const name = nameRow(el, lower, known ? KNOWN_LABELS : KNOWN_LABELS.concat([extra]));
+    if (known && el) ROW_NAMES.set(el, name);
+    return name;
+  }
+
+  function nameRow(el, lower, labels) {
+    const own = leadingLabel(lower, labels);
+    // Without a TreeWalker (a test's stub DOM) the row's own text is all.
+    if (own || !el || typeof document.createTreeWalker !== 'function') return own;
+    // 5 = NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT. A row is a few
+    // nodes; a wrapper with thousands is not one, and innerText per element
+    // is the expensive part.
+    const walker = document.createTreeWalker(el, 5);
+    for (let i = 0, node = walker.nextNode(); node && i < 80;
+         i++, node = walker.nextNode()) {
+      const text = node.nodeType === 3 ? String(node.nodeValue || '') : textOf(node);
+      const found = leadingLabel(text.replace(/\s+/g, ' ').trim().toLowerCase(), labels);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  // Is this row named by `label`, or by another alias of the same meter?
+  function namedFor(el, lower, label) {
+    const name = rowName(el, lower, label);
+    if (name === null) return false;
+    if (name === label) return true;
+    const owner = ALIAS_OWNER[label];
+    return owner !== undefined && ALIAS_OWNER[name] === owner;
+  }
+
   function findRowByLabel(label) {
     const lowerLabel = label.toLowerCase();
     let best = null;
@@ -97,7 +187,23 @@ EXTRACTOR_TEMPLATE = r"""
       const t = candidate.text;
       if (!candidate.lower.includes(lowerLabel)) continue;
       if (!/%/.test(t)) continue;
+      // A single row is read only for the meter it is named by. Mentioning
+      // a label is not enough: claude.ai's "Fable this week · Separate
+      // weekly limit for Fable · 14% used" contains "this week" and
+      // "weekly", and its 14% was shown as the weekly figure while the real
+      // one, "This week", stood at 73%. So, once that row was missing, was
+      // a row for a model the app does not know yet ("Mythos this week"),
+      // whatever order its parts came in. A row named by no known label is
+      // not read at all: a refusal is an error the user sees, and a wrong
+      // number is not. An element holding several meters is left to
+      // readRowText, which refuses it as ambiguous when it can tell.
+      if (pctCount(t) === 1 && !namedFor(candidate.el, candidate.lower, lowerLabel)) continue;
       let score = t.length;
+      // Every usage row claude.ai has rendered says when it resets; a line
+      // of prose that starts with the label does not. "This week: 90% used
+      // at this pace by Friday" in the banner slot is shorter than the real
+      // "This week · Resets Saturday 10:00 AM · 73% used" and won on length.
+      if (!/\bresets?\b/.test(candidate.lower)) score += 1000;
       for (const other of ROW_LABELS) {
         if (other !== label && candidate.lower.includes(other.toLowerCase())) {
           score += 10000;
@@ -117,7 +223,11 @@ EXTRACTOR_TEMPLATE = r"""
   function readRow(label) {
     const row = findRowByLabel(label);
     if (!row) return null;
-    return readRowText(norm(row), label);
+    const text = norm(row);
+    const out = readRowText(text, label);
+    // Whether the element is plainly this meter's row, for readPrimary.
+    out.named = namedFor(row, text.toLowerCase(), label.toLowerCase());
+    return out;
   }
 
   // Split out of readRow so the discovery scan below reads an unrecognized row
@@ -133,10 +243,16 @@ EXTRACTOR_TEMPLATE = r"""
     // A rival label plus a rival number means the percentage cannot be
     // attributed, so hand back no number at all. The full row text still
     // travels in `raw`, which is what makes the layout fixable in one round.
+    // So do two different numbers with no rival label to name either: a
+    // "This week" heading over per-model rows the catalog does not know yet
+    // ("Opus 60% used Sonnet 30% used") reported the last row's 30 as the
+    // weekly figure, and "this week 10% used, last week 40% used" the 40.
+    // The same number twice - a bar's own label and a caption - is one.
     const rivalLabel = ROW_LABELS.some(other =>
       other.toLowerCase() !== label.toLowerCase() &&
       lower.includes(other.toLowerCase()));
-    const ambiguous = pctMatches.length > 1 && rivalLabel;
+    const differing = new Set(pctMatches.map(match => parseFloat(match[1]))).size > 1;
+    const ambiguous = pctMatches.length > 1 && (rivalLabel || differing);
     const pctMatch = ambiguous ? null : pctMatches[pctMatches.length - 1];
 
     // POLARITY. normalize_percent treats an unknown kind as *used*, so a row
@@ -433,13 +549,48 @@ EXTRACTOR_TEMPLATE = r"""
     !!document.querySelector('a[href*="/login"]') &&
     !/Plan usage/i.test(bodyText);
 
-  const session = readRow('Current session');
-  // Claude ships two usage layouts behind a flag. The older one labels the
-  // seven-day meter "All models"; the newer gauge/bar one labels it "Weekly"
-  // (see its es[] meter table: five_hour -> "Current session", seven_day ->
-  // "Weekly", plus Opus only / Sonnet only / Cowork only / Claude Design).
-  // Requiring "All models" made the newer layout permanently unreadable.
-  const weeklyAll = readRow('All models') || readRow('Weekly');
+  // The two primary meters, through their catalog aliases in order, so a
+  // relabel is a data change for them as it is for every other meter: a
+  // hard-coded pair here meant an alias added to the catalog was read into
+  // `rows` but never satisfied the readiness check below. The fallbacks are
+  // the shipped aliases, for a catalog with the meter switched off.
+  //
+  // The seven-day meter has carried three labels: "All models" on the older
+  // layout, "Weekly" on the gauge/bar one (its es[] meter table: five_hour ->
+  // "Current session", seven_day -> "Weekly"), and "This week" since October
+  // 2026, beside "Fable this week".
+  //
+  // The catalog's aliases first, then the shipped ones: an override that
+  // lists labels of its own still has these read after them, as the fixed
+  // pair always was. Replacing them made the README's own override example
+  // miss "This week".
+  //
+  // The first row any alias finds is the answer, as it always was, unless a
+  // later alias finds a row that is plainly this meter's: one percentage,
+  // used/left wording against it, and named by the meter. Only a row like
+  // that may overrule what came first, because "this week" is inside "Fable
+  // this week" and an element holding both reads as ambiguous, and "Save
+  // 20% this week" has no wording - neither may hide the real row. A row
+  // that merely mentions the alias may not overrule an earlier refusal:
+  // "you've used 40% more this week" would turn "could not read Weekly"
+  // into Weekly 40.
+  function readPrimary(key, fallback) {
+    const entry = CATALOG.find(e => e.key === key);
+    const seen = Object.create(null);
+    let first = null;
+    for (const alias of (entry ? entry.aliases : []).concat(fallback)) {
+      const lower = alias.toLowerCase();
+      if (seen[lower]) continue;
+      seen[lower] = true;
+      const row = readRow(alias);
+      if (!row) continue;
+      if (!row.ambiguous && row.kind !== 'unknown' && row.named) return row;
+      if (!first) first = row;
+    }
+    return first;
+  }
+  const session = readPrimary('session', ['Current session']);
+  const weeklyAll = readPrimary('weekly_all', ['All models', 'This week', 'Weekly']);
 
   // The two rows above stay the primary path, unchanged. Everything else the
   // catalog knows about is read alongside them, and each becomes its own field.
