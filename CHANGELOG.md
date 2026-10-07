@@ -6,7 +6,7 @@
 > earlier `0.6.4` entry predates that convention and **is not** upstream's
 > `v0.6.4`, which is different code.
 
-## 1.4.7+cfa.15 - 2026-10-06
+## 1.4.7+cfa.15 - 2026-10-07
 
 A patch release for the Claude tile, which showed Fable's weekly limit as the
 account's weekly limit.
@@ -20,23 +20,28 @@ account's weekly limit.
   labels a row any more, and the only "weekly" left on the page is in the
   Fable row's description, so the tile showed Fable's 14% as the weekly
   figure while the account stood at 73%. It now looks for "This week"
-  before "Weekly".
-  A row is also taken to belong to the meter whose label it starts with, so
-  the Fable row can no longer stand in for another meter, whatever its
-  description says. If the seven-day row is ever missing again, the tile
-  reports that it could not read Weekly instead of showing another meter's
-  number.
+  before "Weekly". A row is also taken to belong to the meter whose label
+  it starts with, so the Fable row can no longer stand in for another
+  meter, whatever its description says; and a row a meter's label starts
+  is preferred to one that only mentions it, so a "<model> this week" row
+  the app does not know yet cannot win "This week" by being shorter. If
+  the seven-day row is ever missing again, the tile reports that it could
+  not read Weekly instead of showing another meter's number.
 - **Session and Weekly follow the meter catalog.** They were read through a
   fixed list of labels, so a label added to the catalog was used for the
   expanded rows but never for the gauge itself. They are now read through
-  the catalog, and a label that reads cleanly wins over one found only in a
-  block holding several meters.
+  the catalog's labels and then the shipped ones, so an override that
+  lists its own labels still gets "This week". A later label overrules
+  what an earlier one found only with a row that is plainly the meter's
+  own: one percentage, used/left wording against it, and the meter's name
+  at its start. Prose such as "you've used 40% more this week" cannot.
 
 ### Added
 
-- **Fable** is read as a meter of its own: its weekly percentage and reset
-  time appear among the informational rows when the Claude tile is expanded.
-  Like Opus only and Sonnet only, it does not drive the tray colour.
+- **Fable** is read as a meter of its own, as "Fable this week" or "Fable":
+  its weekly percentage and reset time appear among the informational rows
+  when the Claude tile is expanded. Like Opus only and Sonnet only, it does
+  not drive the tray colour.
 
 ## 1.4.6+cfa.14 - 2026-10-05
 
