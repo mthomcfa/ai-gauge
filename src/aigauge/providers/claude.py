@@ -89,46 +89,48 @@ EXTRACTOR_TEMPLATE = r"""
     return rowCandidateCache;
   }
 
-  // Which catalog meter each alias names. A row led by another alias of the
-  // meter being read (a "Weekly" heading over the "This week" row) is still
-  // that meter's row; one led by a different meter's alias is not.
+  // Which catalog meter each alias names, so a row named by any alias of a
+  // meter is that meter's ("All models", "This week" and "Weekly" are one).
   const ALIAS_OWNER = Object.create(null);
   for (const entry of CATALOG) {
     for (const alias of entry.aliases) ALIAS_OWNER[alias.toLowerCase()] = entry.key;
   }
+  const KNOWN_LABELS = ROW_LABELS.map(label => label.toLowerCase());
 
-  // Does the row start with `name`, past any icon or bullet, as a whole
-  // word? "This week" does not lead "This weekend".
-  function ledBy(lower, name) {
-    const lead = lower.replace(/^[^\p{L}\p{N}]+/u, '');
-    return lead.startsWith(name) && !/[\p{L}\p{N}]/u.test(lead.charAt(name.length));
+  // The label a row is named by: the known label it starts with, past any
+  // icon or bullet, as a whole word ("This week" does not start "This
+  // weekend"), the longest one when several do ("Fable this week", not
+  // "Fable"). Where one label runs straight into another, as a heading over
+  // a row does, the row is named by the last: "Weekly · Opus only 91% used"
+  // is Opus only's and "This week · Fable 14% used" is Fable's. null when no
+  // known label starts the row. `extra` is the label being read, which a
+  // fallback alias may not be among the known ones.
+  function rowName(lower, extra) {
+    const labels = extra && !KNOWN_LABELS.includes(extra)
+      ? KNOWN_LABELS.concat([extra]) : KNOWN_LABELS;
+    let rest = lower;
+    let name = null;
+    for (;;) {
+      rest = rest.replace(/^[^\p{L}\p{N}]+/u, '');
+      let next = null;
+      for (const label of labels) {
+        if (!rest.startsWith(label)) continue;
+        if (/[\p{L}\p{N}]/u.test(rest.charAt(label.length))) continue;
+        if (!next || label.length > next.length) next = label;
+      }
+      if (!next) return name;
+      name = next;
+      rest = rest.slice(next.length);
+    }
   }
 
-  function ledByAnotherMeter(lower, ownLabel) {
-    const ownKey = ALIAS_OWNER[ownLabel];
-    for (const other of ROW_LABELS) {
-      const otherLower = other.toLowerCase();
-      if (otherLower === ownLabel || ownLabel.startsWith(otherLower)) continue;
-      if (ownKey !== undefined && ALIAS_OWNER[otherLower] === ownKey) continue;
-      if (!ledBy(lower, otherLower)) continue;
-      // A heading run into this meter's own label is a heading, not the
-      // other meter's row: "Weekly · Opus only 91% used" is Opus only's.
-      const lead = lower.replace(/^[^\p{L}\p{N}]+/u, '');
-      if (ledBy(lead.slice(otherLower.length), ownLabel)) continue;
-      return true;
-    }
-    return false;
-  }
-
-  // Led by this label or another alias of the same meter.
-  function ledByThisMeter(lower, ownLabel) {
-    if (ledBy(lower, ownLabel)) return true;
-    const ownKey = ALIAS_OWNER[ownLabel];
-    if (ownKey === undefined) return false;
-    for (const alias in ALIAS_OWNER) {
-      if (ALIAS_OWNER[alias] === ownKey && ledBy(lower, alias)) return true;
-    }
-    return false;
+  // Is this row named by `label`, or by another alias of the same meter?
+  function namedFor(lower, label) {
+    const name = rowName(lower, label);
+    if (name === null) return false;
+    if (name === label) return true;
+    const owner = ALIAS_OWNER[label];
+    return owner !== undefined && ALIAS_OWNER[name] === owner;
   }
 
   function findRowByLabel(label) {
@@ -139,21 +141,19 @@ EXTRACTOR_TEMPLATE = r"""
       const t = candidate.text;
       if (!candidate.lower.includes(lowerLabel)) continue;
       if (!/%/.test(t)) continue;
-      // A row is named by the label it starts with, so a row that starts
-      // with another meter's label is that meter's, whatever its prose says.
-      // claude.ai's "Fable this week · Separate weekly limit for Fable · 14%
-      // used" contains both "this week" and "weekly", and its 14% was shown
-      // as the weekly figure while the real one, "This week", stood at 73%.
-      // One row only: an element holding several meters is left to
-      // readRowText, which refuses it as ambiguous and says so.
-      if (pctCount(t) === 1 && ledByAnotherMeter(candidate.lower, lowerLabel)) continue;
+      // A single row is read only for the meter it is named by. Mentioning
+      // a label is not enough: claude.ai's "Fable this week · Separate
+      // weekly limit for Fable · 14% used" contains "this week" and
+      // "weekly", and its 14% was shown as the weekly figure while the real
+      // one, "This week", stood at 73%. So was any row for a model the app
+      // does not know yet ("Mythos this week"), one that puts its number or
+      // its description first, and one shorter than the real row. A row
+      // named by no known label is not read at all: a refusal is an error
+      // the user sees, and a wrong number is not. An element holding
+      // several meters is left to readRowText, which refuses it as
+      // ambiguous when it can tell.
+      if (pctCount(t) === 1 && !namedFor(candidate.lower, lowerLabel)) continue;
       let score = t.length;
-      // And a row this meter names beats one that only mentions it. Length
-      // alone let "Opus this week · Resets in 2 days · 9% used", a row the
-      // catalog does not know, win "This week" over the real row by being
-      // five characters shorter. A preference, not a rule: a label under a
-      // heading of its own is still found.
-      if (!ledByThisMeter(candidate.lower, lowerLabel)) score += 1000;
       for (const other of ROW_LABELS) {
         if (other !== label && candidate.lower.includes(other.toLowerCase())) {
           score += 10000;
@@ -525,7 +525,7 @@ EXTRACTOR_TEMPLATE = r"""
       const row = readRow(alias);
       if (!row) continue;
       if (!row.ambiguous && row.kind !== 'unknown' &&
-          ledByThisMeter(String(row.raw || '').toLowerCase(), lower)) return row;
+          namedFor(String(row.raw || '').toLowerCase(), lower)) return row;
       if (!first) first = row;
     }
     return first;

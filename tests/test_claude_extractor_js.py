@@ -206,6 +206,10 @@ def test_a_row_that_only_mentions_the_label_cannot_overrule_an_earlier_refusal()
     assert _weekly_row(
         ["All models", "This week"], ambiguous=["All models"], unled=["This week"]
     ) == "All models"
+    # Nor can a read with no wording: the first read is what is reported.
+    assert _weekly_row(
+        ["All models", "This week"], ambiguous=["All models"], unknown=["This week"]
+    ) == "All models"
     # A row the meter names still overrules it.
     assert _weekly_row(["All models", "This week"], ambiguous=["All models"]) == "This week"
 

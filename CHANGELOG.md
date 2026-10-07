@@ -20,13 +20,15 @@ account's weekly limit.
   labels a row any more, and the only "weekly" left on the page is in the
   Fable row's description, so the tile showed Fable's 14% as the weekly
   figure while the account stood at 73%. It now looks for "This week"
-  before "Weekly". A row is also taken to belong to the meter whose label
-  it starts with, so the Fable row can no longer stand in for another
-  meter, whatever its description says; and a row a meter's label starts
-  is preferred to one that only mentions it, so a "<model> this week" row
-  the app does not know yet cannot win "This week" by being shorter. If
-  the seven-day row is ever missing again, the tile reports that it could
-  not read Weekly instead of showing another meter's number.
+  before "Weekly". A row is also read only for the meter it is named by:
+  the label it starts with, or, where a heading runs into a row's label,
+  the last of them. Mentioning a label is no longer enough, so the Fable
+  row cannot stand in for Weekly, and neither can a row for a model the
+  app does not know yet, one that puts its number or description first,
+  or one that is merely shorter than the real row. A page the app cannot
+  attribute like that shows "could not read Weekly" instead of a number.
+  The cost: a label behind something the app does not know, such as a
+  "New" badge, is refused until its wording is added to the catalog.
 - **Session and Weekly follow the meter catalog.** They were read through a
   fixed list of labels, so a label added to the catalog was used for the
   expanded rows but never for the gauge itself. They are now read through

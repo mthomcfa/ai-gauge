@@ -323,15 +323,29 @@ def test_a_row_led_by_another_alias_of_the_same_meter_still_reads():
 
 
 def test_the_leading_label_must_be_a_whole_word():
+    """"This weekend's pass" is not named "This week"; were it, it would win
+    on length over the real row."""
     dom = [
         ("", 900, None),
         ("", 400, 0),
-        ("Claude Designer weekly offer 30% used", 40, 1),
+        ("This weekend's pass 5% used", 40, 1),
+        ("This week Resets Saturday 10:00 AM 73% used", 40, 1),
     ]
 
-    # "Claude Designer" is not "Claude Design": the row is not that meter's,
-    # so the guard does not take it from the meter being read.
-    assert _read_row("Weekly", dom)["percent"] == 30
+    assert _read_row("This week", dom)["percent"] == 73
+
+
+def test_a_heading_run_into_another_meters_label_is_that_meters_row():
+    """"This week · Fable 14% used" in one element is a heading over the
+    Fable row, not the This week row."""
+    dom = [
+        ("", 900, None),
+        ("", 400, 0),
+        ("This week \u00b7 Fable \u00b7 Resets Saturday 10:00 AM 14% used", 40, 1),
+    ]
+
+    assert _read_row("This week", dom) is None
+    assert _read_row("Fable", dom)["percent"] == 14
 
 
 def test_a_label_that_extends_another_meters_alias_keeps_its_own_row():
@@ -361,6 +375,7 @@ def test_an_icon_before_the_label_does_not_hide_whose_row_it_is():
         ("● Fable this week Separate weekly limit for Fable 14% used", 40, 1),
     ]
 
+    assert _read_row("Fable this week", dom)["percent"] == 14
     assert _read_row("Weekly", dom) is None
 
 
@@ -377,6 +392,75 @@ def test_an_element_holding_several_meters_is_still_refused_as_ambiguous():
 
     assert row["ambiguous"] is True
     assert row["percent"] is None
+
+
+# --- pages the app cannot attribute are refused, never misread ------------
+#
+# The review's shapes: what claude.ai could plausibly render next. Each one
+# showed another meter's number as Weekly, as an OK snapshot, before a row
+# had to be named by the meter it was read for.
+
+SESSION = ["Current session", "Resets at 11:00 PM", "20% used"]
+THIS_WEEK = ["This week", "Resets Saturday 10:00 AM", "73% used"]
+FABLE = ["Fable this week",
+         "Separate weekly limit for Fable \u00b7 Resets Saturday 10:00 AM", "14% used"]
+MYTHOS = ["Mythos this week",
+          "Separate weekly limit for Mythos \u00b7 Resets Saturday 10:00 AM", "40% used"]
+
+
+def _panel(rows, *, heading=""):
+    nodes = [
+        ("", 1300, None),
+        ("Settings General Account Privacy Billing Usage", 1200, 0),
+        ("", 1200, 0),
+        ("Your usage Max (20x)", 30, 2),
+        (heading, 360, 2),
+    ]
+    for row in rows:
+        index = len(nodes)
+        nodes.append(("", 70, 4))
+        nodes.extend((part, 20, index) for part in row)
+    nodes.append(("Limit resets Full reset Expires Oct 22", 60, 2))
+    return nodes
+
+
+def _first(row, *order):
+    return [row[i] for i in order]
+
+
+@pytest.mark.parametrize(
+    "rows,heading",
+    [
+        # A model the catalog does not know yet, and the real row gone.
+        ([SESSION, FABLE, MYTHOS], ""),
+        # Percentages first, the real row gone.
+        ([_first(SESSION, 2, 0, 1), _first(FABLE, 2, 0, 1)], ""),
+        # The description before the label, the real row gone.
+        ([SESSION, _first(FABLE, 1, 0, 2)], ""),
+        # "This week" as a heading over per-model rows, Fable first.
+        ([SESSION,
+          ["Fable", "Separate weekly limit for Fable", "14% used"],
+          ["All other models", "Resets Saturday 10:00 AM", "73% used"]], "This week"),
+    ],
+    ids=["unknown-model", "percent-first", "description-first", "heading-over-rows"],
+)
+def test_a_page_the_app_cannot_attribute_is_an_error_not_another_meters_number(rows, heading):
+    snapshot = _build_snapshot(_extract(_panel(rows, heading=heading)),
+                               catalog=bundled_catalog("claude"))
+
+    # On main each of these was OK with Weekly 14 - Fable's number.
+    assert snapshot.status.name == "ERROR", {m.label: m.percent_used for m in snapshot.metrics}
+    assert "could not read" in snapshot.error and "Weekly" in snapshot.error
+
+
+def test_an_unknown_models_row_beside_the_real_one_changes_nothing():
+    snapshot = _build_snapshot(_extract(_panel([SESSION, THIS_WEEK, FABLE, MYTHOS])),
+                               catalog=bundled_catalog("claude"))
+
+    assert snapshot.status.name == "OK", snapshot.error
+    assert {m.label: m.percent_used for m in snapshot.metrics} == {
+        "Session": 20, "Weekly": 73, "Fable": 14,
+    }
 
 
 # --- the primary rows follow the catalog ------------------------------------
@@ -442,7 +526,8 @@ def test_the_shipped_order_tries_all_models_first():
 
 
 def test_the_catalog_names_this_week_before_weekly():
-    """Order matters: "Weekly" is a word the page also uses in prose."""
+    """Where both a "This week" row and a "Weekly" row read cleanly, the
+    first in catalog order is the gauge: today's label, not the older one."""
     aliases = next(
         spec.aliases for spec in bundled_catalog("claude").specs
         if spec.key == "weekly_all"
