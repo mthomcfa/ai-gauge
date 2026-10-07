@@ -97,36 +97,64 @@ EXTRACTOR_TEMPLATE = r"""
   }
   const KNOWN_LABELS = ROW_LABELS.map(label => label.toLowerCase());
 
-  // The label a row is named by: the known label it starts with, past any
-  // icon or bullet, as a whole word ("This week" does not start "This
-  // weekend"), the longest one when several do ("Fable this week", not
-  // "Fable"). Where one label runs straight into another, as a heading over
-  // a row does, the row is named by the last: "Weekly · Opus only 91% used"
-  // is Opus only's and "This week · Fable 14% used" is Fable's. null when no
-  // known label starts the row. `extra` is the label being read, which a
-  // fallback alias may not be among the known ones.
-  function rowName(lower, extra) {
+  // The longest known label `text` starts with, past any icon, bullet or
+  // list number ("1."), as a whole word: no letter straight after it, so
+  // "This week" does not start "This weekend". A digit may follow -
+  // "Current session20% used" is how an inline label and an inline
+  // percentage run together.
+  function leadingLabel(text, labels) {
+    const rest = text.replace(/^(?:[^\p{L}\p{N}]+|\d+[.)](?=\s))+/u, '');
+    let found = null;
+    for (const label of labels) {
+      if (!rest.startsWith(label)) continue;
+      if (/\p{L}/u.test(rest.charAt(label.length))) continue;
+      if (!found || label.length > found.length) found = label;
+    }
+    return found;
+  }
+
+  // The label a row is named by: the first thing in it that starts with a
+  // known label - the row's own text, then each element and each run of
+  // text inside it, in page order. By structure, not by the row's
+  // run-together text, so a badge, a screen-reader prefix, an icon, a
+  // caption or the percentage before the label does not hide it, and a
+  // description after it cannot rename it: "Fable this week · Weekly limit
+  // for Fable · 14% used" is Fable's. Text nodes as well as elements,
+  // because a badge often shares the label's element ("<span>New</span>
+  // This week"). null when nothing in the row starts with a known label, as
+  // in a row for a model the app does not know yet. `extra` is the label
+  // being read, which a fallback alias may not be among the known ones.
+  function rowName(el, lower, extra) {
     const labels = extra && !KNOWN_LABELS.includes(extra)
       ? KNOWN_LABELS.concat([extra]) : KNOWN_LABELS;
-    let rest = lower;
-    let name = null;
-    for (;;) {
-      rest = rest.replace(/^[^\p{L}\p{N}]+/u, '');
-      let next = null;
-      for (const label of labels) {
-        if (!rest.startsWith(label)) continue;
-        if (/[\p{L}\p{N}]/u.test(rest.charAt(label.length))) continue;
-        if (!next || label.length > next.length) next = label;
+    const own = leadingLabel(lower, labels);
+    if (own || !el) return own;
+    // A row is a few nodes; a wrapper with thousands is not one, and
+    // innerText per element is the expensive part.
+    const LIMIT = 80;
+    if (typeof document.createTreeWalker === 'function') {
+      // 5 = NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT.
+      const walker = document.createTreeWalker(el, 5);
+      for (let i = 0, node = walker.nextNode(); node && i < LIMIT;
+           i++, node = walker.nextNode()) {
+        const text = node.nodeType === 3 ? String(node.nodeValue || '') : norm(node);
+        const found = leadingLabel(text.replace(/\s+/g, ' ').trim().toLowerCase(), labels);
+        if (found) return found;
       }
-      if (!next) return name;
-      name = next;
-      rest = rest.slice(next.length);
+      return null;
     }
+    if (typeof el.querySelectorAll !== 'function') return null;
+    const inner = el.querySelectorAll('*');
+    for (let i = 0; i < inner.length && i < LIMIT; i++) {
+      const found = leadingLabel(norm(inner[i]).toLowerCase(), labels);
+      if (found) return found;
+    }
+    return null;
   }
 
   // Is this row named by `label`, or by another alias of the same meter?
-  function namedFor(lower, label) {
-    const name = rowName(lower, label);
+  function namedFor(el, lower, label) {
+    const name = rowName(el, lower, label);
     if (name === null) return false;
     if (name === label) return true;
     const owner = ALIAS_OWNER[label];
@@ -145,14 +173,13 @@ EXTRACTOR_TEMPLATE = r"""
       // a label is not enough: claude.ai's "Fable this week · Separate
       // weekly limit for Fable · 14% used" contains "this week" and
       // "weekly", and its 14% was shown as the weekly figure while the real
-      // one, "This week", stood at 73%. So was any row for a model the app
-      // does not know yet ("Mythos this week"), one that puts its number or
-      // its description first, and one shorter than the real row. A row
-      // named by no known label is not read at all: a refusal is an error
-      // the user sees, and a wrong number is not. An element holding
-      // several meters is left to readRowText, which refuses it as
-      // ambiguous when it can tell.
-      if (pctCount(t) === 1 && !namedFor(candidate.lower, lowerLabel)) continue;
+      // one, "This week", stood at 73%. So, once that row was missing, was
+      // a row for a model the app does not know yet ("Mythos this week"),
+      // whatever order its parts came in. A row named by no known label is
+      // not read at all: a refusal is an error the user sees, and a wrong
+      // number is not. An element holding several meters is left to
+      // readRowText, which refuses it as ambiguous when it can tell.
+      if (pctCount(t) === 1 && !namedFor(candidate.el, candidate.lower, lowerLabel)) continue;
       let score = t.length;
       for (const other of ROW_LABELS) {
         if (other !== label && candidate.lower.includes(other.toLowerCase())) {
@@ -173,7 +200,11 @@ EXTRACTOR_TEMPLATE = r"""
   function readRow(label) {
     const row = findRowByLabel(label);
     if (!row) return null;
-    return readRowText(norm(row), label);
+    const text = norm(row);
+    const out = readRowText(text, label);
+    // Whether the element is plainly this meter's row, for readPrimary.
+    out.named = namedFor(row, text.toLowerCase(), label.toLowerCase());
+    return out;
   }
 
   // Split out of readRow so the discovery scan below reads an unrecognized row
@@ -524,8 +555,7 @@ EXTRACTOR_TEMPLATE = r"""
       seen[lower] = true;
       const row = readRow(alias);
       if (!row) continue;
-      if (!row.ambiguous && row.kind !== 'unknown' &&
-          namedFor(String(row.raw || '').toLowerCase(), lower)) return row;
+      if (!row.ambiguous && row.kind !== 'unknown' && row.named) return row;
       if (!first) first = row;
     }
     return first;

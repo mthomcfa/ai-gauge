@@ -39,9 +39,9 @@ pytestmark = pytest.mark.skipif(
     shutil.which("node") is None, reason="node is required to evaluate the extractor JS"
 )
 
-# (own text, height, parent index). A node's rendered text is its own text
-# plus its descendants', derived below, so a container cannot claim text its
-# children do not have.
+# (own text, height, parent index[, text after its children]). A node's
+# rendered text is its own text, its descendants' and any text after them,
+# derived below, so a container cannot claim text its children do not have.
 PANEL: list[tuple[str, int, int | None]] = [
     ("", 1300, None),  # 0 body
     ("Settings General Account Privacy Billing Usage Capabilities Memory "
@@ -81,6 +81,7 @@ const NODES = RAW.map((n, i) => ({
   _own: n[0],
   _children: [],
   _parent: n[2],
+  _after: n[3] || '',
   getBoundingClientRect: () => ({ height: n[1] }),
 }));
 NODES.forEach(el => {
@@ -92,13 +93,31 @@ NODES.forEach(el => {
   };
 });
 function derive(el) {
-  return [el._own].concat(el._children.map(derive))
+  return [el._own].concat(el._children.map(derive), [el._after])
     .filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
 }
+// Elements and text nodes under a root, in page order, as a TreeWalker
+// showing both yields them.
+function walk(el, out) {
+  if (el._own) out.push({ nodeType: 3, nodeValue: el._own });
+  el._children.forEach(child => { out.push(child); walk(child, out); });
+  if (el._after) out.push({ nodeType: 3, nodeValue: el._after });
+  return out;
+}
 NODES.forEach(el => { el.innerText = derive(el); el.textContent = el.innerText; });
+// Descendants in page order: every list here gives a parent before its
+// children and siblings in order.
+NODES.forEach(el => {
+  el.querySelectorAll = () => NODES.filter(n => n !== el && el.contains(n));
+});
 globalThis.document = {
   querySelectorAll: () => NODES,
   querySelector: () => null,
+  createTreeWalker: root => {
+    const nodes = walk(root, []);
+    let i = 0;
+    return { nextNode: () => nodes[i++] || null };
+  },
   title: 'Claude',
   body: NODES[0],
   documentElement: null,
@@ -268,18 +287,6 @@ def test_an_override_listing_its_own_labels_still_gets_the_fix():
     assert _extract(old, _override_weekly(("Weekly limit",)))["weekly_all"]["percent"] == 30
 
 
-def test_a_heading_run_into_a_meters_own_label_is_still_that_meters_row():
-    """"Weekly · Opus only 91% used" starts with another meter's label, but
-    the row's own label follows it straight away: it is Opus only's."""
-    dom = [
-        ("", 900, None),
-        ("", 400, 0),
-        ("Weekly \u00b7 Opus only 91% used", 40, 1),
-    ]
-
-    assert _read_row("Opus only", dom)["percent"] == 91
-
-
 def test_fable_is_still_read_if_the_row_is_shortened_to_its_name():
     dom = [(t.replace("Fable this week", "Fable"), h, p) for t, h, p in PANEL]
 
@@ -352,19 +359,6 @@ def test_the_leading_label_must_be_a_whole_word():
     ]
 
     assert _read_row("This week", dom)["percent"] == 73
-
-
-def test_a_heading_run_into_another_meters_label_is_that_meters_row():
-    """"This week · Fable 14% used" in one element is a heading over the
-    Fable row, not the This week row."""
-    dom = [
-        ("", 900, None),
-        ("", 400, 0),
-        ("This week \u00b7 Fable \u00b7 Resets Saturday 10:00 AM 14% used", 40, 1),
-    ]
-
-    assert _read_row("This week", dom) is None
-    assert _read_row("Fable", dom)["percent"] == 14
 
 
 def test_a_label_that_extends_another_meters_alias_keeps_its_own_row():
@@ -470,6 +464,115 @@ def test_a_page_the_app_cannot_attribute_is_an_error_not_another_meters_number(r
     # On main each of these was OK with Weekly 14 - Fable's number.
     assert snapshot.status.name == "ERROR", {m.label: m.percent_used for m in snapshot.metrics}
     assert "could not read" in snapshot.error and "Weekly" in snapshot.error
+
+
+FABLE_WEEKLY_DESC = ["Fable this week",
+                     "Weekly limit for Fable \u00b7 Resets Saturday 10:00 AM", "14% used"]
+
+
+def test_a_label_at_the_start_of_a_description_does_not_rename_the_row():
+    """"Fable this week · Weekly limit for Fable · 14% used" is Fable's: the
+    first labelled element names the row, and a description that happens to
+    start with another meter's label comes after it."""
+    shown = _build_snapshot(_extract(_panel([SESSION, THIS_WEEK, FABLE_WEEKLY_DESC])),
+                            catalog=bundled_catalog("claude"))
+    renamed = _build_snapshot(
+        _extract(_panel([SESSION, ["7-day limit", "Resets Saturday 10:00 AM", "73% used"],
+                         FABLE_WEEKLY_DESC])),
+        catalog=bundled_catalog("claude"))
+
+    assert {m.label: m.percent_used for m in shown.metrics} == {
+        "Session": 20, "Weekly": 73, "Fable": 14,
+    }
+    assert renamed.status.name == "ERROR"
+    assert "Weekly" in renamed.error
+
+
+def test_a_session_description_naming_the_weekly_limit_leaves_session_alone():
+    gauge = [
+        ("", 900, None),
+        ("Plan usage", 600, 0),
+        ("Current session \u00b7 Weekly limits reset Thursday \u00b7 8% used", 40, 1),
+        ("Weekly 12% used", 40, 1),
+    ]
+
+    payload = _extract(gauge)
+
+    assert payload["session"]["percent"] == 8
+    assert payload["weekly_all"]["percent"] == 12
+
+
+def test_a_digit_straight_after_the_label_still_names_the_row():
+    """Inline label and percentage elements run together in innerText:
+    "Current session20% used". A digit does not continue the word."""
+    dom = [
+        ("", 900, None),
+        ("", 400, 0),
+        ("Current session20% used", 40, 1),
+    ]
+
+    assert _read_row("Current session", dom)["percent"] == 20
+
+
+def test_a_badge_before_the_label_does_not_hide_whose_row_it_is():
+    """The row's text starts "New This week ...", but its label element
+    starts "This week": the row is named by structure."""
+    rows = [SESSION, ["New", *THIS_WEEK], FABLE]
+
+    snapshot = _build_snapshot(_extract(_panel(rows)), catalog=bundled_catalog("claude"))
+
+    assert {m.label: m.percent_used for m in snapshot.metrics} == {
+        "Session": 20, "Weekly": 73, "Fable": 14,
+    }
+
+
+def _this_week_label_after(prefix: str):
+    """The panel with the This week row's label a bare text node after an
+    element holding ``prefix``, as ``<span><span>New</span>This week</span>``
+    renders: no element of its own starts with the label."""
+    nodes = _panel([SESSION])
+    row = len(nodes)
+    nodes.append(("", 70, 4))
+    wrap = len(nodes)
+    nodes.append(("", 20, row, "This week"))
+    nodes.append((prefix, 20, wrap))
+    nodes.append(("Resets Saturday 10:00 AM", 20, row))
+    nodes.append(("73% used", 20, row))
+    fable = len(nodes)
+    nodes.append(("", 70, 4))
+    nodes.extend((part, 20, fable) for part in FABLE)
+    return nodes
+
+
+@pytest.mark.parametrize(
+    "prefix", ["New", "Usage limit:", "schedule", "Max"],
+    ids=["badge", "screen-reader-text", "ligature-icon", "plan-chip"],
+)
+def test_a_label_sharing_its_element_with_a_prefix_is_still_found(prefix):
+    snapshot = _build_snapshot(_extract(_this_week_label_after(prefix)),
+                               catalog=bundled_catalog("claude"))
+
+    assert {m.label: m.percent_used for m in snapshot.metrics} == {
+        "Session": 20, "Weekly": 73, "Fable": 14,
+    }
+
+
+def test_a_list_number_before_the_label_does_not_hide_it():
+    rows = [SESSION, ["1. This week", "Resets Saturday 10:00 AM", "73% used"], FABLE]
+
+    payload = _extract(_panel(rows))
+
+    assert payload["weekly_all"]["percent"] == 73
+
+
+def test_rows_that_put_the_percentage_first_still_read():
+    rows = [_first(SESSION, 2, 0, 1), _first(THIS_WEEK, 2, 0, 1), _first(FABLE, 2, 0, 1)]
+
+    snapshot = _build_snapshot(_extract(_panel(rows)), catalog=bundled_catalog("claude"))
+
+    assert {m.label: m.percent_used for m in snapshot.metrics} == {
+        "Session": 20, "Weekly": 73, "Fable": 14,
+    }
 
 
 def test_an_unknown_models_row_beside_the_real_one_changes_nothing():

@@ -114,13 +114,6 @@ def test_both_claude_usage_layouts_are_recognised_as_the_usage_panel(heading):
     assert out.stdout == "true", f"layout not recognised: {heading!r}"
 
 
-def _guard_source() -> str:
-    """ALIAS_OWNER, ledBy and the two ledBy* checks, anchored on code."""
-    start = EXTRACTOR_JS.index("const ALIAS_OWNER")
-    end = EXTRACTOR_JS.index("function findRowByLabel")
-    return EXTRACTOR_JS[start:end]
-
-
 def _weekly_row_source() -> str:
     """readPrimary and the two primary reads, anchored on code."""
     start = EXTRACTOR_JS.index("function readPrimary")
@@ -136,18 +129,17 @@ def _weekly_row(available, *, catalog=None, ambiguous=(), unknown=(), unled=()) 
         catalog = bundled_catalog("claude").to_js()
     script = f"""
     const CATALOG = {json.dumps(catalog)};
-    const ROW_LABELS = CATALOG.flatMap(m => m.aliases);
     const available = new Set({json.dumps(list(available))});
     const unclear = new Set({json.dumps(list(ambiguous))});
     const unworded = new Set({json.dumps(list(unknown))});
     const mentioned = new Set({json.dumps(list(unled))});
+    // `named`: whether the element is plainly this meter's row (readRow
+    // works that out from the page's structure).
     const readRow = label => available.has(label)
       ? {{ label: label, ambiguous: unclear.has(label),
            kind: unworded.has(label) ? 'unknown' : 'used',
-           raw: (mentioned.has(label) ? "you've used 40% more " : '') + label + ' 12% used' }}
+           named: !mentioned.has(label) }}
       : null;
-    // The guard helpers readPrimary calls, from the same source.
-    {_guard_source()}
     {_weekly_row_source()}
     process.stdout.write(JSON.stringify(weeklyAll && weeklyAll.label));
     """
